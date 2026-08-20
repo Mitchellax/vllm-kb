@@ -8,6 +8,11 @@
     python scripts/build_vllm_snapshots.py --version 0.22.1   # 只拉指定 vllm 版本
     python scripts/build_vllm_snapshots.py --list             # 只列出需要拉取的版本
     python scripts/build_vllm_snapshots.py --index-only       # 已下载的只重建索引
+    python scripts/build_vllm_snapshots.py --insecure         # 内网：跳过 SSL 证书校验
+    python scripts/build_vllm_snapshots.py --base-url http://mirror:8080   # 内网 http 镜像源
+
+内网场景（SSL 被禁/证书不受信）：--insecure 跳过证书校验；--base-url 换内网镜像
+（默认 https://codeload.github.com）；也可用环境变量 VLLM_KB_INSECURE=1 / VLLM_KB_CODE_BASE。
 
 存储（与 vllm-ascend 分开，避免符号表混淆）：
     data/code/vllm/zips/{v}.zip          # vllm 主仓源码 zip
@@ -16,6 +21,8 @@
 """
 import argparse
 import json
+import os
+import ssl
 import sys
 import urllib.request
 import zipfile
@@ -26,6 +33,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vllm_kb.config import AppConfig  # noqa: E402
 
 VLLM_REPO = "vllm-project/vllm"
+DEFAULT_DOWNLOAD_BASE = "https://codeload.github.com"
+
+
+def _opener(insecure: bool) -> urllib.request.OpenerDirector:
+    """按需构造跳过证书校验的 opener（内网自签证书/SSL 被禁时用）。"""
+    if not insecure:
+        return urllib.request.build_opener()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
 
 
 def companion_vllm_versions(cfg: AppConfig) -> list[str]:
@@ -47,15 +65,16 @@ def _vllm_root(cfg: AppConfig) -> Path:
     return cfg.resolve(cfg.storage.code_root) / "vllm"
 
 
-def download(repo: str, version: str, dest: Path) -> bool:
+def download(repo: str, version: str, dest: Path, insecure: bool = False,
+             base_url: str = DEFAULT_DOWNLOAD_BASE) -> bool:
     if dest.exists() and dest.stat().st_size > 1000:
         return False
-    url = f"https://codeload.github.com/{repo}/zip/refs/tags/v{version}"
+    url = f"{base_url.rstrip('/')}/{repo}/zip/refs/tags/v{version}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"[vllm] 下载 v{version} ...", flush=True)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "vllm-kb"})
-        with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as f:
+        with _opener(insecure).open(req, timeout=300) as r, open(dest, "wb") as f:
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk:
@@ -143,8 +162,20 @@ def main() -> None:
     ap.add_argument("--version", action="append", default=None, help="指定 vllm 版本（可多次）")
     ap.add_argument("--list", action="store_true", help="只列出需要拉取的版本")
     ap.add_argument("--index-only", action="store_true", help="已下载的只重建索引")
+    ap.add_argument("--insecure", action="store_true",
+                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+    ap.add_argument("--base-url", default=None,
+                    help=f"下载源前缀（内网镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
+                         f"亦可用环境变量 VLLM_KB_CODE_BASE）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
+
+    insecure = args.insecure or os.environ.get("VLLM_KB_INSECURE", "").strip().lower() in ("1", "true", "yes", "on")
+    base_url = args.base_url or os.environ.get("VLLM_KB_CODE_BASE", DEFAULT_DOWNLOAD_BASE)
+    if insecure:
+        print("[vllm] --insecure：跳过 SSL 证书校验（内网模式）")
+    if base_url != DEFAULT_DOWNLOAD_BASE:
+        print(f"[vllm] 下载源 {base_url}")
 
     cfg = AppConfig.load(args.config)
     root = _vllm_root(cfg)
@@ -166,7 +197,7 @@ def main() -> None:
     # 1) 下载
     downloaded = 0
     for v in versions:
-        if download(VLLM_REPO, v, root / "zips" / f"{v}.zip"):
+        if download(VLLM_REPO, v, root / "zips" / f"{v}.zip", insecure=insecure, base_url=base_url):
             downloaded += 1
     if downloaded:
         print(f"[vllm] 本轮新下载 {downloaded} 个")

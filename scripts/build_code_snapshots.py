@@ -5,6 +5,13 @@
     python scripts/build_code_snapshots.py --version v0.23.0rc1   # 只预存指定版本
     python scripts/build_code_snapshots.py --index-only    # 已下载的版本只重建符号索引
     python scripts/build_code_snapshots.py --all           # 预存仓库全部 tag（41 个，~570MB）
+    python scripts/build_code_snapshots.py --insecure      # 内网：跳过 SSL 证书校验
+    python scripts/build_code_snapshots.py --base-url http://mirror:8080   # 内网 http 镜像源
+
+内网场景（SSL 被禁/证书不受信）：
+    - --insecure：urllib 用不校验证书的 context（自签证书/代理拦截时）；
+    - --base-url：把下载源换成内网镜像（http 或 https 均可），默认 https://codeload.github.com；
+    - 两者也可经环境变量 VLLM_KB_INSECURE=1 / VLLM_KB_CODE_BASE=<url> 指定（脚本外统一配置）。
 
 下载后每个版本 zip 存 data/code/zips/{version}.zip（~14MB），
 首次访问时按需解压到 data/code/snapshots/{version}/，符号索引建在 data/code/index.sqlite3。
@@ -12,6 +19,8 @@
 """
 import argparse
 import json
+import os
+import ssl
 import sys
 import urllib.request
 import zipfile
@@ -22,16 +31,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vllm_kb.code_index import VersionedCode  # noqa: E402
 from vllm_kb.config import AppConfig  # noqa: E402
 
+DEFAULT_DOWNLOAD_BASE = "https://codeload.github.com"
+DEFAULT_API_BASE = "https://api.github.com"
 
-def list_tags(repo: str) -> list[str]:
-    """GitHub REST 列出全部 tag（无 git 依赖）。"""
+
+def _opener(insecure: bool) -> urllib.request.OpenerDirector:
+    """按需构造跳过证书校验的 opener（内网自签证书/SSL 被禁时用）。"""
+    if not insecure:
+        return urllib.request.build_opener()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+
+
+def _insecure_from_env() -> bool:
+    return os.environ.get("VLLM_KB_INSECURE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def list_tags(repo: str, insecure: bool = False, api_base: str = DEFAULT_API_BASE) -> list[str]:
+    """GitHub REST 列出全部 tag（无 git 依赖）。api_base 可换内网 API 镜像。"""
     tags: list[str] = []
     page = 1
+    opener = _opener(insecure)
     while True:
-        url = f"https://api.github.com/repos/{repo}/tags?per_page=100&page={page}"
+        url = f"{api_base.rstrip('/')}/repos/{repo}/tags?per_page=100&page={page}"
         req = urllib.request.Request(url, headers={"User-Agent": "vllm-kb"})
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with opener.open(req, timeout=30) as r:
                 batch = json.loads(r.read().decode("utf-8"))
         except Exception as e:
             print(f"[warn] 列 tag 失败（page {page}）: {e}")
@@ -45,16 +72,17 @@ def list_tags(repo: str) -> list[str]:
     return tags
 
 
-def download_zip(repo: str, version: str, dest: Path) -> bool:
-    """下载版本源码 zip 到 dest（幂等：已存在跳过）。"""
+def download_zip(repo: str, version: str, dest: Path, insecure: bool = False,
+                 base_url: str = DEFAULT_DOWNLOAD_BASE) -> bool:
+    """下载版本源码 zip 到 dest（幂等：已存在跳过）。base_url 可换内网镜像源。"""
     if dest.exists() and dest.stat().st_size > 1000:
         return False
-    url = f"https://codeload.github.com/{repo}/zip/refs/tags/{version}"
+    url = f"{base_url.rstrip('/')}/{repo}/zip/refs/tags/{version}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"[code] 下载 {version} ...", flush=True)
     req = urllib.request.Request(url, headers={"User-Agent": "vllm-kb"})
     try:
-        with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as f:
+        with _opener(insecure).open(req, timeout=300) as r, open(dest, "wb") as f:
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk:
@@ -112,8 +140,23 @@ def main() -> None:
     ap.add_argument("--version", action="append", default=None, help="指定版本（可多次）")
     ap.add_argument("--all", action="store_true", help="预存全部 tag")
     ap.add_argument("--index-only", action="store_true", help="只重建索引，不下载")
+    ap.add_argument("--insecure", action="store_true",
+                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+    ap.add_argument("--base-url", default=None,
+                    help=f"下载源前缀（内网镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
+                         f"亦可用环境变量 VLLM_KB_CODE_BASE）")
+    ap.add_argument("--api-base", default=None,
+                    help=f"列 tag 的 API 地址（默认 {DEFAULT_API_BASE}；亦可用环境变量 VLLM_KB_CODE_API）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
+
+    insecure = args.insecure or _insecure_from_env()
+    base_url = args.base_url or os.environ.get("VLLM_KB_CODE_BASE", DEFAULT_DOWNLOAD_BASE)
+    api_base = args.api_base or os.environ.get("VLLM_KB_CODE_API", DEFAULT_API_BASE)
+    if insecure:
+        print(f"[code] --insecure：跳过 SSL 证书校验（内网模式）")
+    if base_url != DEFAULT_DOWNLOAD_BASE or api_base != DEFAULT_API_BASE:
+        print(f"[code] 下载源 {base_url} / API {api_base}")
 
     cfg = AppConfig.load(args.config)
     code = VersionedCode(cfg)
@@ -129,18 +172,18 @@ def main() -> None:
     if args.version:
         versions = args.version
     elif args.all:
-        versions = list_tags(repo)
+        versions = list_tags(repo, insecure=insecure, api_base=api_base)
         print(f"[code] 全部 tag: {len(versions)} 个")
     elif cfg.code.versions:
         versions = list(cfg.code.versions)
     else:
-        versions = list_tags(repo)
+        versions = list_tags(repo, insecure=insecure, api_base=api_base)
         print(f"[code] config 未指定，取全部 tag: {len(versions)} 个")
 
     # 1) 下载 zip（幂等）
     downloaded = 0
     for v in versions:
-        if download_zip(repo, v, code.zips_dir / f"{v}.zip"):
+        if download_zip(repo, v, code.zips_dir / f"{v}.zip", insecure=insecure, base_url=base_url):
             downloaded += 1
     if downloaded:
         print(f"[code] 本轮新下载 {downloaded} 个版本")
