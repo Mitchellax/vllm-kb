@@ -25,7 +25,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集重写资产路径）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）
 - **审核工作台**（Web UI）：人工确认统一入口（认证 / 存疑 / 删除+撤回，删除只动数据库记录、原始文件保留），
-  **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）
+  **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）——
+  启动与操作见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)
 - **存算分离**：skill 仅 ~28KB，数据（向量库/索引/图，可 41GB）放远程服务器，本地只发 HTTP 查询
 - **结构只读**：SQLite `mode=ro` + 向量库只读包装 + 无写端点，Agent 提示注入也无法修改知识库
 - **总日志接口**：打屏（默认）+ 可选落盘分卷（RotatingFileHandler，config `logging` 段开启）
@@ -82,6 +83,20 @@ python scripts/serve_api.py            # http://127.0.0.1:8000
 ```
 
 > 更新图（`build_graph.py`）前必须先停止检索服务（Kùzu 单写者，见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）。
+
+### 启动审核工作台（Web UI）
+
+人工确认统一入口 + API 配置中心（启动后浏览器打开 `http://127.0.0.1:8010`）：
+
+```bash
+python scripts/review_ui.py            # http://127.0.0.1:8010（自动补单，幂等）
+```
+
+- **审核**：未验证文档补标、案例标题待审核、OCR 图文不一致、低置信度签名、跨来源合并候选等
+  6 类待办，逐条 **✓ 认证 / ？存疑 / 🗑 标记删除 / ↩ 撤回**（删除只动数据库记录、原始文件保留）；
+- **API 配置中心**：集中编辑 embedding / OCR / GitHub 配置（非密钥进 config.json，
+  密钥脱敏存 `data/secrets.local.json`），embedding / OCR 均支持连通性测试；
+- 完整操作说明（含审核状态机、待实际删除列表）见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)。
 
 ### 查询
 
