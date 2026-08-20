@@ -15,6 +15,7 @@ import hashlib
 import json
 import sqlite3
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -89,18 +90,28 @@ def _hashes(doc: KbDocument) -> tuple[str, str]:
     return embed_hash, meta_hash
 
 
-def _log_progress(processed: int, total: int, start_ts: float, stats: dict, step: int) -> None:
+def _log_progress(
+    processed: int,
+    total: int,
+    start_ts: float,
+    stats: dict,
+    step: int,
+    samples: deque[tuple[float, int]] | None = None,
+) -> None:
     """打印入库进度（标准库实现，无第三方依赖）。
 
     节流：第 1 条、每 step 条、最后一条打印；step 默认 total//100（约 100 行）。
     嵌入是最慢步骤，进度按文档数计，附带已嵌入 chunk 数与 ETA。
+
+    ETA 用近 WINDOW_SECS 秒滑动窗口的实测速率线性外推（对速率波动更敏感），
+    窗口内样本不足（<2 个或窗口时长过短）时回退整体平均速率，避免初期抖动。
     """
     if total <= 0:
         return
     if processed < total and processed % step != 0 and processed != 1:
         return
     elapsed = time.time() - start_ts
-    rate = processed / elapsed if elapsed > 0 else 0.0
+    rate = _window_rate(samples, processed, elapsed) if samples else 0.0
     eta_s = (total - processed) / rate if rate > 0 else 0.0
     pct = processed / total * 100
     print(
@@ -110,6 +121,31 @@ def _log_progress(processed: int, total: int, start_ts: float, stats: dict, step
         f"{elapsed:.0f}s | ETA {eta_s / 60:.1f}min",
         flush=True,
     )
+
+
+# 滑动窗口时长：ETA 外推基于最近这么多秒的实测速率
+_WINDOW_SECS = 60.0
+
+
+def _window_rate(
+    samples: deque[tuple[float, int]], processed: int, elapsed: float
+) -> float:
+    """近 _WINDOW_SECS 秒的滑动窗口速率（docs/s）。
+
+    取窗口内最早样本与当前(processed, now)的差分；样本不足或窗口太短
+    （<10s）时回退整体平均（processed/elapsed），避免早期 ETA 剧烈跳动。
+    """
+    now = time.time()
+    while samples and now - samples[0][0] > _WINDOW_SECS:
+        samples.popleft()
+    if len(samples) >= 2:
+        t0, p0 = samples[0]
+        window_dt = now - t0
+        if window_dt >= 10.0:
+            rate = (processed - p0) / window_dt
+            if rate > 0:
+                return rate
+    return processed / elapsed if elapsed > 0 else 0.0
 
 
 def chunk_meta(doc: KbDocument, reliability: float) -> dict[str, Any]:
@@ -279,6 +315,7 @@ def ingest_docs(
         flush=True,
     )
 
+    samples: deque[tuple[float, int]] = deque()  # (时间戳, 已处理文档数)，ETA 滑动窗口用
     for doc in docs:
         processed += 1
         try:
@@ -319,7 +356,8 @@ def ingest_docs(
             if sum(len(c) for _, c in pending_embed) >= _EMBED_FLUSH_CHUNKS:
                 _flush_embed()
         finally:
-            _log_progress(processed, total, start_ts, stats, step)
+            samples.append((time.time(), processed))
+            _log_progress(processed, total, start_ts, stats, step, samples)
 
     _flush_embed()   # 收尾：嵌入 + 写库残余缓冲
     _flush_vector()  # 收尾：清空残余批量写缓冲
