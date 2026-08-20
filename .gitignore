@@ -13,6 +13,9 @@ secrets.env
 # 服务日志（总日志落盘目录）不入库
 logs/
 
+# 迁移打包产物（内含 secrets.local.json / config.json，不入库）
+deploy/
+
 # Python
 __pycache__/
 *.pyc

@@ -76,7 +76,7 @@
       "enabled": false
     }
   ],
-  "_comment_embedding": "强制 API：OpenAI 兼容 /embeddings 端点（本地 embedding 不做，部署复杂）；base_url 指向其他服务器的 vLLM 部署。api_key 与 api_key_env 二选一（key 可经审核工作台写入 data/secrets.local.json）。provider=echo 仅离线演示（效果粗糙）。max_input_chars 超长截断。",
+  "_comment_embedding": "强制 API：OpenAI 兼容 /embeddings 端点（本地 embedding 不做，部署复杂）；base_url 指向其他服务器的 vLLM 部署（可写裸 ip:port，如 10.0.0.5:8000/v1，会自动补 http://；https 需显式写全）。api_key 与 api_key_env 二选一（key 可经审核工作台写入 data/secrets.local.json）。provider=echo 仅离线演示（效果粗糙）。max_input_chars 超长截断。",
   "embedding": {
     "provider": "openai_compatible",
     "base_url": "https://api.siliconflow.cn/v1",

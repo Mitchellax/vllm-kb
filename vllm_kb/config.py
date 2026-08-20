@@ -17,6 +17,19 @@ from pydantic import BaseModel, ConfigDict, Field
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def ensure_url_scheme(url: str, what: str = "url") -> str:
+    """URL 缺 scheme（裸 ip:port）时补全 http://，避免 requests/urllib 报
+    'no connection adapters were found' / 'unknown url type' 且请求从未发出。
+
+    内网 vLLM/OCR 服务常见裸地址配置；https 应显式写全（本函数只补 http://）。
+    """
+    if url and "://" not in url:
+        fixed = "http://" + url
+        print(f"[warn] {what} 缺少 http(s):// 前缀，已自动补全为 {fixed}（https 请显式写全）")
+        return fixed
+    return url
+
+
 class ProjectCfg(BaseModel):
     name: str = "vllm-kb"
     data_root: str = "data"
@@ -277,6 +290,9 @@ class AppConfig(BaseModel):
         if self.embedding.provider == "openai_compatible":
             if not self.embedding.base_url:
                 raise ValueError("embedding.base_url 为空：OpenAI 兼容端点必填（如 https://api.siliconflow.cn/v1）")
+            self.embedding.base_url = ensure_url_scheme(
+                self.embedding.base_url, "embedding.base_url"
+            )
             if not self.embedding.effective_api_key:
                 msg = (
                     "embedding.api_key 为空且环境变量 "
@@ -290,6 +306,10 @@ class AppConfig(BaseModel):
                 st = src.get("issue_state", "all")
                 if st not in ("open", "closed", "all"):
                     raise ValueError(f"来源 {src.id}: github.issue_state 不合法: {st}")
+            if src.type == "image":
+                base = src.get("ocr_api_base", "")
+                if base:
+                    src.ocr_api_base = ensure_url_scheme(base, f"来源 {src.id} 的 ocr_api_base")
         if self.storage.vector_backend not in ("lancedb", "python"):
             raise ValueError(f"storage.vector_backend 不合法: {self.storage.vector_backend}")
         if not (0 < self.confidence.alpha + self.confidence.beta <= 1.0 + 1e-9):

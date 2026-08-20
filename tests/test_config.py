@@ -73,6 +73,42 @@ class TestConfig(unittest.TestCase):
         finally:
             del os.environ["VLLM_KB_TEST_TOKEN"]
 
+    def test_bare_base_url_gets_scheme(self):
+        """裸 ip:port 的 embedding.base_url / ocr_api_base 自动补 http://，
+        避免 requests 报 'no connection adapters were found'（请求从未发出）。"""
+        import os
+
+        os.environ["EMBEDDING_API_KEY"] = "dummy"
+        try:
+            data = {
+                "embedding": {"provider": "openai_compatible", "base_url": "10.0.0.5:8000/v1", "api_key": ""},
+                "sources": [{"id": "img", "type": "image", "ocr_api_base": "10.0.0.6:9000", "enabled": True}],
+            }
+            cfg = AppConfig.model_validate(data)
+            cfg.validate_runtime()
+            self.assertEqual(cfg.embedding.base_url, "http://10.0.0.5:8000/v1")
+            img = [s for s in cfg.effective_sources() if s.type == "image"][0]
+            self.assertEqual(img.get("ocr_api_base"), "http://10.0.0.6:9000")
+        finally:
+            del os.environ["EMBEDDING_API_KEY"]
+
+    def test_schemed_base_url_unchanged(self):
+        """已带 http(s):// 的地址保持不变。"""
+        data = {
+            "embedding": {"provider": "echo", "base_url": "https://api.siliconflow.cn/v1", "api_key": ""},
+        }
+        cfg = AppConfig.model_validate(data)
+        cfg.validate_runtime()
+        self.assertEqual(cfg.embedding.base_url, "https://api.siliconflow.cn/v1")
+
+    def test_ensure_url_scheme_helper(self):
+        from vllm_kb.config import ensure_url_scheme
+
+        self.assertEqual(ensure_url_scheme(""), "")
+        self.assertEqual(ensure_url_scheme("10.0.0.1:8080"), "http://10.0.0.1:8080")
+        self.assertEqual(ensure_url_scheme("http://x"), "http://x")
+        self.assertEqual(ensure_url_scheme("https://x/v1"), "https://x/v1")
+
 
 if __name__ == "__main__":
     unittest.main()
