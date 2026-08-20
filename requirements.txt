@@ -1,0 +1,24 @@
+# ===== vllm-kb 依赖 =====
+# 离线业务环境：pip install -r requirements.txt 需可用内网 wheel 源；
+# 或先在有网环境 `pip download -r requirements.txt -d wheels/` 打包离线安装。
+
+# ---- 核心（采集 + 检索 + 图，必装）----
+requests>=2.28
+pydantic>=2.5
+lancedb>=0.9            # 向量库（未装时回退纯 Python 模式，功能不完整）
+kuzu>=0.7               # Phase 2 图存储（Kùzu）
+fastapi>=0.110          # 检索 API + 审核工作台
+uvicorn>=0.29
+pillow>=9.0             # 图片处理（md 图片收集 / OCR 测试图）
+
+# ---- 业务来源解析（PDF/Markdown 导入，可选——按需安装）----
+pymupdf>=1.23           # PDF 文字层 + 表格提取
+python-docx>=1.1        # Word 案例（业务环境启用）
+trafilatura>=1.6        # 网页案例（业务环境启用）
+
+# ---- OCR（可选——按需安装；不装则 ocr_provider=ask 时询问/跳过）----
+# paddleocr>=2.7         # 本地 OCR（首次运行下载模型；离线需预置模型目录）
+# paddlepaddle>=2.6
+
+# ---- 开发/测试 ----
+# pytest>=8.0

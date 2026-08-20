@@ -1,0 +1,431 @@
+"""只读检索 API（FastAPI）。结构上杜绝一切写操作，不依赖提示词约束：
+
+1. SQLite 以 URI `mode=ro` 打开 —— 任何 INSERT/UPDATE/CREATE 在连接层必然失败；
+2. 向量库经 ReadOnlyVectorStore 包装 —— add/delete/update/clear 一律抛 ReadOnlyError；
+3. 本模块不导入任何可写模块（ingest/github_pull/pipeline/sources），不含写端点、
+   不打开文件写 —— tests/test_api_readonly.py 的源码级审计兜底；
+4. 运行前可执行 scripts/check_readonly.py 验证只读姿态。
+
+启动（需先 pip install fastapi uvicorn）：
+    python scripts/serve_api.py [--port 8000]
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+from .config import AppConfig
+from .search import SearchEngine
+
+
+# ---------------- 请求模型（模块级：FastAPI 闭包内局部模型 + 延迟注解会解析失败） ----------------
+
+class SearchRequest(BaseModel):
+    query: str
+    target_version: Optional[str] = None
+    component: Optional[str] = None
+    version: Optional[str] = None
+    top_k: Optional[int] = None
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class SignatureRequest(BaseModel):
+    text: str  # 原始报错/描述，现场提取签名
+    component: Optional[str] = None
+    top_k: Optional[int] = 15
+
+
+class CodeSearchRequest(BaseModel):
+    keyword: str
+    version: Optional[str] = None
+    limit: Optional[int] = 20
+    repo: Optional[str] = None  # vllm-ascend | vllm
+    path: Optional[str] = None  # 限定文件路径子串（如 worker/model_runner_v1.py）
+    per_version: Optional[bool] = False  # 每个版本各自收集命中（对比版本差异用）
+
+
+def _readonly_sqlite(path) -> sqlite3.Connection:
+    """URI 级只读 SQLite 连接：文件缺失或任何写操作都会抛错。"""
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def create_app(config_path: Optional[str] = None):
+    """构建 FastAPI 应用（fastapi 懒加载：未安装时本模块仍可导入）。"""
+    from fastapi import FastAPI, HTTPException
+
+    cfg = AppConfig.load(config_path, require_keys=False)
+    engine = SearchEngine(cfg, read_only=True)
+
+    # 版本化代码仓（懒加载：未预存时端点返回可用版本提示，不崩溃）
+    try:
+        from .code_index import VersionedCode
+
+        code_index = VersionedCode(cfg)
+    except Exception:
+        code_index = None
+
+    app = FastAPI(
+        title="vllm-kb 只读检索 API",
+        version="0.1.0",
+        description="vLLM / vllm-ascend 故障知识库检索接口。结构只读：无写端点，"
+                    "SQLite mode=ro，向量库写操作抛错。数据更新由用户运行流水线触发。",
+    )
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "read_only": True, "chunks": engine.vector_store.count()}
+
+    @app.post("/search")
+    def search(req: SearchRequest):
+        filters = dict(req.filters or {})
+        # component 参数同时作为结果过滤（组件查询的 companion 展开 + 过滤）
+        if req.component and "component" not in filters:
+            filters["component"] = req.component
+        results = engine.search(
+            query=req.query,
+            target_version=req.target_version,
+            component=req.component,
+            version=req.version,
+            top_k=req.top_k,
+            filters=filters or None,
+        )
+        return {
+            "context": engine.last_context,
+            "results": [
+                {
+                    "doc_id": r.doc_id,
+                    "title": r.title,
+                    "url": r.url,
+                    "component": r.component,
+                    "resolved": r.resolved,
+                    "kind": r.meta.get("kind", ""),
+                    "status": r.meta.get("status", ""),
+                    "verification": r.meta.get("verification", ""),
+                    "version_ref": r.version_ref,
+                    "version_span": [r.meta.get("version_span_min"), r.meta.get("version_span_max")],
+                    "similarity": r.similarity,
+                    "final": r.final,
+                    "confidence": {
+                        "score": r.confidence.score,
+                        "w_time": r.confidence.time_weight,
+                        "w_ver": r.confidence.version_weight,
+                        "w_rel": r.confidence.reliability,
+                        "target_version": r.confidence.target_version,
+                        "verification": r.confidence.extras.get("verification", ""),
+                    },
+                    "snippet": r.text[:500],
+                }
+                for r in results
+            ],
+            "degraded": engine._embed_error or None,  # embedding 不可用时降级为全文检索的提示
+        }
+
+    @app.get("/doc/{source_id}")
+    def doc(source_id: str):
+        """返回整篇文档全文（只读，从 SQLite FTS 分块按序拼装）。"""
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            row = conn.execute(
+                "SELECT title, url, created_at, resolved_at, status, component, extra "
+                "FROM docs WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="文档不存在")
+            chunks = conn.execute(
+                "SELECT f.text FROM chunks_meta m JOIN chunks_fts f ON f.chunk_id = m.chunk_id "
+                "WHERE m.doc_id = ? ORDER BY m.seq",
+                (source_id,),
+            ).fetchall()
+            return {
+                "source_id": source_id,
+                "title": row[0],
+                "url": row[1],
+                "created_at": row[2],
+                "resolved_at": row[3],
+                "status": row[4],
+                "component": row[5],
+                "extra": json.loads(row[6] or "{}"),
+                "body": "\n\n".join(c[0] for c in chunks),
+            }
+        finally:
+            conn.close()
+
+    @app.get("/components")
+    def components():
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            rows = conn.execute(
+                "SELECT component, count(*) c FROM docs GROUP BY component ORDER BY c DESC"
+            ).fetchall()
+            return {"components": [{"component": r[0], "docs": r[1]} for r in rows]}
+        finally:
+            conn.close()
+
+    @app.get("/companion")
+    def companion(component: str, version: str):
+        m = engine.companion
+        if m is None:
+            return {"component": component, "version": version, "companions": {},
+                    "note": "配套矩阵未配置或为空（运行 scripts/build_companion_matrix.py）"}
+        return {"component": component, "version": version, "companions": m.expand(component, version)}
+
+    @app.get("/matrix")
+    def matrix():
+        m = engine.companion
+        if m is None:
+            return {"rows": []}
+        return {"rows": [r.model_dump(by_alias=True) for r in m.rows]}
+
+    @app.get("/stats")
+    def stats():
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            total = conn.execute("SELECT count(*) FROM docs").fetchone()[0]
+            with_version = conn.execute(
+                "SELECT count(*) FROM docs WHERE version_span_min IS NOT NULL"
+            ).fetchone()[0]
+            return {"docs": total, "docs_with_version": with_version,
+                    "chunks": engine.vector_store.count()}
+        finally:
+            conn.close()
+
+    # ---------------- 签名精确检索 ----------------
+
+    @app.post("/signature-search")
+    def signature_search(req: SignatureRequest):
+        """从原始报错文本现场提取签名，做精确检索（FTS 短语 + 加权聚合）。
+
+        返回聚合视图：提取签名 + 命中的社区高频信号词 + 精确命中 + 标题精确命中。
+        """
+        from .signature import extract_signatures, format_signatures, signature_search
+
+        # 加载源码符号表（三层提取的优先层）；失败则退回基础正则
+        try:
+            from .symbol_table import load_symbol_table, load_signal_words, match_signal_words
+
+            table = load_symbol_table(cfg)
+            signal_words = load_signal_words(cfg)
+            phrase_signals = [
+                {"word": e.name, "weight": e.weight}
+                for e in table.entries if e.kind == "phrase"
+            ]
+        except Exception:
+            table = None
+            signal_words = []
+            phrase_signals = []
+        sigs = extract_signatures(req.text, symbol_table=table)
+        signal_hits = match_signal_words(signal_words, req.text, phrase_signals=phrase_signals) \
+            if (signal_words or phrase_signals) else []
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            hits = signature_search(
+                conn, sigs, top_k=req.top_k or 15, component=req.component,
+            )
+            # 标题精确命中（信号词/签名在标题里出现的最直接线索）
+            from .search import title_search
+
+            title_hits: list[dict] = []
+            for sw in signal_hits[:5]:
+                for th in title_search(conn, sw["word"], component=req.component, limit=5):
+                    if not any(t["doc_id"] == th.doc_id for t in title_hits):
+                        title_hits.append({
+                            "doc_id": th.doc_id, "title": th.title, "url": th.url,
+                            "component": th.component, "resolved": th.resolved,
+                            "signal": sw["word"],
+                        })
+        finally:
+            conn.close()
+        return {
+            "signatures": [
+                {"text": s.text, "kind": s.kind, "weight": s.weight, "origin": s.origin}
+                for s in sigs
+            ],
+            "signatures_text": format_signatures(sigs),
+            "signal_words": signal_hits[:10],
+            "results": [
+                {
+                    "doc_id": h.doc_id,
+                    "title": h.title,
+                    "url": h.url,
+                    "hit_signatures": h.hit_signatures,
+                    "score": h.score,
+                }
+                for h in hits
+            ],
+            "title_hits": title_hits[:10],
+        }
+
+    @app.get("/version")
+    def version_info(version: str, repo: Optional[str] = None):
+        """版本形态判断：正式 release / rc / pre / unknown（基于版本日历）。
+
+        repo: vllm-project/vllm-ascend（默认）| vllm-project/vllm；也接受简名 vllm-ascend/vllm。
+        """
+        from .confidence import load_release_meta, version_kind
+
+        repo = repo or "vllm-project/vllm-ascend"
+        # 简名兼容：vllm-ascend -> vllm-project/vllm-ascend
+        if repo in ("vllm-ascend", "ascend"):
+            repo = "vllm-project/vllm-ascend"
+        elif repo == "vllm":
+            repo = "vllm-project/vllm"
+        repo_slug = repo.replace("/", "-")
+        meta = load_release_meta(cfg.resolve(f"data/compatibility/release_calendar.{repo_slug}.json"))
+        kind = version_kind(meta, version)
+        info = None
+        if meta:
+            v = version.lower()
+            for tag, m in meta.items():
+                if tag.lower() == v or tag.lower().lstrip("v") == v.lstrip("v"):
+                    info = {"tag": tag, **m}
+                    break
+        return {
+            "version": version,
+            "repo": repo,
+            "kind": kind,
+            "calendar_loaded": meta is not None,
+            "release": info,
+            "note": "kind: release=正式版 rc=预发布 pre=早期 pre 版 unknown=日历中无此版本",
+        }
+
+    @app.get("/title")
+    def title(keyword: str, component: Optional[str] = None, limit: int = 20, match: str = "contains"):
+        """标题子串精确检索（SQL LIKE）：已知现象找 issue 的最快路径。"""
+        from .search import title_search
+
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            hits = title_search(conn, keyword, component=component, limit=limit, match=match)
+        finally:
+            conn.close()
+        return {
+            "keyword": keyword,
+            "component": component,
+            "results": [
+                {
+                    "doc_id": h.doc_id,
+                    "title": h.title,
+                    "url": h.url,
+                    "component": h.component,
+                    "resolved": h.resolved,
+                    "resolved_at": h.resolved_at,
+                }
+                for h in hits
+            ],
+        }
+
+    # ---------------- 版本化代码仓检索 ----------------
+
+    def _code_index_for(repo: Optional[str]):
+        """按 repo 取代码仓访问器：vllm-ascend（默认）| vllm。"""
+        if repo not in (None, "", "vllm-ascend", "vllm"):
+            return None
+        repo = "vllm-ascend" if repo in (None, "", "vllm-ascend") else "vllm"
+        try:
+            from .code_index import VersionedCode
+
+            return VersionedCode(cfg, repo=repo)
+        except Exception:
+            return None
+
+    @app.get("/code/versions")
+    def code_versions(repo: Optional[str] = None):
+        ci = _code_index_for(repo)
+        if ci is None:
+            return {"repo": repo or "vllm-ascend", "versions": [],
+                    "note": "code_index 未初始化（检查 config.storage.code_root）"}
+        return {"repo": repo or "vllm-ascend", "versions": ci.available_versions,
+                "note": "预存版本源码快照；未列的版本请先运行 scripts/build_code_snapshots.py 或 build_vllm_snapshots.py"}
+
+    @app.post("/code/search")
+    def code_search(req: CodeSearchRequest):
+        """代码仓检索：先符号索引精确匹配，再关键词全文兜底。
+
+        path：限定文件路径子串（--in-file）；per_version：每个版本各自收集命中，
+        输出各版本行号便于对比"哪个版本引入/移动了该代码"。
+        """
+        repo = req.repo
+        ci = _code_index_for(repo)
+        if ci is None:
+            raise HTTPException(status_code=503, detail="code_index 未初始化（运行 scripts/build_code_snapshots.py）")
+        try:
+            symbols = ci.search_symbols(req.keyword, req.version, limit=req.limit or 20)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"代码索引不可用: {e}")
+        if symbols and not req.per_version:
+            return {"mode": "symbol_index", "symbol": req.keyword, "repo": repo or "vllm-ascend",
+                    "version": req.version, "hits": symbols}
+        try:
+            greps = ci.grep(req.keyword, req.version, limit=req.limit or 20,
+                            path_sub=req.path, per_version=bool(req.per_version))
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"代码索引不可用: {e}")
+        mode = "grep" if not req.per_version else "grep_per_version"
+        return {"mode": mode, "symbol": req.keyword, "repo": repo or "vllm-ascend",
+                "version": req.version, "hits": greps}
+
+    @app.get("/code/file")
+    def code_file(version: str, path: str, max_chars: int = 6000, repo: Optional[str] = None):
+        """读取指定版本的源码文件片段（按需解压）。"""
+        ci = _code_index_for(repo)
+        if ci is None:
+            raise HTTPException(status_code=503, detail="code_index 未初始化")
+        text = ci.read_file(version, path, max_chars)
+        if text is None:
+            raise HTTPException(status_code=404, detail=f"{version}:{path} 不存在（repo={repo or 'vllm-ascend'}）")
+        return {"version": version, "repo": repo or "vllm-ascend", "path": path, "content": text}
+
+    # ---------------- Phase 2：图存储检索（Kùzu，懒加载；只读查询，不触发建图） ----------------
+
+    _graph_state: dict = {"builder": None}
+
+    def _graph():
+        """懒加载图访问器（只读查询）。图未构建时 is_built()=False，端点返回提示。"""
+        from .graph import GraphBuilder, default_graph_path
+
+        b = _graph_state["builder"]
+        if b is None:
+            b = GraphBuilder(default_graph_path(cfg))
+            _graph_state["builder"] = b
+        return b
+
+    def _require_graph():
+        b = _graph()
+        if not b.is_built():
+            raise HTTPException(status_code=503, detail="图未构建：运行 python scripts/build_graph.py")
+        return b
+
+    @app.get("/graph/stats")
+    def graph_stats():
+        b = _graph()
+        if not b.is_built():
+            return {"built": False, "note": "图未构建：运行 python scripts/build_graph.py"}
+        s = b.stats()
+        return {"built": True, "nodes": s.nodes, "rels": s.rels,
+                "summary": s.summary()}
+
+    @app.get("/graph/chain")
+    def graph_chain(doc: str):
+        """issue → 修复 PR → 落地 release 链路（doc=完整 source_id，如 github:vllm-project-vllm:issue:10700）。"""
+        return _require_graph().chain_issue(doc)
+
+    @app.get("/graph/fixes")
+    def graph_fixes(doc: str):
+        """PR 视角：该 PR 修复的 issues + 落地 release。"""
+        return _require_graph().fixes_pr(doc)
+
+    @app.get("/graph/sig")
+    def graph_sig(sig: str, limit: int = 10):
+        """签名实体（算子/错误码/模型/版本）→ 提及它的 issue/PR。"""
+        return _require_graph().sig_lookup(sig, limit=limit)
+
+    @app.get("/graph/doc")
+    def graph_doc(doc: str):
+        """文档邻接视图：MENTIONS 实体（调试/详情）。"""
+        return _require_graph().doc_neighbors(doc)
+
+    return app

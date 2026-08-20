@@ -1,0 +1,170 @@
+{
+  "_comment_project": "项目元信息；data_root 下存放所有数据产物（快照/数据库），建议加入 .gitignore",
+  "project": {
+    "name": "vllm-kb",
+    "data_root": "data"
+  },
+  "_comment_sources": "数据源列表（多来源可配置）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments。markdown/excel 接口已预留，实现待 Phase 4。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
+  "sources": [
+    {
+      "id": "vllm",
+      "type": "github",
+      "repo": "vllm-project/vllm",
+      "token": "",
+      "token_env": "GITHUB_TOKEN",
+      "api_base": "https://api.github.com",
+      "per_page": 100,
+      "max_issues": 0,
+      "issue_state": "all",
+      "include_prs": true,
+      "sort": "created",
+      "direction": "desc",
+      "fetch_comments": true,
+      "request_timeout_seconds": 30,
+      "max_retries": 3,
+      "retry_backoff_seconds": 5,
+      "checkpoint_file": "data/checkpoints/github_issues.json",
+      "raw_dir": "data/raw/github"
+    },
+    {
+      "id": "vllm-ascend",
+      "type": "github",
+      "repo": "vllm-project/vllm-ascend",
+      "token": "",
+      "token_env": "GITHUB_TOKEN",
+      "max_issues": 0,
+      "issue_state": "all",
+      "include_prs": true,
+      "fetch_comments": true,
+      "enabled": false
+    },
+    {
+      "id": "engineer-troubleshooting",
+      "type": "markdown",
+      "path": "data/imports/engineer",
+      "title_pattern": "^#\\s+(.+)",
+      "enabled": false
+    },
+    {
+      "id": "troubleshooting-excel",
+      "type": "excel",
+      "path": "data/imports/engineer/问题定位记录.xlsx",
+      "sheet": "Sheet1",
+      "columns": {"title": "问题标题", "body": "定位过程", "version": "版本", "date": "日期"},
+      "enabled": false
+    },
+    {
+      "id": "wiki",
+      "type": "markdown",
+      "path": "data/imports/md",
+      "title_pattern": "^#\\s+(.+)",
+      "enabled": false
+    },
+    {
+      "id": "manuals",
+      "type": "pdf",
+      "path": "data/imports/pdf",
+      "enabled": false
+    },
+    {
+      "id": "images",
+      "type": "image",
+      "ocr_provider": "ask",
+      "ocr_api_base": "",
+      "ocr_api_key": "",
+      "ocr_api_model": "",
+      "enabled": false
+    }
+  ],
+  "_comment_embedding": "强制 API：OpenAI 兼容 /embeddings 端点（本地 embedding 不做，部署复杂）；base_url 指向其他服务器的 vLLM 部署。api_key 与 api_key_env 二选一（key 可经审核工作台写入 data/secrets.local.json）。provider=echo 仅离线演示（效果粗糙）。max_input_chars 超长截断。",
+  "embedding": {
+    "provider": "openai_compatible",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key": "",
+    "api_key_env": "EMBEDDING_API_KEY",
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
+    "batch_size": 32,
+    "max_input_chars": 12000,
+    "timeout_seconds": 60,
+    "max_retries": 3
+  },
+  "_comment_chunking": "讨论线按段落切块，块间重叠 overlap_chars 字符",
+  "chunking": {
+    "max_chunk_chars": 4000,
+    "overlap_chars": 200
+  },
+  "_comment_storage": "vector_backend: lancedb（推荐）| python（纯标准库兜底）。canonical_file: 多来源统一单文件（不按来源拆分）。companion_file: vllm-ascend 组件配套矩阵（scripts/fetch_quay_tags.py 辅助生成+人工核对）。release_calendar: Phase 1 由 Releases API 生成 tag->日期 映射。code_root: 版本化代码仓根目录（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json），由 scripts/build_code_snapshots.py / build_vllm_snapshots.py 生成。",
+  "storage": {
+    "vector_backend": "lancedb",
+    "lancedb_path": "data/lancedb",
+    "sqlite_path": "data/kb.sqlite3",
+    "canonical_file": "data/raw/canonical.jsonl",
+    "companion_file": "data/compatibility/vllm-ascend.json",
+    "release_calendar": "data/compatibility/release_calendar.json",
+    "code_root": "data/code",
+    "graph_path": "data/graph",
+    "review_path": "data/review.sqlite3"
+  },
+  "_comment_code": "版本化代码仓（code 检索的数据源）。repo: 快照来源仓库。versions: 预存版本列表，留空=构建脚本默认取全部 tag。download_workers: zip 下载并发数。vllm 主仓快照由 scripts/build_vllm_snapshots.py 单独配置（--repo vllm）。",
+  "code": {
+    "repo": "vllm-project/vllm-ascend",
+    "versions": [
+      "v0.18.0",
+      "v0.23.0rc1",
+      "v0.23.0"
+    ],
+    "download_workers": 2
+  },
+  "_comment_confidence": "置信度 = w_time * (alpha*w_ver + beta*w_rel)，最终分 = sim^gamma * conf^(1-gamma)。",
+  "confidence": {
+    "alpha": 0.6,
+    "beta": 0.4,
+    "gamma": 0.6,
+    "half_life_days": 365.0,
+    "time_floor": 0.15,
+    "version_sigma": 1.5,
+    "unknown_version_weight": 0.5,
+    "reliability": {
+      "merged_fix": 0.9,
+      "closed": 0.6,
+      "open": 0.4,
+      "official_doc": 0.85,
+      "wiki": 0.7,
+      "discussion": 0.5
+    }
+  },
+  "_comment_retrieval": "default_target_version 兜底；查询时应显式传实际部署的 vLLM 版本或使用 'vllm-ascend:0.18.0 问题' 组件查询。prefer_unresolved_without_resolved: 无强匹配已解决问题时优先列未解决（含规避方案），resolved_min_similarity 为触发阈值。dedupe_by_doc 让同一 issue 只保留最高分 chunk。",
+  "retrieval": {
+    "vector_top_k": 50,
+    "fts_top_k": 50,
+    "final_top_k": 10,
+    "min_similarity": 0.0,
+    "dedupe_by_doc": true,
+    "prefer_unresolved_without_resolved": true,
+    "resolved_min_similarity": 0.5,
+    "default_target_version": ""
+  },
+  "_comment_api": "只读检索 API（python scripts/serve_api.py）。结构只读：SQLite mode=ro、向量库写操作抛错、无写端点；agent/skill 只能读，数据更新由用户跑流水线触发。",
+  "api": {
+    "host": "127.0.0.1",
+    "port": 8000
+  },
+  "_comment_verify": "verify 脚本默认使用的验收查询",
+  "verify": {
+    "queries": [
+      "CUDA error: an illegal memory access was encountered while running vLLM inference",
+      "ValueError: Not enough memory to allocate paged attention blocks, OOM",
+      "openai api server returned 500 Internal Server Error when calling chat completions",
+      "ValueError: The model's max model len is larger than the maximum number of tokens"
+    ]
+  },
+  "_comment_logging": "总日志：console 打屏（默认）；file=true 落盘（RotatingFileHandler 按 max_bytes 分卷，保留 backup_count 个历史卷）",
+  "logging": {
+    "console": true,
+    "file": false,
+    "file_path": "logs/vllm-kb.log",
+    "max_bytes": 10485760,
+    "backup_count": 5
+  }
+}

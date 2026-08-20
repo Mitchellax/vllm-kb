@@ -1,0 +1,26 @@
+# 数据产物（快照、数据库、checkpoint、资产层、图）——不入库
+data/
+
+# 配置含密钥，不入库（模板见 config.example.json）
+config.json
+
+# 本地密钥（开发调试用，不入库）
+secrets.env
+.env
+.env.*
+!.env.example
+
+# 服务日志（总日志落盘目录）不入库
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

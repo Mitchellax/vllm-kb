@@ -1,0 +1,593 @@
+"""数据源抽象层：所有来源（github / markdown / pdf / image / excel / ...）实现统一接口。
+
+接口约定（新来源只需实现这两个方法 + 注册 type）：
+    pull() -> int                     把原始数据拉取/导入到 raw_dir（幂等、可续传），返回新增条数
+    canonicalize() -> list[KbDocument] 从原始数据再生 canonical 文档（确定性、可重放）
+
+布局约定：
+    - 原始数据按来源分目录存储：data/raw/{source_id}/...（不同来源互不干扰）；
+    - 二进制/文本资产（PDF/Markdown/图片原件）统一存 data/assets/{sub}/（不可变，sha256 记录）；
+    - 解析产物（Markdown 正文、结构化表格 JSON、OCR 结果）存 data/parsed/{sub}/（可重跑）；
+    - canonical 统一单文件（storage.canonical_file），不按来源拆分；
+    - doc 的唯一标识（source_id）由来源自己保证跨来源不冲突（github 源用 repo 命名空间）。
+
+新增来源类型：继承 BaseSource + 注册到 _REGISTRY，即可接入全链路
+（canonical 合并 -> 分块 -> 嵌入 -> 图/向量 -> 置信度 -> 检索），无需改动其他模块。
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import re
+import shutil
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
+
+from .config import PROJECT_ROOT, SourceCfg
+from .models import KbDocument
+
+if TYPE_CHECKING:  # 仅类型标注用，避免循环导入
+    from .config import AppConfig
+
+# Markdown 图片引用：![alt](url "title")——url 取到空白/右括号前
+_IMG_REF_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+_BASE64_IMG_RE = re.compile(r"data:image/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)", re.I)
+_IMG_EXT = {"png": "png", "jpeg": "jpg", "jpg": "jpg", "webp": "webp", "gif": "gif"}
+
+
+def _sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
+    """复制资产到 assets/{sub}/（不可变层）。同名同 sha 幂等跳过；同名异 sha 加 sha 前缀。
+    返回 (assets 相对路径, sha256, 是否新增复制)。"""
+    target_dir = assets_dir / sub
+    target_dir.mkdir(parents=True, exist_ok=True)
+    sha = _sha256(src)
+    target = target_dir / src.name
+    if target.exists() and _sha256(target) == sha:
+        return f"assets/{sub}/{target.name}", sha, False
+    if target.exists():
+        # 同名但内容不同：加 sha 前缀避免覆盖
+        target = target_dir / f"{src.stem}.{sha[:12]}{src.suffix}"
+    shutil.copy2(src, target)
+    return f"assets/{sub}/{target.name}", sha, True
+
+
+class BaseSource(ABC):
+    type: str = "base"
+
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        self.cfg = cfg
+        self.id = cfg.id
+        self.project_root = project_root
+        self.app_cfg = app_cfg  # 提供后路径经 AppConfig.resolve（支持 VLLM_KB_DATA_ROOT 重定向）
+
+    def resolve(self, p: str | Path) -> Path:
+        """路径解析：优先 AppConfig.resolve（VLLM_KB_DATA_ROOT 重定向 + data_root），
+        否则按 project_root 相对解析。绝对路径原样返回。"""
+        path = Path(p)
+        if path.is_absolute():
+            return path
+        if self.app_cfg is not None:
+            return self.app_cfg.resolve(str(path))
+        return self.project_root / path
+
+    @property
+    def raw_dir(self) -> Path:
+        """该来源原始数据的独立目录（默认 data/raw/{source_id}）。"""
+        return self.resolve(self.cfg.get("raw_dir", f"data/raw/{self.id}"))
+
+    @abstractmethod
+    def pull(self) -> int:
+        """把原始数据拉取到 raw_dir（幂等、断点续传），返回本次新增条数。"""
+
+    @abstractmethod
+    def canonicalize(self) -> list[KbDocument]:
+        """从 raw_dir 再生 canonical 文档（确定性、可重放）。"""
+
+
+class GithubSource(BaseSource):
+    """GitHub REST 来源：issue + PR + 评论（见 github_pull.GithubPuller）。"""
+
+    type = "github"
+
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        super().__init__(cfg, project_root, app_cfg=app_cfg)
+        from .github_pull import GithubPuller, recanonicalize
+
+        self.puller = GithubPuller(cfg, project_root)
+        self._recanonicalize = recanonicalize
+
+    def pull(self, max_issues: int | None = None) -> int:
+        if max_issues is not None:
+            self.puller.max_issues = max_issues
+        return self.puller.pull()
+
+    def canonicalize(self) -> list[KbDocument]:
+        return self._recanonicalize(self.cfg, self.project_root)
+
+
+class MarkdownSource(BaseSource):
+    """Markdown 文档来源（案例 / 架构说明 / 经验总结，内容不固定）。
+
+    配置示例：
+        {"id": "wiki", "type": "markdown", "path": "data/imports/md",
+         "title_pattern": "^#\\s+(.+)"}
+
+    - pull(): 扫描配置 path 下 *.md / *.markdown，复制到 data/assets/md/（不可变层）；
+    - canonicalize(): 每个文件一个 KbDocument（title=首个 # 标题或文件名，body=全文）；
+    - verification=unverified（质量参差，后续经审核工作台补标为 tested/expert）。
+    """
+
+    type = "markdown"
+
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        super().__init__(cfg, project_root, app_cfg=app_cfg)
+        self.import_dir = self.resolve(self.cfg.get("path", f"data/imports/{self.id}"))
+        self.title_pattern = str(self.cfg.get("title_pattern", r"^#\s+(.+)"))
+        self._title_re = re.compile(self.title_pattern)
+
+    def _assets_dir(self) -> Path:
+        return self.resolve("data/assets/md")
+
+    def pull(self, max_issues: Optional[int] = None) -> int:
+        """扫描导入目录，把 md 复制到资产层（幂等）。返回新增条数。"""
+        if not self.import_dir.exists():
+            print(f"[sources:{self.id}] 导入目录不存在: {self.import_dir}")
+            return 0
+        added = 0
+        for p in sorted(self.import_dir.rglob("*.md")) + sorted(self.import_dir.rglob("*.markdown")):
+            _, _, copied = _copy_asset(p, self.resolve("data/assets"), "md")
+            if copied:
+                added += 1
+        print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 md）")
+        return added
+
+    def canonicalize(self) -> list[KbDocument]:
+        """从原始 md 再生 KbDocument，并收集正文图片到资产层。
+
+        - **优先读 imports 源文件**：图片相对路径以 md 所在目录为基准解析
+          （md 复制到 assets 后相对路径会失锚）；imports 被清空时回退 assets 副本；
+        - 正文图片引用重写为资产路径（assets/images/xxx.png），图片原件进不可变层；
+        - evidence 记录图片清单（供 ImageSource OCR 与图文互证消费）。
+        """
+        docs: list[KbDocument] = []
+        md_files: list[tuple[Path, bool]] = []
+        if self.import_dir.exists():
+            md_files = [(p, True) for p in sorted(self.import_dir.rglob("*.md"))
+                        + sorted(self.import_dir.rglob("*.markdown"))]
+        if not md_files:
+            assets = self._assets_dir()
+            if assets.exists():
+                md_files = [(p, False) for p in sorted(assets.glob("*.md"))
+                            + sorted(assets.glob("*.markdown"))]
+        for p, from_imports in md_files:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                print(f"[sources:{self.id}] 跳过 {p.name}: {e}")
+                continue
+            body, evidence = self._resolve_images(p, text) if from_imports else (text, [])
+            title = self._title_re.search(text)
+            title = title.group(1).strip() if title else p.stem
+            sha = _sha256(p)
+            extra: dict[str, Any] = {
+                "asset": {"path": f"assets/md/{p.name}", "sha256": sha, "format": "markdown"},
+                "quality": {"text_source": "text_layer", "parsed_with": "raw"},
+                "verification": "unverified",  # 质量参差：先入库，审核工作台补标
+                "structure": {},
+            }
+            if evidence:
+                extra["evidence"] = evidence
+            docs.append(KbDocument(
+                source_type="doc_markdown",
+                source_id=f"md:{p.stem}",
+                url="",
+                title=title,
+                body=body,
+                created_at=None,
+                component="",
+                extra=extra,
+            ))
+        return docs
+
+    # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
+
+    def _resolve_images(self, md_path: Path, text: str) -> tuple[str, list[dict]]:
+        """扫描正文图片引用：本地/base64 资产化并重写引用为资产路径；
+        URL 引用标记 remote（V1 不下载，业务环境内网可达时后续补）；解析失败标记 unresolved。
+        返回 (重写后的 body, evidence 列表)。
+        """
+        evidence: list[dict] = []
+        counter: dict[str, int] = {}
+
+        def repl(m: re.Match) -> str:
+            alt, ref = m.group(1), m.group(2)
+            ev = {"path": None, "source_ref": ref, "kind": "unresolved", "ocr": None}
+            if ref.startswith(("http://", "https://")):
+                ev["kind"] = "remote"
+                evidence.append(ev)
+                return m.group(0)  # 保留原引用
+            if ref.startswith("data:"):
+                bm = _BASE64_IMG_RE.match(ref)
+                if not bm:
+                    evidence.append(ev)
+                    return m.group(0)
+                ext = _IMG_EXT.get(bm.group(1).lower(), "png")
+                try:
+                    data = base64.b64decode(bm.group(2))
+                except Exception:
+                    evidence.append(ev)
+                    return m.group(0)
+                counter[ext] = counter.get(ext, 0) + 1
+                name = f"{md_path.stem}_img{counter[ext]}.{ext}"
+                target = self.resolve("data/assets/images") / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                asset_path = f"assets/images/{name}"
+                ev.update({"kind": "base64", "path": asset_path})
+                evidence.append(ev)
+                return f"![{alt}]({asset_path})"
+            # 本地路径（file:// 剥前缀；相对路径以 md 目录为基准）
+            local = ref[len("file://"):] if ref.startswith("file://") else ref
+            p = Path(local)
+            if not p.is_absolute():
+                p = md_path.parent / p
+            p = p.resolve()
+            if not p.exists():
+                evidence.append(ev)  # unresolved
+                return m.group(0)
+            asset_path, _, _ = _copy_asset(p, self.resolve("data/assets"), "images")
+            ev.update({"kind": "local", "path": asset_path})
+            evidence.append(ev)
+            return f"![{alt}]({asset_path})"
+
+        body = _IMG_REF_RE.sub(repl, text)
+        return body, evidence
+
+
+class PdfSource(BaseSource):
+    """PDF 手册来源（操作手册 / 接口指南：硬件排查命令、错误码参考）。
+
+    配置示例：
+        {"id": "manuals", "type": "pdf", "path": "data/imports/pdf"}
+
+    - pull(): 扫描配置 path 下 *.pdf，复制到 data/assets/pdf/（不可变层，sha256）；
+    - canonicalize(): PyMuPDF 文字层 → Markdown 全文；页面表格（错误码表/命令表）转
+      Markdown 表格附于正文（保证 FTS 可检索），另存结构化 JSON 到 data/parsed/pdf/；
+    - verification=expert（官方操作手册默认专家验证，无需审核补标）。
+    """
+
+    type = "pdf"
+
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        super().__init__(cfg, project_root, app_cfg=app_cfg)
+        self.import_dir = self.resolve(self.cfg.get("path", f"data/imports/{self.id}"))
+
+    # ---------- 布局 ----------
+
+    def _assets_dir(self) -> Path:
+        return self.resolve("data/assets/pdf")
+
+    def _parsed_dir(self) -> Path:
+        return self.resolve("data/parsed/pdf")
+
+    # ---------- 采集 ----------
+
+    def pull(self, max_issues: Optional[int] = None) -> int:
+        """扫描导入目录，把 PDF 复制到资产层（幂等）。返回新增条数。"""
+        if not self.import_dir.exists():
+            print(f"[sources:{self.id}] 导入目录不存在: {self.import_dir}")
+            return 0
+        added = 0
+        for p in sorted(self.import_dir.rglob("*.pdf")):
+            _, _, copied = _copy_asset(p, self.resolve("data/assets"), "pdf")
+            if copied:
+                added += 1
+        print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 pdf）")
+        return added
+
+    # ---------- 解析（可重跑：只读资产层） ----------
+
+    def canonicalize(self) -> list[KbDocument]:
+        """从资产层 PDF 解析出 KbDocument（每篇一个，body=Markdown 全文）。
+
+        表格策略：页面表格转 Markdown 表格拼入正文（错误码/命令可被 FTS 检索），
+        同时写入 parsed/pdf/{stem}.tables.json 供结构化消费（图/查询）。
+        """
+        try:
+            import pymupdf  # PyMuPDF 1.28+（旧名 fitz 已弃用）
+        except ImportError as e:
+            print(f"[sources:{self.id}] 未安装 pymupdf：pip install pymupdf（{e}）")
+            return []
+        docs: list[KbDocument] = []
+        assets = self._assets_dir()
+        if not assets.exists():
+            return docs
+        parsed_dir = self._parsed_dir()
+        parsed_dir.mkdir(parents=True, exist_ok=True)
+        for p in sorted(assets.glob("*.pdf")):
+            try:
+                doc = self._parse_pdf(p, parsed_dir)
+            except Exception as e:
+                print(f"[sources:{self.id}] 解析失败 {p.name}: {e}（跳过）")
+                continue
+            if doc is None:
+                continue
+            docs.append(doc)
+        return docs
+
+    def _parse_pdf(self, p: Path, parsed_dir: Path) -> Optional[KbDocument]:
+        import pymupdf
+
+        sha = _sha256(p)
+        pdf = pymupdf.open(str(p))
+        try:
+            if pdf.needs_pass:
+                print(f"[sources:{self.id}] 跳过加密 PDF: {p.name}")
+                return None
+            md_parts: list[str] = []
+            tables: list[dict] = []
+            first_text = ""
+            for page_no, page in enumerate(pdf, 1):
+                text = page.get_text("text")
+                if text.strip() and not first_text:
+                    first_text = text.strip().splitlines()[0][:120]
+                # 页面表格 → Markdown 表格 + 结构化 JSON
+                try:
+                    page_tables = page.find_tables()
+                except Exception:
+                    page_tables = None
+                for i, tab in enumerate((page_tables or {}).tables or []):
+                    data = tab.extract()
+                    if not data:
+                        continue
+                    md_parts.append(_table_to_markdown(data))
+                    tables.append({"page": page_no, "index": i, "rows": data})
+                if text.strip():
+                    md_parts.append(text.strip())
+            body = "\n\n".join(md_parts).strip()
+            if not body:
+                print(f"[sources:{self.id}] 跳过无文字层 PDF（可能为扫描件，待 OCR）: {p.name}")
+                return None
+            title = first_text or p.stem
+            # 结构化表格落盘（可重跑产物）
+            tables_rel = []
+            if tables:
+                tpath = parsed_dir / f"{p.stem}.tables.json"
+                tpath.write_text(
+                    __import__("json").dumps({"source": f"assets/pdf/{p.name}", "tables": tables},
+                                             ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+                tables_rel.append(f"parsed/pdf/{tpath.name}")
+            return KbDocument(
+                source_type="doc_pdf",
+                source_id=f"pdf:{p.stem}",
+                url="",
+                title=title,
+                body=body,
+                created_at=None,
+                component="",
+                extra={
+                    "asset": {"path": f"assets/pdf/{p.name}", "sha256": sha,
+                              "format": "pdf", "pages": pdf.page_count},
+                    "quality": {"text_source": "text_layer", "parsed_with": "pymupdf"},
+                    "verification": "expert",  # 官方操作手册默认专家验证
+                    "structure": {"tables": tables_rel},
+                },
+            )
+        finally:
+            pdf.close()
+
+
+def _table_to_markdown(rows: list[list]) -> str:
+    """二维表 → Markdown 表格（第一行作表头；列数取最长行并补齐）。"""
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    norm = [r + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in norm[0]) + " |"]
+    lines.append("|" + "---|" * width)
+    for r in norm[1:]:
+        lines.append("| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in r) + " |")
+    return "\n".join(lines)
+
+
+class ImageSource(BaseSource):
+    """图片证据 OCR 来源：对 data/assets/images/ 未 OCR 的图片做**签名导向 OCR**。
+
+    配置示例：
+        {"id": "images", "type": "image",
+         "ocr_provider": "ask",               # ask(默认) | api | paddle | none
+         "ocr_api_base": "http://<ocr-svc>:8000",   # api 模式：HTTP OCR 服务
+         "ocr_api_key": ""}                   # 可选，或环境变量 OCR_API_KEY
+
+    - 图片随 markdown/pdf 导入进资产层（assets/images/），本来源只做 OCR；
+    - canonicalize(): 扫描 assets/images/*，对每张图（幂等：ocr.json 记录 sha256 一致则跳过）
+      OCR → 提取错误签名 → 写 data/parsed/images/<stem>.ocr.json；
+      **返回 []**（图片不单独成文档；OCR 产物由所属文档 extra.evidence 引用）；
+    - OCR 引擎决策（无 API 时的交互）：
+      * provider=ask（默认）：有 ocr_api_base → 走 API；无 → **询问**"是否本地运行（paddle）"，
+        否定（或非交互终端）→ **跳过 OCR**（不写产物，导入不受阻）；
+      * provider=api：调 API；调用失败 → 询问本地/跳过（每次运行最多问一次）；
+      * provider=paddle：本地运行（明确选择，不询问；未安装 → 提示并跳过）；
+      * provider=none：明确跳过。
+    """
+
+    type = "image"
+    _IMG_GLOBS = ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif")
+
+    def _images_dir(self) -> Path:
+        return self.resolve("data/assets/images")
+
+    def _parsed_dir(self) -> Path:
+        return self.resolve("data/parsed/images")
+
+    def pull(self, max_issues: Optional[int] = None) -> int:
+        """图片随 md/pdf 导入资产层，本来源无独立采集。"""
+        return 0
+
+    def _ask_local_ocr(self) -> bool:
+        """无可用 OCR API 时询问是否本地运行（paddle）。非交互终端默认跳过。"""
+        try:
+            interactive = __import__("sys").stdin.isatty()
+        except Exception:
+            interactive = False
+        if not interactive:
+            return False
+        try:
+            ans = input("[ocr] OCR API 不可用，是否本地运行（paddleocr）？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("y", "yes")
+
+    def canonicalize(self) -> list[KbDocument]:
+        import json
+        import os
+
+        from .ocr import OcrApiError, OcrUnavailable, ocr_image
+
+        images = self._images_dir()
+        if not images.exists():
+            return []
+        parsed_dir = self._parsed_dir()
+        parsed_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- OCR 引擎决策 ----
+        provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
+        api_base = str(self.cfg.get("ocr_api_base", "") or "")
+        api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
+        api_model = str(self.cfg.get("ocr_api_model", "") or "")
+        api_mode = str(self.cfg.get("ocr_api_mode", "custom") or "custom")
+        if provider == "ask":
+            provider = "api" if api_base else ("paddle" if self._ask_local_ocr() else "none")
+        if provider == "none":
+            print(f"[sources:{self.id}] 跳过 OCR（可配置 ocr_provider: paddle 本地 / "
+                  f"api + ocr_api_base 服务，或安装 paddleocr）")
+            return []
+
+        processed, skipped, failed = 0, 0, 0
+        asked = False  # API 失败后的本地询问只问一次
+        for img in sorted(p for g in self._IMG_GLOBS for p in images.glob(g)):
+            if provider == "none":
+                break
+            sha = _sha256(img)
+            ocr_path = parsed_dir / f"{img.stem}.ocr.json"
+            if ocr_path.exists():
+                try:
+                    meta = json.loads(ocr_path.read_text(encoding="utf-8"))
+                    if meta.get("sha256") == sha:
+                        skipped += 1
+                        continue
+                except Exception:
+                    pass
+            while True:
+                try:
+                    text, conf = ocr_image(img, provider, api_base=api_base, api_key=api_key,
+                                           model=api_model, mode=api_mode)
+                    break
+                except OcrApiError as e:
+                    print(f"[sources:{self.id}] OCR API 失败: {e}")
+                    if not asked:
+                        asked = True
+                        if self._ask_local_ocr():
+                            provider = "paddle"
+                            continue  # 换本地重试当前图
+                    provider = "none"
+                    break
+                except OcrUnavailable as e:
+                    print(f"[sources:{self.id}] OCR 不可用（{e}）——跳过 OCR")
+                    provider = "none"
+                    break
+            if provider == "none":
+                print(f"[sources:{self.id}] 跳过 OCR（图片 {len(list(images.iterdir()))} 张，"
+                      f"已处理 {processed}）。可配置 ocr_provider: paddle 或 api + ocr_api_base")
+                break
+            # 签名导向：只提取可判错的签名（算子/错误码/模型/版本）
+            from .signature import extract_signatures
+
+            sigs = extract_signatures(text)
+            matched = [
+                {"text": s.text, "kind": s.kind}
+                for s in sigs if s.kind in ("kernel", "op", "errcode", "model", "version")
+            ]
+            ocr_path.write_text(
+                json.dumps({
+                    "image": f"assets/images/{img.name}", "sha256": sha,
+                    "provider": provider, "text": text,
+                    "confidence": round(conf, 4),
+                    "signatures": matched,
+                }, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            processed += 1
+        print(f"[sources:{self.id}] OCR 完成：新增 {processed}，跳过（幂等）{skipped}（图片 {len(list(images.iterdir()))} 张）")
+        return []
+
+
+class ExcelSource(BaseSource):
+    """Excel 表格来源（工程师导出的问题定位记录等）。接口已预留，实现见 Phase 4。
+
+    配置示例：
+        {"id": "engineer-troubleshooting", "type": "excel",
+         "path": "data/imports/engineer/问题定位记录.xlsx",
+         "sheet": "Sheet1", "columns": {"title": "问题标题", "body": "定位过程", "version": "版本", "date": "日期"}}
+    """
+
+    type = "excel"
+
+    def pull(self) -> int:
+        raise NotImplementedError("excel 来源尚未实现（计划 Phase 4）：请先用 github 来源，或联系开发补充该 adapter")
+
+    def canonicalize(self) -> list[KbDocument]:
+        raise NotImplementedError("excel 来源尚未实现（计划 Phase 4）")
+
+
+_REGISTRY: dict[str, type[BaseSource]] = {
+    "github": GithubSource,
+    "markdown": MarkdownSource,
+    "pdf": PdfSource,
+    "image": ImageSource,
+    "excel": ExcelSource,
+}
+
+
+def register_source(source_type: str, cls: type[BaseSource]) -> None:
+    """注册新的来源类型（第三方 adapter 接入点）。"""
+    _REGISTRY[source_type] = cls
+
+
+def create_source(cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                  app_cfg: Optional["AppConfig"] = None) -> BaseSource:
+    cls = _REGISTRY.get(cfg.type)
+    if cls is None:
+        raise ValueError(f"未知数据源类型: {cfg.type}（已注册: {sorted(_REGISTRY)}）")
+    return cls(cfg, project_root, app_cfg=app_cfg)
+
+
+def build_sources(app_cfg: "AppConfig", project_root: Path = PROJECT_ROOT) -> list[BaseSource]:
+    """按配置构建生效的数据源列表（跳过 enabled=false 与未注册类型，并提示）。"""
+    sources: list[BaseSource] = []
+    for sc in app_cfg.effective_sources():
+        if not sc.enabled:
+            print(f"[sources] 来源 {sc.id} ({sc.type}) 已禁用（enabled=false），跳过")
+            continue
+        try:
+            sources.append(create_source(sc, project_root, app_cfg=app_cfg))
+        except ValueError as e:
+            print(f"[warn] 跳过来源 {sc.id}: {e}")
+    if not sources:
+        print("[sources] 没有生效的数据源（请在 config.json 配置 sources）")
+    return sources

@@ -1,0 +1,51 @@
+{
+  "project": { "name": "vllm-kb-offline-demo", "data_root": "data" },
+  "github": {
+    "repo": "vllm-project/vllm",
+    "token": "",
+    "token_env": "GITHUB_TOKEN",
+    "max_issues": 500,
+    "checkpoint_file": "data/checkpoints/demo_issues.json",
+    "raw_dir": "data/raw/demo"
+  },
+  "embedding": {
+    "provider": "echo",
+    "base_url": "",
+    "api_key": "",
+    "model": "echo",
+    "dimensions": 1024,
+    "batch_size": 32,
+    "max_input_chars": 12000
+  },
+  "chunking": { "max_chunk_chars": 4000, "overlap_chars": 200 },
+  "storage": {
+    "vector_backend": "python",
+    "lancedb_path": "data/demo_vec.json",
+    "sqlite_path": "data/demo_kb.sqlite3",
+    "release_calendar": ""
+  },
+  "confidence": {
+    "alpha": 0.6,
+    "beta": 0.4,
+    "gamma": 0.6,
+    "half_life_days": 365.0,
+    "time_floor": 0.15,
+    "version_sigma": 1.5,
+    "unknown_version_weight": 0.5
+  },
+  "retrieval": {
+    "vector_top_k": 50,
+    "fts_top_k": 50,
+    "final_top_k": 10,
+    "min_similarity": 0.0,
+    "default_target_version": "0.6.0"
+  },
+  "verify": {
+    "queries": [
+      "CUDA illegal memory access",
+      "not enough memory to allocate paged attention blocks",
+      "chat completions 500 internal server error",
+      "max model len exceeds maximum number of tokens"
+    ]
+  }
+}
