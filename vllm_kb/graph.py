@@ -29,6 +29,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -227,6 +228,11 @@ class GraphBuilder:
         documents_edges: set[tuple[str, str, str]] = set()  # (doc_id, target_kind, target_id)
 
         with canonical_path.open(encoding="utf-8") as f:
+            # 总行数（进度分母）；66K 文档全量建图约分钟级，节流打印避免刷屏
+            total = sum(1 for _ in f)
+            f.seek(0)
+            step = max(1, total // 100)
+            start_ts = time.time()
             for i, line in enumerate(f):
                 if limit and i >= limit:
                     break
@@ -240,6 +246,17 @@ class GraphBuilder:
                 self._ingest_doc(doc, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
                                  interface_vals, fixes_edges, merged_edges, mention_edges,
                                  documents_edges, calendars, parsed_root)
+                if i and i % step == 0:
+                    elapsed = time.time() - start_ts
+                    rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+                    eta = (total - i - 1) / rate if rate > 0 else 0.0
+                    print(
+                        f"[graph] 解析 {i + 1}/{total} ({100.0 * (i + 1) / total:.1f}%) | "
+                        f"{elapsed:.0f}s | {rate:.0f} 行/s | ETA {eta / 60:.1f}min",
+                        flush=True,
+                    )
+            print(f"[graph] 解析完成 {i + 1} 行（{time.time() - start_ts:.0f}s），写图 …",
+                  flush=True)
 
         # 过滤端点不存在的边（引用编号可能不在库中/编号实际是 PR 等）：Kùzu COPY 强制端点存在
         issue_ids = set(issue_rows)
@@ -255,11 +272,13 @@ class GraphBuilder:
         }
 
         # 写入 CSV 并 COPY
+        copy_start = time.time()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             self._copy_nodes(tmp_path, issue_rows, pr_rows, doc_rows, release_rows,
                              entity_vals, interface_vals)
             self._copy_rels(tmp_path, fixes_edges, merged_edges, mention_edges, documents_edges)
+        print(f"[graph] COPY 完成（{time.time() - copy_start:.0f}s）", flush=True)
 
         return self.stats()
 
@@ -363,29 +382,35 @@ class GraphBuilder:
                             ("Release", release_rows)):
             p = _node_csv(f"{table}.csv", rows)
             if p:
+                print(f"[graph]   COPY {table}（{len(rows)} 节点）…", flush=True)
                 self.conn.execute(f"COPY {table} FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
         if interface_vals:
             p = self._write_csv(tmp, "Interface.csv", ["id"], ([v] for v in sorted(interface_vals)))
+            print(f"[graph]   COPY Interface（{len(interface_vals)} 节点）…", flush=True)
             self.conn.execute(f"COPY Interface FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
         for kind, table in _ENTITY_TABLE.items():
             vals = entity_vals[kind]
             if not vals:
                 continue
             p = self._write_csv(tmp, f"{table}.csv", ["id"], ([v] for v in sorted(vals)))
+            print(f"[graph]   COPY {table}（{len(vals)} 节点）…", flush=True)
             self.conn.execute(f"COPY {table} FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
 
     def _copy_rels(self, tmp: Path, fixes_edges, merged_edges, mention_edges,
                    documents_edges) -> None:
         if fixes_edges:
             p = self._write_csv(tmp, "FIXES.csv", ["PR_id", "Issue_id"], fixes_edges)
+            print(f"[graph]   COPY FIXES（{len(fixes_edges)} 边）…", flush=True)
             self.conn.execute(f"COPY FIXES FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
         if merged_edges:
             p = self._write_csv(tmp, "MERGED_IN.csv", ["PR_id", "Release_id"], merged_edges)
+            print(f"[graph]   COPY MERGED_IN（{len(merged_edges)} 边）…", flush=True)
             self.conn.execute(f"COPY MERGED_IN FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
         if documents_edges:
             # DOCUMENTS 多 label：按目标类型拆分（ErrorCode / Interface）
             err_edges = [(a, c) for a, k, c in documents_edges if k == "error_code"]
             iface_edges = [(a, c) for a, k, c in documents_edges if k == "interface"]
+            print(f"[graph]   COPY DOCUMENTS（{len(documents_edges)} 边）…", flush=True)
             if err_edges:
                 p = self._write_csv(tmp, "DOCUMENTS_E.csv", ["Doc_id", "ErrorCode_id"], err_edges)
                 self.conn.execute(
@@ -399,6 +424,8 @@ class GraphBuilder:
             by_kind: dict[str, list[tuple[str, str]]] = {}
             for doc_id, kind, value in mention_edges:
                 by_kind.setdefault(kind, []).append((doc_id, value))
+            print(f"[graph]   COPY MENTIONS（{len(mention_edges)} 边，{len(by_kind)} 目标类型）…",
+                  flush=True)
             for kind, edges in by_kind.items():
                 table = _ENTITY_TABLE[kind]
                 # from 端点可能是 Issue / PR / Doc：从 source_id 前缀判断
