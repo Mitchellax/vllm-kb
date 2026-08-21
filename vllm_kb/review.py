@@ -99,6 +99,24 @@ def _delete_doc_row(kb_path: str | Path, source_id: str) -> None:
         conn.close()
 
 
+def _delete_doc_chunks(kb_path: str | Path, source_id: str) -> None:
+    """删除该文档的全部 chunk（chunks_fts + chunks_meta），并返回 chunk_id 列表。
+
+    FTS 是 contentless 表（text 在 chunks_fts_content），chunks_fts 只存索引，
+    直接 DELETE FROM chunks_fts 即可；chunks_meta 单独删。
+    """
+    conn = sqlite3.connect(str(kb_path))
+    try:
+        ids = [r[0] for r in conn.execute(
+            "SELECT chunk_id FROM chunks_meta WHERE doc_id=?", (source_id,)).fetchall()]
+        conn.execute("DELETE FROM chunks_fts WHERE doc_id=?", (source_id,))
+        conn.execute("DELETE FROM chunks_meta WHERE doc_id=?", (source_id,))
+        conn.commit()
+        return ids
+    finally:
+        conn.close()
+
+
 def _restore_doc_row(kb_path: str | Path, doc_row: dict) -> None:
     """用备份恢复 docs 行（extra dict → JSON 字符串）。"""
     conn = sqlite3.connect(str(kb_path))
@@ -317,6 +335,66 @@ def default_review_path(cfg: Optional["AppConfig"] = None) -> Path:
     if cfg is not None:
         return cfg.resolve(getattr(cfg.storage, "review_path", "data/review.sqlite3"))
     return Path("data/review.sqlite3")
+
+
+# ---------------- 外源文档管理（审核工作台"文档管理"页签） ----------------
+
+# 外源文档 = 非 GitHub 采集来源（导入的 PDF / Markdown / 表格 / OCR 等）
+_EXTERNAL_SOURCE_TYPES = ("doc_pdf", "doc_markdown", "doc_excel", "doc_other")
+
+
+def list_external_docs(kb_path: str | Path, limit: int = 200, offset: int = 0) -> list[dict]:
+    """列出 kb.sqlite3 中的外源文档（source_type 以 doc_ 开头，排除 github_*）。
+
+    返回 {source_id, source_type, title, component, url, extra}（extra 含 asset 路径/verification）。
+    """
+    conn = sqlite3.connect(str(kb_path))
+    try:
+        rows = conn.execute(
+            """SELECT source_id, source_type, title, component, url, extra
+               FROM docs WHERE source_type NOT LIKE 'github%'
+               ORDER BY source_type, source_id LIMIT ? OFFSET ?""",
+            (int(limit), int(offset)),
+        ).fetchall()
+        out = []
+        for sid, st, title, comp, url, extra in rows:
+            try:
+                ex = json.loads(extra or "{}")
+            except (TypeError, json.JSONDecodeError):
+                ex = {}
+            out.append({
+                "source_id": sid,
+                "source_type": st,
+                "title": title or "",
+                "component": comp or "",
+                "url": url or "",
+                "asset": (ex.get("asset") or {}).get("path", ""),
+                "verification": ex.get("verification", ""),
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def delete_external_doc(kb_path: str | Path, source_id: str,
+                        vector_store=None) -> dict:
+    """从数据库彻底删除外源文档（本地资产文件不动）。
+
+    - kb.sqlite3：docs 行 + chunks_fts/chunks_meta（该文档全部 chunk）；
+    - 向量库：lancedb 删除该文档全部 chunk 向量（vector_store 传入时）。
+    返回 {"chunks_deleted": n}。下次增量入库时若本地文件仍在，会重新入库。
+    """
+    doc_row = _read_doc_row(kb_path, source_id)
+    if doc_row is None:
+        raise ValueError(f"kb.sqlite3 中不存在 {source_id}（可能已删除）")
+    chunk_ids = _delete_doc_chunks(kb_path, source_id)
+    _delete_doc_row(kb_path, source_id)
+    if vector_store is not None:
+        try:
+            vector_store.delete_doc(source_id)
+        except Exception as e:
+            print(f"[review] 向量删除失败（不影响 SQLite 删除）: {e}")
+    return {"chunks_deleted": len(chunk_ids)}
 
 
 # ---------------- 审核项生成（seed，幂等） ----------------

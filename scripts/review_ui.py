@@ -52,17 +52,18 @@ pre{background:#111827;color:#e5e7eb;padding:10px;border-radius:6px;overflow:aut
 <header><strong>vllm-kb 审核工作台</strong>
 <a id="nav-stats" class="active" onclick="tab('stats')">概览</a>
 <a id="nav-queue" onclick="tab('queue')">审核队列</a>
+<a id="nav-docs" onclick="tab('docs')">文档管理</a>
 <a id="nav-configs" onclick="tab('configs')">API 配置</a></header>
 <div id="toast" style="position:fixed;top:12px;right:20px;background:#111827;color:#fff;padding:8px 14px;border-radius:6px;display:none;z-index:99;font-size:13px"></div>
 <main>
-<div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-configs" style="display:none"></div>
+<div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-configs" style="display:none"></div>
 </main>
 <script>
 const $=s=>document.querySelector(s);
 async function j(url,opt){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);return d}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function badge(s){return `<span class="badge ${s}">${s}</span>`}
-function tab(name){['stats','queue','configs'].forEach(t=>{document.getElementById('view-'+t).style.display=t===name?'':'none';document.getElementById('nav-'+t).className=t===name?'active':''});if(name==='stats')loadStats();if(name==='queue')loadQueue();if(name==='configs')loadConfigs()}
+function tab(name){['stats','queue','docs','configs'].forEach(t=>{document.getElementById('view-'+t).style.display=t===name?'':'none';document.getElementById('nav-'+t).className=t===name?'active':''});if(name==='stats')loadStats();if(name==='queue')loadQueue();if(name==='docs')loadDocs();if(name==='configs')loadConfigs()}
 async function loadStats(){const s=await j('/api/stats');const cats=Object.entries(s).sort((a,b)=>b[1].pending-a[1].pending);
 $('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pending,0)} 待办 / ${cats.reduce((a,[k,v])=>a+v.suspected,0)} 存疑）</h3>`+cats.map(([k,v])=>`<div class="card"><b>${esc(k)}</b> <span class="badge pending">待办 ${v.pending}</span>${v.suspected?`<span class="badge suspected">存疑 ${v.suspected}</span>`:''} <span class="muted">共 ${v.total}</span></div>`).join('')||'<div class="card">暂无审核项（导入文档后自动补单）</div>'}
 async function loadQueue(cat=''){const q=await j('/api/queue'+(cat?'?category='+cat:''));
@@ -88,6 +89,15 @@ async function deleteDoc(id){const reviewer=document.getElementById('rev').value
 if(!confirm('标记删除：只删除数据库记录，原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
 await j('/api/item/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,note:document.getElementById('rvnote').value})});loadQueue()}
 async function undoDelete(id){if(!confirm('撤回删除：恢复数据库记录并重新加入队列？'))return;await j('/api/item/'+id+'/undo',{method:'POST'});loadQueue()}
+async function loadDocs(){const ds=await j('/api/external-docs?limit=500');
+$('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
+<div class="card muted">删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。</div>`+ds.map(d=>`<div class="card" style="border-left:3px solid #d1d5db"><div><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span></div>
+<div class="mono muted">${esc(d.source_id)}</div>
+<div class="muted">${esc(d.asset||'')}${d.verification?` · 验证=${esc(d.verification)}`:''}</div>
+<button class="danger" onclick="delExternalDoc('${esc(d.source_id).replace(/'/g,"\\'")}')">🗑 从数据库删除（本地文件保留）</button></div>`).join('')||'<div class="card muted">无外源文档</div>'}
+async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？'))return
+try{await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();toast('✓ 已删除（本地文件保留）')}
+catch(e){toast('✗ 删除失败: '+e.message)}}
 async function loadConfigs(){const cs=await j('/api/configs');fillCache(cs);
 $('#view-configs').innerHTML=`<h3>API 配置中心（key 脱敏；可编辑）</h3>`+cs.map(c=>`<div class="card" id="cfg-${esc(c.name)}"><b>${esc(c.name)}</b> <span class="badge ${c.status==='configured'?'confirmed':'pending'}">${c.status}</span>
 <table><tr><th>provider</th><td>${esc(c.provider)}</td></tr>${c.mode&&c.mode!=='custom'?`<tr><th>mode</th><td>${esc(c.mode)}</td></tr>`:''}${c.model?`<tr><th>model</th><td class="mono">${esc(c.model)}</td></tr>`:''}<tr><th>base_url</th><td class="mono">${esc(c.base_url)}</td></tr><tr><th>key</th><td>${c.key_configured?'已配置':'未配置'}</td></tr><tr><th>说明</th><td class="muted">${esc(c.note||'')}</td></tr></table>
@@ -146,6 +156,35 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     def categories():
         from vllm_kb.review import CATEGORIES
         return CATEGORIES
+
+    @app.get("/api/external-docs")
+    def external_docs(limit: int = 200, offset: int = 0):
+        """外源文档列表（导入的 PDF/MD/表格等，排除 GitHub 采集来源）。"""
+        from vllm_kb.review import list_external_docs
+        return list_external_docs(cfg.resolve(cfg.storage.sqlite_path),
+                                  limit=min(limit, 500), offset=offset)
+
+    @app.post("/api/external-docs/delete")
+    def external_doc_delete(body: dict):
+        """彻底删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量），
+        本地资产文件不动；下次增量入库时文件仍在本地则重新入库。"""
+        from vllm_kb.review import delete_external_doc
+        from vllm_kb.vectorstore import build_vector_store
+
+        source_id = (body.get("source_id") or "").strip()
+        if not source_id:
+            raise HTTPException(400, "source_id 必填")
+        kb_path = cfg.resolve(cfg.storage.sqlite_path)
+        # 向量清理用可写 store（审核工作台本身可写；检索 API 才强制只读）
+        try:
+            vector_store = build_vector_store(cfg)
+        except Exception:
+            vector_store = None
+        try:
+            r = delete_external_doc(kb_path, source_id, vector_store=vector_store)
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+        return {"ok": True, "note": f"已从数据库删除 {source_id}（{r['chunks_deleted']} 个 chunk，本地文件保留）"}
 
     @app.get("/api/stats")
     def stats():

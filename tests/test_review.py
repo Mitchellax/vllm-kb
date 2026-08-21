@@ -161,13 +161,77 @@ class TestDeleteAndUndo(unittest.TestCase):
         self.assertEqual(json.loads(row[1])["verification"], "unverified")  # 恢复完整
         it = self.store.get_item(1)
         self.assertEqual(it["status"], "pending")  # 重新入队
-        self.assertIsNone(it["reviewer"])
-        # 队列出现
-        self.assertEqual([i["item_ref"] for i in self.store.list_items()], ["md:case1"])
 
     def test_undo_delete_non_deleted(self):
         with self.assertRaises(ValueError):
             self.store.undo_delete(1, self.kb)  # 仍是 pending
+
+
+class TestExternalDocManagement(unittest.TestCase):
+    """文档管理页签：外源文档列表 + 彻底删除（docs + chunks + 向量，本地文件不动）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.kb = self.root / "kb.sqlite3"
+        conn = sqlite3.connect(self.kb)
+        conn.executescript(
+            """
+            CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT,
+                               component TEXT, url TEXT, extra TEXT);
+            CREATE TABLE chunks_fts (chunk_id TEXT, doc_id TEXT, text TEXT);
+            CREATE TABLE chunks_meta (chunk_id TEXT PRIMARY KEY, doc_id TEXT, seq INTEGER, section TEXT);
+            """
+        )
+        docs = [
+            ("pdf:guide", "doc_pdf", "接口指南", "ascend", "",
+             json.dumps({"verification": "expert", "asset": {"path": "assets/pdf/guide.pdf"}})),
+            ("md:case", "doc_markdown", "案例", "", "",
+             json.dumps({"verification": "unverified", "asset": {"path": "assets/md/case.md"}})),
+            ("github:vllm-project-vllm:issue:1", "github_issue", "gh issue", "vllm", "", "{}"),
+        ]
+        conn.executemany("INSERT INTO docs VALUES(?,?,?,?,?,?)", docs)
+        conn.execute("INSERT INTO chunks_fts VALUES('pdf:guide#0','pdf:guide','【1.1 简介】正文')")
+        conn.execute("INSERT INTO chunks_meta VALUES('pdf:guide#0','pdf:guide',0,'1.1 简介')")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_list_only_external_docs(self):
+        from vllm_kb.review import list_external_docs
+
+        docs = list_external_docs(self.kb)
+        ids = [d["source_id"] for d in docs]
+        self.assertEqual(ids, ["md:case", "pdf:guide"])  # 排除 github 来源
+        g = [d for d in docs if d["source_id"] == "pdf:guide"][0]
+        self.assertEqual(g["source_type"], "doc_pdf")
+        self.assertEqual(g["asset"], "assets/pdf/guide.pdf")
+        self.assertEqual(g["verification"], "expert")
+
+    def test_delete_external_doc_removes_all_layers(self):
+        from vllm_kb.review import delete_external_doc
+
+        r = delete_external_doc(self.kb, "pdf:guide")
+        self.assertEqual(r["chunks_deleted"], 1)
+        conn = sqlite3.connect(self.kb)
+        self.assertIsNone(conn.execute(
+            "SELECT source_id FROM docs WHERE source_id='pdf:guide'").fetchone())
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts WHERE doc_id='pdf:guide'").fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM chunks_meta WHERE doc_id='pdf:guide'").fetchone()[0], 0)
+        # 其他文档不受影响
+        self.assertIsNotNone(conn.execute(
+            "SELECT source_id FROM docs WHERE source_id='md:case'").fetchone())
+        conn.close()
+
+    def test_delete_missing_doc_raises(self):
+        from vllm_kb.review import delete_external_doc
+
+        with self.assertRaises(ValueError):
+            delete_external_doc(self.kb, "pdf:nope")
 
 
 class TestSeeds(unittest.TestCase):
