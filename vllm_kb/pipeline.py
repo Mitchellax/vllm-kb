@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from .config import AppConfig
 from .embed import EmbeddingClient
@@ -132,7 +133,10 @@ def main() -> None:
     ap.add_argument("--config", default=None, help="config.json 路径（默认项目根 config.json）")
     ap.add_argument("--skip-pull", action="store_true", help="跳过拉取，用现有原始数据再生并入库")
     ap.add_argument("--limit", type=int, default=None, help="本次拉取条数上限（覆盖 github 来源配置）")
-    ap.add_argument("--rebuild", action="store_true", help="清空向量库与 SQLite 后全量重建")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="高危：清空向量库与 SQLite 后全量重建（需交互确认，或加 --yes）")
+    ap.add_argument("--yes", action="store_true",
+                    help="跳过 --rebuild 的确认提示（自动化/无人值守用）")
     ap.add_argument("--recanonicalize", action="store_true",
                     help="跳过拉取，从原始 JSON 再生统一 canonical 并重新入库（逐来源）")
     args = ap.parse_args()
@@ -141,12 +145,40 @@ def main() -> None:
     if args.rebuild:
         from .ingest import rebuild
 
+        _confirm_rebuild(args.yes)
         stats = rebuild(cfg)
         print(f"[build] 全量重建完成: {stats}")
         return
     grand = run_build(cfg, pull=not (args.skip_pull or args.recanonicalize), limit=args.limit)
     print(f"[build] 本轮汇总: {grand}")
     print("[build] 提示：中途 Ctrl-C 后重跑同一命令即断点续传；逐来源处理，先完成的来源已可用。")
+
+
+def _confirm_rebuild(yes: bool) -> None:
+    """--rebuild 高危确认：清空向量库 + 删除 kb.sqlite3 后全量重嵌。
+
+    - TTY 交互：输入 y/yes 确认，否则中止；
+    - 非 TTY（agent/CI/管道）：必须 --yes，否则拒绝执行——避免无人值守时
+      误触发几十小时的全量重嵌入。
+    """
+    print(
+        "[告警] --rebuild 是高危操作：将清空向量库（lancedb）并删除 kb.sqlite3，\n"
+        "      然后从 canonical.jsonl 全量重新分块 + 嵌入（66K 文档约数小时）。\n"
+        "      canonical/raw/图/审核库不受影响；中断后重跑仍会先清空再重建。"
+    )
+    if yes:
+        print("[build] --yes：跳过确认，开始重建 …")
+        return
+    if not sys.stdin.isatty():
+        print("[build] 非交互环境（agent/管道）执行 --rebuild 需要 --yes，已中止。")
+        sys.exit(3)
+    try:
+        ans = input("确认清空并全量重建？输入 y 继续，其余中止: ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans not in ("y", "yes"):
+        print("[build] 已取消（未确认）。")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
