@@ -50,7 +50,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 CREATE TABLE IF NOT EXISTS chunks_meta (
   chunk_id TEXT PRIMARY KEY,
   doc_id TEXT NOT NULL,
-  seq INTEGER
+  seq INTEGER,
+  section TEXT
 );
 """
 
@@ -68,6 +69,9 @@ def _connect(sqlite_path: Path) -> sqlite3.Connection:
     ):
         if col not in cols:
             conn.execute(ddl)
+    mcols = [r[1] for r in conn.execute("PRAGMA table_info(chunks_meta)")]
+    if "section" not in mcols:
+        conn.execute("ALTER TABLE chunks_meta ADD COLUMN section TEXT")
     conn.commit()
     return conn
 
@@ -265,12 +269,14 @@ def ingest_docs(
             pending_deletes.append(doc.source_id)
             conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc.source_id,))
             conn.execute("DELETE FROM chunks_meta WHERE doc_id = ?", (doc.source_id,))
-            # 写向量（攒批）
-            meta = chunk_meta(doc, rel)
-            items = [
-                VectorItem(id=c.chunk_id, vector=v, meta=meta, text=c.text)
-                for c, v in zip(chunks, doc_vecs)
-            ]
+            # 写向量（攒批）：chunk meta 带 section（所属章节标题）
+            base_meta = chunk_meta(doc, rel)
+            items = []
+            for c, v in zip(chunks, doc_vecs):
+                m = dict(base_meta)
+                if c.section:
+                    m["section"] = c.section
+                items.append(VectorItem(id=c.chunk_id, vector=v, meta=m, text=c.text))
             pending_adds.extend(items)
             # 写 SQLite
             _upsert_docs_row(conn, doc, rel, eh, mh)
@@ -280,8 +286,8 @@ def ingest_docs(
                     (c.chunk_id, doc.source_id, c.text),
                 )
                 conn.execute(
-                    "INSERT INTO chunks_meta (chunk_id, doc_id, seq) VALUES (?,?,?)",
-                    (c.chunk_id, doc.source_id, c.seq),
+                    "INSERT INTO chunks_meta (chunk_id, doc_id, seq, section) VALUES (?,?,?,?)",
+                    (c.chunk_id, doc.source_id, c.seq, c.section),
                 )
             stats["docs"] += 1
             stats["chunks"] += len(chunks)

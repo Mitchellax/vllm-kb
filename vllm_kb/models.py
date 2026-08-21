@@ -44,6 +44,7 @@ class KbChunk(BaseModel):
     doc_id: str
     seq: int
     text: str
+    section: str = ""  # 所属章节标题（PDF 手册等结构化文档；无章节则空）
 
 
 def doc_to_json(doc: KbDocument) -> str:

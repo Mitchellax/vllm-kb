@@ -101,6 +101,7 @@ def create_app(config_path: Optional[str] = None):
                     "url": r.url,
                     "component": r.component,
                     "resolved": r.resolved,
+                    "section": r.meta.get("section", ""),  # PDF 手册等：所属章节标题
                     "kind": r.meta.get("kind", ""),
                     "status": r.meta.get("status", ""),
                     "verification": r.meta.get("verification", ""),

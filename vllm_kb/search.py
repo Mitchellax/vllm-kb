@@ -341,7 +341,7 @@ class SearchEngine:
         import json as _json
 
         extra = _json.loads(row[11] or "{}")
-        return {
+        meta = {
             "doc_id": doc_id[0],
             "source_type": row[0],
             "url": row[1],
@@ -357,6 +357,13 @@ class SearchEngine:
             "kind": extra.get("kind", ""),
             "verification": extra.get("verification", ""),  # unverified | tested | expert（质量分级维度 B）
         }
+        # FTS 路径补 section（chunks_meta.section，PDF 手册章节标题）
+        sec = conn.execute(
+            "SELECT section FROM chunks_meta WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()
+        if sec and sec[0]:
+            meta["section"] = sec[0]
+        return meta
 
     @staticmethod
     def _pass_filters(meta: dict, filters: dict) -> bool:

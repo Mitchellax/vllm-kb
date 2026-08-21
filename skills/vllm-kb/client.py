@@ -20,6 +20,21 @@ import urllib.parse
 DEFAULT_BASE = os.environ.get("VLLM_KB_BASE", "http://127.0.0.1:8000")
 
 
+def _force_utf8_stdio() -> None:
+    """强制 stdout/stderr 以 UTF-8 输出（Python 3.7+）。
+
+    检索结果含中文（标题/URL），而 Windows PowerShell 下 Python 默认按代码页
+    （GBK/cp936）编码 stdout——中文会乱码或抛 UnicodeEncodeError，调用方
+    （agent/管道）不得不额外设 PYTHONIOENCODING=utf-8。这里在进程内直接
+    reconfigure，任何环境（PowerShell/重定向/容器）输出一致 UTF-8，无需外部设置。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass  # 非 TTY / 被替换的流 / 老版本：保持原样
+
+
 def _get(base: str, path: str, params: dict | None = None) -> dict:
     url = base.rstrip("/") + path
     if params:
@@ -51,12 +66,14 @@ def fmt_search(data: dict) -> str:
     for i, r in enumerate(data.get("results", []), 1):
         c = r["confidence"]
         tag = "已解决" if r["resolved"] else "未解决"
+        section = r.get("section") or ""
+        sec_txt = f"  章节: {section}" if section else ""
         lines.append(
             f"[{i}] final={r['final']:.3f} sim={r['similarity']:.3f} conf={c['score']:.3f} "
             f"[{tag}] 组件={r['component'] or '-'} 版本参考={r['version_ref'] or '-'}"
         )
         lines.append(f"    w_time={c['w_time']:.3f} w_ver={c['w_ver']:.3f} w_rel={c['w_rel']:.3f}")
-        lines.append(f"    {r['title']}")
+        lines.append(f"    {r['title']}{sec_txt}")
         ver = r.get("verification") or ""
         ver_txt = f"  验证={ver}" if ver else ""
         lines.append(f"    {r['url']}  status={r['status']}{ver_txt}  version_span={r['version_span']}")
@@ -229,6 +246,7 @@ def fmt_graph_stats(data: dict) -> str:
 
 
 def main() -> None:
+    _force_utf8_stdio()
     ap = argparse.ArgumentParser(description="vllm-kb 只读检索客户端")
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"API 地址（默认 {DEFAULT_BASE}）")
     sub = ap.add_subparsers(dest="cmd", required=True)
