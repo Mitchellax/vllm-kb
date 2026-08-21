@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -44,12 +45,28 @@ class SearchResult:
 
 
 class SearchEngine:
+    # 熔断器参数：embedding 服务不可用时的降级节奏
+    _EMBED_CIRCUIT_FAIL_THRESHOLD = 3    # 连续失败 N 次打开熔断
+    _EMBED_CIRCUIT_OPEN_SECS = 60.0      # 熔断打开时长（期间零等待直接降级）
+    _EMBED_QUERY_TIMEOUT = 5.0           # 查询用嵌入超时（入库仍用 config 的 60s）
+    _EMBED_QUERY_RETRIES = 1             # 查询用嵌入重试次数
+
     def __init__(self, cfg: AppConfig, read_only: bool = False):
         """read_only=True：结构只读 —— SQLite mode=ro 连接 + 向量库只读包装，
         任何写路径（INSERT/UPDATE/向量写入）硬失败，供检索 API 使用。"""
         self.cfg = cfg
         self.read_only = read_only
-        self.embed = EmbeddingClient(cfg.embedding)
+        # 查询用嵌入客户端：快速失败（短超时少重试），避免 embedding 服务不可用时
+        # 每次查询都等 config 的 60s×4 次重试——熔断打开期间更是零等待直接降级。
+        # 入库路径（ingest）仍用 config.embedding 原值，保证大文本嵌入可靠。
+        from .config import EmbeddingCfg
+
+        qcfg = EmbeddingCfg.model_validate({
+            **cfg.embedding.model_dump(),
+            "timeout_seconds": self._EMBED_QUERY_TIMEOUT,
+            "max_retries": self._EMBED_QUERY_RETRIES,
+        })
+        self.embed = EmbeddingClient(qcfg)
         store = build_vector_store(cfg)
         self.vector_store: BaseVectorStore = ReadOnlyVectorStore(store) if read_only else store
         self.sqlite_path: Path = cfg.resolve(cfg.storage.sqlite_path)
@@ -60,6 +77,32 @@ class SearchEngine:
         self._warned_no_version = False
         self.last_context: dict[str, Any] = {}  # 最近一次查询的组件上下文（verify/agent 展示用）
         self._embed_error: Optional[str] = None  # 查询时 embedding 失败原因（降级提示）
+        # 熔断状态
+        self._embed_fail_streak = 0       # 连续失败次数
+        self._embed_circuit_open_until = 0.0  # 熔断打开截止时间戳（0=未打开）
+        self._embed_recovered = True      # 最近一次探测是否成功（用于关闭熔断）
+
+    def _embed_available(self) -> bool:
+        """熔断判断：打开期间直接返回 False（跳过 embed 调用，零等待降级）。"""
+        return time.time() >= self._embed_circuit_open_until
+
+    def _embed_succeeded(self) -> None:
+        self._embed_fail_streak = 0
+        self._embed_circuit_open_until = 0.0
+        self._embed_error = None
+
+    def _embed_failed(self, exc: Exception) -> None:
+        self._embed_fail_streak += 1
+        self._embed_error = str(exc)[:200]
+        if self._embed_fail_streak >= self._EMBED_CIRCUIT_FAIL_THRESHOLD:
+            self._embed_circuit_open_until = time.time() + self._EMBED_CIRCUIT_OPEN_SECS
+            self._embed_error = (
+                f"{self._embed_error} | 已熔断：embedding 服务不可用，"
+                f"此后 {int(self._EMBED_CIRCUIT_OPEN_SECS)}s 内查询跳过向量召回（全文检索），"
+                f"到期后自动探测恢复"
+            )
+            print(f"[warn] embedding 连续失败 {self._embed_fail_streak} 次，"
+                  f"熔断 {int(self._EMBED_CIRCUIT_OPEN_SECS)}s（期间查询降级为全文检索）")
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -128,15 +171,17 @@ class SearchEngine:
             "companions": companion_ctx,
         }
 
-        # 查询向量：embedding 失败（无 key/网络）时优雅降级为 FTS-only 检索，
-        # 不依赖密钥即可完成查询（只读检索不应被更新所需的密钥阻塞）。
-        try:
-            q_vec = self.embed.embed(semantic)
-            embed_ok = True
-        except Exception as e:
-            embed_ok = False
-            self._embed_error = str(e)[:200]
-            print(f"[warn] embedding 不可用（{type(e).__name__}: {str(e)[:80]}），降级为全文检索")
+        # 查询向量：embedding 失败（无 key/网络/服务不可用）时优雅降级为 FTS-only 检索。
+        # 熔断器：连续失败后短暂打开，期间跳过 embed 调用零等待降级；到期自动探测恢复。
+        embed_ok = False
+        if self._embed_available():
+            try:
+                q_vec = self.embed.embed(semantic)
+                self._embed_succeeded()
+                embed_ok = True
+            except Exception as e:
+                self._embed_failed(e)
+                print(f"[warn] embedding 不可用（{type(e).__name__}: {str(e)[:80]}），降级为全文检索")
 
         # 只读模式：本次查询用独立的只读 SQLite 连接（线程安全 + 写必败）
         conn = self._ro_conn() if self.read_only else self.conn

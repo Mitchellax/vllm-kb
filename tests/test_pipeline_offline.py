@@ -5,6 +5,7 @@
 """
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -409,6 +410,38 @@ class TestOfflinePipeline(unittest.TestCase):
                 )
             # CUDA_ISSUE 组件为 vllm（默认），应保留；全库无其他组件时仍返回
             self.assertTrue(all(r.component == "vllm" for r in results))
+        finally:
+            engine.close()
+
+    def test_embedding_circuit_breaker(self):
+        """熔断器：连续失败后打开（跳过 embed 调用零等待降级），到期自动探测恢复。"""
+        from unittest import mock
+
+        from vllm_kb.search import SearchEngine
+
+        ingest_docs(self.cfg, [CUDA_ISSUE], self.embed, self.store)
+        engine = SearchEngine(self.cfg, read_only=True)
+        try:
+            # 连续失败达到阈值 -> 熔断打开
+            with mock.patch.object(engine.embed, "embed", side_effect=RuntimeError("svc down")):
+                for _ in range(engine._EMBED_CIRCUIT_FAIL_THRESHOLD):
+                    engine.search("illegal memory access", target_version="0.6.0")
+                engine.search("illegal memory access", target_version="0.6.0")
+            self.assertFalse(engine._embed_available(), "连续失败后熔断应打开")
+            self.assertIn("熔断", engine._embed_error or "")
+
+            # 熔断打开期间：embed 不应再被调用（零等待降级）
+            with mock.patch.object(engine.embed, "embed", side_effect=AssertionError("熔断期不应调用 embed")) as m:
+                engine.search("illegal memory access", target_version="0.6.0")
+                m.assert_not_called()
+
+            # 熔断到期：半开探测，成功即恢复
+            engine._embed_circuit_open_until = time.time() - 1  # 手动拨快时钟
+            with mock.patch.object(engine.embed, "embed", return_value=[0.1] * 8) as m:
+                engine.search("illegal memory access", target_version="0.6.0")
+                m.assert_called_once()
+            self.assertTrue(engine._embed_available(), "探测成功后熔断应关闭")
+            self.assertIsNone(engine._embed_error)
         finally:
             engine.close()
 

@@ -76,7 +76,16 @@ def create_app(config_path: Optional[str] = None):
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "read_only": True, "chunks": engine.vector_store.count()}
+        embed_state = "ok"
+        if engine._embed_error:
+            embed_state = "degraded" if not engine._embed_available() else "degraded-retrying"
+        return {
+            "status": "ok",  # 服务可用（embedding 不可用时检索自动降级为全文）
+            "read_only": True,
+            "chunks": engine.vector_store.count(),
+            "embedding": embed_state,
+            "embedding_note": engine._embed_error or None,
+        }
 
     @app.post("/search")
     def search(req: SearchRequest):
