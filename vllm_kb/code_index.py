@@ -204,7 +204,9 @@ class VersionedCode:
             try:
                 snap = self._repo_root(self.ensure_snapshot(v))
             except CodeIndexError:
-                continue
+                if version:
+                    raise  # 显式指定版本未预存：明确报错（API 转 404），不静默返回空
+                continue  # 全量遍历：跳过缺失版本
             v_hits: list[dict] = []
             for ext in ("*.py", "*.cpp"):
                 for p in snap.rglob(ext):

@@ -342,6 +342,23 @@ def create_app(config_path: Optional[str] = None):
         except Exception:
             return None
 
+    def _code_call(fn, *args, **kwargs):
+        """统一代码仓调用异常处理：
+        - 版本未预存（客户端请求问题）→ 404，带可用版本与预存指引；
+        - 符号索引未构建/其他意外（服务端状态）→ 503，不向客户端泄漏堆栈。
+        """
+        from .code_index import CodeIndexError
+
+        try:
+            return fn(*args, **kwargs)
+        except CodeIndexError as e:
+            if "未预存" in str(e):
+                raise HTTPException(status_code=404, detail=str(e))
+            raise HTTPException(status_code=503, detail=str(e))
+        except Exception as e:
+            print(f"[api] code 调用异常（{type(e).__name__}: {e}）", flush=True)
+            raise HTTPException(status_code=503, detail="代码仓检索暂时不可用（详见服务端日志）")
+
     @app.get("/code/versions")
     def code_versions(repo: Optional[str] = None):
         ci = _code_index_for(repo)
@@ -362,18 +379,12 @@ def create_app(config_path: Optional[str] = None):
         ci = _code_index_for(repo)
         if ci is None:
             raise HTTPException(status_code=503, detail="code_index 未初始化（运行 scripts/build_code_snapshots.py）")
-        try:
-            symbols = ci.search_symbols(req.keyword, req.version, limit=req.limit or 20)
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"代码索引不可用: {e}")
+        symbols = _code_call(ci.search_symbols, req.keyword, req.version, limit=req.limit or 20)
         if symbols and not req.per_version:
             return {"mode": "symbol_index", "symbol": req.keyword, "repo": repo or "vllm-ascend",
                     "version": req.version, "hits": symbols}
-        try:
-            greps = ci.grep(req.keyword, req.version, limit=req.limit or 20,
-                            path_sub=req.path, per_version=bool(req.per_version))
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"代码索引不可用: {e}")
+        greps = _code_call(ci.grep, req.keyword, req.version, limit=req.limit or 20,
+                           path_sub=req.path, per_version=bool(req.per_version))
         mode = "grep" if not req.per_version else "grep_per_version"
         return {"mode": mode, "symbol": req.keyword, "repo": repo or "vllm-ascend",
                 "version": req.version, "hits": greps}
@@ -384,7 +395,7 @@ def create_app(config_path: Optional[str] = None):
         ci = _code_index_for(repo)
         if ci is None:
             raise HTTPException(status_code=503, detail="code_index 未初始化")
-        text = ci.read_file(version, path, max_chars)
+        text = _code_call(ci.read_file, version, path, max_chars)
         if text is None:
             raise HTTPException(status_code=404, detail=f"{version}:{path} 不存在（repo={repo or 'vllm-ascend'}）")
         return {"version": version, "repo": repo or "vllm-ascend", "path": path, "content": text}
