@@ -280,6 +280,8 @@ def main() -> None:
     p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
     p.add_argument("--file", dest="code_file", metavar="PATH", default=None,
                    help="直接读取指定版本源码文件（需配合 --version）")
+    p.add_argument("--max-chars", dest="code_max_chars", type=int, default=20000,
+                   help="--file 读取的最大字符数（默认 20000；函数体较长时可调大，截断会明确标注）")
     p.add_argument("--in-file", dest="in_file", metavar="SUBSTR", default=None,
                    help="限定 grep 的文件路径子串（如 worker/model_runner_v1.py）")
     p.add_argument("--per-version", action="store_true",
@@ -347,7 +349,8 @@ def main() -> None:
                 print("[client] 读取文件需指定 --version")
                 sys.exit(2)
             data = _get(base, "/code/file",
-                        {"version": args.version, "path": args.code_file, "repo": args.repo})
+                        {"version": args.version, "path": args.code_file, "repo": args.repo,
+                         "max_chars": args.code_max_chars})
             print(fmt_code_file(data))
         else:
             data = _post(base, "/code/search",

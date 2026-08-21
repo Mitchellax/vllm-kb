@@ -113,12 +113,23 @@ class VersionedCode:
         cand = snap / rel
         return cand if cand.is_file() else None
 
-    def read_file(self, version: str, path: str, max_chars: int = 6000) -> Optional[str]:
+    def read_file(self, version: str, path: str, max_chars: int = 6000,
+                  mark_truncation: bool = True) -> Optional[str]:
+        """读取指定版本源码文件（截断保护：默认 max_chars 字符）。
+
+        mark_truncation=True（默认）：截断时在末尾追加明确标记
+        "\n... (已截断，共 N 字符，仅前 max_chars)"，调用方（agent）能识别
+        内容不完整，而不是拿到一段被静默切掉的代码。
+        """
         f = self.find_file(version, path)
         if f is None:
             return None
         text = f.read_text(encoding="utf-8", errors="replace")
-        return text[:max_chars]
+        if len(text) > max_chars:
+            if mark_truncation:
+                return text[:max_chars] + f"\n... (已截断：全文 {len(text)} 字符，仅前 {max_chars})"
+            return text[:max_chars]
+        return text
 
     # ---------------- 符号索引 ----------------
 

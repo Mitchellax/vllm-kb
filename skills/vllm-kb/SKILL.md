@@ -38,6 +38,9 @@ python client.py search "..."    # 全部命令走远程（含 graph）
 
 ## 用法（调用本 skill 目录下的 client.py，不需要其他工具）
 
+> 输出统一 UTF-8：client.py 已内置强制（Windows PowerShell 下无需手动设置
+> `PYTHONIOENCODING=utf-8`，中文标题/URL 不会乱码或报 UnicodeEncodeError）。
+
 ```bash
 # 1) 语义检索（支持组件查询格式）—— 适合"问题描述"式查询
 python client.py search "vllm-ascend:0.18.0 GLM5.1 PD分离P节点挂死"
@@ -52,6 +55,10 @@ python client.py code-versions                          # 列出已预存版本
 python client.py code DispatchFFNCombine --version v0.23.0rc1   # 符号/关键词定位
 python client.py code dispatch_ffn_combine --version v0.23.0rc1 --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
 python client.py code halMemCreate                       # 不加版本 = 全部预存版本 grep
+
+# 3b) 读取完整源码文件（--file 默认截断 20000 字符，末尾带"已截断"标记；
+#     需要完整函数体时调大 --max-chars）
+python client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp --version v0.23.0rc1 --max-chars 100000
 
 # 4) 其他只读查询
 python client.py doc github:vllm-project-vllm-ascend:issue:13042

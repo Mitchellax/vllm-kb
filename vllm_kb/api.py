@@ -370,8 +370,8 @@ def create_app(config_path: Optional[str] = None):
                 "version": req.version, "hits": greps}
 
     @app.get("/code/file")
-    def code_file(version: str, path: str, max_chars: int = 6000, repo: Optional[str] = None):
-        """读取指定版本的源码文件片段（按需解压）。"""
+    def code_file(version: str, path: str, max_chars: int = 20000, repo: Optional[str] = None):
+        """读取指定版本的源码文件片段（按需解压；截断时末尾带明确标记）。"""
         ci = _code_index_for(repo)
         if ci is None:
             raise HTTPException(status_code=503, detail="code_index 未初始化")
