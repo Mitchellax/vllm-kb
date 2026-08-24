@@ -139,6 +139,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="预存版本化代码仓快照")
     ap.add_argument("--version", action="append", default=None, help="指定版本（可多次）")
     ap.add_argument("--all", action="store_true", help="预存全部 tag")
+    ap.add_argument("--list", action="store_true",
+                    help="只列出可用版本对比（GitHub 全部 tag / 已预存 / 缺失），不下载——"
+                         "方便人工更新 config.code.versions")
     ap.add_argument("--index-only", action="store_true", help="只重建索引，不下载")
     ap.add_argument("--insecure", action="store_true",
                     help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
@@ -167,6 +170,22 @@ def main() -> None:
             index_version(code, v)
         build_symbol_table(cfg)
         print(f"[code] 索引重建完成，可用版本: {code.available_versions}")
+        return
+
+    if args.list:
+        all_tags = list_tags(repo, insecure=insecure, api_base=api_base)
+        stored = set(code.available_versions)
+        cfg_list = set(cfg.code.versions or [])
+        missing = [t for t in all_tags if t not in stored]
+        print(f"[code] 仓库 {repo} 版本对比（GitHub 全部 tag {len(all_tags)} 个）：")
+        print(f"  已预存 {len(stored)} 个:")
+        for v in sorted(stored):
+            tag = "[config]" if v in cfg_list else ""
+            print(f"    {v} {tag}")
+        print(f"  缺失 {len(missing)} 个（未预存，可加到 config.code.versions 或 --version/--all 预存）:")
+        for v in missing:
+            print(f"    {v}")
+        print(f"[code] config.code.versions 当前 {len(cfg_list)} 个: {sorted(cfg_list)}")
         return
 
     if args.version:

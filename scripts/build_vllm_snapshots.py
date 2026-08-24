@@ -182,9 +182,16 @@ def main() -> None:
     versions = args.version or companion_vllm_versions(cfg)
 
     if args.list:
-        print(f"需要拉取的 vllm 版本（{len(versions)} 个）:")
-        for v in versions:
-            print(f"  {v}")
+        stored = sorted(d.stem for d in (root / "zips").glob("*.zip")) if (root / "zips").exists() else []
+        need = sorted(set(versions) - set(stored))
+        print(f"[vllm] 需要拉取的 vllm 版本（{len(versions)} 个，已预存 {len(stored)} / 缺失 {len(need)}）:")
+        if need:
+            print("  缺失（未预存）:")
+            for v in need:
+                print(f"    {v}")
+        print("  已预存:")
+        for v in stored:
+            print(f"    v{v}")
         return
 
     if args.index_only:
