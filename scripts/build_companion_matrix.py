@@ -21,6 +21,7 @@
 import argparse
 import json
 import re
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -181,18 +182,53 @@ def extract_from_env(env: list[str]) -> dict[str, str]:
 # ---------------- GitHub release 说明 ----------------
 
 def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com") -> dict[str, str]:
-    """拉取 vllm-ascend release 说明，返回 {tag_name: body}。失败返回 {}。"""
+    """拉取 vllm-ascend 全部 release 说明，返回 {tag_name: body}。失败返回 {}。
+
+    - 分页全量拉取（per_page=100，翻页直到取完，vllm-ascend release 已超 100 条）；
+    - socket 级默认超时兜底：requests timeout 不覆盖 DNS 解析/代理握手，
+      内网环境可能挂远超 timeout，先设 socket 超时保证任何阶段都限时；
+    - 带重试（5xx/限流/网络抖动）；单页重试耗尽返回已拿到的部分，不阻塞矩阵。
+    """
+    import time as _t
+
     from vllm_kb.net import get_session
 
-    url = f"{gbase.rstrip('/')}/repos/vllm-project/vllm-ascend/releases"
-    try:
-        r = get_session(insecure).get(url, params={"per_page": 100},
-                                      headers={"User-Agent": "vllm-kb"}, timeout=30)
-        r.raise_for_status()
-        return {rel.get("tag_name", ""): (rel.get("body") or "") for rel in r.json()}
-    except Exception as e:
-        print(f"[matrix] 拉取 GitHub release 说明失败: {e}")
-        return {}
+    print(f"[matrix] 拉取 GitHub release 说明（{gbase}/repos/vllm-project/vllm-ascend/releases）...",
+          flush=True)
+    # requests timeout 只覆盖连接+读取，DNS/代理握手无超时——socket 层兜底
+    socket.setdefaulttimeout(30)
+    session = get_session(insecure)
+    releases: dict[str, str] = {}
+    page = 1
+    while True:
+        url = f"{gbase.rstrip('/')}/repos/vllm-project/vllm-ascend/releases"
+        ok = False
+        for attempt in range(3):
+            try:
+                r = session.get(url, params={"per_page": 100, "page": page},
+                                headers={"User-Agent": "vllm-kb"}, timeout=30)
+                r.raise_for_status()
+                batch = r.json()
+                for rel in batch:
+                    if rel.get("tag_name"):
+                        releases[rel["tag_name"]] = rel.get("body") or ""
+                ok = True
+                break
+            except Exception as e:
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    print(f"[matrix] release 拉取失败（page {page}）: {e}，{wait}s 后重试", flush=True)
+                    _t.sleep(wait)
+                else:
+                    print(f"[matrix] 拉取 GitHub release 说明失败（page {page}）: {e}，"
+                          f"已返回部分数据 {len(releases)} 条", flush=True)
+                    return releases
+        if not ok:
+            return releases
+        print(f"[matrix] release 说明 {len(releases)} 条（page {page} 完成）", flush=True)
+        if len(batch) < 100:
+            return releases
+        page += 1
 
 
 def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:

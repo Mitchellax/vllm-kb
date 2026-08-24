@@ -206,5 +206,68 @@ class TestGapReport(unittest.TestCase):
         self.assertEqual(n, 2)
 
 
+class TestFetchReleases(unittest.TestCase):
+    """fetch_releases：分页全量、重试、失败不阻塞。"""
+
+    def _resp(self, rows):
+        r = unittest.mock.Mock()
+        r.raise_for_status.return_value = None
+        r.json.return_value = rows
+        return r
+
+    def test_single_page(self):
+        from unittest import mock
+
+        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"):
+            ms.return_value.get.return_value = self._resp(
+                [{"tag_name": "v0.23.0", "body": "aligns with upstream vLLM v0.23.0"},
+                 {"tag_name": "v0.22.1", "body": ""}])
+            rel = bm.fetch_releases()
+        self.assertEqual(rel, {"v0.23.0": "aligns with upstream vLLM v0.23.0", "v0.22.1": ""})
+
+    def test_pagination_all_pages(self):
+        from unittest import mock
+
+        def fake_get(url, **kw):
+            page = kw["params"]["page"]
+            if page == 1:
+                return self._resp([{"tag_name": f"v0.20.{i}", "body": ""} for i in range(100)])
+            return self._resp([{"tag_name": "v0.19.1", "body": "x"}, {}])
+
+        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"):
+            ms.return_value.get.side_effect = fake_get
+            rel = bm.fetch_releases()
+        self.assertEqual(len(rel), 101)  # 100 + 1（空 dict 不计）
+        self.assertIn("v0.19.1", rel)
+        self.assertIn("v0.20.0", rel)
+
+    def test_retry_then_success(self):
+        from unittest import mock
+
+        attempts = {"n": 0}
+
+        def flaky_get(url, **kw):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise RuntimeError("boom")
+            return self._resp([{"tag_name": "v0.23.0", "body": ""}])
+
+        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"), \
+                mock.patch("time.sleep"):
+            ms.return_value.get.side_effect = flaky_get
+            rel = bm.fetch_releases()
+        self.assertEqual(attempts["n"], 3)
+        self.assertEqual(rel, {"v0.23.0": ""})
+
+    def test_all_fail_returns_empty(self):
+        from unittest import mock
+
+        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"), \
+                mock.patch("time.sleep"):
+            ms.return_value.get.side_effect = RuntimeError("total down")
+            rel = bm.fetch_releases()
+        self.assertEqual(rel, {})  # 不抛异常，矩阵生成不阻塞
+
+
 if __name__ == "__main__":
     unittest.main()
