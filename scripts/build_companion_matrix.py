@@ -43,6 +43,8 @@ PLATFORM_SUFFIXES = ("-openeuler", "-310p", "-a3", "-a5", "-a2")
 _CANN_RE = re.compile(r"cann-(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
 _SOC_RE = re.compile(r"^SOC_VERSION=(.+)$")
 _PYTHON_RE = re.compile(r"python(\d+\.\d+(?:\.\d+)?)")
+# 镜像 Env 里的 vllm tag（如 VLLM_TAG=v0.26.0）——比 release 说明更直接的配套证据
+_VLLM_TAG_RE = re.compile(r"(?:^|[\s;])VLLM_TAG\s*=\s*v?(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
 _UPSTREAM_VLLM_RE = re.compile(
     r"(?i)(?:upstream\s+vllm|based\s+on\s+vllm|align(?:ing|s)?\s+the\s+plugin\s+with\s+upstream\s+vllm)"
     r"[^\d]*v?(\d+\.\d+(?:\.\d+)?)"
@@ -150,8 +152,12 @@ def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: 
 
 
 def extract_from_env(env: list[str]) -> dict[str, str]:
-    """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本。"""
-    out = {"cann": "", "soc": "", "python": ""}
+    """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本 / vllm tag。
+
+    vllm_tag：镜像 Env 的 VLLM_TAG（如 VLLM_TAG=v0.26.0）——镜像构建时锁定的
+    vllm 配套版本，比 GitHub release 说明/版本号启发式更可靠。
+    """
+    out = {"cann": "", "soc": "", "python": "", "vllm_tag": ""}
     for e in env:
         if not out["cann"]:
             m = _CANN_RE.search(e)
@@ -165,6 +171,10 @@ def extract_from_env(env: list[str]) -> dict[str, str]:
             m = _PYTHON_RE.search(e)
             if m and "PATH" in e:
                 out["python"] = m.group(1)
+        if not out["vllm_tag"]:
+            m = _VLLM_TAG_RE.search(e)
+            if m:
+                out["vllm_tag"] = m.group(1)
     return out
 
 
@@ -205,31 +215,67 @@ def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:
 
 # ---------------- 构建与合并 ----------------
 
+def base_version_key(tag: str) -> str:
+    """基础版本号（跨 rc/pre 回退用）：v0.13.0rc1 / v0.13.0 / v0.13.0rc3 -> 0.13.0。
+
+    部分早期镜像（如 v0.13.0rc1）的 Env 不含 cann 版本，但同基础版本的其他
+    形态（rc2/rc3/正式版）有——按基础版本号回退推断，避免 cann 缺成 '-'
+    （cann 是随大版本演进，同 0.13.0 系列的 cann 基本一致）。
+    """
+    m = re.match(r"^v?(\d+\.\d+(?:\.\d+)?)", tag)
+    return m.group(1) if m else ""
+
+
 def build_rows(groups: dict, releases: dict[str, str], token: str,
                insecure: bool = False, qbase: str = "https://quay.io") -> list[dict]:
+    # 第一遍：收齐所有组的 env 信息（同基础版本的组共享 cann 用于回退）
+    infos: dict[str, dict] = {}  # base(group key) -> extract_from_env 结果
+    for base in groups:
+        rep = pick_representative(groups[base])
+        env = fetch_image_env(rep, token, insecure=insecure, qbase=qbase)
+        infos[base] = extract_from_env(env)
+    # 基础版本号 -> 该系列任一非空 cann（首个遇到即用，确定性依赖排序）
+    cann_by_base: dict[str, str] = {}
+    for base in sorted(groups):
+        c = infos[base]["cann"]
+        if c:
+            cann_by_base.setdefault(base_version_key(base), c)
+
     rows = []
     total = len(groups)
     for i, base in enumerate(sorted(groups), 1):
-        rep = pick_representative(groups[base])
-        env = fetch_image_env(rep, token, insecure=insecure, qbase=qbase)
-        info = extract_from_env(env)
+        info = infos[base]
+        cann = info["cann"]
+        cann_src = "镜像env"
+        if not cann:
+            # Env 无 cann：按基础版本号回退同系列其他形态（rc2/rc3/正式版）
+            fb = cann_by_base.get(base_version_key(base), "")
+            if fb:
+                cann, cann_src = fb, f"同系列回退({base_version_key(base)})"
         rel_body = releases.get(base, "")
-        vllm_ver, vllm_src = extract_vllm_from_release(base, rel_body) if rel_body else extract_vllm_from_release(base, "")
+        # vllm 配套版本优先级：镜像 VLLM_TAG（构建时锁定）> release 说明 > 版本号启发式
+        vllm_ver, vllm_src = info["vllm_tag"], "镜像env(VLLM_TAG)"
+        if not vllm_ver:
+            vllm_ver, vllm_src = extract_vllm_from_release(
+                base, rel_body) if rel_body else extract_vllm_from_release(base, "")
         notes = []
         if info["soc"]:
             notes.append(f"SOC={info['soc']}")
         if info["python"]:
             notes.append(f"python={info['python']}")
         provenance = []
-        if info["cann"]:
-            provenance.append("cann=镜像env")
+        if cann:
+            provenance.append(f"cann={cann_src}")
         if vllm_src:
             provenance.append(f"vllm={vllm_src}")
+        if not cann:
+            # Env 无 cann 且同系列也没有：存空人工看护（缺口由 report_gaps 列出）
+            provenance.append("cann=缺失(待人工)")
         rows.append(
             {
                 "vllm-ascend": base,
                 "vllm": vllm_ver,
-                "cann": info["cann"],
+                "cann": cann,
                 "pytorch": "",
                 "pytorch-ascend": "",
                 "npu-driver": "",
@@ -237,9 +283,9 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
                 "source": "自动(" + "+".join(provenance) + ")" if provenance else "待人工",
             }
         )
-        flag = "ok" if (info["cann"] or vllm_ver) else "gap"
+        flag = "ok" if (cann or vllm_ver) else "gap"
         print(
-            f"[matrix] ({i}/{total}) {base:<28} cann={info['cann'] or '-':<8} vllm={vllm_ver or '-':<8} "
+            f"[matrix] ({i}/{total}) {base:<28} cann={cann or '-':<8} vllm={vllm_ver or '-':<8} "
             f"{vllm_src or ''} [{flag}]",
             flush=True,
         )
@@ -293,6 +339,26 @@ def report_gaps(rows: list[dict]) -> int:
     else:
         print("[matrix] 必需配套完整（npu-driver/HDK 与镜像解耦，缺失属预期）")
     return len(gaps)
+
+
+# 合法版本号：x.y[.z][rcN/.postN]（vllm/cann/pytorch/pytorch-ascend 数字版本，含 rc/post 后缀）
+_VERSION_VALID_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?(?:rc\d+|\.post\d+)*$", re.IGNORECASE)
+
+
+def validate_version_fields(rows: list[dict]) -> int:
+    """写回前校验所有版本字段合法性：非法值置空 + 告警，避免非法版本存入矩阵。
+
+    返回非法字段数。合法格式示例：0.26.0 / 8.5.1 / 2.6.0 / 0.13.0rc1。
+    """
+    bad = 0
+    for r in rows:
+        for f in COMPANION_FIELDS:
+            v = r.get(f) or ""
+            if v and not _VERSION_VALID_RE.match(v):
+                print(f"[matrix] [!] {r['vllm-ascend']} 的 {f}={v!r} 非法版本，置空待人工", flush=True)
+                r[f] = ""
+                bad += 1
+    return bad
 
 
 def default_matrix_path() -> str:
@@ -384,6 +450,10 @@ def main() -> None:
 
     auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase)
     merged = merge_with_manual(auto_rows, manual_rows)
+    # 写回前版本号合法性校验：非法版本置空（不污染矩阵，缺口报告会列出）
+    n_bad = validate_version_fields(merged)
+    if n_bad:
+        print(f"[matrix] [!] {n_bad} 个非法版本字段已置空（详见上方）", flush=True)
     n_gaps = report_gaps(merged)
 
     if not args.no_write:

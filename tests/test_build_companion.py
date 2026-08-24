@@ -37,10 +37,110 @@ class TestExtractFromEnv(unittest.TestCase):
         self.assertEqual(out["cann"], "8.5.1")
         self.assertEqual(out["soc"], "ascend910b1")
         self.assertEqual(out["python"], "3.11.14")
+        self.assertEqual(out["vllm_tag"], "")
 
     def test_empty_env(self):
         out = bm.extract_from_env([])
-        self.assertEqual(out, {"cann": "", "soc": "", "python": ""})
+        self.assertEqual(out, {"cann": "", "soc": "", "python": "", "vllm_tag": ""})
+
+    def test_vllm_tag_extraction(self):
+        # 带 v 前缀的 VLLM_TAG（镜像构建锁定的 vllm 配套版本）
+        out = bm.extract_from_env(["VLLM_TAG=v0.26.0", "ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.1"])
+        self.assertEqual(out["vllm_tag"], "0.26.0")
+        self.assertEqual(out["cann"], "8.5.1")
+        # 无 v 前缀
+        out2 = bm.extract_from_env(["VLLM_TAG=0.23.0"])
+        self.assertEqual(out2["vllm_tag"], "0.23.0")
+
+    def test_vllm_tag_priority_over_release(self):
+        """VLLM_TAG（镜像 env）优先于 release 说明作为 vllm 配套版本。"""
+        groups = {"deepseekv4-flash-0731": [{"name": "deepseekv4-flash-0731", "manifest_digest": "d"}]}
+        releases = {"deepseekv4-flash-0731": "aligns with upstream vLLM v0.22.1"}
+        from unittest import mock
+
+        with mock.patch("build_companion_matrix.fetch_image_env", return_value=["VLLM_TAG=v0.26.0"]):
+            rows = bm.build_rows(groups, releases, "T")
+        self.assertEqual(rows[0]["vllm"], "0.26.0")
+        self.assertIn("VLLM_TAG", rows[0]["source"])
+        # 无 VLLM_TAG 时回退 release 说明
+        with mock.patch("build_companion_matrix.fetch_image_env", return_value=["cann-8.5.1"]):
+            rows2 = bm.build_rows(groups, releases, "T")
+        self.assertEqual(rows2[0]["vllm"], "0.22.1")
+
+    def test_base_version_key(self):
+        self.assertEqual(bm.base_version_key("v0.13.0rc1"), "0.13.0")
+        self.assertEqual(bm.base_version_key("v0.13.0"), "0.13.0")
+        self.assertEqual(bm.base_version_key("v0.13.0rc3"), "0.13.0")
+        self.assertEqual(bm.base_version_key("glm5"), "")
+        self.assertEqual(bm.base_version_key("deepseekv4-flash-0731"), "")
+
+    def test_cann_fallback_same_base_series(self):
+        """Env 无 cann 的版本（如 v0.13.0rc1）按基础版本号回退同系列其他形态。"""
+        from unittest import mock
+
+        groups = {
+            "v0.13.0rc1": [{"name": "v0.13.0rc1", "manifest_digest": "d1"}],
+            "v0.13.0": [{"name": "v0.13.0", "manifest_digest": "d2"}],
+            "v0.13.0rc2": [{"name": "v0.13.0rc2", "manifest_digest": "d3"}],
+        }
+        envs = {
+            "v0.13.0rc1": ["SOC_VERSION=ascend910b1"],  # 无 cann
+            "v0.13.0": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.0"],
+            "v0.13.0rc2": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.0"],
+        }
+
+        def fake_env(tag_info, token, **kw):
+            return envs[tag_info["name"]]
+
+        with mock.patch("build_companion_matrix.fetch_image_env", side_effect=fake_env):
+            rows = bm.build_rows(groups, {}, "T")
+        by_key = {r["vllm-ascend"]: r for r in rows}
+        # rc1 从同系列回退得到 cann
+        self.assertEqual(by_key["v0.13.0rc1"]["cann"], "8.5.0")
+        self.assertIn("同系列回退(0.13.0)", by_key["v0.13.0rc1"]["source"])
+        # 有 Env 的版本仍用自己镜像的 cann
+        self.assertEqual(by_key["v0.13.0"]["cann"], "8.5.0")
+        self.assertIn("镜像env", by_key["v0.13.0"]["source"])
+        self.assertEqual(by_key["v0.13.0rc2"]["cann"], "8.5.0")
+
+    def test_cann_missing_all_kept_empty_for_manual(self):
+        """cann 同系列也未找到：存空 + source 标注缺失，交人工看护。"""
+        from unittest import mock
+
+        groups = {
+            "glm5": [{"name": "glm5", "manifest_digest": "d1"}],
+            "v0.20.0": [{"name": "v0.20.0", "manifest_digest": "d2"}],
+        }
+
+        def fake_env(tag_info, token, **kw):
+            return ["SOC_VERSION=ascend910b1"]  # 全部无 cann
+
+        with mock.patch("build_companion_matrix.fetch_image_env", side_effect=fake_env):
+            rows = bm.build_rows(groups, {}, "T")
+        for r in rows:
+            self.assertEqual(r["cann"], "")
+            self.assertIn("cann=缺失(待人工)", r["source"])
+
+    def test_validate_version_fields(self):
+        valid = [
+            {"vllm-ascend": "v0.26.0", "vllm": "0.26.0", "cann": "8.5.1",
+             "pytorch": "2.6.0", "pytorch-ascend": "2.6.0.post1", "npu-driver": "25.1.0"},
+        ]
+        bad = [
+            {"vllm-ascend": "v0.26.0", "vllm": "0.26.0", "cann": "cann-8.5.1-恶意",  # 非法
+             "pytorch": "latest", "pytorch-ascend": "", "npu-driver": ""},
+        ]
+        self.assertEqual(bm.validate_version_fields([dict(x) for x in valid]), 0)
+        n = bm.validate_version_fields(bad)
+        self.assertGreaterEqual(n, 2)
+        self.assertEqual(bad[0]["cann"], "")   # 非法置空
+        self.assertEqual(bad[0]["pytorch"], "")
+        self.assertEqual(bad[0]["vllm"], "0.26.0")  # 合法保留
+        # rc 后缀合法
+        self.assertTrue(bm._VERSION_VALID_RE.match("0.13.0rc1"))
+        self.assertTrue(bm._VERSION_VALID_RE.match("2.6.0.post1"))
+        self.assertFalse(bm._VERSION_VALID_RE.match("latest"))
+        self.assertFalse(bm._VERSION_VALID_RE.match("cann-8.5.1"))
 
 
 class TestExtractVllmFromRelease(unittest.TestCase):
