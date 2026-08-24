@@ -129,6 +129,23 @@ def fmt_title(data: dict) -> str:
     return "\n".join(lines)
 
 
+def fmt_matrix(data: dict) -> str:
+    rows = data.get("rows") or []
+    if not rows:
+        return "(配套矩阵未构建或为空 —— 运行 scripts/build_companion_matrix.py)"
+    lines = [f"配套矩阵共 {len(rows)} 行（全量视图，调试/管理用；日常查询用 companion <组件> <版本>）:"]
+    for r in rows[:60]:
+        parts = "  ".join(
+            f"{k}={v}" for k, v in r.items() if v and k not in ("notes", "source")
+        )
+        notes = f"  notes: {r.get('notes')}" if r.get("notes") else ""
+        src = f"  source: {r.get('source')}" if r.get("source") else ""
+        lines.append(f"  {parts}{notes}{src}")
+    if len(rows) > 60:
+        lines.append(f"  … 共 {len(rows)} 行（显示前 60）")
+    return "\n".join(lines)
+
+
 def fmt_code_versions(data: dict) -> str:
     versions = data.get("versions", [])
     repo = data.get("repo", "vllm-ascend")
@@ -301,6 +318,8 @@ def main() -> None:
     p.add_argument("component")
     p.add_argument("version")
 
+    sub.add_parser("matrix", help="全量配套矩阵（调试/管理用；日常用 companion）")
+
     # Phase 2：图检索
     p = sub.add_parser("graph", help="Phase 2 图检索（关系追溯）")
     gsub = p.add_subparsers(dest="graph_cmd", required=True)
@@ -375,6 +394,8 @@ def main() -> None:
     elif args.cmd == "companion":
         data = _get(base, "/companion", {"component": args.component, "version": args.version})
         print(json.dumps(data, ensure_ascii=False, indent=2))
+    elif args.cmd == "matrix":
+        print(fmt_matrix(_get(base, "/matrix")))
     elif args.cmd == "graph":
         if args.graph_cmd == "stats":
             print(fmt_graph_stats(_get(base, "/graph/stats")))

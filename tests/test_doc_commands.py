@@ -79,6 +79,19 @@ class TestDocCommands(unittest.TestCase):
         )
         self.assertIn(b"OK", r.stdout + r.stderr)
 
+    def test_skill_covers_all_client_subcommands(self):
+        """反向核验：client.py 每个子命令（含 graph 子命令）都必须在 SKILL.md 中出现。
+
+        与 test_all_doc_commands_resolve_and_parse 互补：那条只保证"文档中的命令可解析"，
+        这条保证"client 暴露的命令都被 skill 文档化"（防新增命令漏写进 SKILL.md）。
+        """
+        client_py = (ROOT / "skills/vllm-kb/client.py").read_text(encoding="utf-8")
+        skill = (ROOT / "skills/vllm-kb/SKILL.md").read_text(encoding="utf-8")
+        subcmds = sorted(set(re.findall(r'add_parser\("([a-z][a-z0-9-]*)"', client_py)))
+        self.assertGreater(len(subcmds), 10, "client 子命令解析异常，正则可能失效")
+        missing = [c for c in subcmds if c not in skill]
+        self.assertEqual(missing, [], f"SKILL.md 未覆盖的 client 子命令: {missing}")
+
 
 if __name__ == "__main__":
     unittest.main()

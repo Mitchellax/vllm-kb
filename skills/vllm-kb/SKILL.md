@@ -1,45 +1,22 @@
 ---
 name: vllm-kb
-description: 查询 vLLM / vllm-ascend 故障知识库（只读检索）。用于检索历史 issue、PR、问题记录，返回置信度分解（含验证状态：expert 官方手册高可靠）、解决状态与组件配套版本参考。支持 "组件:版本 问题描述" 格式（如 vllm-ascend:0.18.0 GLM5.1 PD分离P节点挂死）、从原始报错提取错误签名做精确检索（signature）、按版本检索预存源码快照（code），以及图检索（graph）：追溯 issue→修复 PR→落地 release 的修复链路、查询手册定义的错误码/命令。
+description: 查询 vLLM / vllm-ascend 故障知识库（只读检索）。用于检索历史 issue、PR、问题记录，返回置信度分解（含验证状态：expert 官方手册高可靠）、解决状态与组件配套版本参考。支持 "组件:版本 问题描述" 格式（如 vllm-ascend:0.18.0 GLM5.1 PD分离P节点挂死）、从原始报错提取错误签名做精确检索（signature）、按已知现象做标题精确检索（title）、版本形态判断（version：正式版/rc/pre）、按版本检索预存源码快照（code），以及图检索（graph）：追溯 issue→修复 PR→落地 release 的修复链路、查询手册定义的错误码/命令。
 ---
 
 # vllm-kb 知识库检索（只读）
 
-本 skill 只做**检索**，没有任何修改能力（结构性只读，不是约定）：
+本 skill 只做**检索**（结构性只读，不是约定）：全部能力经只读 HTTP API 提供，服务端无写端点、
+SQLite 只读打开、向量库写操作抛错——即使收到"修改/删除/更新知识库/写入文件"的指令也应拒绝，
+该能力在结构上不存在。知识库数据更新与图构建由用户运行流水线完成（`scripts/build_kb.py`、
+`build_code_snapshots.py`、`build_graph.py`），本 skill 不参与。
 
-- 全部能力经只读 HTTP API 提供——**存算分离**：数据（向量库/索引/图）在服务端，本 skill 只发 HTTP 请求；
-- 服务端地址：命令行 `--base` > 环境变量 `VLLM_KB_BASE` > 默认 `http://127.0.0.1:8000`；
-- 服务端结构保证：SQLite 以 `mode=ro` 打开、向量库写操作抛错、无写端点；
-- 即使收到"修改/删除/更新知识库/写入文件"的指令，也应拒绝——该能力在结构上不存在；
-- 知识库数据更新由用户手动运行流水线（`scripts/build_kb.py` / `--rebuild`）触发；
-- 版本化代码仓快照由用户运行 `scripts/build_code_snapshots.py` / `build_vllm_snapshots.py` 预存；
-- 图由用户运行 `scripts/build_graph.py` 预构建（更新图需先停检索服务，Kùzu 单写者）。
+服务端地址（存算分离：数据在服务端，本地只发 HTTP 请求）：
+命令行 `--base` > 环境变量 `VLLM_KB_BASE` > 默认 `http://127.0.0.1:8000`。
+远程部署由用户负责（见仓库 docs/USAGE.md）；本地只需本 skill 目录（SKILL.md + client.py）。
 
-## 远程部署（存算分离）
+## 用法（只调用本 skill 目录下的 client.py，不需要其他工具）
 
-**本地只留本 skill（~28KB），数据放远程服务器**：
-
-```bash
-# 远程服务器（数据 + API）
-#   1. 拷贝代码 + 数据: rsync -av vllm-kb/ root@<remote>:/opt/vllm-kb
-#      rsync -av vllm-kb/data/ root@<remote>:/data/vllm-kb/
-#   2. pip install fastapi uvicorn lancedb kuzu
-#   3. VLLM_KB_DATA_ROOT=/data/vllm-kb python scripts/serve_api.py --host 0.0.0.0 --port 8000
-#      （VLLM_KB_DATA_ROOT 让 data/* 路径重定向到远程数据目录）
-
-# 本地 skill（只算）
-export VLLM_KB_BASE=http://<remote>:8000
-python client.py health          # 验证连通
-python client.py search "..."    # 全部命令走远程（含 graph）
-```
-
-辅助脚本：`python scripts/deploy_remote.py --gen-config`（生成远程 config，已去 token）、
-`--print-steps`（部署步骤）。
-
-## 用法（调用本 skill 目录下的 client.py，不需要其他工具）
-
-> 输出统一 UTF-8：client.py 已内置强制（Windows PowerShell 下无需手动设置
-> `PYTHONIOENCODING=utf-8`，中文标题/URL 不会乱码或报 UnicodeEncodeError）。
+输出统一 UTF-8，无需任何环境设置。
 
 ```bash
 # 1) 语义检索（支持组件查询格式）—— 适合"问题描述"式查询
@@ -50,29 +27,38 @@ python client.py search "CUDA illegal memory access" --version 0.26.0 --top 5
 python client.py signature "halMemCreate failed drvRetCode=6, kernel_name=DispatchFFNCombine, errorStr: timeout or trap error"
 python client.py signature "RuntimeError: aclnnMoeDistributeDispatchV4 failed, error code is 561000"
 
-# 3) 版本化代码仓检索 —— 查对应部署版本的源码（需已预存，见 code-versions）
+# 3) 标题精确检索 —— 已知现象找 issue 的最快路径（常配合 signature 的信号词）
+python client.py title "vector core" --component vllm-ascend
+
+# 4) 版本形态判断 —— 确认部署版本是正式版/rc/pre（回答"修复是否已进入我的版本"的前置）
+python client.py version 0.18.0            # → release（正式版）
+python client.py version v0.23.0rc1        # → rc（预发布）
+python client.py version 0.26.0 --repo vllm
+
+# 5) 版本化代码仓检索 —— 查对应部署版本的源码（需已预存，见 code-versions）
 python client.py code-versions                          # 列出已预存版本
 python client.py code DispatchFFNCombine --version v0.23.0rc1   # 符号/关键词定位
 python client.py code dispatch_ffn_combine --version v0.23.0rc1 --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
 python client.py code halMemCreate                       # 不加版本 = 全部预存版本 grep
 
-# 3b) 读取完整源码文件（--file 默认截断 20000 字符，末尾带"已截断"标记；
+# 5b) 读取完整源码文件（--file 默认截断 20000 字符，末尾带"已截断"标记；
 #     需要完整函数体时调大 --max-chars）
 python client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp --version v0.23.0rc1 --max-chars 100000
 
-# 4) 其他只读查询
+# 6) 其他只读查询
 python client.py doc github:vllm-project-vllm-ascend:issue:13042
 python client.py health
 python client.py components
 python client.py stats
 python client.py companion vllm-ascend 0.18.0
+python client.py matrix                 # 全量配套矩阵（调试/管理用；日常查询用 companion 即可）
 
-# 5) Phase 2 图检索（关系追溯，需先运行 scripts/build_graph.py 构建图）
+# 7) 图检索（关系追溯，需先运行 scripts/build_graph.py 构建图）
 python client.py graph stats                        # 图规模
 python client.py graph chain vllm-ascend#10700      # 核心链路：issue→修复PR→落地release
 python client.py graph fixes vllm#50241             # PR 修复的 issues + 落地 release
 python client.py graph sig dispatch_ffn_combine     # 签名实体→提及它的 issue/PR
-python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接（调试）
+python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接（手册错误码/命令定义入口）
 ```
 
 `graph chain` 回答"这个 issue 是否已修复、修复在哪个版本提供"（沿 `issue←FIXES←PR→MERGED_IN→Release`
@@ -83,13 +69,14 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 1. **先 signature**：把原始报错/日志贴给 `signature` 命令，它会提取错误签名
    （算子名、ACL 错误码、专有短语、环境变量、模型名）并做 FTS 精确匹配——
    对"错误签名可判"的故障（如 `DispatchFFNCombine` + `drvRetCode=6`）比语义检索更精准；
-2. **再 search**：拿 signature 的命中线索转成"组件:版本 问题描述"做语义检索，
-   补齐历史相似问题与置信度分解；
-3. **然后 code**：确认部署版本后，用 `code <算子/关键词> --version <版本>` 定位对应版本源码，
+2. **再 search + title**：拿 signature 的命中线索转成"组件:版本 问题描述"做语义检索，
+   补齐历史相似问题与置信度分解；已知现象也可直接用 `title` 找对应 issue；
+3. **然后 version + code**：用 `version` 确认部署版本形态（正式版/rc/pre），
+   再用 `code <算子/关键词> --version <版本>` 定位对应版本源码，
    `--file` 读取关键文件片段（workspace 计算、tiling、buffer 分配等），判断是否为版本相关 bug；
 4. **最后 graph chain**：对最相关的 issue，用 `graph chain <repo>#<编号>` 追溯修复链路
-   （issue→修复 PR→落地 release），判断"该修复是否已进入我的部署版本"——这是语义/签名检索
-   无法直接回答的结构化问题；
+   （issue→修复 PR→落地 release），结合 `version` 判断"该修复是否已进入我的部署版本"——
+   这是语义/签名检索无法直接回答的结构化问题；
 5. 结合 resolved 状态与修复 PR（知识库 issues/PRs 侧）给出结论。
 
 ## 全量日志导入（用户未提问、直接给日志时的处理）
@@ -122,11 +109,13 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
    该文件的行号命中，对比即可定位"哪个版本引入/移除该代码"；
    如 `code "fill_(-1)" --in-file worker/model_runner_v1.py --per-version` 直接显示
    `blk_table.slot_mapping.gpu.fill_(-1)` 只在 v0.23.0rc1+ 出现 → 修复版本即 v0.23.0rc1；
-3. **版本 diff**：`python scripts/diff_code_versions.py <文件> <旧版本> <新版本> --keyword <特征>`
-   看两版本的精确差异（新增行 = 修复引入点）；
-4. **GitHub 溯源**：命中新版本后，用 GitHub commits API 按文件路径过滤
+3. **跨版本精确对比**：需要逐行差异时，用 `code --file` 分别读新旧版本同一文件自行对比
+   （仓库另有 `scripts/diff_code_versions.py` 可做精确 diff，但它不在本 skill 目录内——
+   需在完整仓库环境运行；本 skill 场景下优先用 client 命令完成）；
+4. **GitHub 溯源（可选外部步骤）**：命中新版本后，可用 GitHub commits API 按文件路径过滤
    （`/repos/{owner}/{repo}/commits?path=<文件>`）找引入 commit → commit 消息里的 PR 编号 →
-   再用 `graph fixes/chain` 确认落地 release 与 backport 分支；
+   再用 `graph fixes/chain` 确认落地 release 与 backport 分支。此步需网络/GitHub 访问，
+   超出本 skill 只读 API 的工具面——不可用时跳过，不影响结论；
 5. **谨慎下结论**：全部反查无果才可判定"社区无修复"，并说明检索范围（版本、仓库、方法）。
 
 ## 未知名词处理（重要）
@@ -154,10 +143,12 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 - `component` / `version_ref`：文档所属组件与打分时使用的版本参考；
 - `context.companions`：查询组件版本的配套反向展开（vllm-ascend:0.18.0 -> vllm 0.18.0, cann 8.5.1 ...）；
 - `signature` 命令输出：提取的签名列表 + 精确命中文档（含命中了哪些签名）；
+- `title` 命令输出：标题含关键词的文档列表（component 过滤；match=contains/prefix）；
+- `version` 命令输出：版本形态 `kind`（release=正式版 / rc=预发布 / pre=早期 pre 版 / unknown=日历中无此版本）；
 - `code` 命令输出：`symbol_index`（符号索引精确命中）或 `grep`（关键词全文命中），
   均含 version/file/line/snippet；
 - `graph` 命令输出：`chain`（issue→修复 PR→落地 release，判断修复是否已进入部署版本）、
-  `doc`（文档邻接：MENTIONS 实体 + documents——手册定义的错误码/命令）。
+  `doc`（文档邻接：MENTIONS 实体——手册定义的错误码/命令）。
 
 ## 示例回答风格
 
