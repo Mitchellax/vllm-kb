@@ -269,5 +269,58 @@ class TestFetchReleases(unittest.TestCase):
         self.assertEqual(rel, {})  # 不抛异常，矩阵生成不阻塞
 
 
+class TestPtaExtraction(unittest.TestCase):
+    """pytorch-ascend（PTA）：requirements.txt 的 torch-npu 提取 + 0day 回退。"""
+
+    def test_torch_npu_regex(self):
+        self.assertTrue(bm._TORCH_NPU_RE.match("torch-npu==2.10.0.post2"))
+        self.assertTrue(bm._TORCH_NPU_RE.match("torch_npu==2.6.0.post1"))
+        self.assertFalse(bm._TORCH_NPU_RE.match("torch==2.10.0"))
+        m = bm._TORCH_NPU_RE.match("torch-npu==2.10.0.post2")
+        self.assertEqual(m.group(1), "2.10.0.post2")
+
+    def _build(self, groups, envs, reqs):
+        from unittest import mock
+
+        def fake_env(tag_info, token, **kw):
+            return envs[tag_info["name"]]
+
+        def fake_req(tag, **kw):
+            return reqs.get(tag, "")
+
+        with mock.patch("build_companion_matrix.fetch_image_env", side_effect=fake_env), \
+                mock.patch("build_companion_matrix.fetch_pta_from_requirements", side_effect=fake_req):
+            return {r["vllm-ascend"]: r for r in bm.build_rows(groups, {}, "T")}
+
+    def test_version_tag_pta_from_requirements(self):
+        groups = {"v0.23.0rc1": [{"name": "v0.23.0rc1", "manifest_digest": "d"}],
+                  "v0.18.0rc1": [{"name": "v0.18.0rc1", "manifest_digest": "d"}]}
+        envs = {"v0.23.0rc1": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.1"],
+                "v0.18.0rc1": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.1"]}
+        reqs = {"v0.23.0rc1": "2.10.0.post2"}
+        rows = self._build(groups, envs, reqs)
+        self.assertEqual(rows["v0.23.0rc1"]["pytorch-ascend"], "2.10.0.post2")
+        self.assertIn("requirements", rows["v0.23.0rc1"]["source"])
+        self.assertEqual(rows["v0.23.0rc1"]["pytorch"], "")  # torch 不必须留空
+        self.assertEqual(rows["v0.18.0rc1"]["pytorch-ascend"], "")  # 无 requirements 留空
+
+    def test_0day_pta_via_vllm_version(self):
+        groups = {"deepseekv4-flash-0731": [{"name": "deepseekv4-flash-0731", "manifest_digest": "d"}],
+                  "v0.26.0": [{"name": "v0.26.0", "manifest_digest": "d"}]}
+        envs = {"deepseekv4-flash-0731": ["VLLM_TAG=v0.26.0"],
+                "v0.26.0": ["VLLM_TAG=v0.26.0"]}
+        reqs = {"v0.26.0": "2.7.0.post1"}
+        rows = self._build(groups, envs, reqs)
+        m0 = rows["deepseekv4-flash-0731"]
+        self.assertEqual(m0["pytorch-ascend"], "2.7.0.post1")  # 参考 v0.26.0 的 PTA
+        self.assertIn("0day", m0["source"])
+
+    def test_0day_no_vllm_hit_kept_empty(self):
+        groups = {"glm5": [{"name": "glm5", "manifest_digest": "d"}]}
+        envs = {"glm5": ["SOC_VERSION=ascend910b1"]}  # 无 VLLM_TAG
+        rows = self._build(groups, envs, {})
+        self.assertEqual(rows["glm5"]["pytorch-ascend"], "")  # 无命中留空
+
+
 if __name__ == "__main__":
     unittest.main()

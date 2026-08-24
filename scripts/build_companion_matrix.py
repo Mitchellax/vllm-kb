@@ -231,6 +231,37 @@ def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com"
         page += 1
 
 
+# torch-npu 依赖行（requirements.txt）：torch-npu==2.10.0.post2 / torch_npu==2.6.0.post1
+_TORCH_NPU_RE = re.compile(r"^torch[-_]npu\s*==\s*(\d+\.\d+(?:\.\d+)?(?:\.post\d+)?)", re.IGNORECASE)
+
+
+def fetch_pta_from_requirements(tag: str, insecure: bool = False,
+                                gbase: str = "https://api.github.com") -> str:
+    """从 vllm-ascend 指定 tag 的 requirements.txt 提取 pytorch-ascend（torch-npu）版本。
+
+    返回 ""（无法获取）。GitHub API contents 端点（走内网镜像 gbase）。
+    """
+    from vllm_kb.net import get_session
+
+    url = (f"{gbase.rstrip('/')}/repos/vllm-project/vllm-ascend/"
+           f"contents/requirements.txt?ref={tag}")
+    try:
+        r = get_session(insecure).get(url, headers={"User-Agent": "vllm-kb", "Accept": "application/vnd.github.raw"},
+                                      timeout=30)
+        if r.status_code == 404:
+            print(f"[matrix] {tag} 无 requirements.txt（跳过 PTA 提取）", flush=True)
+            return ""
+        r.raise_for_status()
+        for line in r.text.splitlines():
+            m = _TORCH_NPU_RE.match(line.strip())
+            if m:
+                return m.group(1)
+        return ""
+    except Exception as e:
+        print(f"[matrix] {tag} requirements.txt 拉取失败: {e}", flush=True)
+        return ""
+
+
 def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:
     """从 release 说明提取配套 vllm 版本，返回 (version, 来源说明)。
 
@@ -263,7 +294,8 @@ def base_version_key(tag: str) -> str:
 
 
 def build_rows(groups: dict, releases: dict[str, str], token: str,
-               insecure: bool = False, qbase: str = "https://quay.io") -> list[dict]:
+               insecure: bool = False, qbase: str = "https://quay.io",
+               gbase: str = "https://api.github.com") -> list[dict]:
     # 第一遍：收齐所有组的 env 信息（同基础版本的组共享 cann 用于回退）
     infos: dict[str, dict] = {}  # base(group key) -> extract_from_env 结果
     for base in groups:
@@ -276,6 +308,18 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         c = infos[base]["cann"]
         if c:
             cann_by_base.setdefault(base_version_key(base), c)
+
+    # 版本型 tag：从各自 requirements.txt 提取 PTA（pytorch-ascend）
+    pta_by_tag: dict[str, str] = {}
+    for base in sorted(groups):
+        if base_version_key(base):
+            p = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase)
+            if p:
+                pta_by_tag[base] = p
+    # 基础版本号 -> PTA（同系列回退用）
+    pta_by_base: dict[str, str] = {}
+    for base in sorted(pta_by_tag):
+        pta_by_base.setdefault(base_version_key(base), pta_by_tag[base])
 
     rows = []
     total = len(groups)
@@ -294,6 +338,22 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         if not vllm_ver:
             vllm_ver, vllm_src = extract_vllm_from_release(
                 base, rel_body) if rel_body else extract_vllm_from_release(base, "")
+        # pytorch-ascend（PTA）：
+        #   版本型 tag -> 自身 requirements.txt（torch-npu==x.y.z.postN）；
+        #   0day 模型（无基础版本号）-> 参考其 vllm 版本对应 tag 的 PTA；
+        #   torch（pytorch 字段）不必须，留空。
+        pta = ""
+        pta_src = ""
+        bv = base_version_key(base)
+        if bv:
+            pta = pta_by_tag.get(base) or pta_by_base.get(bv, "")
+            pta_src = f"requirements({bv})"
+        elif vllm_ver:
+            # 0day：vllm 版本 -> 找 vllm-ascend tag（v{vllm_ver} 或 v{vllm_ver}rc*）的 PTA
+            cand = f"v{vllm_ver}"
+            pta = pta_by_tag.get(cand) or pta_by_base.get(vllm_ver, "")
+            if pta:
+                pta_src = f"0day→v{vllm_ver}的requirements"
         notes = []
         if info["soc"]:
             notes.append(f"SOC={info['soc']}")
@@ -304,6 +364,8 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             provenance.append(f"cann={cann_src}")
         if vllm_src:
             provenance.append(f"vllm={vllm_src}")
+        if pta:
+            provenance.append(f"pytorch-ascend={pta_src}")
         if not cann:
             # Env 无 cann 且同系列也没有：存空人工看护（缺口由 report_gaps 列出）
             provenance.append("cann=缺失(待人工)")
@@ -312,17 +374,17 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
                 "vllm-ascend": base,
                 "vllm": vllm_ver,
                 "cann": cann,
-                "pytorch": "",
-                "pytorch-ascend": "",
+                "pytorch": "",          # torch 不必须，留空
+                "pytorch-ascend": pta,
                 "npu-driver": "",
                 "notes": "; ".join(notes),
                 "source": "自动(" + "+".join(provenance) + ")" if provenance else "待人工",
             }
         )
-        flag = "ok" if (cann or vllm_ver) else "gap"
+        flag = "ok" if (cann or vllm_ver or pta) else "gap"
         print(
             f"[matrix] ({i}/{total}) {base:<28} cann={cann or '-':<8} vllm={vllm_ver or '-':<8} "
-            f"{vllm_src or ''} [{flag}]",
+            f"pta={pta or '-':<10} {vllm_src or ''} [{flag}]",
             flush=True,
         )
     return rows
@@ -484,7 +546,7 @@ def main() -> None:
     releases = fetch_releases(insecure=insecure, gbase=gbase)
     print(f"[matrix] 获取 GitHub release 说明 {len(releases)} 条", flush=True)
 
-    auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase)
+    auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase, gbase=gbase)
     merged = merge_with_manual(auto_rows, manual_rows)
     # 写回前版本号合法性校验：非法版本置空（不污染矩阵，缺口报告会列出）
     n_bad = validate_version_fields(merged)
