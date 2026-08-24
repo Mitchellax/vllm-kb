@@ -20,15 +20,27 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   FIXES/MERGED_IN/MENTIONS/DOCUMENTS 边——**修复链路追溯**（`graph chain`：issue→修复 PR→落地 release，
   "这个修复是否已进入我的部署版本"）、**手册定义查询**（错误码/命令在哪个手册定义）
 - **版本化代码仓**：预存 vllm-ascend 各版本 + 对应 vllm 主仓源码快照，按部署版本定位 `file:line`；
-  `--in-file` 限定文件检索、`--per-version` 版本差异对比、`diff_code_versions.py` 定位修复引入版本
+  `--in-file` 限定文件检索、`--per-version` 版本差异对比、`diff_code_versions.py` 定位修复引入版本；
+  `--file --max-chars` 读取完整源码（截断带明确标记）、`--list` 对比可用/已存/缺失版本
 - **版本日历**：正式 release / rc 形态判断（`version 0.18.0` → release），置信度版本上界映射
+- **组件配套矩阵**：vllm-ascend → vllm/cann/pytorch-ascend 自动匹配——vllm 取镜像 `VLLM_TAG`
+  （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、PTA 从对应 tag 的 `requirements.txt`
+  提取（0day 模型经 vllm 版本关联）；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集重写资产路径）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）
 - **审核工作台**（Web UI）：人工确认统一入口（认证 / 存疑 / 删除+撤回，删除只动数据库记录、原始文件保留），
-  **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）——
+  **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）、
+  **文档管理**（外源文档列表 + 彻底删除：docs+chunks+向量四层，本地文件保留可重新入库）——
   启动与操作见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)
-- **存算分离**：skill 仅 ~28KB，数据（向量库/索引/图，可 41GB）放远程服务器，本地只发 HTTP 查询
+- **平稳降级**：embedding 服务不可用时检索自动降级为全文检索——查询用快速失败客户端（5s）+ 熔断器
+  （连续失败 3 次熔断 60s，零等待降级，到期自动探测恢复）；`/health` 暴露 embedding 状态
+- **内网部署支持**：所有联网脚本（代码快照/版本日历/配套矩阵）支持 `--insecure` 跳过 SSL 校验 +
+  `--github-base/--quay-base/--base-url` 换内网 http 镜像，环境变量统一配置
+- **存算分离**：skill 仅 ~28KB，数据（向量库/索引/图，约 0.8GB 干净库）放远程服务器，本地只发 HTTP 查询；
+  `scripts/pack_migrate.py` 打包迁移（业务环境重新嵌入，不传向量库）
 - **结构只读**：SQLite `mode=ro` + 向量库只读包装 + 无写端点，Agent 提示注入也无法修改知识库
+- **高危操作防护**：`build_kb.py --rebuild` 执行前强制确认（TTY 交互 y/yes，非交互需 `--yes`），
+  防止误触发全量重嵌
 - **总日志接口**：打屏（默认）+ 可选落盘分卷（RotatingFileHandler，config `logging` 段开启）
 - **离线可用**：数据采集完成后，全部检索不依赖网络
 
@@ -37,7 +49,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 ### 环境要求
 
 - Python 3.10+
-- 磁盘：数据约 5~45GB（视采集范围）
+- 磁盘：数据约 4~6GB（canonical/原始快照/代码快照/向量库/图；若曾用旧版库反复增量入库，
+  LanceDB 会累积历史版本致体积膨胀数十 GB，可用 `cleanup_old_versions()` 清理，见 [使用指南 §7](docs/USAGE.md#7-常见问题)）
 - 外部依赖：GitHub token（采集）、Embedding API key（**强制 API**：OpenAI 兼容端点，可指向其他服务器的 vLLM 部署；`echo` 仅离线演示）
 
 ### 安装与配置
@@ -218,10 +231,11 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 | `search.py` / `confidence.py` | 混合检索（向量+FTS+标题）+ 查询时置信度（时间衰退/版本区间/来源可靠度/验证状态） |
 | `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS，含手册表格→错误码、命令格式→Interface）+ 链路查询 |
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布 |
-| `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 本地密钥文件（AppConfig.load 自动加载） |
+| `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔 |
+| `net.py` | 网络统一入口：内网模式（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
-| `api.py` | 只读 FastAPI 检索服务（SQLite `mode=ro`、向量库只读包装、无写端点、/graph 端点） |
+| `api.py` | 只读 FastAPI 检索服务（SQLite `mode=ro`、向量库只读包装、无写端点、/graph 端点、/health 含 embedding 状态） |
 
 ## 🗺️ 版本计划
 
@@ -237,7 +251,7 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 ## 🧪 测试
 
 ```bash
-python -m unittest discover tests    # 300 个测试（含文档-命令一致性核验）
+python -m unittest discover tests    # 321 个测试（含文档-命令一致性核验）
 ```
 
 ## 📄 文档

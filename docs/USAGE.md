@@ -27,6 +27,9 @@ export EMBEDDING_API_KEY=sk-xxx
 `embedding` 定义嵌入端点，`storage` 定义数据目录（含 `code_root`：版本化代码仓根），
 `code` 定义代码仓快照来源与预存版本列表。所有路径相对 `data/`，可整体迁移。
 
+> **URL 可写裸地址**：`embedding.base_url` / OCR `ocr_api_base` 可写 `10.0.0.5:8000/v1` 这种
+> 裸 ip:port（内网 vLLM/OCR 服务），配置加载时自动补 `http://` 前缀并告警；https 需显式写全。
+
 > **离线体验**：不想配 token / embedding key 时，用仓库自带的 `config.offline.json`
 > （`echo` 嵌入 + 纯 Python 向量后端）+ 模拟数据跑通全链路：
 >
@@ -57,21 +60,48 @@ python scripts/build_kb.py --limit 100
 | 提取逻辑升级后重生成 canonical | `python scripts/build_kb.py --recanonicalize` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
 
+> **`--rebuild` 高危确认**：会清空向量库 + 删除 kb.sqlite3 后全量重嵌（66K 文档约数小时）。
+> 执行前强制确认——TTY 交互输入 `y/yes`；**非交互环境（agent/CI）必须加 `--yes`**，否则拒绝执行。
+> canonical/raw/图/审核库不受影响；中断后重跑仍会先清空再重建。
+
 ### 2.2 辅助数据构建
 
 ```bash
 # 版本日历（tag→日期 + 正式/rc 形态）——置信度版本上界依赖
 python scripts/build_release_calendar.py --all-repos
 
-# 版本化代码仓：vllm-ascend 各版本
-python scripts/build_code_snapshots.py
-# 版本化代码仓：对应 vllm 主仓版本（companion 矩阵映射）
-python scripts/build_vllm_snapshots.py --list      # 先看要拉哪些
+# 版本化代码仓：vllm-ascend 各版本（config.code.versions 手动维护；--list 先看对比）
+python scripts/build_code_snapshots.py --list       # 可用(GitHub tag)/已预存/缺失 对比
+python scripts/build_code_snapshots.py             # 按 config.code.versions 增量下载
+python scripts/build_code_snapshots.py --all       # 全量预存（所有 tag）
+
+# 版本化代码仓：对应 vllm 主仓版本（companion 矩阵映射，自动跟随）
+python scripts/build_vllm_snapshots.py --list      # 先看要拉哪些（已预存/缺失分组）
 python scripts/build_vllm_snapshots.py             # 全部下载 + 建索引
 
-# 组件配套矩阵（vllm-ascend → vllm/cann/pytorch 版本映射）
+# 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配）
 python scripts/build_companion_matrix.py
 ```
+
+**内网（SSL 被禁/镜像源）**：以上联网脚本均支持 `--insecure`（跳过 SSL 校验）与镜像源参数，
+也可用环境变量统一配置（多脚本共享）：
+
+```bash
+export VLLM_KB_INSECURE=1                        # 跳过 SSL 证书校验
+export VLLM_KB_GITHUB_BASE=http://<镜像>/api/v3  # GitHub API 镜像
+export VLLM_KB_QUAY_BASE=http://<镜像>           # quay 镜像
+export VLLM_KB_CODE_BASE=http://<镜像>           # codeload 源码 zip 镜像
+python scripts/build_companion_matrix.py         # 全部脚本自动走内网配置
+```
+
+**配套矩阵自动匹配规则**（`build_companion_matrix.py`）：
+
+- `vllm`：镜像 Env 的 `VLLM_TAG`（构建时锁定，最可靠）> GitHub release 说明 > 版本号启发式；
+- `cann`：镜像 Env 的 `cann-X.Y.Z` 路径；缺失时按**基础版本号**回退同系列其他形态
+  （如 `v0.13.0rc1` 用 `0.13.0` 系列的 cann），同系列也没有则留空人工看护；
+- `pytorch-ascend`（PTA）：对应 tag 的 `requirements.txt` 中 `torch-npu==X.Y.Z.postN`；
+  0day 模型（非版本 tag）参考其 vllm 版本对应 tag 的 PTA，无命中留空；`pytorch`（torch）不必须留空；
+- 写回前**版本号正则校验**：非法值（`latest`、带前缀等）置空 + 告警，不污染矩阵。
 
 ### 2.3 业务来源导入（PDF 手册 / Markdown 文档）—— 完整实操
 
@@ -196,8 +226,13 @@ python scripts/serve_api.py --host 0.0.0.0     # 远程访问（配合存算分�
 - `file=true` 后，uvicorn 访问/错误日志与业务 logging 输出写入 `file_path`，
   **按 `max_bytes` 分卷**（RotatingFileHandler，保留 `backup_count` 个历史卷）；
 - `file=false`（默认）不落盘，仅打屏；
-- 服务状态监控：`serve_api` 的 `GET /health`（只读状态/规模）、`review_ui` 的 `/api/stats`（审核队列）；
-  业务日志打屏观察即可。
+- 服务状态监控：`serve_api` 的 `GET /health` 返回 `{status, chunks, embedding, embedding_note}`——
+  `status` 恒为 ok（检索自动降级），`embedding` 反映嵌入服务健康（ok / degraded / degraded-retrying）；
+  `review_ui` 的 `/api/stats`（审核队列）；业务日志打屏观察即可。
+
+**embedding 不可用时平稳降级**：查询自动降级为全文检索（向量召回跳过，结果照常返回）。
+查询用快速失败客户端（5s 超时 × 1 重试），连续失败 3 次熔断 60s（期间跳过 embed 调用零等待降级），
+到期自动探测恢复；降级期间 `/search` 响应带 `degraded` 提示，agent 可见。
 
 ### 3.2 图更新流程（Kùzu 单写者约束）
 
@@ -245,6 +280,10 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 
 自动补单规则：`verification=unverified` 的文档 → verification_pending；标题含"待审核/待修改"→
 case_title_flag。审核结果回写 canonical 依赖重跑 `--recanonicalize`（后续版本支持热更新）。
+
+**文档管理**（外源文档页签）：列出 kb.sqlite3 中**外源文档**（导入的 PDF/Markdown/表格等，
+GitHub 采集不在此列），支持**彻底删除**——同时清除 docs 行 + chunks_fts + chunks_meta + 向量四层，
+**本地资产文件不动**；下次增量入库时文件仍在本地会**自动重新入库**，文档废弃由管理员手动删本地文件。
 
 **与只读检索 API 的关系**：分离端口（检索 8000 / 审核 8010）、分离数据（kb.sqlite3 只读 /
 review.sqlite3 可写）；审核库检索 API 不碰。权限（谁能标注专家认证）由部署方加 nginx basic auth 等。
@@ -306,9 +345,14 @@ python skills/vllm-kb/client.py code worker_busy_loop --repo vllm --version 0.22
 
 # 列出已预存版本
 python skills/vllm-kb/client.py code-versions --repo vllm
+
+# 读取完整源码文件（--file 默认截断 20000 字符，截断带明确"已截断"标记；
+# 需要完整函数体时调大 --max-chars）
+python skills/vllm-kb/client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp --version v0.23.0rc1 --max-chars 100000
 ```
 
 返回 `symbol_index`（符号精确命中）或 `grep`（关键词全文命中），含 `version/file/line/snippet`。
+**版本未预存**返回 404 并列出可用版本与预存指引（`code-versions` 查看全部已预存）。
 
 **定位"哪个版本引入/移除了某代码"（故障排查高频）**：
 
@@ -330,7 +374,7 @@ python scripts/diff_code_versions.py vllm_ascend/worker/model_runner_v1.py v0.22
 ### 4.6 其他
 
 ```bash
-python skills/vllm-kb/client.py health                  # 服务健康
+python skills/vllm-kb/client.py health                  # 服务健康（含 embedding 状态 ok/degraded）
 python skills/vllm-kb/client.py stats                   # 知识库规模
 python skills/vllm-kb/client.py doc github:vllm-project-vllm-ascend:issue:10700   # 整篇 issue 全文
 python skills/vllm-kb/client.py companion vllm-ascend 0.23.0rc1   # 组件配套版本展开
@@ -391,26 +435,37 @@ python skills/vllm-kb/client.py graph stats
 
 ## 6. 远程部署（存算分离）
 
-数据（向量库 ~41GB、索引）放远程服务器，本地 skill 只留 ~16KB 发 HTTP 查询。
+数据（向量库、索引、图）放远程服务器，本地 skill 只留 ~28KB 发 HTTP 查询。
 
 ```bash
 # 远程服务器
 rsync -av vllm-kb/ root@<remote>:/opt/vllm-kb
 rsync -av vllm-kb/data/ root@<remote>:/data/vllm-kb/      # 一次全量，之后增量
-pip install fastapi uvicorn lancedb
+pip install fastapi uvicorn lancedb kuzu
 VLLM_KB_DATA_ROOT=/data/vllm-kb python scripts/serve_api.py --host 0.0.0.0 --port 8000
-#   VLLM_KB_DATA_ROOT 让 data/* 路径重定向到远程数据目录
+#   VLLM_KB_DATA_ROOT 指向 data/ 目录本身（data/lancedb -> {root}/lancedb，不再包一层 data/）
 
 # 本地 skill
 export VLLM_KB_BASE=http://<remote>:8000
 python skills/vllm-kb/client.py search "..."    # 全部命令走远程
 ```
 
+**迁移打包（业务环境重新嵌入，不传向量库）**——`scripts/pack_migrate.py`：
+
+```bash
+python scripts/pack_migrate.py --with-graph --out deploy/migrate.tar.gz  # 最小集打包（~90MB）
+python scripts/pack_migrate.py --steps        # 业务环境重建步骤（改 embedding.base_url → --rebuild）
+python scripts/pack_migrate.py --with-code    # 无外网时连带 1.7GB 代码快照
+```
+
+包内含 canonical（重嵌入唯一输入）+ 业务数据 + 图；**不含 lancedb（向量库，业务环境 `--rebuild`
+重建，干净库约 0.8GB）与 kb.sqlite3（--rebuild 自动重建）**。详见脚本 docstring。
+
 辅助脚本：
 
 ```bash
 python scripts/deploy_remote.py --gen-config    # 生成远程 config（已去 token/api_key）
-python scripts/deploy_remote.py --pack-data     # 打包数据成 tar.gz（41GB 推荐 rsync）
+python scripts/deploy_remote.py --pack-data     # 打包数据成 tar.gz（大数据推荐 rsync/scp -r）
 python scripts/deploy_remote.py --print-steps   # 部署步骤说明
 ```
 
@@ -422,8 +477,16 @@ python scripts/deploy_remote.py --print-steps   # 部署步骤说明
 A: 语义检索要传目标版本（`--version` 或 `组件:版本` 前缀）；且需先生成版本日历
 （`python scripts/build_release_calendar.py`）才能做"修复落地版本"上界映射。
 
-**Q: 41GB 向量库太大，想精简？**
-A: 存算分离把数据放远程；或 `--rebuild` 时用更小的 embedding 维度/更少数据源。
+**Q: 向量库体积异常大（数十 GB）？**
+A: 干净向量库约 **0.8GB**（122K chunks × 1024 维）。体积膨胀是 LanceDB **历史版本累积**所致：
+每次入库提交新版本 manifest，旧版本从不清理（全量嵌入可累积 4 万+ 份历史快照，占体积 98%）。
+数据完整时用 `db.open_table('chunks').cleanup_old_versions()` 清理即可恢复 ~772MB；
+业务环境 `--rebuild` 全新库天然无历史版本。也可存算分离把数据放远程，或换更小维度模型。
+
+**Q: 内网 SSL 被禁 / 证书不受信？**
+A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳过证书校验；若域名不可达
+需用内网 http 镜像（`--github-base/--quay-base/--base-url`，或环境变量 `VLLM_KB_GITHUB_BASE` 等）；
+`embedding.base_url` 可写裸 ip:port 自动补 `http://`。
 
 **Q: 离线能用吗？**
 A: 能。采集完成后全部检索离线；嵌入可用 `echo` provider 离线自测（效果粗糙）。

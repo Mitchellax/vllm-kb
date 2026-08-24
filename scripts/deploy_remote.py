@@ -46,7 +46,8 @@ def gen_remote_config(cfg: AppConfig, out: Path) -> None:
 def pack_data(cfg: AppConfig, out: Path, include_raw: bool = False) -> None:
     """打包数据（LanceDB/SQLite/code/compatibility，可选 raw）成 tar.gz。
 
-    体积：LanceDB ~41GB → 打包可能仍大；建议远程直接用数据目录拷贝（rsync/scp -r），
+    体积：干净向量库约 0.8GB（LanceDB 历史版本累积可达数十 GB——数据完整时可先
+    cleanup_old_versions() 瘦身再打包）；打包/上传仍建议 rsync/scp -r 整目录拷贝，
     此脚本适用于中小数据或目录拷贝不便时。
     """
     root = cfg.resolve("data")
@@ -69,7 +70,7 @@ def pack_data(cfg: AppConfig, out: Path, include_raw: bool = False) -> None:
                 tar.add(p, arcname=f"data/{f}")
     size = out.stat().st_size / 1e9
     print(f"[deploy] 数据包 -> {out}（{size:.2f} GB）")
-    print(f"[deploy] 提示: 41GB LanceDB 打包/上传较慢，推荐 rsync/scp -r 整目录拷贝到远程")
+    print(f"[deploy] 提示: 大目录打包/上传较慢，推荐 rsync/scp -r 整目录拷贝到远程")
 
 
 def print_steps() -> None:

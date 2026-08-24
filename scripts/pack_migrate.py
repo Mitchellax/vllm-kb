@@ -1,7 +1,6 @@
 """迁移打包：业务环境重新嵌入（不传向量库）。
 
-场景：本地已有完整数据（含 41GB LanceDB 向量库），业务环境要重新嵌入
-（向量库太大不传输）。本脚本打包"重嵌入最小集"：
+场景：本地已有完整数据，业务环境要重新嵌入（向量库不必传输）。本脚本打包"重嵌入最小集"：
 
 必需（重嵌入输入 + 业务数据）：
   - data/raw/canonical.jsonl        统一 canonical（66K 文档全文，重嵌入唯一输入）
@@ -18,7 +17,9 @@
   - data/review.sqlite3  审核队列状态，全新环境可不传（<1KB）
 
 不传（业务环境重建）：
-  - data/lancedb/   41GB 向量库 —— 业务环境跑 build_kb.py --rebuild 重新嵌入
+  - data/lancedb/   向量库 —— 业务环境跑 build_kb.py --rebuild 重新嵌入
+                   （干净库约 0.8GB；本地若因 LanceDB 历史版本累积膨胀到数十 GB，
+                     可用 cleanup_old_versions() 瘦身，见 USAGE §7）
   - data/kb.sqlite3 645MB —— --rebuild 会重建（docs + FTS5）
   - data/raw/github/、data/raw/vllm-ascend/  818MB 原始 JSON，仅增量拉取需要
   - data/checkpoints/、data/graph_debug*/     调试/断点产物
