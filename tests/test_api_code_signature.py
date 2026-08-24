@@ -74,6 +74,27 @@ class TestApiCodeAndSignature(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIn("content", r.json())
 
+    def test_code_diff_endpoint(self):
+        r = self.client.get(
+            "/code/diff",
+            params={"version1": "v0.22.1rc1", "version2": "v0.23.0rc1",
+                    "path": "vllm_ascend/worker/model_runner_v1.py", "keyword": "fill_(-1)"},
+        )
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertIn("diff", d)
+        self.assertIn("lines1", d)
+        self.assertIn("lines2", d)
+
+    def test_code_diff_endpoint_missing_version(self):
+        # 未预存版本 → 404（与 /code/file 的"未预存"处理一致）
+        r = self.client.get(
+            "/code/diff",
+            params={"version1": "v0.99.0", "version2": "v0.23.0rc1",
+                    "path": "vllm_ascend/worker/model_runner_v1.py"},
+        )
+        self.assertEqual(r.status_code, 404)
+
 
 class TestSignaturePipeline(unittest.TestCase):
     """签名提取 → 检索的 Python 层集成（不依赖 API/网络）。"""

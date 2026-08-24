@@ -20,8 +20,9 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   FIXES/MERGED_IN/MENTIONS/DOCUMENTS 边——**修复链路追溯**（`graph chain`：issue→修复 PR→落地 release，
   "这个修复是否已进入我的部署版本"）、**手册定义查询**（错误码/命令在哪个手册定义）
 - **版本化代码仓**：预存 vllm-ascend 各版本 + 对应 vllm 主仓源码快照，按部署版本定位 `file:line`；
-  `--in-file` 限定文件检索、`--per-version` 版本差异对比、`diff_code_versions.py` 定位修复引入版本；
-  `--file --max-chars` 读取完整源码（截断带明确标记）、`--list` 对比可用/已存/缺失版本
+  `--in-file` 限定文件检索、`--per-version` 版本差异对比、`diff` 命令跨版本精确 diff 定位修复引入版本
+  （`--keyword` 过滤相关差异行）；`--file --max-chars` 读取完整源码（截断带明确标记）、
+  `--list` 对比可用/已存/缺失版本
 - **版本日历**：正式 release / rc 形态判断（`version 0.18.0` → release），置信度版本上界映射
 - **组件配套矩阵**：vllm-ascend → vllm/cann/pytorch-ascend 自动匹配——vllm 取镜像 `VLLM_TAG`
   （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、PTA 从对应 tag 的 `requirements.txt`
@@ -36,7 +37,7 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   （连续失败 3 次熔断 60s，零等待降级，到期自动探测恢复）；`/health` 暴露 embedding 状态
 - **内网部署支持**：所有联网脚本（代码快照/版本日历/配套矩阵）支持 `--insecure` 跳过 SSL 校验 +
   `--github-base/--quay-base/--base-url` 换内网 http 镜像，环境变量统一配置
-- **存算分离**：skill 仅 ~28KB，数据（向量库/索引/图，约 0.8GB 干净库）放远程服务器，本地只发 HTTP 查询；
+- **存算分离**：skill 仅 ~34KB，数据（向量库/索引/图，约 0.8GB 干净库）放远程服务器，本地只发 HTTP 查询；
   `scripts/pack_migrate.py` 打包迁移（业务环境重新嵌入，不传向量库）
 - **结构只读**：SQLite `mode=ro` + 向量库只读包装 + 无写端点，Agent 提示注入也无法修改知识库
 - **高危操作防护**：`build_kb.py --rebuild` 执行前强制确认（TTY 交互 y/yes，非交互需 `--yes`），
@@ -130,6 +131,7 @@ python skills/vllm-kb/client.py version 0.18.0          # → release（正式�
 python skills/vllm-kb/client.py code DispatchFFNCombine --version v0.23.0rc1
 python skills/vllm-kb/client.py code make_zmq_socket --repo vllm --version 0.22.1
 python skills/vllm-kb/client.py code "fill_(-1)" --in-file worker/model_runner_v1.py --per-version  # 定位修复引入版本
+python skills/vllm-kb/client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"  # 跨版本精确 diff（新增行=修复引入点）
 
 # 图检索：修复链路追溯（issue→修复 PR→落地 release）
 python skills/vllm-kb/client.py graph chain vllm-ascend#10700

@@ -45,6 +45,10 @@ python client.py code halMemCreate                       # 不加版本 = 全部
 #     需要完整函数体时调大 --max-chars）
 python client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp --version v0.23.0rc1 --max-chars 100000
 
+# 5c) 跨版本精确 diff —— 定位"哪个版本引入/修改了某代码"（新增行出现版本即引入版本）
+python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py
+python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"
+
 # 6) 其他只读查询
 python client.py doc github:vllm-project-vllm-ascend:issue:13042
 python client.py health
@@ -115,9 +119,10 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
    该文件的行号命中，对比即可定位"哪个版本引入/移除该代码"；
    如 `code "fill_(-1)" --in-file worker/model_runner_v1.py --per-version` 直接显示
    `blk_table.slot_mapping.gpu.fill_(-1)` 只在 v0.23.0rc1+ 出现 → 修复版本即 v0.23.0rc1；
-3. **跨版本精确对比**：需要逐行差异时，用 `code --file` 分别读新旧版本同一文件自行对比
-   （仓库另有 `scripts/diff_code_versions.py` 可做精确 diff，但它不在本 skill 目录内——
-   需在完整仓库环境运行；本 skill 场景下优先用 client 命令完成）；
+3. **跨版本精确 diff**：`diff <旧版本> <新版本> <文件路径> [--keyword <特征>]`——对比两个版本
+   同一文件的 unified diff，新增行 = 修复引入点。如
+   `diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"`
+   直接显示该文件两版本间的差异行（--keyword 过滤后只留相关行）；
 4. **GitHub 溯源（可选外部步骤）**：命中新版本后，可用 GitHub commits API 按文件路径过滤
    （`/repos/{owner}/{repo}/commits?path=<文件>`）找引入 commit → commit 消息里的 PR 编号 →
    再用 `graph fixes/chain` 确认落地 release 与 backport 分支。此步需网络/GitHub 访问，
@@ -157,6 +162,8 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 - `version` 命令输出：版本形态 `kind`（release=正式版 / rc=预发布 / pre=早期 pre 版 / unknown=日历中无此版本）；
 - `code` 命令输出：`symbol_index`（符号索引精确命中）或 `grep`（关键词全文命中），
   均含 version/file/line/snippet；
+- `diff` 命令输出：两版本同一文件的 unified diff（各版本行数 + 差异行；`--keyword` 过滤后
+  只留含该特征的差异行，无命中时给出提示）；
 - `graph` 命令输出：`chain`（issue→修复 PR→落地 release，判断修复是否已进入部署版本）、
   `doc`（文档邻接：MENTIONS 实体——手册定义的错误码/命令）。
 

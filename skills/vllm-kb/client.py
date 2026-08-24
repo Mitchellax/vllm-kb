@@ -185,6 +185,18 @@ def fmt_code_file(data: dict) -> str:
     return f"===== {data['version']}:{data['path']} =====\n" + (data.get("content") or "")
 
 
+def fmt_diff(data: dict) -> str:
+    lines = [f"===== {data['path']}  {data['v1']} ({data.get('lines1')} 行) → {data['v2']} ({data.get('lines2')} 行) ====="]
+    diff = data.get("diff") or ""
+    if diff:
+        lines.append(diff)
+    else:
+        lines.append("(无差异)")
+    if data.get("note"):
+        lines.append(f"[diff] {data['note']}")
+    return "\n".join(lines)
+
+
 def _resolve_graph_doc(arg: str, kind: str) -> str:
     """图查询的 doc 参数解析：完整 source_id 或 repo#number 简写。
 
@@ -307,6 +319,14 @@ def main() -> None:
     p = sub.add_parser("code-versions", help="列出已预存的代码仓版本")
     p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
 
+    p = sub.add_parser("diff", help="跨版本精确 diff：对比两个版本同一文件的 unified diff")
+    p.add_argument("v1", help="旧版本（如 v0.22.1rc1）")
+    p.add_argument("v2", help="新版本（如 v0.23.0rc1）")
+    p.add_argument("path", help="文件路径（相对仓库根，如 vllm_ascend/worker/model_runner_v1.py）")
+    p.add_argument("--keyword", default=None, help="只显示包含该关键词的差异行（定位修复代码）")
+    p.add_argument("--context", type=int, default=3, help="diff 上下文行数")
+    p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
+
     p = sub.add_parser("doc", help="读取整篇文档")
     p.add_argument("doc_id")
 
@@ -379,6 +399,12 @@ def main() -> None:
             print(fmt_code_hits(data))
     elif args.cmd == "code-versions":
         print(fmt_code_versions(_get(base, "/code/versions", {"repo": args.repo})))
+    elif args.cmd == "diff":
+        params = {"version1": args.v1, "version2": args.v2, "path": args.path,
+                  "repo": args.repo, "context": args.context}
+        if args.keyword:
+            params["keyword"] = args.keyword
+        print(fmt_diff(_get(base, "/code/diff", params)))
     elif args.cmd == "doc":
         data = _get(base, f"/doc/{urllib.parse.quote(args.doc_id, safe='')}")
         print(f"# {data['title']}")

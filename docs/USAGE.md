@@ -364,8 +364,10 @@ python skills/vllm-kb/client.py code "fill_(-1)" --in-file worker/model_runner_v
 python skills/vllm-kb/client.py code "fill_(-1)" --in-file worker/model_runner_v1.py --per-version
 #   → 若 blk_table.slot_mapping.gpu.fill_(-1) 只在 v0.23.0rc1+ 出现，修复引入版本即 v0.23.0rc1
 
-# 精确 diff 两个版本的源码（新增行 = 修复引入点）：
-python scripts/diff_code_versions.py vllm_ascend/worker/model_runner_v1.py v0.22.1rc1 v0.23.0rc1 --keyword "fill_(-1)"
+# 跨版本精确 diff（新增行 = 修复引入点；--keyword 只留相关差异行，--context 调上下文行数）：
+python skills/vllm-kb/client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"
+#   → 显示该文件两版本 unified diff，`+ blk_table.slot_mapping.gpu.fill_(-1)` 只在 v0.23.0rc1 出现
+#   仓库另有 scripts/diff_code_versions.py 等价实现（需完整仓库环境）；client diff 走只读 API 即可
 ```
 
 命中新版本后，用 GitHub commits API 按文件路径过滤找引入 commit → PR 编号 →
@@ -378,6 +380,7 @@ python skills/vllm-kb/client.py health                  # 服务健康（含 emb
 python skills/vllm-kb/client.py stats                   # 知识库规模
 python skills/vllm-kb/client.py doc github:vllm-project-vllm-ascend:issue:10700   # 整篇 issue 全文
 python skills/vllm-kb/client.py companion vllm-ascend 0.23.0rc1   # 组件配套版本展开
+python skills/vllm-kb/client.py matrix                            # 全量配套矩阵（调试/管理用；日常用 companion）
 ```
 
 ### 4.7 graph —— Phase 2 图检索（关系追溯）
@@ -430,12 +433,16 @@ python skills/vllm-kb/client.py graph stats
 6. doc        读 issue 全文 → 结合 resolved 状态与修复 PR 给结论
 ```
 
-**未知名词处理**：检索不到、无法确认的名词（产品名/内部代号），先问用户；用户也不知道时
-才基于上下文推断，并标注"这是推断，未经确认"。
+**信息缺失与未知名词处理**：关键事实（部署形态、卡数/节点数、部署版本、组件范围）或名词含义
+无法确认时，先问用户，不要假设通用拓扑或自行脑补（如日志中 timeout 7 次是否是"8 卡缺 1"，
+取决于机器卡数）；用户也不知道时才基于上下文推断，并标注"这是推断，未经确认"。
+
+**未命中反查**：检索不到时用 `code --in-file --per-version` 逐版本对比、`diff` 命令做跨版本
+精确 diff（§4.5）定位修复引入版本，仍无果才判定"社区无修复"并说明检索范围。
 
 ## 6. 远程部署（存算分离）
 
-数据（向量库、索引、图）放远程服务器，本地 skill 只留 ~28KB 发 HTTP 查询。
+数据（向量库、索引、图）放远程服务器，本地 skill 只留 ~34KB 发 HTTP 查询。
 
 ```bash
 # 远程服务器

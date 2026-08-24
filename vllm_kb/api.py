@@ -400,6 +400,50 @@ def create_app(config_path: Optional[str] = None):
             raise HTTPException(status_code=404, detail=f"{version}:{path} 不存在（repo={repo or 'vllm-ascend'}）")
         return {"version": version, "repo": repo or "vllm-ascend", "path": path, "content": text}
 
+    @app.get("/code/diff")
+    def code_diff(version1: str, version2: str, path: str,
+                  keyword: Optional[str] = None, context: int = 3,
+                  repo: Optional[str] = None):
+        """跨版本精确 diff：同一文件在两个版本快照间的 unified diff。
+
+        定位"哪个版本引入/修改了某代码"（新增行 = 修复引入点）；--keyword 只显示含关键词的差异行。
+        """
+        import difflib
+
+        ci = _code_index_for(repo)
+        if ci is None:
+            raise HTTPException(status_code=503, detail="code_index 未初始化")
+        p1 = _code_call(ci.find_file, version1, path)
+        p2 = _code_call(ci.find_file, version2, path)
+        missing = [v for v, p in ((version1, p1), (version2, p2)) if p is None]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"版本 {missing} 未预存文件 {path}（repo={repo or 'vllm-ascend'}）",
+            )
+        t1 = p1.read_text(encoding="utf-8", errors="replace").splitlines()
+        t2 = p2.read_text(encoding="utf-8", errors="replace").splitlines()
+        diff_lines = list(difflib.unified_diff(
+            t1, t2, fromfile=f"{version1}:{path}", tofile=f"{version2}:{path}",
+            n=context, lineterm=""))
+        out: list[str] = []
+        shown = 0
+        for line in diff_lines:
+            if line.startswith(("+++", "---", "@@")):
+                out.append(line)  # 头部/块标记始终显示
+            elif keyword and keyword.lower() not in line.lower():
+                continue
+            else:
+                out.append(line)
+                shown += 1
+        return {
+            "path": path, "v1": version1, "v2": version2, "repo": repo or "vllm-ascend",
+            "lines1": len(t1), "lines2": len(t2), "keyword": keyword, "context": context,
+            "diff": "\n".join(out),
+            "note": f"无包含关键词 '{keyword}' 的差异行（v1/v2 该文件可能无差异）"
+                    if shown == 0 and keyword else None,
+        }
+
     # ---------------- Phase 2：图存储检索（Kùzu，懒加载；只读查询，不触发建图） ----------------
 
     _graph_state: dict = {"builder": None}

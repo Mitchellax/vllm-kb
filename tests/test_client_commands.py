@@ -176,6 +176,25 @@ class TestCliDispatch(unittest.TestCase):
         self.assertEqual(calls["payload"]["path"], "worker/model_runner_v1.py")
         self.assertTrue(calls["payload"]["per_version"])
 
+    def test_diff_dispatch(self):
+        calls = {}
+
+        def fake_get(base, path, params=None):
+            calls["path"] = path
+            calls["params"] = params
+            return {"path": "p", "v1": "v0.22.1rc1", "v2": "v0.23.0rc1",
+                    "lines1": 10, "lines2": 12, "diff": "-a\n+b", "note": None}
+
+        txt = run_main(["diff", "v0.22.1rc1", "v0.23.0rc1",
+                        "vllm_ascend/worker/model_runner_v1.py", "--keyword", "fill_(-1)"],
+                       get_data=fake_get)
+        self.assertEqual(calls["path"], "/code/diff")
+        self.assertEqual(calls["params"]["version1"], "v0.22.1rc1")
+        self.assertEqual(calls["params"]["version2"], "v0.23.0rc1")
+        self.assertEqual(calls["params"]["keyword"], "fill_(-1)")
+        self.assertIn("v0.22.1rc1", txt)
+        self.assertIn("+b", txt)
+
 
 if __name__ == "__main__":
     unittest.main()
