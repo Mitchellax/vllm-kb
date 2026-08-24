@@ -21,6 +21,9 @@
     python scripts/build_release_calendar.py                     # 默认 vllm-ascend（config.code.repo）
     python scripts/build_release_calendar.py --repo vllm-project/vllm
     python scripts/build_release_calendar.py --all-repos
+    python scripts/build_release_calendar.py --insecure          # 内网：跳过 SSL 证书校验
+    python scripts/build_release_calendar.py --github-base http://mirror/api/v3
+        # GitHub API 镜像（http/https 均可）；亦可用环境变量 VLLM_KB_GITHUB_BASE / VLLM_KB_INSECURE
 """
 import argparse
 import json
@@ -36,15 +39,18 @@ from vllm_kb.config import AppConfig  # noqa: E402
 _UA = {"User-Agent": "vllm-kb"}
 
 
-def fetch_releases(repo: str) -> list[dict]:
+def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.github.com") -> list[dict]:
     """GitHub Releases API 全量拉取（分页）。返回 [{tag, date, prerelease}...] 按日期降序。"""
+    from vllm_kb.net import get_opener
+
+    opener = get_opener(insecure)
     releases: list[dict] = []
     page = 1
     while True:
-        url = f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}"
+        url = f"{gbase.rstrip('/')}/repos/{repo}/releases?per_page=100&page={page}"
         try:
             req = urllib.request.Request(url, headers=_UA)
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with opener.open(req, timeout=30) as r:
                 batch = json.loads(r.read().decode("utf-8"))
         except Exception as e:
             print(f"[warn] {repo} releases 拉取失败（page {page}）: {e}")
@@ -82,8 +88,8 @@ def classify_version(tag: str) -> str:
     return "release"
 
 
-def build_calendar(repo: str) -> dict:
-    releases = fetch_releases(repo)
+def build_calendar(repo: str, insecure: bool = False, gbase: str = "https://api.github.com") -> dict:
+    releases = fetch_releases(repo, insecure=insecure, gbase=gbase)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo": repo,
@@ -111,11 +117,21 @@ def write_calendar(cfg: AppConfig, calendar: dict, path: Path | None = None) -> 
 
 
 def main() -> None:
+    from vllm_kb.net import add_insecure_args, github_api_base, insecure_from_env
+
     ap = argparse.ArgumentParser(description="生成版本日历（GitHub Releases API）")
     ap.add_argument("--repo", default=None, help="仓库（默认 config.code.repo）")
     ap.add_argument("--all-repos", action="store_true", help="vllm-ascend + vllm 两个仓库")
     ap.add_argument("--config", default=None)
+    add_insecure_args(ap)
     args = ap.parse_args()
+
+    insecure = args.insecure or insecure_from_env()
+    gbase = github_api_base(args.github_base)
+    if insecure:
+        print("[calendar] --insecure：跳过 SSL 证书校验（内网模式）")
+    if gbase != "https://api.github.com":
+        print(f"[calendar] GitHub API 镜像 {gbase}")
 
     cfg = AppConfig.load(args.config)
     repos = []
@@ -126,7 +142,7 @@ def main() -> None:
 
     for repo in repos:
         print(f"[calendar] 拉取 {repo} releases ...", flush=True)
-        cal = build_calendar(repo)
+        cal = build_calendar(repo, insecure=insecure, gbase=gbase)
         out = write_calendar(cfg, cal)
         kinds = {}
         for r in cal["releases"]:

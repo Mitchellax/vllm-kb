@@ -14,6 +14,9 @@
     python scripts/build_companion_matrix.py                 # 下载+匹配+写回+缺口报告
     python scripts/build_companion_matrix.py --strict        # 存在缺口时退出码 1（CI 用）
     python scripts/build_companion_matrix.py --no-write      # 只报告不写回
+    python scripts/build_companion_matrix.py --insecure      # 内网：跳过 SSL 证书校验
+    python scripts/build_companion_matrix.py --quay-base http://mirror:8080 --github-base http://mirror/api/v3
+        # 内网 http 镜像（quay / GitHub API）；亦可用环境变量 VLLM_KB_QUAY_BASE / VLLM_KB_GITHUB_BASE / VLLM_KB_INSECURE
 """
 import argparse
 import json
@@ -84,11 +87,20 @@ def pick_representative(group: list[dict]) -> dict:
 
 # ---------------- quay 镜像 env ----------------
 
-def get_quay_token() -> str:
-    import requests
+def _quay_api(qbase: str) -> str:
+    """quay API 前缀（内网镜像时替换域名）。"""
+    return f"{qbase.rstrip('/')}/api/v1/repository/ascend/vllm-ascend"
 
-    r = requests.get(
-        "https://quay.io/v2/auth",
+
+def _quay_v2(qbase: str) -> str:
+    return f"{qbase.rstrip('/')}/v2/ascend/vllm-ascend"
+
+
+def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io") -> str:
+    from vllm_kb.net import get_session
+
+    r = get_session(insecure).get(
+        f"{qbase.rstrip('/')}/v2/auth",
         params={"service": "quay.io", "scope": "repository:ascend/vllm-ascend:pull"},
         timeout=30,
     )
@@ -96,14 +108,18 @@ def get_quay_token() -> str:
     return r.json()["token"]
 
 
-def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3) -> list[str]:
+def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
+                    insecure: bool = False, qbase: str = "https://quay.io") -> list[str]:
     """拉取镜像 config Env（manifest list -> amd64 子清单 -> config blob）。失败返回 []。"""
-    import requests
+    from vllm_kb.net import get_session
 
     digest = tag_info["manifest_digest"]
+    session = get_session(insecure)
+    api = _quay_api(qbase)
+    v2 = _quay_v2(qbase)
     for attempt in range(max_retries + 1):
         try:
-            m = requests.get(f"{API}/manifest/{digest}", timeout=timeout)
+            m = session.get(f"{api}/manifest/{digest}", timeout=timeout)
             m.raise_for_status()
             md = json.loads(m.json()["manifest_data"])
             if md.get("manifests"):
@@ -111,12 +127,12 @@ def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: 
                     (x for x in md["manifests"] if x["platform"].get("architecture") == "amd64"),
                     md["manifests"][0],
                 )
-                cm = requests.get(f"{API}/manifest/{arch['digest']}", timeout=timeout)
+                cm = session.get(f"{api}/manifest/{arch['digest']}", timeout=timeout)
                 cm.raise_for_status()
                 md = json.loads(cm.json()["manifest_data"])
             cfg_digest = md["config"]["digest"]
-            blob = requests.get(
-                f"{V2}/blobs/{cfg_digest}",
+            blob = session.get(
+                f"{v2}/blobs/{cfg_digest}",
                 headers={"Authorization": "Bearer " + token},
                 timeout=timeout,
             )
@@ -154,12 +170,14 @@ def extract_from_env(env: list[str]) -> dict[str, str]:
 
 # ---------------- GitHub release 说明 ----------------
 
-def fetch_releases() -> dict[str, str]:
+def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com") -> dict[str, str]:
     """拉取 vllm-ascend release 说明，返回 {tag_name: body}。失败返回 {}。"""
-    import requests
+    from vllm_kb.net import get_session
 
+    url = f"{gbase.rstrip('/')}/repos/vllm-project/vllm-ascend/releases"
     try:
-        r = requests.get(GITHUB_RELEASES, params={"per_page": 100}, headers={"User-Agent": "vllm-kb"}, timeout=30)
+        r = get_session(insecure).get(url, params={"per_page": 100},
+                                      headers={"User-Agent": "vllm-kb"}, timeout=30)
         r.raise_for_status()
         return {rel.get("tag_name", ""): (rel.get("body") or "") for rel in r.json()}
     except Exception as e:
@@ -187,12 +205,13 @@ def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:
 
 # ---------------- 构建与合并 ----------------
 
-def build_rows(groups: dict, releases: dict[str, str], token: str) -> list[dict]:
+def build_rows(groups: dict, releases: dict[str, str], token: str,
+               insecure: bool = False, qbase: str = "https://quay.io") -> list[dict]:
     rows = []
     total = len(groups)
     for i, base in enumerate(sorted(groups), 1):
         rep = pick_representative(groups[base])
-        env = fetch_image_env(rep, token)
+        env = fetch_image_env(rep, token, insecure=insecure, qbase=qbase)
         info = extract_from_env(env)
         rel_body = releases.get(base, "")
         vllm_ver, vllm_src = extract_vllm_from_release(base, rel_body) if rel_body else extract_vllm_from_release(base, "")
@@ -320,13 +339,24 @@ def suggest_from_issues(canonical_path: str | Path, min_issues: int = 1) -> None
 
 
 def main() -> None:
+    from vllm_kb.net import add_insecure_args, github_api_base, insecure_from_env, quay_base
+
     ap = argparse.ArgumentParser(description="自动生成/更新 vllm-ascend 组件配套矩阵")
     ap.add_argument("--matrix", default=None, help="矩阵文件路径（默认取 config.json 的 storage.companion_file）")
     ap.add_argument("--strict", action="store_true", help="存在缺口时以退出码 1 结束（CI 用）")
     ap.add_argument("--no-write", action="store_true", help="只报告不写回")
     ap.add_argument("--suggest-from-issues", nargs="?", const="data/raw/canonical.jsonl", metavar="CANONICAL",
                     help="从 canonical 的 issue 数据统计配套参考（真实部署众数，不写回矩阵）")
+    add_insecure_args(ap)
     args = ap.parse_args()
+
+    insecure = args.insecure or insecure_from_env()
+    qbase = quay_base(args.quay_base)
+    gbase = github_api_base(args.github_base)
+    if insecure:
+        print("[matrix] --insecure：跳过 SSL 证书校验（内网模式）")
+    if qbase != "https://quay.io" or gbase != "https://api.github.com":
+        print(f"[matrix] 镜像源 quay={qbase} github={gbase}")
 
     if args.suggest_from_issues:
         suggest_from_issues(args.suggest_from_issues)
@@ -343,16 +373,16 @@ def main() -> None:
     print(f"[matrix] 现有手工行 {len(manual_rows)} 条（非空字段将优先保留）", flush=True)
 
     # 1) quay tag
-    tags = fq.fetch_tags()
+    tags = fq.fetch_tags(insecure=insecure, base=qbase)
     groups = group_base_versions(tags)
     print(f"[matrix] 看护 tag 分组为 {len(groups)} 个基础版本（含模型专属镜像）", flush=True)
 
     # 2) 镜像 env + 3) release 说明
-    token = get_quay_token()
-    releases = fetch_releases()
+    token = get_quay_token(insecure=insecure, qbase=qbase)
+    releases = fetch_releases(insecure=insecure, gbase=gbase)
     print(f"[matrix] 获取 GitHub release 说明 {len(releases)} 条", flush=True)
 
-    auto_rows = build_rows(groups, releases, token)
+    auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase)
     merged = merge_with_manual(auto_rows, manual_rows)
     n_gaps = report_gaps(merged)
 

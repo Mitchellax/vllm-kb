@@ -40,15 +40,24 @@ _EXCLUDE_RE = re.compile(
 VERSION_RE = re.compile(r"^v?\d+\.\d+\.\d+")
 
 
-def fetch_tags(timeout: int = 30, max_retries: int = 3) -> list[dict]:
-    """分页拉取全部活跃 tag；带重试与逐页进度日志。"""
-    import requests
+def _tags_url(base: str) -> str:
+    """quay tag 列表 URL（base 可换内网镜像前缀，默认 https://quay.io）。"""
+    return f"{base.rstrip('/')}/api/v1/repository/ascend/vllm-ascend/tag/"
 
+
+def fetch_tags(timeout: int = 30, max_retries: int = 3, insecure: bool = False,
+               base: str = "https://quay.io") -> list[dict]:
+    """分页拉取全部活跃 tag；带重试与逐页进度日志。"""
+    from vllm_kb.net import get_session
+
+    url = _tags_url(base)
+    session = get_session(insecure)
     tags: list[dict] = []
     page = 1
     start = time.time()
     print(
-        f"[quay] 开始拉取 {API}（onlyActiveTags=true, timeout={timeout}s, 最大重试 {max_retries} 次）",
+        f"[quay] 开始拉取 {url}（onlyActiveTags=true, timeout={timeout}s, 最大重试 {max_retries} 次"
+        + (", 跳过SSL校验" if insecure else "") + "）",
         flush=True,
     )
     while True:
@@ -56,7 +65,7 @@ def fetch_tags(timeout: int = 30, max_retries: int = 3) -> list[dict]:
         r = None
         for attempt in range(max_retries + 1):
             try:
-                r = requests.get(API, params=params, timeout=timeout)
+                r = session.get(url, params=params, timeout=timeout)
             except requests.RequestException as e:
                 if attempt == max_retries:
                     raise RuntimeError(f"page {page} 请求异常（已重试 {max_retries} 次）: {e}") from e
@@ -119,16 +128,22 @@ def fmt_ts(ts) -> str:
 
 
 def main() -> None:
+    from vllm_kb.net import add_insecure_args, insecure_from_env, quay_base
+
     ap = argparse.ArgumentParser(description="拉取 quay.io ascend/vllm-ascend tag 清单")
     ap.add_argument("--json-out", default=None, help="把候选 tag 写入 JSON（骨架，供人工填写配套）")
     ap.add_argument("--all", action="store_true", help="列出全部 tag（含 nightly/release 等）")
     ap.add_argument("--timeout", type=int, default=30, help="单请求超时秒数")
     ap.add_argument("--max-retries", type=int, default=3, help="每页最大重试次数")
+    add_insecure_args(ap)
     args = ap.parse_args()
 
+    insecure = args.insecure or insecure_from_env()
+    base = quay_base(args.quay_base)
     start = time.time()
     try:
-        tags = fetch_tags(timeout=args.timeout, max_retries=args.max_retries)
+        tags = fetch_tags(timeout=args.timeout, max_retries=args.max_retries,
+                          insecure=insecure, base=base)
     except Exception as e:
         print(f"[quay] 拉取失败: {e}")
         print("[quay] 可改为人工核对：访问 https://quay.io/repository/ascend/vllm-ascend?tab=tags")
