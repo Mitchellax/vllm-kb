@@ -2,7 +2,9 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from vllm_kb.config import AppConfig
 from vllm_kb.embed import EmbeddingClient
@@ -62,6 +64,19 @@ VLLM_ISSUE = KbDocument(
     labels=["bug", "pd"],
     version_span=VersionSpan(min="0.12.1"),
     component="vllm",
+)
+
+ASC_NO_SPAN = KbDocument(
+    source_type="github_issue",
+    source_id="github:vllm-project-vllm-ascend:issue:9201",
+    url="https://github.com/vllm-project/vllm-ascend/issues/9201",
+    title="[Bug]: 无标签版本声明的已解决问题",
+    body="PD 分离挂死，已定位并修复。\n### Your current environment\n- **vllm-ascend version**: 0.18.0",
+    created_at="2026-01-20T00:00:00Z",
+    resolved_at="2026-02-10T00:00:00Z",
+    status="closed",
+    labels=["bug"],
+    component="vllm-ascend",
 )
 
 MATRIX = {
@@ -219,6 +234,89 @@ class TestCompanionSearch(unittest.TestCase):
             self.assertLess(idx[bug_issue.source_id], idx[doc_issue.source_id])
         finally:
             engine.close()
+
+
+class TestQueryTimeSpanMax(unittest.TestCase):
+    """查询期版本上界（修复落地版本）：resolved_at + 按文档仓库选日历现算，仅打分用、不返回。
+
+    背景：入库期用单一日历推导曾导致跨仓库错配（vllm-ascend 文档出现 vllm 主仓版本号），
+    现改为查询期按 repo 分仓日历现算，且派生值不写入 meta、不随 API 泄露。
+    mock load_release_calendar 提供分仓日历（不依赖磁盘/环境变量）。
+    """
+
+    UTC = timezone.utc
+
+    CAL_BY_NAME = {
+        "release_calendar.vllm-project-vllm-ascend.json": {
+            "v0.18.0": datetime(2026, 1, 15, tzinfo=UTC),
+            "v0.19.0": datetime(2026, 3, 1, tzinfo=UTC),
+        },
+        "release_calendar.vllm-project-vllm.json": {
+            "v0.12.1": datetime(2026, 1, 10, tzinfo=UTC),
+        },
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cfg = make_cfg(self.root, resolved_min_sim=0.1)
+        self.store = PythonVectorStore(self.cfg.resolve(self.cfg.storage.lancedb_path + "_py.json"))
+        self.embed = EmbeddingClient(self.cfg.embedding)
+        ingest_docs(self.cfg, [ASC_NO_SPAN], self.embed, self.store)
+        self.engines: list[SearchEngine] = []
+
+    def tearDown(self):
+        # 必须先关 SearchEngine（SQLite 连接），否则 Windows 下 tmp 目录删除被占用
+        for e in self.engines:
+            try:
+                e.close()
+            except Exception:
+                pass
+        self.tmp.cleanup()
+
+    def _engine(self):
+        patcher = mock.patch(
+            "vllm_kb.search.load_release_calendar",
+            side_effect=lambda p: self.CAL_BY_NAME.get(Path(p).name),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        engine = SearchEngine(self.cfg)
+        self.engines.append(engine)
+        return engine
+
+    def test_calendar_selected_by_doc_repo(self):
+        engine = self._engine()
+        # vllm-ascend 文档 -> vllm-ascend 日历；vllm 文档 -> vllm 日历；其他 -> None
+        self.assertEqual(
+            set(engine._calendar_for("github:vllm-project-vllm-ascend:issue:9201")),
+            {"v0.18.0", "v0.19.0"},
+        )
+        self.assertEqual(set(engine._calendar_for("github:vllm-project-vllm:issue:9")), {"v0.12.1"})
+        self.assertIsNone(engine._calendar_for("github:some-other-org:issue:1"))
+
+    def test_span_max_derived_at_query_time_for_scoring(self):
+        """resolved 2026-02-10 -> 上界 v0.18.0（查询期现算）：目标版本 >0.18.0 降权，<=0.18.0 满权。"""
+        engine = self._engine()
+        # 目标 0.19.0 > 上界 0.18.0 -> w_ver 衰减
+        results = engine.search("vllm-ascend:0.19.0 PD 分离 挂死", top_k=5)
+        hit = next((r for r in results if r.doc_id == ASC_NO_SPAN.source_id), None)
+        self.assertIsNotNone(hit)
+        self.assertLess(hit.confidence.version_weight, 1.0)
+        # 目标 0.18.0 <= 上界 -> 满权
+        results2 = engine.search("vllm-ascend:0.18.0 PD 分离 挂死", top_k=5)
+        hit2 = next((r for r in results2 if r.doc_id == ASC_NO_SPAN.source_id), None)
+        self.assertIsNotNone(hit2)
+        self.assertAlmostEqual(hit2.confidence.version_weight, 1.0)
+
+    def test_derived_span_max_not_leaked_to_meta(self):
+        """查询期现算的上界不写入 meta（API version_span 不会出现派生版本）。"""
+        engine = self._engine()
+        results = engine.search("vllm-ascend:0.19.0 PD 分离 挂死", top_k=5)
+        hit = next((r for r in results if r.doc_id == ASC_NO_SPAN.source_id), None)
+        self.assertIsNotNone(hit)
+        self.assertIsNone(hit.meta.get("version_span_max"))
+        self.assertIsNone(hit.meta.get("version_span_min"))
 
 
 if __name__ == "__main__":

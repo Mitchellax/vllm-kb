@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .companion import CompanionMatrix, parse_component_query
-from .confidence import ConfidenceBreakdown, compute_confidence, final_score, version_weight
+from .confidence import (
+    ConfidenceBreakdown,
+    compute_confidence,
+    final_score,
+    load_release_calendar,
+    version_at_date,
+    version_weight,
+)
 from .config import AppConfig
 from .embed import EmbeddingClient
 from .vectorstore import BaseVectorStore, ReadOnlyVectorStore, build_vector_store
@@ -75,6 +82,7 @@ class SearchEngine:
         )
         self._conn: Optional[sqlite3.Connection] = None
         self._warned_no_version = False
+        self._calendar_cache: dict[str, Optional[dict]] = {}  # slug -> 分仓日历（查询期现算上界用）
         self.last_context: dict[str, Any] = {}  # 最近一次查询的组件上下文（verify/agent 展示用）
         self._embed_error: Optional[str] = None  # 查询时 embedding 失败原因（降级提示）
         # 熔断状态
@@ -232,8 +240,16 @@ class SearchEngine:
                 continue
             meta = m["meta"]
             doc_comp = meta.get("component", "")
+            span_min = meta.get("version_span_min")
+            # version_span_max：只取文档**显式**声明/入库的值（github 提取从不写 max）。
+            # 日历推导的"修复落地版本"为派生值，查询期现算、仅参与打分，不写入 meta/不返回
+            # （教训：入库期用单一日历推导导致跨仓库版本错配，如 vllm-ascend 文档出现
+            #  vllm 主仓版本号——派生值不应以数据属性形式泄露）。
+            span_max = meta.get("version_span_max")
+            if span_max is None:
+                span_max = self._derive_span_max(meta)
             version_ref, w_ver = self._resolve_version_ref(
-                doc_comp, meta.get("version_span_min"), meta.get("version_span_max"),
+                doc_comp, span_min, span_max,
                 comp, ver, companion_ctx,
             )
             if version_ref is None:
@@ -243,8 +259,8 @@ class SearchEngine:
                 resolved_at=meta.get("resolved_at"),
                 status=meta.get("status", "open"),
                 source_type=meta.get("source_type", "github_issue"),
-                span_min=meta.get("version_span_min"),
-                span_max=meta.get("version_span_max"),
+                span_min=span_min,
+                span_max=span_max,
                 target_version=version_ref,
                 now=now,
                 cfg=c_cfg,
@@ -296,6 +312,45 @@ class SearchEngine:
                 deduped.append(r)
             results = deduped
         return results[:final_top_k]
+
+    # ---------------- 查询期版本上界（修复落地版本，仅打分用，不落库不返回） ----------------
+
+    def _derive_span_max(self, meta: dict) -> Optional[str]:
+        """resolved_at -> 该文档仓库日历的最近发布版（查询期现算，仅用于 w_ver）。
+
+        不写入 meta、不随 API 返回：派生值是推断（resolved_at 对应最近发布版），
+        不是文档声称的事实——入库期持久化曾导致跨仓库错配（vllm-ascend 文档
+        出现 vllm 主仓版本号），故改为查询期按仓库选日历实时计算。
+        """
+        resolved = meta.get("resolved_at")
+        if not resolved:
+            return None
+        cal = self._calendar_for(meta.get("doc_id") or "")
+        if not cal:
+            return None
+        try:
+            dt = datetime.fromisoformat(resolved.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return version_at_date(cal, dt)
+
+    def _calendar_for(self, source_id: str) -> Optional[dict]:
+        """按文档仓库选日历（分仓文件 release_calendar.{repo_slug}.json，--all-repos 生成）。
+
+        仓库判定用 source_id 的 repo 段（github:vllm-project-xxx:...）；无法判定
+        或文件缺失 -> None（不推导，w_ver 退化为无上界）。
+        """
+        if ":vllm-project-vllm-ascend:" in source_id:
+            slug = "vllm-project-vllm-ascend"
+        elif ":vllm-project-vllm:" in source_id:
+            slug = "vllm-project-vllm"
+        else:
+            return None
+        if slug not in self._calendar_cache:
+            self._calendar_cache[slug] = load_release_calendar(
+                self.cfg.resolve(f"data/compatibility/release_calendar.{slug}.json")
+            )
+        return self._calendar_cache[slug]
 
     def _resolve_version_ref(
         self,

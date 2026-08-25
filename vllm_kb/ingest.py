@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .chunking import chunk_doc
-from .confidence import load_release_calendar, reliability_score, version_at_date
+from .confidence import reliability_score
 from .config import AppConfig
 from .embed import EmbeddingClient
 from .models import KbDocument
@@ -170,18 +170,6 @@ def chunk_meta(doc: KbDocument, reliability: float) -> dict[str, Any]:
     }
 
 
-def _enrich_version_span(doc: KbDocument, calendar) -> None:
-    """resolved_at -> 版本上界（需 release 日历，Phase 1 才有；就地修改 doc）。"""
-    if doc.resolved_at and doc.version_span.max is None and calendar:
-        from datetime import datetime
-
-        try:
-            dt = datetime.fromisoformat(doc.resolved_at.replace("Z", "+00:00"))
-            doc.version_span.max = version_at_date(calendar, dt)
-        except ValueError:
-            pass
-
-
 def _upsert_docs_row(conn: sqlite3.Connection, doc: KbDocument, rel: float,
                      embed_hash: str, meta_hash: str) -> None:
     conn.execute(
@@ -220,7 +208,6 @@ def ingest_docs(
     """入库（幂等 + 增量断点续传）。返回统计。"""
     sqlite_path = sqlite_path or cfg.resolve(cfg.storage.sqlite_path)
     conn = _connect(sqlite_path)
-    calendar = load_release_calendar(cfg.storage.release_calendar)
     stats = {"docs": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0, "meta_refresh": 0, "skipped_empty": 0}
 
     total = len(docs)
@@ -260,7 +247,6 @@ def ingest_docs(
             doc_vecs = vectors[idx : idx + len(chunks)]
             idx += len(chunks)
             eh, mh = _hashes(doc)
-            _enrich_version_span(doc, calendar)
             rel = reliability_score(
                 doc.source_type, doc.status, doc.resolved_at, doc.reliability, cfg.confidence,
                 kind=doc.extra.get("kind", ""),
@@ -340,14 +326,12 @@ def ingest_docs(
                         doc.source_type, doc.status, doc.resolved_at, doc.reliability,
                         cfg.confidence, kind=doc.extra.get("kind", ""),
                     )
-                    _enrich_version_span(doc, calendar)
                     _upsert_docs_row(conn, doc, rel, eh, mh)
                     vector_store.update_doc_meta(doc.source_id, chunk_meta(doc, rel))
                     stats["meta_refresh"] += 1
                     continue
 
             # ---- 全量路径：版本补全 + 可靠度 + 分块（嵌入与写库攒批） ----
-            _enrich_version_span(doc, calendar)
             rel = reliability_score(
                 doc.source_type, doc.status, doc.resolved_at, doc.reliability, cfg.confidence,
                 kind=doc.extra.get("kind", ""),

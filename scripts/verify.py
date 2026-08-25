@@ -34,7 +34,10 @@ def show(results, query, target_version, context=None) -> None:
         print(f"    w_time={c.time_weight:.3f} w_ver={c.version_weight:.3f} w_rel={c.reliability:.3f}")
         print(f"    {r.title}")
         print(f"    {r.url}  status={r.meta.get('status')} resolved={r.meta.get('resolved_at')}")
-        print(f"    version_span=[{r.meta.get('version_span_min')} .. {r.meta.get('version_span_max')}]")
+        span_min = r.meta.get("version_span_min")
+        span_max = r.meta.get("version_span_max")
+        span_txt = f"[{span_min or '-'}]" if span_max is None else f"[{span_min or '-'} .. {span_max}]"
+        print(f"    version_span={span_txt}")
         snippet = r.text[:180].replace("\n", " ")
         print(f"    ...{snippet}...")
 
