@@ -162,6 +162,8 @@ python scripts/build_release_calendar.py --all-repos
 # 6. 版本化代码仓快照
 python scripts/build_code_snapshots.py          # vllm-ascend 版本
 python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本
+#    符号索引（index.sqlite3）是派生数据：提取规则/schema 升级后重建
+#    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
 
 # 7. 图存储重建（修复链路/手册定义；需先停检索服务）
 python scripts/build_graph.py

@@ -315,6 +315,9 @@ def main() -> None:
                    help="限定 grep 的文件路径子串（如 worker/model_runner_v1.py）")
     p.add_argument("--per-version", action="store_true",
                    help="每个版本各自收集命中（输出各版本行号，对比哪个版本引入/移动了该代码）")
+    p.add_argument("--kind", choices=["def", "op", "env", "msg"], default=None,
+                   help="限定符号类型：msg=报错字面量子串检索（raise/assert/logger.error 的字符串参数，"
+                        "定位'报错文本来自哪段代码'）；默认全部类型")
 
     p = sub.add_parser("code-versions", help="列出已预存的代码仓版本")
     p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
@@ -392,10 +395,12 @@ def main() -> None:
                          "max_chars": args.code_max_chars})
             print(fmt_code_file(data))
         else:
-            data = _post(base, "/code/search",
-                         {"keyword": args.keyword, "version": args.version,
-                          "limit": args.limit, "repo": args.repo,
-                          "path": args.in_file, "per_version": args.per_version})
+            payload = {"keyword": args.keyword, "version": args.version,
+                       "limit": args.limit, "repo": args.repo,
+                       "path": args.in_file, "per_version": args.per_version}
+            if args.kind:
+                payload["kind"] = args.kind
+            data = _post(base, "/code/search", payload)
             print(fmt_code_hits(data))
     elif args.cmd == "code-versions":
         print(fmt_code_versions(_get(base, "/code/versions", {"repo": args.repo})))

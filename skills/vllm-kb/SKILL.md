@@ -49,6 +49,11 @@ python client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_
 python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py
 python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"
 
+# 5d) 报错字面量索引 —— 报错文本→源码定义处 file:line 的索引命中（无需全文 grep）：
+#     检索代码里 raise/assert/logger.error 的错误字符串参数（--kind msg 子串匹配）
+python client.py code "memory leak" --kind msg --version v0.23.0rc1
+python client.py code "wait_for_remote" --kind msg --version v0.23.0rc1
+
 # 6) 其他只读查询
 python client.py doc github:vllm-project-vllm-ascend:issue:13042
 python client.py health
@@ -103,9 +108,11 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
    依赖"8 卡"这一事实，必须问用户确认部署形态后再继续；
 5. **多故障并列**：全量日志可能含多个独立故障——逐个检索后**分别**给结论，
    再判断是否同源（同进程/同时段/同组件）；不要把多个报错混成一个问题；
-6. **未命中处理**：某条报错检索不到时，用 `code` 在该版本代码里搜报错字符串
-   （报错文本通常来自代码常量，`code <报错关键词> --version <部署版本>` 可直接定位来源文件），
-   再沿代码上下文判断；仍无果才按"未找到反查流程"（见下）继续。
+6. **未命中处理**：某条报错检索不到时，先用 `code <报错片段> --kind msg --version <部署版本>`
+   命中源码里 raise/assert/logger.error 的错误字面量（索引命中，直接给出定义处 file:line）；
+   无命中再退到普通 `code <报错关键词> --version <部署版本>` 全文 grep
+   （报错文本通常来自代码常量，可定位来源文件），沿代码上下文判断；
+   仍无果才按"未找到反查流程"（见下）继续。
 
 ## 未找到时的反查流程（重要——避免"知识库没检索到 = 社区不存在"）
 
@@ -160,7 +167,8 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 - `signature` 命令输出：提取的签名列表 + 精确命中文档（含命中了哪些签名）；
 - `title` 命令输出：标题含关键词的文档列表（component 过滤；match=contains/prefix）；
 - `version` 命令输出：版本形态 `kind`（release=正式版 / rc=预发布 / pre=早期 pre 版 / unknown=日历中无此版本）；
-- `code` 命令输出：`symbol_index`（符号索引精确命中）或 `grep`（关键词全文命中），
+- `code` 命令输出：`symbol_index`（符号索引精确命中）或 `grep`（关键词全文命中）或
+  `message_index`（`--kind msg`：报错字面量 LIKE 命中，报错文本→定义处），
   均含 version/file/line/snippet；
 - `diff` 命令输出：两版本同一文件的 unified diff（各版本行数 + 差异行；`--keyword` 过滤后
   只留含该特征的差异行，无命中时给出提示）；

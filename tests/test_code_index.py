@@ -133,5 +133,122 @@ class TestCodeIndex(unittest.TestCase):
         self.assertTrue(hits)
 
 
+# Python ast 提取 + 报错字面量索引（kind 语义）
+PY_AST_SRC = '''\
+"""module docstring: def ghost_fn():  # 字符串里的 def，不应被索引
+"""
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class Foo:
+    def bar(self, x):
+        return x
+
+
+async def baz(a,
+              b):
+    return a + b
+
+
+def boom():
+    raise RuntimeError("boom happened here")
+    assert False, "assert boom happened"
+    logger.error("log boom happened")
+    logging.warning("warn boom happened")
+    self.logger.exception("exc boom happened")
+    raise TimeoutError("time_out error")
+    raise ValueError("timexout error")
+'''
+
+
+class TestPythonAstExtraction(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cfg = make_cfg(self.root)
+        self.code = VersionedCode(self.cfg)
+        snap = self.code.snapshots_dir / "v0.25.0rc1"
+        (snap / "csrc").mkdir(parents=True, exist_ok=True)  # 多子目录，避免 _repo_root 下钻后相对路径失配
+        worker = snap / "vllm_ascend" / "worker"
+        worker.mkdir(parents=True)
+        (worker / "ast_sample.py").write_text(PY_AST_SRC, encoding="utf-8")
+        self.code.build_index_for_version("v0.25.0rc1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_ast_indexes_methods_and_async(self):
+        # 缩进方法（旧行级正则 ^def 匹配不到的）与 async/多行签名都应命中
+        self.assertTrue(self.code.search_symbols("bar", "v0.25.0rc1"))
+        self.assertTrue(self.code.search_symbols("baz", "v0.25.0rc1"))
+
+    def test_ast_ignores_string_false_positive(self):
+        # 字符串/docstring 里的 "def ghost_fn" 不应被索引
+        self.assertEqual(self.code.search_symbols("ghost_fn", "v0.25.0rc1"), [])
+
+    def test_kind_filter(self):
+        # "boom" 是函数（kind=def）；报错字面量是长消息，精确搜 "boom" 不命中 msg
+        self.assertTrue(self.code.search_symbols("boom", "v0.25.0rc1", kind="def"))
+        self.assertEqual(self.code.search_symbols("boom", "v0.25.0rc1", kind="msg"), [])
+        # 默认（kind=None）返回全部
+        self.assertTrue(self.code.search_symbols("boom", "v0.25.0rc1"))
+
+    def test_ast_fallback_on_syntax_error(self):
+        # ast 解析失败的文件退回行级正则，def 仍被索引
+        snap = self.code.snapshots_dir / "v0.25.0rc1" / "vllm_ascend" / "ops"
+        snap.mkdir(parents=True, exist_ok=True)
+        (snap / "broken.py").write_text(
+            "def fallback_fn():\n    pass\n\ndef broken(:\n", encoding="utf-8"
+        )
+        self.code.build_index_for_version("v0.25.0rc1")
+        self.assertTrue(self.code.search_symbols("fallback_fn", "v0.25.0rc1"))
+
+
+class TestMessageIndex(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cfg = make_cfg(self.root)
+        self.code = VersionedCode(self.cfg)
+        snap = self.code.snapshots_dir / "v0.25.0rc1"
+        (snap / "csrc").mkdir(parents=True, exist_ok=True)  # 多子目录，避免 _repo_root 下钻后相对路径失配
+        worker = snap / "vllm_ascend" / "worker"
+        worker.mkdir(parents=True)
+        (worker / "ast_sample.py").write_text(PY_AST_SRC, encoding="utf-8")
+        self.code.build_index_for_version("v0.25.0rc1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_search_messages_finds_raise_assert_log(self):
+        hits = self.code.search_messages("boom happened", "v0.25.0rc1")
+        src = "vllm_ascend/worker/ast_sample.py"
+        # raise / assert / logger.error / logging.warning / self.logger.exception
+        self.assertTrue(any(h["file"] == src and h["snippet"].startswith("raise RuntimeError") for h in hits))
+        self.assertTrue(any("assert False" in h["snippet"] for h in hits))
+        self.assertTrue(any("logger.error" in h["snippet"] for h in hits))
+        self.assertTrue(any("logging.warning" in h["snippet"] for h in hits))
+        self.assertTrue(any("self.logger.exception" in h["snippet"] for h in hits))
+
+    def test_search_messages_wildcard_escape(self):
+        # 片段里的 _ 按字面匹配：time_out 只命中 time_out error，不命中 timexout error
+        hits = self.code.search_messages("time_out", "v0.25.0rc1")
+        snippets = [h["snippet"] for h in hits]
+        self.assertTrue(any("time_out error" in s for s in snippets))
+        self.assertFalse(any("timexout" in s for s in snippets))
+
+    def test_search_messages_version_filter(self):
+        self.assertEqual(self.code.search_messages("boom happened", "v0.99.0"), [])
+
+    def test_msg_not_found_by_partial_symbol_search(self):
+        # 符号检索是精确匹配：部分字符串（无通配）不命中长消息；
+        # 子串命中由 search_messages（--kind msg）负责
+        self.assertEqual(
+            self.code.search_symbols("boom happened", "v0.25.0rc1"), []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

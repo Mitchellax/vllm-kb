@@ -195,6 +195,18 @@ class TestCliDispatch(unittest.TestCase):
         self.assertIn("v0.22.1rc1", txt)
         self.assertIn("+b", txt)
 
+    def test_code_kind_msg_dispatch(self):
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["payload"] = payload
+            return {"mode": "message_index", "symbol": "boom", "version": "v0.23.0rc1", "hits": []}
+
+        txt = run_main(["code", "boom", "--kind", "msg", "--version", "v0.23.0rc1"],
+                       post_data=fake_post)
+        self.assertEqual(calls["payload"]["kind"], "msg")
+        self.assertIn("message_index", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

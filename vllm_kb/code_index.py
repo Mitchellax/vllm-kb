@@ -3,8 +3,11 @@
 设计：
 - 快照以 zip 存储（每版本 ~14MB，41 版本 ~570MB 原始下载 / 磁盘占用小），
   解压目录为缓存（data/code/snapshots/{version}/），首次访问按需解压；
-- 符号索引（SQLite）：算子名/内核名/函数名 -> {version, file, line, snippet}，
+- 符号索引（SQLite）：算子名/内核名/函数名 -> {version, file, line, snippet, kind}，
   构建时一次性提取（不依赖网络，离线可用）；
+  - kind：def（函数/类/方法，Python 用 ast 精确提取）、op（aclnn/npu/内核名）、
+    env（环境变量）、msg（报错字面量：raise/assert/logger.error 的字符串参数——
+    支持"报错文本 -> 定义处 file:line"的索引命中，无需全文 grep）；
 - 检索流程：签名/关键词 + 版本 -> 符号索引定位 -> 解压读取代码片段；
 - 全部只读：本模块不提供任何写入口给 API（构建由 scripts/build_code_snapshots.py 触发）。
 
@@ -16,6 +19,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sqlite3
@@ -25,7 +29,7 @@ from typing import Optional
 
 from .config import AppConfig
 
-# 符号提取规则（Python / C++ / 配置）
+# 符号提取规则（Python：ast 精确提取；C++：正则；算子/环境变量：跨语言正则）
 _PY_DEF_RE = re.compile(
     r"^(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(|"
     r"^class\s+([A-Za-z_][A-Za-z0-9_]*)",
@@ -35,9 +39,19 @@ _CPP_DEF_RE = re.compile(
     r"\b(class|struct)\s+([A-Za-z_][A-Za-z0-9_]*)|"
     r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?:const)?\s*\{",
 )
+# C++ 控制流关键字被 _CPP_DEF_RE 误当成符号（实测 while 被索引 1500+ 次），显式过滤
+_CPP_KEYWORD_STOP = {
+    "while", "switch", "if", "for", "return", "sizeof", "delete", "new",
+    "catch", "try", "do", "else", "case", "default", "goto", "throw",
+}
 _OP_ATTR_RE = re.compile(r"\b(aclnn[A-Z][A-Za-z0-9_]*|npu[A-Z][A-Za-z0-9_]*)")
 _KERNEL_NAME_RE = re.compile(r"\b(dispatch_ffn_combine|mega_moe|[a-z0-9_]+_combine|[a-z0-9_]+_dispatch)\b")
 _ENV_NAME_RE = re.compile(r"\b(VLLM_ASCEND_[A-Z0-9_]+|HCCL_[A-Z0-9_]+)")
+
+# 报错字面量提取：logger 调用方的记录方法（vllm-ascend 用 logger = init_logger(__name__)）
+_MSG_ATTRS = {"error", "warning", "fatal", "critical", "exception"}
+# 报错字面量长度下限（太短无区分度）/ 上限（防超长模板占索引）
+_MSG_MIN_LEN, _MSG_MAX_LEN = 8, 300
 
 # 重要文件白名单（提取符号时只扫这些目录，控制索引体积）
 _INDEXED_SUBDIRS = ("csrc", "vllm_ascend")
@@ -144,37 +158,82 @@ class VersionedCode:
                   symbol  TEXT NOT NULL,
                   file    TEXT NOT NULL,
                   line    INTEGER,
-                  snippet TEXT
+                  snippet TEXT,
+                  kind    TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_sym_ver ON symbols(symbol, version);
                 """
             )
+            # schema 迁移：旧索引无 kind 列（提取规则升级前构建）——自动补列，
+            # 之后需 --index-only 重建才有 kind 数据（kind 为 NULL 的行不被 kind 过滤检索命中）
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)")]
+            if "kind" not in cols:
+                conn.execute("ALTER TABLE symbols ADD COLUMN kind TEXT")
             return conn
         if not self.index_path.exists():
             raise CodeIndexError("符号索引不存在：运行 scripts/build_code_snapshots.py 构建")
-        return sqlite3.connect(f"file:{self.index_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{self.index_path}?mode=ro", uri=True)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)")]
+        if "kind" not in cols:
+            conn.close()
+            raise CodeIndexError(
+                "符号索引 schema 过旧（缺 kind 列，提取规则升级前构建）："
+                "先停检索 API，运行 scripts/build_code_snapshots.py --index-only 重建，再重启"
+            )
+        return conn
 
     def search_symbols(
         self,
         symbol: str,
         version: Optional[str] = None,
         limit: int = 20,
+        kind: Optional[str] = None,
     ) -> list[dict]:
-        """符号精确检索：符号名 + 可选版本过滤。"""
+        """符号精确检索：符号名 + 可选版本/kind 过滤。"""
         conn = self._connect_index(write=False)
         try:
+            conds = ["symbol = ?"]
+            args: list = [symbol.lower()]
+            if kind:
+                conds.append("kind = ?")
+                args.append(kind)
             if version:
-                rows = conn.execute(
-                    "SELECT version, file, line, snippet FROM symbols "
-                    "WHERE symbol = ? AND version = ? LIMIT ?",
-                    (symbol.lower(), version, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT version, file, line, snippet FROM symbols "
-                    "WHERE symbol = ? LIMIT ?",
-                    (symbol.lower(), limit),
-                ).fetchall()
+                conds.append("version = ?")
+                args.append(version)
+            sql = "SELECT version, file, line, snippet FROM symbols WHERE " + " AND ".join(conds)
+            sql += " LIMIT ?"
+            args.append(limit)
+            rows = conn.execute(sql, args).fetchall()
+            return [
+                {"version": r[0], "file": r[1], "line": r[2], "snippet": r[3]}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def search_messages(
+        self,
+        fragment: str,
+        version: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """报错字面量检索：raise/assert/logger.error 的错误字符串参数含该片段（LIKE 子串）。
+
+        把"报错文本来自代码常量"的逆向定位从全文 grep 升级为索引命中：
+        `code <报错片段> --kind msg --version <版本>` 直接给出定义处 file:line。
+        片段中的 % _ 按字面处理（转义），不做通配。
+        """
+        conn = self._connect_index(write=False)
+        try:
+            esc = fragment.lower().replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+            sql = "SELECT version, file, line, snippet FROM symbols WHERE kind = 'msg' AND symbol LIKE ? ESCAPE '\\'"
+            args: list = [f"%{esc}%"]
+            if version:
+                sql += " AND version = ?"
+                args.append(version)
+            sql += " LIMIT ?"
+            args.append(limit)
+            rows = conn.execute(sql, args).fetchall()
             return [
                 {"version": r[0], "file": r[1], "line": r[2], "snippet": r[3]}
                 for r in rows
@@ -279,36 +338,104 @@ class VersionedCode:
         except Exception:
             return
         lines = text.splitlines()
-        syms: set[tuple[str, int, str]] = set()
+        # (kind, name_lower, line_no, snippet) 集合：同文件内按此去重
+        syms: set[tuple[str, str, int, str]] = set()
+        if p.suffix == ".py":
+            _extract_python_ast(text, lines, syms)
+        else:
+            _extract_cpp_regex(text, lines, syms)
+        # 算子/内核/环境变量（跨语言，对 .py 与 C++ 都生效）
+        _extract_pattern_symbols(text, lines, syms)
+        for kind, sym, ln, sn in syms:
+            conn.execute(
+                "INSERT OR IGNORE INTO symbols (version, symbol, file, line, snippet, kind) "
+                "VALUES (?,?,?,?,?,?)",
+                (version, sym, rel, ln, sn, kind),
+            )
+
+
+def _line_snippet(lines: list[str], line_no: int) -> str:
+    return lines[line_no - 1].strip()[:120] if 0 < line_no <= len(lines) else ""
+
+
+def _extract_python_ast(text: str, lines: list[str], syms: set) -> None:
+    """Python 符号提取：标准库 ast 精确解析（替代行级正则）。
+
+    - FunctionDef/AsyncFunctionDef/ClassDef（含缩进方法、嵌套、多行签名、async）→ kind=def；
+    - 字符串/注释里的"def xxx(" 不会误命中（正则会）；
+    - 报错字面量（raise/assert/logger.error 的字符串参数）→ kind=msg；
+    - ast 解析失败（语法错误/非 Python 内容）→ 退回行级正则（保底，不丢符号）。
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        # 保底：行级正则（只提取 def/class，算子等由 _extract_pattern_symbols 负责）
         for m in _PY_DEF_RE.finditer(text):
             name = m.group(1) or m.group(2)
             if name:
                 line_no = text[: m.start()].count("\n") + 1
-                snippet = lines[line_no - 1].strip()[:120] if line_no <= len(lines) else ""
-                syms.add((name.lower(), line_no, snippet))
-        for m in _CPP_DEF_RE.finditer(text):
-            name = m.group(2) or m.group(3)
-            if name and len(name) >= 4:
-                line_no = text[: m.start()].count("\n") + 1
-                snippet = lines[line_no - 1].strip()[:120] if line_no <= len(lines) else ""
-                syms.add((name.lower(), line_no, snippet))
-        for m in _OP_ATTR_RE.finditer(text):
+                syms.add(("def", name.lower(), line_no, _line_snippet(lines, line_no)))
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            syms.add(("def", node.name.lower(), node.lineno, _line_snippet(lines, node.lineno)))
+            continue
+        msg = _extract_message_literal(node)
+        if msg and _MSG_MIN_LEN <= len(msg) <= _MSG_MAX_LEN:
+            syms.add(("msg", msg.lower(), node.lineno, _line_snippet(lines, node.lineno)))
+
+
+def _extract_message_literal(node: ast.AST) -> Optional[str]:
+    """从语句节点提取报错字面量（字符串参数），无则返回 None。
+
+    - raise RuntimeError("...") / raise ValueError("a", "b")：取首个字符串参数；
+    - assert cond, "..."：取 msg；
+    - logger.error("...") / log.warning / logging.fatal / self.logger.exception("...") 等；
+    - f-string 模板（ast.JoinedStr）不提取——动态内容无法与用户报错子串匹配，
+      静态前缀仍可经普通全文 grep 兜底。
+    """
+    if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call) and node.exc.args:
+        a = node.exc.args[0]
+        return a.value if isinstance(a, ast.Constant) and isinstance(a.value, str) else None
+    if isinstance(node, ast.Assert) and isinstance(node.msg, ast.Constant) \
+            and isinstance(node.msg.value, str):
+        return node.msg.value
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+            and node.func.attr in _MSG_ATTRS and _is_logger_base(node.func.value) and node.args:
+        a = node.args[0]
+        return a.value if isinstance(a, ast.Constant) and isinstance(a.value, str) else None
+    return None
+
+
+def _is_logger_base(v: ast.AST) -> bool:
+    """调用基座是否像 logger：logger/log/logging/_logger 或 *logger 属性链。"""
+    if isinstance(v, ast.Name):
+        return v.id in ("logger", "log", "logging", "_logger") or v.id.endswith("logger")
+    if isinstance(v, ast.Attribute):
+        return v.attr.endswith("logger") or _is_logger_base(v.value)
+    return False
+
+
+def _extract_cpp_regex(text: str, lines: list[str], syms: set) -> None:
+    """C++ 符号提取（正则；模板/重载等盲区由 grep 兜底）。"""
+    for m in _CPP_DEF_RE.finditer(text):
+        name = m.group(2) or m.group(3)
+        if name and len(name) >= 4 and name.lower() not in _CPP_KEYWORD_STOP:
             line_no = text[: m.start()].count("\n") + 1
-            snippet = lines[line_no - 1].strip()[:120] if line_no <= len(lines) else ""
-            syms.add((m.group(1).lower(), line_no, snippet))
-        for m in _KERNEL_NAME_RE.finditer(text):
-            line_no = text[: m.start()].count("\n") + 1
-            snippet = lines[line_no - 1].strip()[:120] if line_no <= len(lines) else ""
-            syms.add((m.group(1).lower(), line_no, snippet))
-        for m in _ENV_NAME_RE.finditer(text):
-            line_no = text[: m.start()].count("\n") + 1
-            snippet = lines[line_no - 1].strip()[:120] if line_no <= len(lines) else ""
-            syms.add((m.group(1).lower(), line_no, snippet))
-        for sym, ln, sn in syms:
-            conn.execute(
-                "INSERT OR IGNORE INTO symbols (version, symbol, file, line, snippet) VALUES (?,?,?,?,?)",
-                (version, sym, rel, ln, sn),
-            )
+            syms.add(("def", name.lower(), line_no, _line_snippet(lines, line_no)))
+
+
+def _extract_pattern_symbols(text: str, lines: list[str], syms: set) -> None:
+    """跨语言符号模式：aclnn/npu 算子、内核名、环境变量。"""
+    for m in _OP_ATTR_RE.finditer(text):
+        line_no = text[: m.start()].count("\n") + 1
+        syms.add(("op", m.group(1).lower(), line_no, _line_snippet(lines, line_no)))
+    for m in _KERNEL_NAME_RE.finditer(text):
+        line_no = text[: m.start()].count("\n") + 1
+        syms.add(("op", m.group(1).lower(), line_no, _line_snippet(lines, line_no)))
+    for m in _ENV_NAME_RE.finditer(text):
+        line_no = text[: m.start()].count("\n") + 1
+        syms.add(("env", m.group(1).lower(), line_no, _line_snippet(lines, line_no)))
 
 
 def load_versioned_code(cfg: Optional[AppConfig] = None) -> VersionedCode:

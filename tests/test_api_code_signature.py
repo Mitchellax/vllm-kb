@@ -64,6 +64,16 @@ class TestApiCodeAndSignature(unittest.TestCase):
         d = r.json()
         self.assertIn("mode", d)
 
+    def test_code_search_msg_kind_endpoint(self):
+        # kind=msg：报错字面量索引检索（索引需已按新 schema 重建，否则 503 带重建指引）
+        r = self.client.post(
+            "/code/search", json={"keyword": "boom happened", "kind": "msg", "version": "v0.23.0rc1"}
+        )
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["mode"], "message_index")
+        self.assertIsInstance(d["hits"], list)
+
     def test_code_file_endpoint(self):
         r = self.client.get(
             "/code/file",

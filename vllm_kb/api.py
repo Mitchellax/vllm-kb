@@ -45,6 +45,7 @@ class CodeSearchRequest(BaseModel):
     repo: Optional[str] = None  # vllm-ascend | vllm
     path: Optional[str] = None  # 限定文件路径子串（如 worker/model_runner_v1.py）
     per_version: Optional[bool] = False  # 每个版本各自收集命中（对比版本差异用）
+    kind: Optional[str] = None  # def | op | env | msg（msg=报错字面量 LIKE 子串检索）
 
 
 def _readonly_sqlite(path) -> sqlite3.Connection:
@@ -370,16 +371,23 @@ def create_app(config_path: Optional[str] = None):
 
     @app.post("/code/search")
     def code_search(req: CodeSearchRequest):
-        """代码仓检索：先符号索引精确匹配，再关键词全文兜底。
+        """代码仓检索：符号索引精确命中 → 关键词全文兜底；kind=msg 走报错字面量 LIKE 检索。
 
-        path：限定文件路径子串（--in-file）；per_version：每个版本各自收集命中，
-        输出各版本行号便于对比"哪个版本引入/移动了该代码"。
+        - kind=msg：报错字面量索引（raise/assert/logger.error 字符串参数）子串检索，
+          定位"报错文本来自哪段代码"（无需全文 grep）；
+        - path：限定文件路径子串（--in-file）；per_version：每个版本各自收集命中，
+          输出各版本行号便于对比"哪个版本引入/移动了该代码"。
         """
         repo = req.repo
         ci = _code_index_for(repo)
         if ci is None:
             raise HTTPException(status_code=503, detail="code_index 未初始化（运行 scripts/build_code_snapshots.py）")
-        symbols = _code_call(ci.search_symbols, req.keyword, req.version, limit=req.limit or 20)
+        if req.kind == "msg":
+            hits = _code_call(ci.search_messages, req.keyword, req.version, limit=req.limit or 20)
+            return {"mode": "message_index", "symbol": req.keyword, "repo": repo or "vllm-ascend",
+                    "version": req.version, "hits": hits}
+        symbols = _code_call(ci.search_symbols, req.keyword, req.version, limit=req.limit or 20,
+                             kind=req.kind)
         if symbols and not req.per_version:
             return {"mode": "symbol_index", "symbol": req.keyword, "repo": repo or "vllm-ascend",
                     "version": req.version, "hits": symbols}
