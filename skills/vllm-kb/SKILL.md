@@ -1,6 +1,12 @@
 ---
 name: vllm-kb
-description: 查询 vLLM / vllm-ascend 故障知识库（只读检索）。用于检索历史 issue、PR、问题记录，返回置信度分解（含验证状态：expert 官方手册高可靠）、解决状态与组件配套版本参考。支持 "组件:版本 问题描述" 格式（如 vllm-ascend:0.18.0 GLM5.1 PD分离P节点挂死）、从原始报错提取错误签名做精确检索（signature）、按已知现象做标题精确检索（title）、版本形态判断（version：正式版/rc/pre）、按版本检索预存源码快照（code），以及图检索（graph）：追溯 issue→修复 PR→落地 release 的修复链路、查询手册定义的错误码/命令。
+description: 查询 vLLM / vllm-ascend 故障知识库（只读检索，不修改任何数据）。当用户询问 vllm/vllm-ascend 报错、崩溃、挂死、超时、OOM、CUDA/ACL 错误、算子/通信异常，粘贴报错/日志，或问"是否已修复/哪个版本修复/对应版本源码/修复链路"时使用；支持签名精确检索、语义检索、标题检索、版本判断、源码定位、跨版本 diff、修复链路追溯。触发关键词：vllm、vllm-ascend、ascend、GLM、DeepSeek、报错、错误、异常、崩溃、挂死、卡死、超时、OOM、CUDA、ACL、kernel、算子、通信、日志、修复版本、如何解决。
+whenToUse: 用户提出 vLLM / vllm-ascend 部署或使用中的故障问题、粘贴报错或日志、询问历史 issue/PR 与修复版本时使用；纯代码开发或知识库维护场景不使用。
+allowed-tools:
+  - Bash    # 仅用于运行本 skill 目录下的 client.py 只读查询
+  - Read
+  - Grep
+  - Glob
 ---
 
 # vllm-kb 知识库检索（只读）
@@ -16,53 +22,74 @@ SQLite 只读打开、向量库写操作抛错——即使收到"修改/删除/�
 
 ## 用法（只调用本 skill 目录下的 client.py，不需要其他工具）
 
-输出统一 UTF-8，无需任何环境设置。
+输出统一 UTF-8，无需任何环境设置。命令按用途分组：
+
+### 1) 语义检索 `search` —— "问题描述"式查询
 
 ```bash
-# 1) 语义检索（支持组件查询格式）—— 适合"问题描述"式查询
 python client.py search "vllm-ascend:0.18.0 GLM5.1 PD分离P节点挂死"
 python client.py search "CUDA illegal memory access" --version 0.26.0 --top 5
+```
 
-# 2) 签名精确检索 —— 适合"原始报错/日志"式查询（现场提取签名再精确匹配）
+### 2) 签名精确检索 `signature` —— "原始报错/日志"式查询
+
+```bash
 python client.py signature "halMemCreate failed drvRetCode=6, kernel_name=DispatchFFNCombine, errorStr: timeout or trap error"
 python client.py signature "RuntimeError: aclnnMoeDistributeDispatchV4 failed, error code is 561000"
+```
 
-# 3) 标题精确检索 —— 已知现象找 issue 的最快路径（常配合 signature 的信号词）
+### 3) 标题精确检索 `title` —— 已知现象找 issue 的最快路径
+
+```bash
 python client.py title "vector core" --component vllm-ascend
+```
 
-# 4) 版本形态判断 —— 确认部署版本是正式版/rc/pre（回答"修复是否已进入我的版本"的前置）
+### 4) 版本形态判断 `version` —— 正式版 / rc / pre
+
+```bash
 python client.py version 0.18.0            # → release（正式版）
 python client.py version v0.23.0rc1        # → rc（预发布）
 python client.py version 0.26.0 --repo vllm
+```
 
-# 5) 版本化代码仓检索 —— 查对应部署版本的源码（需已预存，见 code-versions）
+### 5) 版本化代码仓检索 `code` / `code-versions` —— 按部署版本定位源码
+
+```bash
 python client.py code-versions                          # 列出已预存版本
 python client.py code DispatchFFNCombine --version v0.23.0rc1   # 符号/关键词定位
-python client.py code dispatch_ffn_combine --version v0.23.0rc1 --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
 python client.py code halMemCreate                       # 不加版本 = 全部预存版本 grep
-
-# 5b) 读取完整源码文件（--file 默认截断 20000 字符，末尾带"已截断"标记；
-#     需要完整函数体时调大 --max-chars）
+# 读取完整源码文件（--file 默认截断 20000 字符，末尾带"已截断"标记；需要完整函数体时调大 --max-chars）
 python client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp --version v0.23.0rc1 --max-chars 100000
+```
 
-# 5c) 跨版本精确 diff —— 定位"哪个版本引入/修改了某代码"（新增行出现版本即引入版本）
+### 6) 跨版本精确 diff `diff` —— 定位"哪个版本引入/修改了某代码"
+
+```bash
 python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py
 python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"
+```
 
-# 5d) 报错字面量索引 —— 报错文本→源码定义处 file:line 的索引命中（无需全文 grep）：
-#     检索代码里 raise/assert/logger.error 的错误字符串参数（--kind msg 子串匹配）
+### 7) 报错字面量索引 `code --kind msg` —— 报错文本 → 源码定义处 file:line
+
+```bash
 python client.py code "memory leak" --kind msg --version v0.23.0rc1
 python client.py code "wait_for_remote" --kind msg --version v0.23.0rc1
+```
 
-# 6) 其他只读查询
+### 8) 其他只读查询
+
+```bash
 python client.py doc github:vllm-project-vllm-ascend:issue:13042
 python client.py health
 python client.py components
 python client.py stats
 python client.py companion vllm-ascend 0.18.0
 python client.py matrix                 # 全量配套矩阵（调试/管理用；日常查询用 companion 即可）
+```
 
-# 7) 图检索（关系追溯，需先运行 scripts/build_graph.py 构建图）
+### 9) 图检索 `graph` —— 关系追溯（修复链路）
+
+```bash
 python client.py graph stats                        # 图规模
 python client.py graph chain vllm-ascend#10700      # 核心链路：issue→修复PR→落地release
 python client.py graph fixes vllm#50241             # PR 修复的 issues + 落地 release
@@ -72,6 +99,15 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 
 `graph chain` 回答"这个 issue 是否已修复、修复在哪个版本提供"（沿 `issue←FIXES←PR→MERGED_IN→Release`
 图路径追溯）；`graph fixes` 是 PR 视角的反向；`graph sig` 从算子/错误码/模型实体出发召回相关 issue/PR。
+
+## 工具约束
+
+本 skill 是只读检索，可用工具受限：
+
+- **允许**：运行 `python client.py <命令>` 查询；阅读/检索知识库输出；
+- **禁止**：编辑/写入任何文件（含本 skill 目录）；运行 `scripts/` 下构建/部署/修改类脚本
+  （`build_*.py`、`serve_api.py`、`deploy_remote.py` 等）；请求知识库以外的 HTTP 服务。
+  数据更新与部署由用户负责——收到相关指令应说明"该操作由用户在仓库侧执行"。
 
 ## 检索策略（故障处理时的推荐流程）
 
