@@ -67,8 +67,8 @@ python scripts/build_kb.py --limit 100
 ### 2.2 辅助数据构建
 
 ```bash
-# 版本日历（tag→日期 + 正式/rc 形态）——置信度版本上界依赖
-python scripts/build_release_calendar.py --all-repos
+# 版本日历（tag→日期 + 正式/rc 形态）——"修复落地版本"上界在查询期按文档仓库现算
+python scripts/build_release_calendar.py --all-repos   # 生成分仓文件 release_calendar.{repo_slug}.json
 
 # 版本化代码仓：vllm-ascend 各版本（config.code.versions 手动维护；--list 先看对比）
 python scripts/build_code_snapshots.py --list       # 可用(GitHub tag)/已预存/缺失 对比
@@ -491,8 +491,13 @@ python scripts/deploy_remote.py --print-steps   # 部署步骤说明
 ## 7. 常见问题
 
 **Q: 查询结果 w_ver 都是默认值？**
-A: 语义检索要传目标版本（`--version` 或 `组件:版本` 前缀）；且需先生成版本日历
-（`python scripts/build_release_calendar.py`）才能做"修复落地版本"上界映射。
+A: 依次检查：
+1. 语义检索要传目标版本（`--version` 或 `组件:版本` 前缀）；
+2. 需先生成**分仓**版本日历（`python scripts/build_release_calendar.py --all-repos`，
+   生成 `release_calendar.{repo_slug}.json`）——"修复落地版本"上界在**查询期**按文档
+   所属仓库的日历实时计算（resolved_at → 该日期前最近发布版），不落库、不随 API 返回；
+3. 文档自身无版本信号（标签/正文未声明版本、未解决无 resolved_at）时无法映射，w_ver 取
+   默认值——这属于数据侧信号缺失，不是配置问题。
 
 **Q: 向量库体积异常大（数十 GB）？**
 A: 干净向量库约 **0.8GB**（122K chunks × 1024 维）。体积膨胀是 LanceDB **历史版本累积**所致：
