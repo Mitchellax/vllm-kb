@@ -390,7 +390,7 @@ python skills/vllm-kb/client.py health                  # 服务健康（含 emb
 python skills/vllm-kb/client.py stats                   # 知识库规模
 python skills/vllm-kb/client.py doc github:vllm-project-vllm-ascend:issue:10700   # 整篇 issue 全文
 python skills/vllm-kb/client.py companion vllm-ascend 0.23.0rc1   # 组件配套版本展开
-python skills/vllm-kb/client.py matrix                            # 全量配套矩阵（调试/管理用；日常用 companion）
+python skills/vllm-kb/client.py matrix --limit 20              # 全量配套矩阵（调试/管理用；日常用 companion；--limit 控制显示行数）
 ```
 
 ### 4.7 graph —— Phase 2 图检索（关系追溯）

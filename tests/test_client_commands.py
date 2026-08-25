@@ -129,6 +129,82 @@ class TestFormatting(unittest.TestCase):
         self.assertIn("[v0.22.1rc1] 1 处命中", txt)
         self.assertIn("[v0.23.0rc1] 1 处命中", txt)
 
+    def test_fmt_matrix_limit(self):
+        data = {"rows": [
+            {"vllm-ascend": f"v{i}", "vllm": "x", "cann": "y", "pytorch": "z",
+             "pytorch-ascend": "p", "npu-driver": "d", "notes": "", "source": "auto"}
+            for i in range(5)
+        ]}
+        txt = client.fmt_matrix(data, limit=2)
+        self.assertIn("共 5 行", txt)
+        self.assertIn("显示前 2", txt)
+        self.assertEqual(txt.count("vllm-ascend=v"), 2)  # 只渲染 2 行
+        full = client.fmt_matrix(data)
+        self.assertNotIn("显示前", full)
+        self.assertIn("共 5 行", full)
+
+
+class TestClientErrors(unittest.TestCase):
+    """_request 统一错误处理：HTTP 4xx/5xx、连接失败、非 JSON 响应都转 ClientError（含服务端 detail）。"""
+
+    def test_http_error_surfaces_status_and_detail(self):
+        import io
+        import urllib.error
+
+        err = urllib.error.HTTPError(
+            "http://x/api", 404, "Not Found", {},
+            io.BytesIO('{"detail": "版本 [\'v0.99.0\'] 未预存文件"}'.encode("utf-8")))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(client.ClientError) as cm:
+                client._get("http://x", "/api")
+        msg = str(cm.exception)
+        self.assertIn("API 错误 404", msg)
+        self.assertIn("未预存文件", msg)  # 服务端 detail 透出，而非笼统"无法连接"
+
+    def test_post_http_error_surfaces_detail(self):
+        import io
+        import urllib.error
+
+        err = urllib.error.HTTPError(
+            "http://x/search", 503, "Service Unavailable", {},
+            io.BytesIO('{"detail": "图未构建：运行 python scripts/build_graph.py"}'.encode("utf-8")))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(client.ClientError) as cm:
+                client._post("http://x", "/search", {"query": "q"})
+        self.assertIn("API 错误 503", str(cm.exception))
+        self.assertIn("build_graph", str(cm.exception))
+
+    def test_connection_error_message(self):
+        import urllib.error
+
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("conn refused")):
+            with self.assertRaises(client.ClientError) as cm:
+                client._get("http://x", "/api")
+        self.assertIn("无法连接 API", str(cm.exception))
+
+    def test_oserror_message(self):
+        with mock.patch("urllib.request.urlopen", side_effect=ConnectionResetError("reset")):
+            with self.assertRaises(client.ClientError) as cm:
+                client._get("http://x", "/api")
+        self.assertIn("请求失败", str(cm.exception))
+
+    def test_non_json_response(self):
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"<html>proxy error</html>"
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            with self.assertRaises(client.ClientError) as cm:
+                client._post("http://x", "/api", {"q": 1})
+        self.assertIn("非 JSON", str(cm.exception))
+
 
 class TestCliDispatch(unittest.TestCase):
     """main() 分发：graph 命令走 /graph/* 端点；code 透传新参数。"""
@@ -206,6 +282,18 @@ class TestCliDispatch(unittest.TestCase):
                        post_data=fake_post)
         self.assertEqual(calls["payload"]["kind"], "msg")
         self.assertIn("message_index", txt)
+
+    def test_matrix_limit_dispatch(self):
+        def fake_get(base, path, params=None):
+            return {"rows": [
+                {"vllm-ascend": f"v{i}", "vllm": "x", "cann": "y", "pytorch": "z",
+                 "pytorch-ascend": "p", "npu-driver": "d"}
+                for i in range(5)
+            ]}
+
+        txt = run_main(["matrix", "--limit", "3"], get_data=fake_get)
+        self.assertIn("共 5 行", txt)
+        self.assertIn("显示前 3", txt)
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ python client.py health
 python client.py components
 python client.py stats
 python client.py companion vllm-ascend 0.18.0
-python client.py matrix                 # 全量配套矩阵（调试/管理用；日常查询用 companion 即可）
+python client.py matrix --limit 20       # 全量配套矩阵（调试/管理用；日常查询用 companion；--limit 控制显示行数）
 ```
 
 ### 9) 图检索 `graph` —— 关系追溯（修复链路）

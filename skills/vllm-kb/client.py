@@ -35,23 +35,64 @@ def _force_utf8_stdio() -> None:
             pass  # 非 TTY / 被替换的流 / 老版本：保持原样
 
 
+class ClientError(Exception):
+    """客户端可预期的失败（连接失败/HTTP 错误/非 JSON 响应），消息可直接展示给 agent。"""
+
+
+def _error_detail(err: "urllib.error.HTTPError") -> str:
+    """从 HTTPError 响应体提取 FastAPI 风格 detail（{"detail": "..."}）；解析失败退回原文截断。"""
+    try:
+        body = err.read().decode("utf-8")
+    except Exception:
+        return ""
+    try:
+        j = json.loads(body)
+        if isinstance(j, dict) and j.get("detail"):
+            d = j["detail"]
+            return d if isinstance(d, str) else json.dumps(d, ensure_ascii=False)
+    except Exception:
+        pass
+    return body.strip()[:200]
+
+
+def _request(url: str, timeout: int, payload: dict | None = None) -> dict:
+    """发只读请求并统一错误处理（调用方无需再处理 HTTP/连接异常）：
+
+    - HTTP 4xx/5xx：抛 ClientError，含状态码 + 服务端 detail（如"版本未预存/图未构建"）；
+    - 连接失败/超时：抛 ClientError，说明服务地址与启动方式；
+    - 200 但非 JSON 响应：抛 ClientError。
+    """
+    if payload is not None:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+    else:
+        req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:  # 4xx/5xx（HTTPError 是 URLError 子类，须先捕获）
+        raise ClientError(f"API 错误 {e.code}（{e.url}）: {_error_detail(e) or e.reason}") from e
+    except urllib.error.URLError as e:
+        raise ClientError(
+            f"无法连接 API（{e.reason}）：请确认服务已启动（python scripts/serve_api.py）"
+            f"且 --base 地址正确（当前 {url.split('?')[0]}）"
+        ) from e
+    except OSError as e:  # socket.timeout / 连接重置等
+        raise ClientError(f"请求失败（{e}）：请检查网络与服务状态") from e
+    except ValueError as e:  # json.JSONDecodeError
+        raise ClientError(f"API 返回非 JSON 响应（HTTP 200）：{e}") from e
+
+
 def _get(base: str, path: str, params: dict | None = None) -> dict:
     url = base.rstrip("/") + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+    return _request(url, timeout=30)
 
 
 def _post(base: str, path: str, payload: dict) -> dict:
-    req = urllib.request.Request(
-        base.rstrip("/") + path,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode("utf-8"))
+    return _request(base.rstrip("/") + path, timeout=60, payload=payload)
 
 
 def fmt_search(data: dict) -> str:
@@ -129,20 +170,21 @@ def fmt_title(data: dict) -> str:
     return "\n".join(lines)
 
 
-def fmt_matrix(data: dict) -> str:
+def fmt_matrix(data: dict, limit: int = 100) -> str:
     rows = data.get("rows") or []
     if not rows:
         return "(配套矩阵未构建或为空 —— 运行 scripts/build_companion_matrix.py)"
-    lines = [f"配套矩阵共 {len(rows)} 行（全量视图，调试/管理用；日常查询用 companion <组件> <版本>）:"]
-    for r in rows[:60]:
+    shown = rows[:limit]
+    lines = [f"配套矩阵共 {len(rows)} 行（调试/管理用；日常查询用 companion <组件> <版本>）:"]
+    for r in shown:
         parts = "  ".join(
             f"{k}={v}" for k, v in r.items() if v and k not in ("notes", "source")
         )
         notes = f"  notes: {r.get('notes')}" if r.get("notes") else ""
         src = f"  source: {r.get('source')}" if r.get("source") else ""
         lines.append(f"  {parts}{notes}{src}")
-    if len(rows) > 60:
-        lines.append(f"  … 共 {len(rows)} 行（显示前 60）")
+    if len(rows) > limit:
+        lines.append(f"  … 共 {len(rows)} 行（显示前 {limit}；用 --limit 调整）")
     return "\n".join(lines)
 
 
@@ -341,7 +383,8 @@ def main() -> None:
     p.add_argument("component")
     p.add_argument("version")
 
-    sub.add_parser("matrix", help="全量配套矩阵（调试/管理用；日常用 companion）")
+    p = sub.add_parser("matrix", help="全量配套矩阵（调试/管理用；日常用 companion）")
+    p.add_argument("--limit", type=int, default=100, help="最多显示行数（默认 100）")
 
     # Phase 2：图检索
     p = sub.add_parser("graph", help="Phase 2 图检索（关系追溯）")
@@ -426,7 +469,7 @@ def main() -> None:
         data = _get(base, "/companion", {"component": args.component, "version": args.version})
         print(json.dumps(data, ensure_ascii=False, indent=2))
     elif args.cmd == "matrix":
-        print(fmt_matrix(_get(base, "/matrix")))
+        print(fmt_matrix(_get(base, "/matrix"), limit=args.limit))
     elif args.cmd == "graph":
         if args.graph_cmd == "stats":
             print(fmt_graph_stats(_get(base, "/graph/stats")))
@@ -445,6 +488,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except urllib.error.URLError as e:
+    except ClientError as e:
+        print(f"[client] {e}")
+        sys.exit(1)
+    except urllib.error.URLError as e:  # 兜底（正常路径已被 _request 转成 ClientError）
         print(f"[client] 无法连接只读 API（{e.reason}）：请先运行 python scripts/serve_api.py")
         sys.exit(1)
