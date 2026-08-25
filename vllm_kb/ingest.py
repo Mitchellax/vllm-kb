@@ -162,8 +162,9 @@ def chunk_meta(doc: KbDocument, reliability: float) -> dict[str, Any]:
         "resolved_at": doc.resolved_at,
         "status": doc.status,
         "labels": doc.labels,
+        # version_span_max 不再写入（历史列含旧版日历推导的跨仓库错配值；修复落地上界
+        # 一律查询期按仓库日历现算，不落库、不随 meta/API 返回）
         "version_span_min": doc.version_span.min,
-        "version_span_max": doc.version_span.max,
         "component": doc.component,
         "kind": doc.extra.get("kind", ""),
         "reliability": reliability,

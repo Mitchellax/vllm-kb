@@ -7,7 +7,9 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from vllm_kb.config import AppConfig
 from vllm_kb.embed import EmbeddingClient
@@ -208,7 +210,9 @@ class TestOfflinePipeline(unittest.TestCase):
             results = engine.search("illegal memory access", target_version="0.6.4", top_k=3)
             hit = next((r for r in results if r.doc_id == CUDA_ISSUE.source_id), None)
             self.assertIsNotNone(hit)
-            self.assertEqual(hit.meta.get("version_span_max"), "0.6.4")
+            # min 仍入库；max 一律不返回（历史列/派生值不泄露，查询期按仓库日历现算打分）
+            self.assertEqual(hit.meta.get("version_span_min"), "0.5.0")
+            self.assertIsNone(hit.meta.get("version_span_max"))
         finally:
             engine.close()
 
@@ -251,12 +255,21 @@ class TestOfflinePipeline(unittest.TestCase):
             engine.close()
 
     def test_version_decay_visible(self):
+        """修复落地上界（查询期按仓库日历现算）-> 超出上界的目标版本降权。"""
         ingest_docs(self.cfg, [CUDA_ISSUE], self.embed, self.store)
         engine = SearchEngine(self.cfg)
         try:
-            r_new = engine.search("CUDA illegal memory access", target_version="0.5.4")
-            r_old = engine.search("CUDA illegal memory access", target_version="0.8.0")
-            # 0.8.0 超出修复版本 0.5.4 很远 -> 版本权重低 -> final 分更低
+            # resolved 2024-03-10 -> 上界 v0.5.4（mock 仓库日历）
+            with mock.patch.object(
+                SearchEngine, "_calendar_for",
+                return_value={
+                    "v0.5.4": datetime(2024, 3, 5, tzinfo=timezone.utc),
+                    "v0.6.1": datetime(2024, 4, 5, tzinfo=timezone.utc),
+                },
+            ):
+                r_new = engine.search("CUDA illegal memory access", target_version="0.5.4")
+                r_old = engine.search("CUDA illegal memory access", target_version="0.8.0")
+            # 0.8.0 超出修复版本上界 0.5.4 很远 -> 版本权重低 -> final 分更低
             self.assertGreater(r_new[0].final, r_old[0].final)
             self.assertLess(r_old[0].confidence.version_weight, 0.5)
         finally:

@@ -241,13 +241,10 @@ class SearchEngine:
             meta = m["meta"]
             doc_comp = meta.get("component", "")
             span_min = meta.get("version_span_min")
-            # version_span_max：只取文档**显式**声明/入库的值（github 提取从不写 max）。
-            # 日历推导的"修复落地版本"为派生值，查询期现算、仅参与打分，不写入 meta/不返回
-            # （教训：入库期用单一日历推导导致跨仓库版本错配，如 vllm-ascend 文档出现
-            #  vllm 主仓版本号——派生值不应以数据属性形式泄露）。
-            span_max = meta.get("version_span_max")
-            if span_max is None:
-                span_max = self._derive_span_max(meta)
+            # version_span_max：**不读取库值**（历史列——旧版入库期日历推导的派生值曾造成
+            # 跨仓库版本错配，如 vllm-ascend 文档出现 vllm 主仓版本号；该值不应再以数据属性
+            # 形式出现）。"修复落地版本"上界一律查询期按文档仓库的分仓日历现算，仅参与打分。
+            span_max = self._derive_span_max(meta)
             version_ref, w_ver = self._resolve_version_ref(
                 doc_comp, span_min, span_max,
                 comp, ver, companion_ctx,
@@ -432,7 +429,7 @@ class SearchEngine:
             return {}
         row = conn.execute(
             """SELECT source_type, url, title, created_at, resolved_at, status,
-                      labels, version_span_min, version_span_max, reliability, component, extra
+                      labels, version_span_min, reliability, component, extra
                FROM docs WHERE source_id = ?""",
             (doc_id[0],),
         ).fetchone()
@@ -440,7 +437,7 @@ class SearchEngine:
             return {}
         import json as _json
 
-        extra = _json.loads(row[11] or "{}")
+        extra = _json.loads(row[10] or "{}")
         meta = {
             "doc_id": doc_id[0],
             "source_type": row[0],
@@ -450,10 +447,10 @@ class SearchEngine:
             "resolved_at": row[4],
             "status": row[5],
             "labels": _json.loads(row[6] or "[]"),
+            # version_span_max 不读库（历史列含旧版日历推导的跨仓库错配值，见 _derive_span_max）
             "version_span_min": row[7],
-            "version_span_max": row[8],
-            "reliability": row[9],
-            "component": row[10] or "",
+            "reliability": row[8],
+            "component": row[9] or "",
             "kind": extra.get("kind", ""),
             "verification": extra.get("verification", ""),  # unverified | tested | expert（质量分级维度 B）
         }

@@ -318,6 +318,28 @@ class TestQueryTimeSpanMax(unittest.TestCase):
         self.assertIsNone(hit.meta.get("version_span_max"))
         self.assertIsNone(hit.meta.get("version_span_min"))
 
+    def test_legacy_polluted_max_never_surfaces(self):
+        """看护：旧库存量污染（docs.version_span_max 有值）既不上返回面、也不影响打分。
+
+        回归保护：若未来有人把库里的 version_span_max 读回 meta/打分路径，此测试会失败。
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(str(self.cfg.resolve(self.cfg.storage.sqlite_path)))
+        conn.execute(
+            "UPDATE docs SET version_span_max='v0.26.0' WHERE source_id = ?",
+            (ASC_NO_SPAN.source_id,),
+        )
+        conn.commit()
+        conn.close()
+        engine = self._engine()
+        results = engine.search("vllm-ascend:0.19.0 PD 分离 挂死", top_k=5)
+        hit = next((r for r in results if r.doc_id == ASC_NO_SPAN.source_id), None)
+        self.assertIsNotNone(hit)
+        self.assertIsNone(hit.meta.get("version_span_max"))  # 不返回
+        # 打分不受污染值影响：上界仍来自查询期现算（v0.18.0），target 0.19.0 衰减
+        self.assertLess(hit.confidence.version_weight, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
