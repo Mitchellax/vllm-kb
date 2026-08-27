@@ -154,5 +154,126 @@ class AssetRegistryTest(unittest.TestCase):
             self.assertEqual(list_assets(Path(tmp) / "none.sqlite3"), {})
 
 
+class TagManagementTest(unittest.TestCase):
+    """词典管理 + tag_candidate seed/采纳 + 审核页标签编辑（数据层）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data_root")
+        self.cfg_path = self.root / "config.json"
+        self.cfg_path.write_text(json.dumps({
+            "embedding": {"provider": "echo", "dimensions": 64},
+            "tags": {"registry": [{"name": "HCCL", "tier": "domain"}]},
+            "storage": {
+                "vector_backend": "python",
+                "lancedb_path": "data/lancedb",
+                "sqlite_path": "data/kb.sqlite3",
+                "canonical_file": "data/raw/canonical.jsonl",
+                "review_path": "data/review.sqlite3",
+            },
+        }), encoding="utf-8")
+        self.cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        from vllm_kb.review import ReviewStore, default_review_path
+
+        self.store = ReviewStore(default_review_path(self.cfg))
+        self.kb = self.cfg.resolve(self.cfg.storage.sqlite_path)
+
+    def tearDown(self):
+        os.environ.pop("VLLM_KB_DATA_ROOT", None)
+        self.tmp.cleanup()
+
+    def _ingest(self, source_id="pdf:guide", tags=None, cands=None):
+        from vllm_kb.ingest import ingest_docs
+
+        extra = {}
+        if cands:
+            extra["tag_candidates"] = cands
+        doc = KbDocument(source_type="doc_pdf", source_id=source_id, url="", title=source_id,
+                         body="正文内容", tags=tags or [], extra=extra)
+        ingest_docs(self.cfg, [doc], EmbeddingClient(self.cfg.embedding),
+                    PythonVectorStore(self.cfg.resolve("data/vec.json")))
+
+    def test_seed_and_adopt_tag_candidate(self):
+        from vllm_kb.review import adopt_tag_candidate, seed_tag_candidates
+
+        self._ingest(cands=[{"name": "超时排查", "tier": "purpose"},
+                            {"name": "HCCL", "tier": "domain"}])
+        # seed：HCCL 已收录不生成，只生成超时排查
+        added = seed_tag_candidates(self.cfg, self.store)
+        self.assertEqual(added, 1)
+        q = self.store.list_items(category="tag_candidate")
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["payload"]["candidate"], "超时排查")
+        # 幂等：重复 seed 不新增
+        self.assertEqual(seed_tag_candidates(self.cfg, self.store), 0)
+        # 采纳 → 入词典（config.json）+ 写 manual（立即生效）+ approved
+        r = adopt_tag_candidate(self.cfg, self.store, q[0]["id"], "tester",
+                                config_path=self.cfg_path)
+        self.assertEqual(r["tag"], "超时排查")
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        names = [x["name"] for x in data["tags"]["registry"]]
+        self.assertIn("超时排查", names)
+        conn = sqlite3.connect(self.kb)
+        try:
+            row = conn.execute("SELECT tags FROM docs WHERE source_id='pdf:guide'").fetchone()
+        finally:
+            conn.close()
+        self.assertIn("超时排查", json.loads(row[0]))  # final 立即包含
+        it = self.store.get_item(q[0]["id"])
+        self.assertEqual(it["status"], "approved")
+
+    def test_tag_dict_management(self):
+        from vllm_kb.review import (
+            add_tag_to_registry,
+            delete_tag,
+            rename_tag,
+            set_tag_tier,
+            tag_dict,
+        )
+
+        self._ingest(tags=["HCCL", "故障排查"])
+        # add
+        add_tag_to_registry(self.cfg, "网络", "domain", config_path=self.cfg_path)
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertIn({"name": "网络", "tier": "domain"}, data["tags"]["registry"])
+        # rename：先入词典再改名（registry + docs.tags 全库替换）
+        add_tag_to_registry(self.cfg, "故障排查", "purpose", config_path=self.cfg_path)
+        rename_tag(self.cfg, "故障排查", "故障定位", self.kb, config_path=self.cfg_path)
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        names = [x["name"] for x in data["tags"]["registry"]]
+        self.assertIn("故障定位", names)
+        self.assertNotIn("故障排查", names)
+        conn = sqlite3.connect(self.kb)
+        try:
+            row = conn.execute("SELECT tags FROM docs WHERE source_id='pdf:guide'").fetchone()
+        finally:
+            conn.close()
+        self.assertIn("故障定位", json.loads(row[0]))
+        self.assertNotIn("故障排查", json.loads(row[0]))
+        # tier 修改（全局生效）
+        set_tag_tier(self.cfg, "HCCL", "purpose", config_path=self.cfg_path)
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        hccl = next(x for x in data["tags"]["registry"] if x["name"] == "HCCL")
+        self.assertEqual(hccl["tier"], "purpose")
+        # delete：仅移出词典（已打标文档保留）
+        delete_tag(self.cfg, "HCCL", config_path=self.cfg_path)
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertNotIn("HCCL", [x["name"] for x in data["tags"]["registry"]])
+        conn = sqlite3.connect(self.kb)
+        try:
+            row = conn.execute("SELECT tags FROM docs WHERE source_id='pdf:guide'").fetchone()
+        finally:
+            conn.close()
+        self.assertIn("HCCL", json.loads(row[0]))
+        # tag_dict 分组 + 计数（词典以临时 config 文件为准）
+        td = tag_dict(self.cfg, self.kb, config_path=self.cfg_path)
+        # 故障定位（原名故障排查）：add 时 tier 指定 purpose → purpose 组
+        # 网络 → domain；故 domain=1(网络), purpose=1(故障定位)
+        self.assertEqual(td["stats"]["domain"], 1)
+        self.assertEqual(td["stats"]["purpose"], 1)
+        self.assertEqual(td["stats"]["tagged_docs"], 2)  # HCCL + 故障定位 打标 1 篇
+
+
 if __name__ == "__main__":
     unittest.main()

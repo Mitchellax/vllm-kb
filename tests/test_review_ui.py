@@ -68,6 +68,99 @@ class ReviewUiApiTest(unittest.TestCase):
         self.assertIn("ocr_api_model", html)
         self.assertIn("ocr_provider", html)
         self.assertIn("testApi('ocr'", html)
+        # 标签管理 tab / 文档标签编辑 / 候选采纳
+        for token in ("loadTagDict", "tagEdit(", "adoptCandidate", "tagDictAdd", "标签管理"):
+            self.assertIn(token, html, f"页面缺少 {token}")
+
+    def test_docs_tags_edit_flow(self):
+        """标签编辑端点：exclude/restore/add/remove + final 同步（检索侧立即生效）+ 词典同步。"""
+        from vllm_kb.config import AppConfig
+        import sqlite3
+
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        kb = cfg.resolve(cfg.storage.sqlite_path)
+        kb.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(kb)
+        conn.execute("CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT, extra TEXT)")
+        conn.execute("INSERT INTO docs VALUES(?,?,?,?)",
+                     ("md:case1", "doc_markdown", "案例",
+                      json.dumps({"verification": "unverified"})))
+        conn.commit()
+        conn.close()
+        # 缺 reviewer → 400
+        r = self.client.post("/api/docs/tags/edit",
+                             json={"source_id": "md:case1", "action": "exclude", "tag": "HCCL"})
+        self.assertEqual(r.status_code, 400)
+        # 排除自动标签（最终 = (auto − excluded) ∪ manual）
+        r = self.client.post("/api/docs/tags/edit",
+                             json={"source_id": "md:case1", "action": "exclude",
+                                   "tag": "HCCL", "reviewer": "t"})
+        self.assertEqual(r.status_code, 200)
+        # 人工添加（不在词典 → 自动同步词典到临时 config）
+        r = self.client.post("/api/docs/tags/edit",
+                             json={"source_id": "md:case1", "action": "add",
+                                   "tag": "命令参考", "reviewer": "t"})
+        self.assertEqual(r.status_code, 200)
+        v = self.client.get("/api/docs/tags", params={"source_id": "md:case1"}).json()
+        self.assertEqual(v["excluded"], ["HCCL"])
+        self.assertEqual(v["manual"], ["命令参考"])
+        self.assertEqual(v["final"], ["命令参考"])  # auto 空 → 只含人工
+        cfg_json = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        names = [x["name"] for x in cfg_json["tags"]["registry"]]
+        self.assertIn("命令参考", names)  # 词典同步
+        # 恢复 + 删除人工
+        self.client.post("/api/docs/tags/edit",
+                         json={"source_id": "md:case1", "action": "restore",
+                               "tag": "HCCL", "reviewer": "t"})
+        v = self.client.get("/api/docs/tags", params={"source_id": "md:case1"}).json()
+        self.assertEqual(v["excluded"], [])
+        self.client.post("/api/docs/tags/edit",
+                         json={"source_id": "md:case1", "action": "remove",
+                               "tag": "命令参考", "reviewer": "t"})
+        v = self.client.get("/api/docs/tags", params={"source_id": "md:case1"}).json()
+        self.assertEqual(v["manual"], [])
+
+    def test_tag_dict_api(self):
+        """词典端点：add/rename/tier/delete（写临时 config）+ 视图分组。"""
+        import sqlite3
+
+        from vllm_kb.config import AppConfig
+
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        kb = cfg.resolve(cfg.storage.sqlite_path)
+        kb.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(kb)
+        conn.execute("CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT, extra TEXT)")
+        conn.execute("INSERT INTO docs VALUES(?,?,?,?)",
+                     ("md:case1", "doc_markdown", "案例", json.dumps({})))
+        conn.commit()
+        conn.close()
+        # add
+        r = self.client.post("/api/tag-dict/add", json={"name": "网络", "tier": "domain"})
+        self.assertEqual(r.status_code, 200)
+        cfg_json = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertIn({"name": "网络", "tier": "domain"}, cfg_json["tags"]["registry"])
+        # 视图（以临时 config 为准）
+        td = self.client.get("/api/tag-dict").json()
+        self.assertIn("groups", td)
+        self.assertEqual(td["groups"]["domain"][0]["name"], "网络")
+        # rename
+        r = self.client.post("/api/tag-dict/rename", json={"old": "网络", "new": "组网"})
+        self.assertEqual(r.status_code, 200)
+        cfg_json = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        names = [x["name"] for x in cfg_json["tags"]["registry"]]
+        self.assertIn("组网", names)
+        self.assertNotIn("网络", names)
+        # tier 修改
+        r = self.client.post("/api/tag-dict/tier", json={"name": "组网", "tier": "purpose"})
+        self.assertEqual(r.status_code, 200)
+        td = self.client.get("/api/tag-dict").json()
+        self.assertEqual(td["groups"]["purpose"][0]["name"], "组网")
+        # 删除
+        r = self.client.post("/api/tag-dict/delete", json={"name": "组网"})
+        self.assertEqual(r.status_code, 200)
+        td = self.client.get("/api/tag-dict").json()
+        self.assertEqual(td["groups"]["domain"] + td["groups"]["purpose"], [])
 
     def test_stats_queue_item_review_flow(self):
         # stats 初始为空

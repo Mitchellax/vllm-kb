@@ -207,8 +207,12 @@ class TestExternalDocManagement(unittest.TestCase):
         self.assertEqual(ids, ["md:case", "pdf:guide"])  # 排除 github 来源
         g = [d for d in docs if d["source_id"] == "pdf:guide"][0]
         self.assertEqual(g["source_type"], "doc_pdf")
-        self.assertEqual(g["asset"], "assets/pdf/guide.pdf")
         self.assertEqual(g["verification"], "expert")
+        # 路径脱敏：返回 asset_id/asset_path（asset_path 为空——旧数据无 asset_registry）
+        self.assertNotIn("asset", g)
+        self.assertEqual(g["tags"]["final"], [])
+        self.assertIn("tags", g)
+        self.assertFalse(g["duplicate"])
 
     def test_delete_external_doc_removes_all_layers(self):
         from vllm_kb.review import delete_external_doc

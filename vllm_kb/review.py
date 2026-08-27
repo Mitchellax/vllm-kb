@@ -28,6 +28,7 @@ CATEGORIES = (
     "low_confidence_ocr",     # C 档低质量 OCR 签名待核对
     "equivalence_candidate",  # 跨来源疑似同一问题（EQUIVALENT_TO 候选）
     "table_join_candidate",   # 表格行引用 GitHub 编号 join 候选
+    "tag_candidate",          # 自动提取的未收录标签候选（采纳→入词典+打标；忽略不记录）
 )
 
 # 审核项状态机（审核人员无编辑权限，只有三类动作）：
@@ -374,11 +375,16 @@ def default_review_path(cfg: Optional["AppConfig"] = None) -> Path:
 _EXTERNAL_SOURCE_TYPES = ("doc_pdf", "doc_markdown", "doc_excel", "doc_other")
 
 
-def list_external_docs(kb_path: str | Path, limit: int = 200, offset: int = 0) -> list[dict]:
+def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = None,
+                       limit: int = 200, offset: int = 0) -> list[dict]:
     """列出 kb.sqlite3 中的外源文档（source_type 以 doc_ 开头，排除 github_*）。
 
-    返回 {source_id, source_type, title, component, url, extra}（extra 含 asset 路径/verification）。
+    返回 {source_id, source_type, title, component, url, verification,
+    asset_id, asset_path（管理员侧 rel_path，经 asset_registry）,
+    tags: {auto, excluded, manual, final}, duplicate（同 stem 重名告警）}。
     """
+    from .tagging import merge_final
+
     conn = sqlite3.connect(str(kb_path))
     try:
         rows = conn.execute(
@@ -387,24 +393,51 @@ def list_external_docs(kb_path: str | Path, limit: int = 200, offset: int = 0) -
                ORDER BY source_type, source_id LIMIT ? OFFSET ?""",
             (int(limit), int(offset)),
         ).fetchall()
-        out = []
-        for sid, st, title, comp, url, extra in rows:
-            try:
-                ex = json.loads(extra or "{}")
-            except (TypeError, json.JSONDecodeError):
-                ex = {}
-            out.append({
-                "source_id": sid,
-                "source_type": st,
-                "title": title or "",
-                "component": comp or "",
-                "url": url or "",
-                "asset": (ex.get("asset") or {}).get("path", ""),
-                "verification": ex.get("verification", ""),
-            })
-        return out
+        overlay = load_doc_tags_conn(conn)
+        try:
+            tags_by_id = {
+                sid: json.loads(raw) if raw else []
+                for sid, raw in conn.execute("SELECT source_id, tags FROM docs").fetchall()
+            }
+        except sqlite3.OperationalError:
+            tags_by_id = {}  # 旧库无 tags 列
     finally:
         conn.close()
+    assets = list_assets(review_db) if review_db else {}
+    # 同 stem 重名统计（pdf:/md: 前缀后的部分）
+    stems: dict[str, int] = {}
+    for sid, *_ in rows:
+        stem = sid.split(":", 1)[1] if ":" in sid else sid
+        stems[stem] = stems.get(stem, 0) + 1
+    out = []
+    for sid, st, title, comp, url, extra in rows:
+        try:
+            ex = json.loads(extra or "{}")
+        except (TypeError, json.JSONDecodeError):
+            ex = {}
+        asset = ex.get("asset") or {}
+        asset_id = str(asset.get("asset_id", "") or "")
+        rel_path = (assets.get(asset_id) or {}).get("rel_path", "")
+        ov = overlay.get(sid, {"excluded": [], "manual": [], "auto_snapshot": []})
+        auto = list(ov.get("auto_snapshot") or [])
+        if not auto:
+            auto = list(tags_by_id.get(sid, []))  # 旧库无快照：以最终标签近似
+        final = merge_final(auto, ov.get("excluded", []), ov.get("manual", []))
+        stem = sid.split(":", 1)[1] if ":" in sid else sid
+        out.append({
+            "source_id": sid,
+            "source_type": st,
+            "title": title or "",
+            "component": comp or "",
+            "url": url or "",
+            "verification": ex.get("verification", ""),
+            "asset_id": asset_id,
+            "asset_path": rel_path,
+            "tags": {"auto": auto, "excluded": ov.get("excluded", []),
+                     "manual": ov.get("manual", []), "final": final},
+            "duplicate": stems.get(stem, 0) > 1,
+        })
+    return out
 
 
 def delete_external_doc(kb_path: str | Path, source_id: str,
@@ -433,15 +466,19 @@ def delete_external_doc(kb_path: str | Path, source_id: str,
 # 覆盖层函数统一接受 sqlite3.Connection：ingest 传自己的写连接，审核页开短连接传入。
 
 def load_doc_tags_conn(conn: sqlite3.Connection) -> dict[str, dict]:
-    """批量读取覆盖层：{source_id: {"excluded": [...], "manual": [...]}}（ingest/建图预读）。"""
+    """批量读取覆盖层：{source_id: {"excluded": [...], "manual": [...], "auto_snapshot": [...]}}
+    （ingest/建图预读 excluded/manual；审核页列表展示用 auto_snapshot）。"""
     out: dict[str, dict] = {}
     _ensure_doc_tags(conn)
     try:
-        rows = conn.execute("SELECT source_id, excluded, manual FROM doc_tags").fetchall()
+        rows = conn.execute(
+            "SELECT source_id, auto_snapshot, excluded, manual FROM doc_tags"
+        ).fetchall()
     except sqlite3.OperationalError:
         return out  # 旧库尚无 doc_tags 表（ingest 首次写入时创建）
-    for sid, excluded, manual in rows:
+    for sid, auto, excluded, manual in rows:
         out[sid] = {
+            "auto_snapshot": json.loads(auto) if auto else [],
             "excluded": json.loads(excluded) if excluded else [],
             "manual": json.loads(manual) if manual else [],
         }
@@ -495,6 +532,7 @@ def set_doc_tags_conn(conn: sqlite3.Connection, source_id: str,
     from .tagging import merge_final
 
     _ensure_doc_tags(conn)
+    _ensure_docs_tags_col(conn)
     row = conn.execute("SELECT excluded, manual FROM doc_tags WHERE source_id=?",
                        (source_id,)).fetchone()
     cur_ex = json.loads(row[0]) if row and row[0] else []
@@ -525,9 +563,20 @@ def set_doc_tags_conn(conn: sqlite3.Connection, source_id: str,
         if trow and trow[0]:
             auto = json.loads(trow[0])
     final = merge_final(auto, cur_ex, cur_ma)
+    _ensure_docs_tags_col(conn)
     conn.execute("UPDATE docs SET tags=? WHERE source_id=?",
                  (json.dumps(final, ensure_ascii=False), source_id))
     return {"source_id": source_id, "excluded": cur_ex, "manual": cur_ma, "final": final}
+
+
+def _ensure_docs_tags_col(conn: sqlite3.Connection) -> None:
+    """旧库 docs 表补 tags 列（与 ingest 迁移一致；审核页标签编辑兼容老库）。"""
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(docs)")]
+    except sqlite3.OperationalError:
+        return
+    if "tags" not in cols:
+        conn.execute("ALTER TABLE docs ADD COLUMN tags TEXT")
 
 
 # ---------------- 资产注册表（asset_registry，review.sqlite3，管理员侧） ----------------
@@ -582,6 +631,211 @@ def list_assets(db_path: str | Path) -> dict[str, dict]:
     return out
 
 
+# ---------------- 文档标签视图（审核页数据层） ----------------
+
+def doc_tags_view(kb_path: str | Path, source_id: str) -> dict:
+    """文档标签视图：auto（自动快照）/ excluded / manual / final（合并结果）。"""
+    conn = sqlite3.connect(f"file:{Path(kb_path).as_posix()}?mode=ro", uri=True)
+    try:
+        ov = get_doc_tags_conn(conn, source_id)
+        row = conn.execute("SELECT tags FROM docs WHERE source_id=?", (source_id,)).fetchone()
+        final = json.loads(row[0]) if row and row[0] else []
+        auto = ov["auto_snapshot"]
+        if not auto and row:
+            auto = list(final)  # 旧库无快照：以最终标签为近似自动标签
+        return {
+            "source_id": source_id,
+            "auto": auto,
+            "excluded": ov["excluded"],
+            "manual": ov["manual"],
+            "final": final,
+        }
+    finally:
+        conn.close()
+
+
+def update_doc_tags(kb_path: str | Path, source_id: str, action: str, tag: str,
+                    reviewer: str, config_path: Optional[str | Path] = None) -> dict:
+    """审核页标签编辑：exclude（排除自动）/ restore（恢复排除）/ add（人工添加）/ remove（删除人工）。
+    人工添加的标签不在词典时自动同步进词典（config.tags.registry）。"""
+    from .tagging import TagRegistry, save_registry_to_config
+
+    tag = (tag or "").strip()
+    if not tag:
+        raise ValueError("标签不能为空")
+    conn = sqlite3.connect(str(kb_path))
+    try:
+        ov = get_doc_tags_conn(conn, source_id)
+        excluded = list(ov["excluded"])
+        manual = list(ov["manual"])
+        if action == "exclude":
+            if tag not in excluded:
+                excluded.append(tag)
+        elif action == "restore":
+            excluded = [t for t in excluded if t != tag]
+        elif action == "add":
+            if tag not in manual:
+                manual.append(tag)
+        elif action == "remove":
+            manual = [t for t in manual if t != tag]
+        else:
+            raise ValueError(f"未知标签动作: {action}")
+        r = set_doc_tags_conn(conn, source_id, excluded=excluded, manual=manual, reviewer=reviewer)
+        conn.commit()
+    finally:
+        conn.close()
+    # 人工添加的新标签同步词典（config.tags.registry；审核页是唯一入口）
+    if action == "add":
+        try:
+            registry = TagRegistry.load_from_config_file(config_path)
+            if not registry.contains(tag):
+                registry.add(tag)
+                save_registry_to_config(_cfg_from_kb(kb_path), registry, config_path=config_path)
+        except Exception as e:
+            print(f"[review] 词典同步失败（标签已打标，下次 build_graph 后入图）: {e}")
+    return r
+
+
+def _cfg_from_kb(kb_path: str | Path):
+    """从 kb 路径回推 AppConfig（审核页标签编辑时同步词典用；失败返回 None）。"""
+    from .config import AppConfig
+
+    try:
+        return AppConfig.load(require_keys=False)
+    except Exception:
+        return None
+
+
+# ---------------- 标签词典管理（registry，config.json 为唯一事实源） ----------------
+
+def tag_dict(cfg: "AppConfig", kb_path: str | Path,
+             config_path: Optional[str | Path] = None) -> dict:
+    """词典视图：按 tier 分组 + 文档计数 + 统计（审核页标签管理 tab）。
+
+    词典以配置文件为准（load_from_config_file——多次编辑后内存 cfg 可能滞后）。
+    """
+    from .tagging import TagRegistry
+
+    registry = TagRegistry.load_from_config_file(config_path)
+    counts: dict[str, int] = {}
+    if Path(kb_path).exists():
+        conn = sqlite3.connect(f"file:{Path(kb_path).as_posix()}?mode=ro", uri=True)
+        try:
+            try:
+                tag_rows = conn.execute(
+                    "SELECT tags FROM docs WHERE tags IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                tag_rows = []  # 旧库无 tags 列
+            for (tags_json,) in tag_rows:
+                try:
+                    for t in json.loads(tags_json or "[]"):
+                        counts[t] = counts.get(t, 0) + 1
+                except (TypeError, json.JSONDecodeError):
+                    continue
+        finally:
+            conn.close()
+    groups = {"domain": [], "purpose": []}
+    for e in sorted(registry.entries, key=lambda x: (x.tier, x.name)):
+        groups.setdefault(e.tier, []).append({"name": e.name, "docs": counts.get(e.name, 0)})
+    return {
+        "groups": groups,
+        "stats": {
+            "domain": len(groups["domain"]),
+            "purpose": len(groups["purpose"]),
+            "tagged_docs": sum(1 for c in counts.values() if c > 0) if False else len(counts),
+        },
+        "note": "词典为 config.json tags.registry 唯一事实源；新增/改名/改 tier 同步配置，重建图后入图",
+    }
+
+
+def add_tag_to_registry(cfg: "AppConfig", name: str, tier: Optional[str] = None,
+                        config_path: Optional[str | Path] = None) -> dict:
+    """新增词典标签（同步 config.json）。以配置文件为准（内存 cfg 可能滞后）。"""
+    from .tagging import TagRegistry, save_registry_to_config
+
+    registry = TagRegistry.load_from_config_file(config_path)
+    entry = registry.add(name, tier)
+    save_registry_to_config(cfg, registry, config_path=config_path)
+    return {"name": entry.name, "tier": entry.tier}
+
+
+def rename_tag(cfg: "AppConfig", old: str, new: str, kb_path: str | Path,
+               config_path: Optional[str | Path] = None) -> dict:
+    """词典改名：registry + 全库替换 docs.tags / doc_tags.excluded+manual。返回受影响文档数。"""
+    from .tagging import TagRegistry, save_registry_to_config
+
+    registry = TagRegistry.load_from_config_file(config_path)
+    if not registry.rename(old, new):
+        raise ValueError(f"词典中不存在标签 {old}")
+    save_registry_to_config(cfg, registry, config_path=config_path)
+    n = 0
+    if Path(kb_path).exists():
+        conn = sqlite3.connect(str(kb_path))
+        try:
+            n += _replace_json_list_tag(conn, "docs", "tags", old, new)
+            n += _replace_json_list_tag(conn, "doc_tags", "excluded", old, new)
+            n += _replace_json_list_tag(conn, "doc_tags", "manual", old, new)
+            conn.commit()
+        finally:
+            conn.close()
+    return {"renamed": {"old": old, "new": new}, "docs_updated": n}
+
+
+def _replace_json_list_tag(conn: sqlite3.Connection, table: str, column: str,
+                           old: str, new: str) -> int:
+    """把 table.column（JSON 数组）中的 old 替换为 new（同名去重）。返回受影响行数。"""
+    changed = 0
+    try:
+        rows = conn.execute(f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL").fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    for rowid, raw in rows:
+        if not raw:
+            continue
+        try:
+            vals = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if old not in vals:
+            continue
+        vals = [new if v == old else v for v in vals]
+        seen, dedup = set(), []
+        for v in vals:
+            if v not in seen:
+                seen.add(v)
+                dedup.append(v)
+        conn.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?", (json.dumps(dedup, ensure_ascii=False), rowid))
+        changed += 1
+    return changed
+
+
+def set_tag_tier(cfg: "AppConfig", name: str, tier: str,
+                 config_path: Optional[str | Path] = None) -> dict:
+    """修改标签层级（domain/purpose，全局生效；tier 是标签固有属性）。"""
+    from .tagging import TagRegistry, save_registry_to_config
+
+    if tier not in ("domain", "purpose"):
+        raise ValueError(f"非法 tier: {tier}")
+    registry = TagRegistry.load_from_config_file(config_path)
+    if not registry.set_tier(name, tier):
+        raise ValueError(f"词典中不存在标签 {name}")
+    save_registry_to_config(cfg, registry, config_path=config_path)
+    return {"name": name, "tier": tier}
+
+
+def delete_tag(cfg: "AppConfig", name: str,
+               config_path: Optional[str | Path] = None) -> dict:
+    """词典删除：仅移出词典（不动已打标文档上的该标签）。"""
+    from .tagging import TagRegistry, save_registry_to_config
+
+    registry = TagRegistry.load_from_config_file(config_path)
+    if not registry.remove(name):
+        raise ValueError(f"词典中不存在标签 {name}")
+    save_registry_to_config(cfg, registry, config_path=config_path)
+    return {"deleted": name}
+
+
 # ---------------- 审核项生成（seed，幂等） ----------------
 
 def seed_verification_pending(cfg: "AppConfig", store: ReviewStore) -> int:
@@ -631,11 +885,85 @@ def seed_case_title_flags(cfg: "AppConfig", store: ReviewStore) -> int:
     return added
 
 
+def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
+    """扫描 kb.sqlite3 中 extra.tag_candidates（未收录强候选）→ tag_candidate 审核项（幂等）。
+
+    词典已收录的候选不生成（避免重复打扰）；item_ref 用 f"{source_id}::{candidate}"
+    保证同一候选只出现一次（含已处理状态——dedupe 语义）。
+    """
+    from .tagging import TagRegistry
+
+    kb = cfg.resolve(cfg.storage.sqlite_path)
+    if not kb.exists():
+        return 0
+    registry = TagRegistry.load(cfg)
+    conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
+    added = 0
+    try:
+        rows = conn.execute("SELECT source_id, title, extra FROM docs").fetchall()
+        for source_id, title, extra in rows:
+            try:
+                ex = json.loads(extra or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            cands = ex.get("tag_candidates") or []
+            for c in cands:
+                name = c.get("name") if isinstance(c, dict) else str(c)
+                if not name or registry.contains(name):
+                    continue
+                tier = c.get("tier") if isinstance(c, dict) else None
+                if store.add_item("tag_candidate", f"{source_id}::{name}", {
+                    "source_id": source_id, "title": title or source_id,
+                    "candidate": name, "suggested_tier": tier,
+                }):
+                    added += 1
+    finally:
+        conn.close()
+    return added
+
+
+def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
+                        reviewer: str, tier: Optional[str] = None,
+                        config_path: Optional[str | Path] = None) -> dict:
+    """采纳候选：① 入词典（config.tags.registry，tier 取审核选择或启发式）
+    ② 写入该文档 manual（立即生效，无需等下次入库）；③ 审核项标记 approved。"""
+    from .tagging import TagRegistry, save_registry_to_config
+
+    it = store.get_item(item_id)
+    if it is None:
+        raise ValueError(f"审核项不存在: {item_id}")
+    if it["category"] != "tag_candidate":
+        raise ValueError(f"不是 tag_candidate 审核项: {it['category']}")
+    payload = it["payload"] or {}
+    source_id = payload.get("source_id", "")
+    name = payload.get("candidate", "")
+    if not source_id or not name:
+        raise ValueError("审核项缺少 source_id/candidate")
+    registry = TagRegistry.load_from_config_file(config_path)
+    entry = registry.add(name, tier)  # tier=None → 启发式
+    save_registry_to_config(cfg, registry, config_path=config_path)
+    kb = cfg.resolve(cfg.storage.sqlite_path)
+    conn = sqlite3.connect(str(kb))
+    try:
+        ov = get_doc_tags_conn(conn, source_id)
+        manual = list(ov["manual"])
+        if name not in manual:
+            manual.append(name)
+        set_doc_tags_conn(conn, source_id, manual=manual, reviewer=reviewer)
+        conn.commit()
+    finally:
+        conn.close()
+    store.review(item_id, "approved", reviewer,
+                 result={"action": "adopt", "tag": name, "tier": entry.tier})
+    return {"ok": True, "tag": name, "tier": entry.tier, "source_id": source_id}
+
+
 def seed_all(cfg: "AppConfig", store: ReviewStore) -> dict[str, int]:
     """运行全部 seed（幂等），返回各 seed 新增数。"""
     return {
         "verification_pending": seed_verification_pending(cfg, store),
         "case_title_flag": seed_case_title_flags(cfg, store),
+        "tag_candidate": seed_tag_candidates(cfg, store),
     }
 
 
