@@ -510,18 +510,28 @@ def title_search(
     limit: int = 20,
     match: str = "contains",
 ) -> list[TitleHit]:
-    """标题子串精确检索（SQL LIKE）。
+    """标题/文档名子串精确检索（SQL LIKE，title 或 source_id 匹配）。
 
     用于"已知现象找 issue"：报错里出现专有名词（vector core / rtDeviceSynchronize 等）
     时，标题含该词的 issue 是最直接的线索——语义检索对英文描述正文的召回常不足。
 
-    match: contains（默认，子串）| prefix（标题前缀）。
+    对业务文档（PDF/MD）：title 只含首页首行（如 "Atlas A3 中心推理和训练硬件"），
+    主题词（npu-smi、命令参考）在**文件名**里——故同时匹配 source_id（`pdf:<stem>` /
+    `md:<stem>`，含完整文件名）避免主题词 0 命中。
+
+    match: contains（默认，子串）| prefix（标题前缀；source_id 始终子串匹配，
+    "pdf:" 前缀对用户无意义）。返回 TitleHit 不含文件名形态（title/url/component/resolved，
+    doc_id 为不透明检索标识，与其他端点一致）。
     """
     kw = keyword.strip()
     if not kw:
         return []
-    sql = "SELECT source_id, title, url, component, resolved_at FROM docs WHERE title LIKE ?"
-    params: list = [f"%{kw}%" if match == "contains" else f"{kw}%"]
+    # title 按 match 语义；source_id（文件名）始终子串匹配
+    title_pat = f"%{kw}%" if match == "contains" else f"{kw}%"
+    sid_pat = f"%{kw}%"
+    sql = "SELECT source_id, title, url, component, resolved_at FROM docs " \
+          "WHERE (title LIKE ? OR source_id LIKE ?)"
+    params: list = [title_pat, sid_pat]
     if component:
         sql += " AND component = ?"
         params.append(component)

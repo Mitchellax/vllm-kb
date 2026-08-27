@@ -84,6 +84,27 @@ class TestTitleSearch(unittest.TestCase):
         hits = title_search(self.conn, "[Bug]", match="prefix")
         self.assertEqual(len(hits), 2)
 
+    def test_title_matches_source_id_without_exposing_filename(self):
+        """业务文档主题词在文件名（source_id）里：title 检索按 source_id 命中；
+        返回的 title 字段仍是文档标题（不把文件名当标题暴露）。"""
+        from vllm_kb.search import title_search
+
+        self.conn.execute(
+            "INSERT INTO docs VALUES (?,?,?,?,?)",
+            ("pdf:npu-smi 命令参考 02", "Atlas A3 中心推理和训练硬件", "", "", None),
+        )
+        self.conn.commit()
+        # 主题词只在 source_id（文件名）→ 按 source_id 命中
+        hits = title_search(self.conn, "npu-smi")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].doc_id, "pdf:npu-smi 命令参考 02")
+        # 返回的 title 是文档标题，不含文件名主题词（不新增文件名暴露面）
+        self.assertEqual(hits[0].title, "Atlas A3 中心推理和训练硬件")
+        self.assertNotIn("npu-smi", hits[0].title)
+        # 标题本身含词时照常命中（两字段 OR）
+        hits2 = title_search(self.conn, "Atlas")
+        self.assertGreaterEqual(len(hits2), 1)
+
 
 class TestSignalWords(unittest.TestCase):
     def setUp(self):

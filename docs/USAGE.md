@@ -350,6 +350,10 @@ python skills/vllm-kb/client.py title "vector core" --component vllm-ascend
 python skills/vllm-kb/client.py title "MTE" --component vllm-ascend
 ```
 
+业务文档（PDF/MD）主题词常在**文件名**里（title 只含首页首行，如手册
+"Atlas A3 中心推理和训练硬件"）——`title` 同时匹配文档名（source_id）：
+`title "npu-smi"` 能命中 npu-smi 命令参考手册（输出仍显示文档标题，不含文件名）。
+
 ### 4.4 version —— 版本形态判断
 
 ```bash
