@@ -429,7 +429,7 @@ class SearchEngine:
             return {}
         row = conn.execute(
             """SELECT source_type, url, title, created_at, resolved_at, status,
-                      labels, version_span_min, reliability, component, extra
+                      labels, version_span_min, reliability, component, extra, tags
                FROM docs WHERE source_id = ?""",
             (doc_id[0],),
         ).fetchone()
@@ -453,6 +453,7 @@ class SearchEngine:
             "component": row[9] or "",
             "kind": extra.get("kind", ""),
             "verification": extra.get("verification", ""),  # unverified | tested | expert（质量分级维度 B）
+            "tags": _json.loads(row[11]) if row[11] else [],  # 文档最终标签（两级分类）
         }
         # FTS 路径补 section（chunks_meta.section，PDF 手册章节标题）
         sec = conn.execute(
@@ -480,6 +481,12 @@ class SearchEngine:
         if "max_created" in filters:
             c = meta.get("created_at") or ""
             if c > filters["max_created"]:
+                return False
+        if "tags" in filters and isinstance(filters["tags"], list):
+            # 文档最终标签（meta.tags）必须包含过滤要求的所有标签（精确匹配）
+            want = set(filters["tags"])
+            have = set(meta.get("tags") or [])
+            if not want.issubset(have):
                 return False
         return True
 

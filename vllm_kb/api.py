@@ -48,9 +48,46 @@ class CodeSearchRequest(BaseModel):
     kind: Optional[str] = None  # def | op | env | msg（msg=报错字面量 LIKE 子串检索）
 
 
+class TagMatchRequest(BaseModel):
+    text: str  # 问题描述（context 命令后端：问题→标签匹配）
+
+
 def _readonly_sqlite(path) -> sqlite3.Connection:
     """URI 级只读 SQLite 连接：文件缺失或任何写操作都会抛错。"""
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def _sanitize_extra(extra: Any) -> dict:
+    """出口白名单（纵深防御）：剥离 asset/evidence 中可能含服务器路径的字段。
+
+    - 只保留 verification/quality/structure/kind/tag_candidates（知识性字段）；
+    - evidence 只保留无路径形态（kind/asset_id/sha256/source_ref 仅 http(s) URL）——
+      即使存量库残留历史路径也不外泄（安全约束：skill 响应不含服务器路径）。
+    """
+    if not isinstance(extra, dict):
+        return {}
+    out: dict = {}
+    for k in ("verification", "quality", "structure", "kind"):
+        if k in extra:
+            out[k] = extra[k]
+    if "tag_candidates" in extra and isinstance(extra["tag_candidates"], list):
+        out["tag_candidates"] = [
+            {"name": c.get("name"), "tier": c.get("tier")}
+            for c in extra["tag_candidates"] if isinstance(c, dict)
+        ]
+    if "evidence" in extra and isinstance(extra["evidence"], list):
+        safe = []
+        for e in extra["evidence"]:
+            if not isinstance(e, dict):
+                continue
+            item = {k: e[k] for k in ("kind", "asset_id", "sha256") if k in e}
+            sr = e.get("source_ref", "")
+            if isinstance(sr, str) and sr.startswith(("http://", "https://")):
+                item["source_ref"] = sr
+            safe.append(item)
+        if safe:
+            out["evidence"] = safe
+    return out
 
 
 def create_app(config_path: Optional[str] = None):
@@ -115,6 +152,7 @@ def create_app(config_path: Optional[str] = None):
                     "kind": r.meta.get("kind", ""),
                     "status": r.meta.get("status", ""),
                     "verification": r.meta.get("verification", ""),
+                    "tags": r.meta.get("tags", []),  # 文档最终标签（两级分类）
                     "version_ref": r.version_ref,
                     "version_span": [r.meta.get("version_span_min"), r.meta.get("version_span_max")],
                     "similarity": r.similarity,
@@ -136,11 +174,14 @@ def create_app(config_path: Optional[str] = None):
 
     @app.get("/doc/{source_id}")
     def doc(source_id: str):
-        """返回整篇文档全文（只读，从 SQLite FTS 分块按序拼装）。"""
+        """返回整篇文档全文（只读，从 SQLite FTS 分块按序拼装）。
+
+        extra 经 _sanitize_extra 白名单清理——不返回任何服务器路径（安全约束）。
+        """
         conn = _readonly_sqlite(engine.sqlite_path)
         try:
             row = conn.execute(
-                "SELECT title, url, created_at, resolved_at, status, component, extra "
+                "SELECT title, url, created_at, resolved_at, status, component, extra, tags "
                 "FROM docs WHERE source_id = ?",
                 (source_id,),
             ).fetchone()
@@ -159,7 +200,8 @@ def create_app(config_path: Optional[str] = None):
                 "resolved_at": row[3],
                 "status": row[4],
                 "component": row[5],
-                "extra": json.loads(row[6] or "{}"),
+                "tags": json.loads(row[7]) if row[7] else [],
+                "extra": _sanitize_extra(json.loads(row[6] or "{}")),
                 "body": "\n\n".join(c[0] for c in chunks),
             }
         finally:
@@ -500,5 +542,172 @@ def create_app(config_path: Optional[str] = None):
     def graph_doc(doc: str):
         """文档邻接视图：MENTIONS 实体（调试/详情）。"""
         return _require_graph().doc_neighbors(doc)
+
+    # ---------------- 文档级标签（能力目录 / 标签检索 / 问题匹配） ----------------
+
+    def _tag_counts() -> dict[str, int]:
+        """docs.tags（最终标签）→ 文档数聚合。"""
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT tags FROM docs WHERE tags IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        finally:
+            conn.close()
+        counts: dict[str, int] = {}
+        for (tags_json,) in rows:
+            try:
+                for t in json.loads(tags_json or "[]"):
+                    counts[t] = counts.get(t, 0) + 1
+            except (TypeError, json.JSONDecodeError):
+                continue
+        return counts
+
+    @app.get("/tags")
+    def tags_catalog():
+        """能力目录：按 tier 分组 {name, docs}（docs>0；registry-only 标签不出现避免噪音）。
+
+        这是"知识能力目录"（有哪些主题/作用类文档可提供知识），非文件枚举——
+        agent 据此知道可查哪些文档类别，再按标签检索。
+        """
+        from .tagging import TagRegistry
+
+        registry = TagRegistry.load(cfg)
+        groups: dict[str, list] = {"domain": [], "purpose": []}
+        counts = _tag_counts()
+        for name, n in sorted(counts.items()):
+            tier = registry.tier(name)
+            groups.setdefault(tier, []).append({"name": name, "docs": n})
+        return {
+            "groups": groups,
+            "total_tags": len(counts),
+            "note": "主题/领域类 domain=这是什么领域的知识；具体作用类 purpose=文档能帮我做什么。"
+                    "按标签检索: /tags/{tag}/docs",
+        }
+
+    @app.get("/tags/{tag}/docs")
+    def tags_docs(tag: str, limit: int = 50):
+        """标签过滤检索：该标签下文档的标题/文档 id/验证状态/片段（上限 200，精确匹配最终标签）。"""
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT source_id, source_type, title, url, extra, tags "
+                    "FROM docs WHERE tags IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        finally:
+            conn.close()
+        out = []
+        for sid, st, title, url, extra, tags_json in rows:
+            try:
+                tags = json.loads(tags_json or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if tag not in tags:
+                continue
+            try:
+                ex = json.loads(extra or "{}")
+            except (TypeError, json.JSONDecodeError):
+                ex = {}
+            out.append({
+                "doc_id": sid,
+                "source_type": st,
+                "title": title or "",
+                "url": url or "",
+                "verification": ex.get("verification", ""),
+                "tags": tags,
+            })
+            if len(out) >= min(limit, 200):
+                break
+        return {"tag": tag, "docs": out, "count": len(out),
+                "note": "标签过滤的检索结果（非文件枚举）；读取全文用 doc <id>"}
+
+    @app.post("/tags/match")
+    def tags_match(req: TagMatchRequest):
+        """问题→标签自动匹配（context 命令后端）：从问题文本命中词典标签。
+
+        domain 组做范围圈定、purpose 组做能力提示、两维交集的文档排前——
+        agent 据此发现"知识库有哪些文档能帮上这个问题"（如 HCCL 超时 →
+        命中 HCCL(domain) + 超时排查/命令参考(purpose) 及其文档线索）。
+        """
+        import re as _re
+
+        from .tagging import TagEntry, TagRegistry
+
+        registry = TagRegistry.load(cfg)
+        lowered = (req.text or "").lower()
+        counts = _tag_counts()
+        # 1) 词典子串命中；2) 无命中时回退：问题拉丁 token 与已用标签（docs>0）词级匹配
+        matched: list[TagEntry] = []
+        seen: set[str] = set()
+        for e in registry.entries:
+            if e.name and e.name.lower() in lowered and e.name not in seen:
+                matched.append(e)
+                seen.add(e.name)
+        if not matched:
+            tokens = {t for t in _re.findall(r"[A-Za-z][A-Za-z0-9_]{1,}", lowered)}
+            for name in counts:
+                if name and name.lower() in tokens and name not in seen:
+                    matched.append(TagEntry(name=name, tier=registry.tier(name)))
+                    seen.add(name)
+        if not matched:
+            return {"matched": [], "count": 0,
+                    "note": "问题文本未命中任何标签（可尝试 tags 查看全部能力目录）"}
+
+        conn = _readonly_sqlite(engine.sqlite_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT source_id, source_type, title, url, extra, tags "
+                    "FROM docs WHERE tags IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        finally:
+            conn.close()
+        docs_by_tag: dict[str, list[dict]] = {e.name: [] for e in matched}
+        doc_tags_map: dict[str, set[str]] = {}
+        for sid, st, title, url, extra, tags_json in rows:
+            try:
+                tags = set(json.loads(tags_json or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not tags:
+                continue
+            doc_tags_map[sid] = tags
+            for e in matched:
+                if e.name in tags and len(docs_by_tag[e.name]) < 3:
+                    try:
+                        ex = json.loads(extra or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        ex = {}
+                    docs_by_tag[e.name].append({
+                        "doc_id": sid, "title": title or "",
+                        "verification": ex.get("verification", ""), "url": url or "",
+                    })
+        # 交集排序：同时命中 domain+purpose 标签的文档线索排前
+        matched_names = [e.name for e in matched]
+        hits: list[dict] = []
+        for e in matched:
+            top = docs_by_tag[e.name]
+            # 同标签文档按"是否同时命中其他标签"排序
+            top.sort(key=lambda d: -len(doc_tags_map.get(d["doc_id"], set()) & set(matched_names)))
+            hits.append({
+                "name": e.name,
+                "tier": e.tier,
+                "docs": counts.get(e.name, 0),
+                "top": top,
+            })
+        return {
+            "matched": hits,
+            "count": len(hits),
+            "note": "匹配的标签：domain=领域范围，purpose=能力（能帮我做什么）；"
+                    "top=各标签下代表性文档线索（读取全文用 doc <id>）",
+        }
 
     return app
