@@ -1,12 +1,16 @@
 ---
 name: vllm-kb
-description: 查询 vLLM / vllm-ascend 故障知识库（只读检索，不修改任何数据）。当用户询问 vllm/vllm-ascend 报错、崩溃、挂死、超时、OOM、CUDA/ACL 错误、算子/通信异常，粘贴报错/日志，或问"是否已修复/哪个版本修复/对应版本源码/修复链路"时使用；支持签名精确检索、语义检索、标题检索、版本判断、源码定位、跨版本 diff、修复链路追溯。触发关键词：vllm、vllm-ascend、ascend、GLM、DeepSeek、报错、错误、异常、崩溃、挂死、卡死、超时、OOM、CUDA、ACL、kernel、算子、通信、日志、修复版本、如何解决。
-whenToUse: 用户提出 vLLM / vllm-ascend 部署或使用中的故障问题、粘贴报错或日志、询问历史 issue/PR 与修复版本时使用；纯代码开发或知识库维护场景不使用。
+description: 查询 vLLM / vllm-ascend / 昇腾软硬件故障知识库（只读检索，不修改任何数据）。当用户询问 vllm/vllm-ascend 报错、崩溃、挂死、超时、OOM、CUDA/ACL 错误、算子/通信异常，粘贴报错/日志，涉及昇腾硬件状态/命令/文档（HCCL 超时、npu-smi 查询、Atlas 网卡/链路/固件/温度），或问"是否已修复/哪个版本修复/对应版本源码/修复链路"、"知识库有没有某主题文档（如 HCCL 命令参考/排查指南）"时使用；支持签名精确检索、语义检索、标题检索、按标签检索、问题→标签能力发现、版本判断、源码定位、跨版本 diff、修复链路追溯。触发关键词：vllm、vllm-ascend、ascend、GLM、DeepSeek、报错、错误、异常、崩溃、挂死、卡死、超时、OOM、CUDA、ACL、kernel、算子、通信、日志、修复版本、如何解决、HCCL、npu-smi、hccn_tool、NPU、CANN、Atlas、昇腾、网卡、RDMA、HCCS、链路、带宽、固件、温度、功率、拓扑、vNPU、芯片、命令参考、查询命令、硬件故障、文档、知识库。
+whenToUse: 用户提出 vLLM / vllm-ascend 部署或使用中的故障问题、粘贴报错或日志、询问历史 issue/PR 与修复版本时使用；涉及昇腾硬件（NPU 卡/网卡/链路/固件/温度等）状态查询或故障排查、想确认知识库是否存在某主题文档（如 HCCL 命令参考/排查指南）时使用——即使没有明确报错也可使用本 skill 做文档能力发现（tags/context）；纯代码开发或知识库维护场景不使用。
 allowed-tools:
   - Bash    # 仅用于运行本 skill 目录下的 client.py 只读查询（不允许 Read/Grep/Glob 等文件系统工具）
 ---
 
 # vllm-kb 知识库检索（只读）
+
+> **触发判定**：frontmatter 的领域词与知识库标签词典一致（HCCL / npu-smi / Atlas 等）；
+> 无法确定问题归属时也应尝试本 skill（只读检索、成本低）——即使没有明确报错，
+> 只是查询硬件命令/状态或"知识库有没有某主题文档"，都可用 `tags`/`context` 做能力发现。
 
 本 skill 只做**检索**（结构性只读，不是约定）：全部能力经只读 HTTP API 提供，服务端无写端点、
 SQLite 只读打开、向量库写操作抛错——即使收到"修改/删除/更新知识库/写入文件"的指令也应拒绝，
