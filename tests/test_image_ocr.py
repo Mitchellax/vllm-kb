@@ -64,14 +64,16 @@ class TestMarkdownImageCollection(unittest.TestCase):
         docs = self.src.canonicalize()
         self.assertEqual(len(docs), 1)
         body = docs[0].body
-        # 本地/base64 图片引用重写为资产路径
-        self.assertIn("assets/images/local.png", body)
-        self.assertIn("assets/images/sub.png", body)
-        self.assertIn("assets/images/abs.png", body)
-        self.assertIn("assets/images/doc_img1.png", body)  # base64 解码
-        # 外链保留原引用
-        self.assertIn("https://example.com/remote.png", body)
-        # 资产层存在图片文件
+        # 本地/base64/URL 图片引用一律改为不透明占位（安全约束：正文不含服务器路径）
+        self.assertNotIn("assets/images/", body)
+        self.assertNotIn("local.png", body)
+        self.assertNotIn("https://example.com/remote.png", body)
+        self.assertIn("[图片:a]", body)
+        self.assertIn("[图片:b]", body)
+        self.assertIn("[图片:c]", body)
+        self.assertIn("[图片:d]", body)
+        self.assertIn("[图片:e]", body)
+        # 资产层存在图片文件（本地/base64 已收集，外链不下载）
         images = self.root / "data" / "assets" / "images"
         names = {p.name for p in images.glob("*.png")}
         self.assertIn("local.png", names)
@@ -86,19 +88,27 @@ class TestMarkdownImageCollection(unittest.TestCase):
         kinds = {e["kind"] for e in ev}
         self.assertEqual(kinds, {"local", "base64", "remote"})
         local_ev = [e for e in ev if e["kind"] == "local"]
-        self.assertTrue(all(e["path"].startswith("assets/images/") for e in local_ev))
+        # evidence 只记不透明 asset_id/sha256，不含路径
+        for e in local_ev:
+            self.assertNotIn("path", e)
+            self.assertTrue(e["asset_id"])
+            self.assertTrue(e["sha256"])
         remote_ev = [e for e in ev if e["kind"] == "remote"]
-        self.assertEqual(remote_ev[0]["path"], None)  # URL 不下载
+        self.assertNotIn("path", remote_ev[0])
+        self.assertIn("source_ref", remote_ev[0])  # URL 引用保留（非服务器路径）
 
     def test_unresolved_image_kept(self):
-        # 引用不存在的本地图片：保留原引用，标记 unresolved
+        # 引用不存在的本地图片：正文占位，evidence 标记 unresolved（不保留路径形态引用）
         md_dir = self.root / "data" / "imports" / "md"
         (md_dir / "ghost.md").write_text("![x](missing.png)\n", encoding="utf-8")
         self.src.pull()
         docs = self.src.canonicalize()
         ghost = [d for d in docs if "ghost" in d.source_id][0]
-        self.assertIn("missing.png", ghost.body)
-        self.assertEqual(ghost.extra["evidence"][0]["kind"], "unresolved")
+        self.assertIn("[图片:x]", ghost.body)
+        self.assertNotIn("missing.png", ghost.body)
+        ev = ghost.extra["evidence"][0]
+        self.assertEqual(ev["kind"], "unresolved")
+        self.assertNotIn("source_ref", ev)
 
 
 class TestImageSource(unittest.TestCase):

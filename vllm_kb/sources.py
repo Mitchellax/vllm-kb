@@ -26,6 +26,13 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from .config import PROJECT_ROOT, SourceCfg
 from .models import KbDocument
+from .tagging import (
+    TagEntry,
+    TagRegistry,
+    extract_tags,
+    headings_from_markdown,
+    headings_from_pdf,
+)
 
 if TYPE_CHECKING:  # 仅类型标注用，避免循环导入
     from .config import AppConfig
@@ -158,10 +165,12 @@ class MarkdownSource(BaseSource):
 
         - **优先读 imports 源文件**：图片相对路径以 md 所在目录为基准解析
           （md 复制到 assets 后相对路径会失锚）；imports 被清空时回退 assets 副本；
-        - 正文图片引用重写为资产路径（assets/images/xxx.png），图片原件进不可变层；
+        - 正文图片引用改为**不透明占位**（`[图片]`），原引用只进 evidence（含资产 asset_id），
+          **正文与 canonical 不暴露任何服务器路径**；
         - evidence 记录图片清单（供 ImageSource OCR 与图文互证消费）。
         """
         docs: list[KbDocument] = []
+        registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
         md_files: list[tuple[Path, bool]] = []
         if self.import_dir.exists():
             md_files = [(p, True) for p in sorted(self.import_dir.rglob("*.md"))
@@ -181,11 +190,16 @@ class MarkdownSource(BaseSource):
             title = self._title_re.search(text)
             title = title.group(1).strip() if title else p.stem
             sha = _sha256(p)
+            asset_id = sha[:16]
+            # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
+            tags, cands = extract_tags(p.stem, headings_from_markdown(text), registry=registry)
             extra: dict[str, Any] = {
-                "asset": {"path": f"assets/md/{p.name}", "sha256": sha, "format": "markdown"},
+                "asset": {"asset_id": asset_id, "sha256": sha, "format": "markdown"},
                 "quality": {"text_source": "text_layer", "parsed_with": "raw"},
                 "verification": "unverified",  # 质量参差：先入库，审核工作台补标
                 "structure": {},
+                # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+                "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
             }
             if evidence:
                 extra["evidence"] = evidence
@@ -197,6 +211,7 @@ class MarkdownSource(BaseSource):
                 body=body,
                 created_at=None,
                 component="",
+                tags=[t.name for t in tags],
                 extra=extra,
             ))
         return docs
@@ -204,40 +219,44 @@ class MarkdownSource(BaseSource):
     # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
 
     def _resolve_images(self, md_path: Path, text: str) -> tuple[str, list[dict]]:
-        """扫描正文图片引用：本地/base64 资产化并重写引用为资产路径；
-        URL 引用标记 remote（V1 不下载，业务环境内网可达时后续补）；解析失败标记 unresolved。
-        返回 (重写后的 body, evidence 列表)。
+        """扫描正文图片引用：本地/base64 资产化（**不透明占位**替换引用，原引用只进 evidence）；
+        URL 引用标记 remote（V1 不下载）；解析失败标记 unresolved。
+        返回 (占位化后的 body, evidence 列表)。
+
+        安全约束：正文与 canonical **不含任何服务器路径**——evidence 只记 asset_id/sha256
+        （管理员侧经 asset_registry 映射回文件），unresolved 不保留原文引用（可能是路径形态）。
         """
         evidence: list[dict] = []
         counter: dict[str, int] = {}
 
         def repl(m: re.Match) -> str:
             alt, ref = m.group(1), m.group(2)
-            ev = {"path": None, "source_ref": ref, "kind": "unresolved", "ocr": None}
+            placeholder = f"[图片:{alt}]" if alt.strip() else "[图片]"
+            ev: dict = {"kind": "unresolved", "ocr": None}
             if ref.startswith(("http://", "https://")):
-                ev["kind"] = "remote"
+                ev = {"kind": "remote", "source_ref": ref, "ocr": None}
                 evidence.append(ev)
-                return m.group(0)  # 保留原引用
+                return placeholder  # URL 引用不下载，正文占位
             if ref.startswith("data:"):
                 bm = _BASE64_IMG_RE.match(ref)
                 if not bm:
                     evidence.append(ev)
-                    return m.group(0)
+                    return placeholder
                 ext = _IMG_EXT.get(bm.group(1).lower(), "png")
                 try:
                     data = base64.b64decode(bm.group(2))
                 except Exception:
                     evidence.append(ev)
-                    return m.group(0)
+                    return placeholder
                 counter[ext] = counter.get(ext, 0) + 1
                 name = f"{md_path.stem}_img{counter[ext]}.{ext}"
                 target = self.resolve("data/assets/images") / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
-                asset_path = f"assets/images/{name}"
-                ev.update({"kind": "base64", "path": asset_path})
+                sha = _sha256(target)
+                ev.update({"kind": "base64", "asset_id": sha[:16], "sha256": sha})
                 evidence.append(ev)
-                return f"![{alt}]({asset_path})"
+                return placeholder
             # 本地路径（file:// 剥前缀；相对路径以 md 目录为基准）
             local = ref[len("file://"):] if ref.startswith("file://") else ref
             p = Path(local)
@@ -245,12 +264,12 @@ class MarkdownSource(BaseSource):
                 p = md_path.parent / p
             p = p.resolve()
             if not p.exists():
-                evidence.append(ev)  # unresolved
-                return m.group(0)
-            asset_path, _, _ = _copy_asset(p, self.resolve("data/assets"), "images")
-            ev.update({"kind": "local", "path": asset_path})
+                evidence.append(ev)  # unresolved（不记 source_ref，避免路径形态进库）
+                return placeholder
+            asset_path, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
+            ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
             evidence.append(ev)
-            return f"![{alt}]({asset_path})"
+            return placeholder
 
         body = _IMG_REF_RE.sub(repl, text)
         return body, evidence
@@ -332,6 +351,9 @@ class PdfSource(BaseSource):
         import pymupdf
 
         sha = _sha256(p)
+        # 资产唯一标识：sha256 前缀（不可变、不暴露存储路径；管理员侧经 asset_registry 映射）
+        asset_id = sha[:16]
+        registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
         pdf = pymupdf.open(str(p))
         try:
             if pdf.needs_pass:
@@ -362,12 +384,14 @@ class PdfSource(BaseSource):
                 print(f"[sources:{self.id}] 跳过无文字层 PDF（可能为扫描件，待 OCR）: {p.name}")
                 return None
             title = first_text or p.stem
-            # 结构化表格落盘（可重跑产物）
+            # 文档级自动标签：文件名 + 内部编号标题（两级分类，见 tagging.py）
+            tags, cands = extract_tags(p.stem, headings_from_pdf(body), registry=registry)
+            # 结构化表格落盘（可重跑产物，以 asset_id 命名——不暴露文件名/路径）
             tables_rel = []
             if tables:
-                tpath = parsed_dir / f"{p.stem}.tables.json"
+                tpath = parsed_dir / f"{asset_id}.tables.json"
                 tpath.write_text(
-                    __import__("json").dumps({"source": f"assets/pdf/{p.name}", "tables": tables},
+                    __import__("json").dumps({"source": f"pdf:{asset_id}", "tables": tables},
                                              ensure_ascii=False, indent=1),
                     encoding="utf-8",
                 )
@@ -380,12 +404,15 @@ class PdfSource(BaseSource):
                 body=body,
                 created_at=None,
                 component="",
+                tags=[t.name for t in tags],
                 extra={
-                    "asset": {"path": f"assets/pdf/{p.name}", "sha256": sha,
+                    "asset": {"asset_id": asset_id, "sha256": sha,
                               "format": "pdf", "pages": pdf.page_count},
                     "quality": {"text_source": "text_layer", "parsed_with": "pymupdf"},
                     "verification": "expert",  # 官方操作手册默认专家验证
                     "structure": {"tables": tables_rel},
+                    # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+                    "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
                 },
             )
         finally:
