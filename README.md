@@ -27,9 +27,16 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 - **组件配套矩阵**：vllm-ascend → vllm/cann/pytorch-ascend 自动匹配——vllm 取镜像 `VLLM_TAG`
   （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、PTA 从对应 tag 的 `requirements.txt`
   提取（0day 模型经 vllm 版本关联）；写回前版本号正则校验，非法值置空
-- **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集重写资产路径）、
-  截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）
-- **审核工作台**（Web UI）：人工确认统一入口（认证 / 存疑 / 删除+撤回，删除只动数据库记录、原始文件保留），
+- **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
+  截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）；
+  入库自动打**文档级两级标签**（主题/领域类 + 具体作用类，确定性提取自文件名+内部标题，
+  词典 `config.tags.registry` 驱动）——经 skill 的 `tags`/`context` 命令做**能力发现**
+  （agent 先知道"知识库有哪些文档类别可提供知识"，如 HCCL 超时 → 命中 HCCL 领域 +
+  超时排查/命令参考作用类，先读文档再下结论）；**资产路径不进库**（asset_id 标识 + API 出口白名单清理，
+  管理员侧路径仅存审核库）
+- **审核工作台**（Web UI）：人工确认统一入口（认证 / 存疑 / 删除+撤回，删除只动数据库记录、原始文件保留）、
+  **两层标签治理**（自动标签排除/恢复、人工添加、词典管理——新增/改名/改 tier 同步 config.json，
+  重建图后入图；tag_candidate 候选采纳；同 stem 重名告警）、
   **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）、
   **文档管理**（外源文档列表 + 彻底删除：docs+chunks+向量四层，本地文件保留可重新入库）——
   启动与操作见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)
@@ -232,6 +239,7 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 | `chunking.py` / `embed.py` | 讨论线按段切块 + 批量嵌入（攒批降 API 调用） |
 | `ingest.py` / `vectorstore.py` / `pipeline.py` | 幂等入库流水线：SQLite+FTS5、LanceDB 批量写入、`build_kb.py` 入口 |
 | `signature.py` / `error_parse.py` / `symbol_table.py` | 三层签名提取（源码符号表 → 结构化解析 → 社区信号词） |
+| `tagging.py` | 文档级标签（两级分类）确定性提取：词典 registry 子串命中 + 文件名/标题 token；tier 启发式；合并公式唯一实现 `final=(auto−excluded)∪manual`（ingest 与建图共用） |
 | `search.py` / `confidence.py` | 混合检索（向量+FTS+标题）+ 查询时置信度（时间衰退/版本区间/来源可靠度/验证状态） |
 | `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS，含手册表格→错误码、命令格式→Interface）+ 链路查询 |
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布 |

@@ -152,6 +152,30 @@ canonical 仍统一单文件，仅扩展字段（§7）。
 2. **图像增强**：超分/去噪提升 OCR 召回率（成本可控时启用）；
 3. **多模态检索**：Phase 5+ 若评估集显示图片类来源高频命中，再引入图片向量（V1 明确不做）。
 
+## 6.5 文档级标签（两级分类）—— 让"有哪些文档可提供知识"可被发现
+
+**背景**：故障定位时 agent 需要知道知识库有哪些文档类别（如 HCCL 命令参考/超时排查指南），
+而不是搜不到 issue 就直接查代码下判断。文档级标签提供**能力目录**（agent 侧 `tags`/`context` 命令）。
+
+**两级分类（标签固有属性，词典全局唯一）**：
+- 主题/领域类（domain）：HCCL、网络、NPU、CANN… = 这是什么领域的知识（过滤/圈定范围）；
+- 具体作用类（purpose）：超时排查、命令参考、错误码表… = 文档能帮我做什么（能力/动作匹配）；
+- 检索语义：domain 过滤 × purpose 匹配，交集文档最相关（`context` 输出即此）。
+
+**数据流**：
+1. **自动提取（确定性、零 LLM）**：入库时从文件名 + 内部标题（PDF 编号标题 / Markdown `#` 标题），
+   词典 `config.tags.registry` 子串命中为准（未收录强候选 → `extra.tag_candidates` 进审核队列）；
+2. **人工覆盖层**：`kb.sqlite3.doc_tags`（auto_snapshot / excluded 可恢复 / manual），
+   **最终标签 = (auto − excluded) ∪ manual**（`tagging.merge_final` 单点实现，ingest 与建图共用）；
+   审核页修改后 `docs.tags` 立即同步（检索侧即时生效），图侧重建时同公式一致；
+3. **图**：Tag(id, tier) 节点 + TAGGED_WITH(Doc/Issue/PR → Tag) 边；registry 全量标签也建节点
+   （新增标签重建图即入图，Kùzu 单写者约束下不做热插）；
+4. **能力发现（skill）**：`tags list`（目录）、`tags docs <标签>`（按标签检索）、
+   `context <问题描述>`（问题→标签自动匹配，返回领域×作用交集文档线索）——agent 先读文档再下结论。
+
+**安全边界**：标签体系与路径脱敏配套——文档路径不进 canonical/检索库（asset_id 标识）、
+API 出口白名单清理、agent 无文件枚举指令面（可用工具仅 Bash）。
+
 ## 7. Canonical Schema 扩展
 
 `KbDocument` 现有字段不动（`source_type`/`source_id`/`title`/`body`/`version_span`/`reliability`...），
@@ -161,10 +185,13 @@ canonical 仍统一单文件，仅扩展字段（§7）。
 {
   "source_type": "doc_pdf | doc_word | doc_html | evidence_image | engineer_record | table_row",
   "source_id": "case:huawei:glm5-1-oom",          // 来源命名空间保证全局唯一
-  "title": "...", "body": "（Markdown 化正文，图片以 ![ev](assets/images/xxx.png) 引用）",
+  "title": "...", "body": "（Markdown 化正文，图片以不透明占位 [图片] 引用，不暴露路径）",
   "reliability": 0.85,                              // 维度 B 折算后的初始可靠度（或 None 走规则）
+  "tags": ["npu-smi", "命令参考"],                  // 文档级自动标签（两级分类，见 §6.5）
   "extra": {
-    "asset": {"path": "assets/pdf/npu_hccn_tool_guide.pdf", "sha256": "...", "format": "pdf", "pages": 132},
+    "asset": {"asset_id": "d4c7ead16c5b59e6", "sha256": "...", "format": "pdf", "pages": 132},
+    // 安全约束：asset 只存不透明 asset_id（sha256 前缀），**不存服务器路径**；
+    // 管理员侧路径仅存审核库 asset_registry（asset_id → rel_path 映射）
     "quality": {"text_source": "text_layer | ocr", "ocr_confidence": 0.0, "parsed_with": "pymupdf | paddleocr"},
     "verification": "unverified | tested | expert",  // 维度 B 原始标记（未验证/已测试有效/专家认证）
     "structure": {"sections": ["接口概览", "错误码表"], "tables": ["parsed/pdf/xxx.tables.json"]},

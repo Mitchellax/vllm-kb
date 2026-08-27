@@ -149,15 +149,21 @@ python skills/vllm-kb/client.py stats                           # chunks 数应�
 **步骤 6：产物与质量规则**
 
 ```
-data/assets/pdf/<name>.pdf           # 原始文件（不可变层，sha256）
-data/parsed/pdf/<name>.tables.json   # 结构化表格（错误码表/命令表）
-data/raw/canonical.jsonl             # canonical 追加（verification 等元数据）
+data/assets/pdf/<name>.pdf           # 原始文件（不可变层，sha256；路径不进库，以 asset_id 标识）
+data/parsed/pdf/<asset_id>.tables.json   # 结构化表格（错误码表/命令表，asset_id 命名）
+data/raw/canonical.jsonl             # canonical 追加（verification/tags 等元数据）
 ```
 
 - PDF 表格转 Markdown 表格拼入正文（FTS 可检索）+ 另存结构化 JSON；
+- **自动标签（两级分类）**：入库时从文件名 + 内部标题确定性提取——**主题/领域类**（domain，
+  如 `npu-smi`/`Atlas`，=这是什么领域的知识）与**具体作用类**（purpose，如 `命令参考`/`错误码表`，
+  =文档能帮我做什么），与 `config.json` 的 `tags.registry` 词典子串命中为准；
+  未收录强候选进审核队列 `tag_candidate`，采纳后入词典并即时打标；
 - 验证状态默认：**PDF 手册 = `expert`**、**Markdown = `unverified`**（审核工作台补标）；
 - 检索结果显示 `验证=expert/unverified`；embedding key 有效时语义检索（向量）生效，
-  无效时自动降级全文检索（`search` 仍可用）。
+  无效时自动降级全文检索（`search` 仍可用）；
+- **路径不进库（安全约束）**：canonical/检索库不含服务器路径（资产以 asset_id 标识），
+  `/doc` 等 API 返回的 extra 经白名单清理；管理员侧路径仅存审核库（asset_registry）。
 
 **步骤 7：重启检索服务（改过 key / config 后）**
 
@@ -170,9 +176,10 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 **Markdown 图片处理（随 md 一起入库）**：
 
 - md 正文里的图片引用自动收集：相对路径（以 md 所在目录为基准）、绝对路径、base64 内嵌 → 复制到
-  `data/assets/images/`，正文引用**重写为资产路径**，`extra.evidence` 记录清单；
+  `data/assets/images/`，**正文引用改为不透明占位 `[图片]`**（不暴露路径），`extra.evidence`
+  记录 asset_id/sha256（管理员侧经 asset_registry 找回原图）；
 - 网络 URL 图片：标记 `remote` 不阻塞导入（业务环境内网可达时可后续补抓）；
-- 引用不存在的本地图片：保留原引用并标记 `unresolved`；
+- 引用不存在的本地图片：标记 `unresolved`（不保留路径形态引用）；
 - 图片的 OCR 由 image source 完成（见下）。
 
 **图片 OCR（签名导向，provider 可插拔）**：
@@ -261,16 +268,28 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 
 **功能**：
 
-- **概览**：6 类审核项的待办/存疑数（verification_pending / case_title_flag / ocr_mismatch /
-  low_confidence_ocr / equivalence_candidate / table_join_candidate）；
+- **概览**：7 类审核项的待办/存疑数（verification_pending / case_title_flag / ocr_mismatch /
+  low_confidence_ocr / equivalence_candidate / table_join_candidate / **tag_candidate**）
+  与标签词典统计（领域/作用类个数、已打标文档数）；
 - **审核队列**（未审核在前、存疑在后）：按类别筛选；详情页可预览原图（assets 静态服务）。
   **审核动作（只做判定，不修改原始内容）**：
   - **✓ 认证**：文档有效，不再提示；
   - **？ 存疑**：重新进入队列，排在未审核之后；
   - **🗑 标记删除**：只删除 `kb.sqlite3` 数据库记录，**原始资产文件保留**——进入队列底部
     "**待实际删除**"列表（含资产路径），由人员**手动本地删除**原始文件；
-  - **↩ 撤回**：在待删除列表恢复数据库记录（用删除前的备份），重新进入队列。
+  - **↩ 撤回**：在待删除列表恢复数据库记录（用删除前的备份），重新进入队列；
+  - **tag_candidate 采纳**：未收录的自动标签候选 → "✓ 采纳为标签"（入词典 + 即时打标），
+    忽略不记录（候选可再次出现）。
   审核记录存 `data/review.sqlite3`（独立于只读检索库），带审核人/时间戳可审计；
+- **文档管理（含两层标签编辑）**：列出外源文档（导入的 PDF/Markdown 等，GitHub 不在此列），
+  每条显示**自动标签**（领域/作用分区，点 ✕ 排除）、**已排除**（点 ↺ 恢复）、**人工标签**
+  （添加/删除）与**最终标签预览**（`(自动 − 排除) ∪ 人工`，与入库/建图一致）；
+  人工添加的新标签自动同步词典；**同 stem 重名告警**（人工处理，不自动消歧）；
+  支持**彻底删除**——同时清除 docs 行 + chunks_fts + chunks_meta + 向量四层，
+  **本地资产文件不动**；下次增量入库时文件仍在本地会**自动重新入库**，文档废弃由管理员手动删本地文件；
+- **标签管理**：词典（`config.json` `tags.registry`，全局唯一事实源）按领域/作用分组 + 文档数，
+  支持**新增 / 改名（全库替换）/ 改 tier / 删除**——均同步 config.json；**不热插图**
+  （Kùzu 单写者约束），运行 `build_graph.py` 重建后入图；
 - **API 配置中心**：集中查看并**编辑** embedding / OCR / GitHub 的配置——
   **非密钥字段**（provider/base_url/model/ocr_provider/ocr_api_mode 等）保存到 `config.json`；
   **密钥**（embedding key / OCR key / GitHub token）保存到 `data/secrets.local.json`
@@ -279,11 +298,8 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
   （OCR 用内置测试图走真实识别链路，验证 HTTP/鉴权/模型）；修改对已运行的服务需**重启生效**。
 
 自动补单规则：`verification=unverified` 的文档 → verification_pending；标题含"待审核/待修改"→
-case_title_flag。审核结果回写 canonical 依赖重跑 `--recanonicalize`（后续版本支持热更新）。
-
-**文档管理**（外源文档页签）：列出 kb.sqlite3 中**外源文档**（导入的 PDF/Markdown/表格等，
-GitHub 采集不在此列），支持**彻底删除**——同时清除 docs 行 + chunks_fts + chunks_meta + 向量四层，
-**本地资产文件不动**；下次增量入库时文件仍在本地会**自动重新入库**，文档废弃由管理员手动删本地文件。
+case_title_flag；`extra.tag_candidates`（未收录强候选）→ tag_candidate。
+审核结果回写 canonical 依赖重跑 `--recanonicalize`（后续版本支持热更新）。
 
 **与只读检索 API 的关系**：分离端口（检索 8000 / 审核 8010）、分离数据（kb.sqlite3 只读 /
 review.sqlite3 可写）；审核库检索 API 不碰。权限（谁能标注专家认证）由部署方加 nginx basic auth 等。
@@ -390,10 +406,37 @@ python skills/vllm-kb/client.py health                  # 服务健康（含 emb
 python skills/vllm-kb/client.py stats                   # 知识库规模
 python skills/vllm-kb/client.py doc github:vllm-project-vllm-ascend:issue:10700   # 整篇 issue 全文
 python skills/vllm-kb/client.py companion vllm-ascend 0.23.0rc1   # 组件配套版本展开
-python skills/vllm-kb/client.py matrix --limit 20              # 全量配套矩阵（调试/管理用；日常用 companion；--limit 控制显示行数）
+# matrix/code-versions 为管理员调试命令（列全量配套矩阵/预存代码版本），故障流程不使用
 ```
 
-### 4.7 graph —— Phase 2 图检索（关系追溯）
+### 4.7 文档标签（能力发现）—— `tags` / `context`
+
+文档级标签两级分类：**主题/领域类**（domain：HCCL、网络、NPU、CANN…=这是什么领域的知识）与
+**具体作用类**（purpose：超时排查、命令参考、错误码表…=文档能帮我做什么）。
+
+```bash
+# 能力目录：两级分组 + 各标签文档数（agent 先看"知识库有哪些文档类别可提供知识"）
+python skills/vllm-kb/client.py tags list
+
+# 按标签检索文档（标题/文档id/验证状态；非文件枚举）
+python skills/vllm-kb/client.py tags docs HCCL
+python skills/vllm-kb/client.py tags docs 超时排查
+
+# 问题→标签匹配（文档能力发现）：命中领域×作用的文档交集排前
+python skills/vllm-kb/client.py context "vllm-ascend:0.23.0 HCCL 超时"
+#   → [领域] HCCL（12 篇）→ pdf:xxx HCCL 超时排查指南
+#     [作用] 超时排查（8 篇）→ ...
+#   → 先读命中文档（doc <id>），再结合 issue/代码下结论
+
+# 图侧标签查询：标签 → 打标文档（Doc/Issue/PR）
+python skills/vllm-kb/client.py graph tags HCCL
+```
+
+标签来源与治理：入库时从文件名 + 内部标题确定性提取（词典 `config.json` `tags.registry`
+子串命中为准）；审核工作台可**排除自动标签 / 添加人工标签 / 管理词典**（新增/改名/改 tier/删除，
+均同步 config.json；不热插图——`build_graph.py` 重建后入图）。检索结果（search/doc）携带 `tags`。
+
+### 4.8 graph —— Phase 2 图检索（关系追溯）
 
 先构建图（Kùzu，基于 canonical 与版本日历，确定性零 LLM）：
 
@@ -419,13 +462,17 @@ python skills/vllm-kb/client.py graph sig 561000
 # 文档邻接（调试）与图规模
 python skills/vllm-kb/client.py graph doc github:vllm-project-vllm:issue:10700
 python skills/vllm-kb/client.py graph stats
+# 标签 → 打标文档（Doc/Issue/PR）
+python skills/vllm-kb/client.py graph tags HCCL
 ```
 
 **图内容说明**：Issue/PR/Release（修复链路）+ Operator/ErrorCode/Model/Version（签名实体）+
 **Doc**（PDF 手册/Markdown 等非 github 文档）+ **Interface**（手册"命令格式"段提取的工具.子命令，
-如 `hccn_tool.bandwidth`）。文档经两条 `DOCUMENTS` 边入图：
+如 `hccn_tool.bandwidth`）+ **Tag**（文档级标签，两级分类）。文档经两条 `DOCUMENTS` 边入图：
 - **错误码表 → ErrorCode**：`graph doc pdf:<手册>` 的 `documents` 含该手册定义的错误码；
 - **命令格式段 → Interface**：`documents` 含该手册定义的接口/命令；
+- **标签 → Tag**：`TAGGED_WITH` 边（最终标签 = 自动 − 排除 ∪ 人工，与入库一致；
+  registry 全量标签也建节点——新增标签重建图即入图）；
 错误码/命令与 GitHub issue 的 MENTIONS 共享节点——可回答"这个错误码在哪个手册定义、
 社区哪些 issue 提到"、"查带宽用哪个命令、命令在哪本手册"。
 
@@ -435,6 +482,8 @@ python skills/vllm-kb/client.py graph stats
 ## 5. 故障处理推荐流程
 
 ```
+0. context   文档能力发现（硬件/组件/领域名词问题或 signature/search 无强命中时先做）：
+             "HCCL 超时" → 命中 HCCL(领域) + 超时排查/命令参考(作用) → 先读对应文档（tags docs / doc）
 1. signature  贴原始报错 → 提取签名 + 精确命中（最直接线索）
 2. title      拿签名/信号词做标题精确检索 → 找已知 issue
 3. search     组件:版本 问题描述 → 语义检索 + 置信度分解，补齐相似问题
@@ -442,6 +491,10 @@ python skills/vllm-kb/client.py graph stats
 5. code       按部署版本定位源码 → 判断是否版本相关 bug
 6. doc        读 issue 全文 → 结合 resolved 状态与修复 PR 给结论
 ```
+
+**安全边界（本 skill）**：所有输出不含服务器文件路径、不暴露内部存储结构；知识库对内部文档
+只提供检索结果（标题/文档id/片段），无"列出所有文件/文档"指令面（可用工具仅 Bash，
+`tags list` 是能力目录、`tags docs <标签>` 是按标签过滤的检索，均非文件枚举）。
 
 **信息缺失与未知名词处理**：关键事实（部署形态、卡数/节点数、部署版本、组件范围）或名词含义
 无法确认时，先问用户，不要假设通用拓扑或自行脑补（如日志中 timeout 7 次是否是"8 卡缺 1"，

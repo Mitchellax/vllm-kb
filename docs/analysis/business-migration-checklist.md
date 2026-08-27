@@ -54,6 +54,7 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 | A4 | 置信度融合 | `verification_factor`（expert 0.95 / tested 0.85 / unverified 0.5，可配置）并入 `w_rel`（max 下限提升）；向量路径 meta 补全 verification | 手册检索 w_rel 0.4→0.95（✅ 实测）；样例置信度分解可见 verification | ✅ 完成 |
 | A5 | 审核工作台 | `review.sqlite3` + `review_ui.py`（6 类审核项、原图 assets 预览、标注回写）+ **API 配置中心**（embedding/OCR/GitHub 配置状态，key 脱敏，embedding 连通测试） | 各类别各 1 条走完 pending→confirmed 闭环 | ✅ 框架（UI + store + seed 幂等 + 配置中心）；审核结果回写 canonical 热更新 🔲 |
 | A6 | 图扩展 | `Doc` 通用节点 + `DOCUMENTS` 边（手册表格 → ErrorCode；**手册"命令格式"段 → Interface 节点**，工具.子命令级如 hccn_tool.bandwidth）；`Evidence`/OCR 边与 EQUIVALENT_TO 待业务环境 | 手册表格错误码 + 44 个 Interface（Atlas HCCN 实测）；`graph doc pdf:<手册>` 显示 documents | 🚧 手册→ErrorCode + Interface ✅，Evidence/EQUIVALENT_TO 🔲 |
+| A7 | 文档级标签 | **两级分类**（主题/领域 domain + 具体作用 purpose）：确定性提取（文件名+内部标题，词典 `config.tags.registry` 驱动）+ 审核页治理（自动排除/恢复、人工添加、词典新增/改名/改 tier 同步 config）+ **图 Tag 节点/TAGGED_WITH 边**（registry 全量节点）+ **skill 能力发现**（`tags` 目录、`context` 问题→标签匹配，agent 先发现"有哪些文档可提供知识"如 HCCL 超时→命中领域×作用）；**资产路径不进库**（asset_id + API 出口白名单） | npu-smi 命令参考 PDF 提取 [npu-smi/Atlas/命令参考] 命中 + `context "HCCL 超时"` 返回文档线索；`graph tags` 可查 | ✅ 框架（tagging/ingest/graph/review/api/skill）；词典与候选质量待业务数据标定 |
 
 ### B. 部署/运维
 
