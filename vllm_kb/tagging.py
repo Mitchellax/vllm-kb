@@ -124,16 +124,10 @@ class TagRegistry:
     # ---------- 构造 ----------
 
     @classmethod
-    def load(cls, cfg: Optional["AppConfig"] = None) -> "TagRegistry":
-        """从 config.tags.registry 加载（无 tags 配置段时为空词典）。
-
-        兼容两种条目形态：{"name": "...", "tier": "..."} 与裸字符串（tier 走启发式）。
-        """
+    def _from_raw(cls, raw: list) -> "TagRegistry":
+        """从原始 registry 列表构造（兼容 dict 与裸字符串条目）。"""
         entries: list[TagEntry] = []
-        raw: list = []
-        if cfg is not None:
-            raw = list(getattr(cfg.tags, "registry", []) or [])
-        for item in raw:
+        for item in raw or []:
             if isinstance(item, str):
                 name = normalize_tag(item)
                 if name:
@@ -150,6 +144,31 @@ class TagRegistry:
         for e in entries:
             merged[e.name] = e
         return cls(list(merged.values()))
+
+    @classmethod
+    def load(cls, cfg: Optional["AppConfig"] = None) -> "TagRegistry":
+        """从 config.tags.registry 加载（无 tags 配置段时为空词典）。
+
+        兼容两种条目形态：{"name": "...", "tier": "..."} 与裸字符串（tier 走启发式）。
+        """
+        raw: list = []
+        if cfg is not None:
+            raw = list(getattr(cfg.tags, "registry", []) or [])
+        return cls._from_raw(raw)
+
+    @classmethod
+    def load_from_config_file(cls, config_path: Optional[str | Path] = None) -> "TagRegistry":
+        """直接从 config.json 文件读取词典（审核页多次编辑后内存 cfg 可能滞后，以文件为准）。"""
+        from .config import PROJECT_ROOT
+
+        p = Path(config_path) if config_path else PROJECT_ROOT / "config.json"
+        if not p.exists():
+            return cls()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return cls()
+        return cls._from_raw((data.get("tags") or {}).get("registry", []) or [])
 
     # ---------- 查询 ----------
 
