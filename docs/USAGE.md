@@ -165,6 +165,13 @@ data/raw/canonical.jsonl             # canonical 追加（verification/tags 等�
 - **路径不进库（安全约束）**：canonical/检索库不含服务器路径（资产以 asset_id 标识），
   `/doc` 等 API 返回的 extra 经白名单清理；管理员侧路径仅存审核库（asset_registry）。
 
+**PDF 解析缓存（性能，增量入库 / recanonicalize 通用）**：PyMuPDF 逐页提取耗时较长
+（241 页手册约 7s/篇），解析中间产物（文字层 + 表格 + 页数）按资产 sha256 缓存到
+`data/parsed/pdf/<asset_id>.extract.json`——**资产未变时直接复用缓存**（进度行标注
+"缓存命中"，毫秒级），仅标签/元数据提取每次重算（词典/提取规则升级**无需清缓存**即生效）。
+**强制重新解析**（如 PyMuPDF 升级后想重新提取文字层）：删除 `data/parsed/pdf/` 目录即可，
+资产层（`data/assets/`）与 kb 数据不受影响。
+
 **步骤 7：重启检索服务（改过 key / config 后）**
 
 ```bash
@@ -253,6 +260,11 @@ python scripts/build_graph.py
 # 3. 重启 serve_api
 python scripts/serve_api.py
 ```
+
+**路径限制（Kùzu）**：图库路径（`storage.graph_path` = `data/graph`，或存算分离时的
+`VLLM_KB_DATA_ROOT`）**不能含非 ASCII 字符**（中文、emoji 等）——Kùzu 打开含非 ASCII
+路径的库会报错打不开。若部署根路径含中文（如 `C:\Users\张三\...`），请把数据根移到
+纯 ASCII 路径（如 `D:\vllm-kb-data`）后重建图。
 
 ## 3.5 审核工作台（人工确认统一入口 + API 配置中心）
 
@@ -565,6 +577,16 @@ A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳�
 
 **Q: 离线能用吗？**
 A: 能。采集完成后全部检索离线；嵌入可用 `echo` provider 离线自测（效果粗糙）。
+
+**Q: 图打不开 / build_graph 失败，数据根路径含中文？**
+A: Kùzu 图库路径**不能含非 ASCII 字符**（中文、emoji 等）——`data/graph` 或存算分离的
+`VLLM_KB_DATA_ROOT` 若在中文路径下（如 `C:\Users\张三\...`），建图/图查询会失败。
+把数据根移到纯 ASCII 路径（如 `D:\vllm-kb-data`）后重建图（`scripts/build_graph.py`）。
+
+**Q: PDF 重新入库/`--recanonicalize` 很慢，怎么跳过已解析的？**
+A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.extract.json`），
+资产未变时自动复用（进度行标注"缓存命中"）；想强制重新解析（如 PyMuPDF 升级），
+删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。
 
 **Q: 想加自己的故障记录（excel/markdown）？**
 A: config.json 的 `sources` 加 `engineer-troubleshooting` 条目（markdown/excel 接口已预留，
