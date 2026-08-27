@@ -51,5 +51,39 @@ class TestChunking(unittest.TestCase):
         self.assertIn(chunks[0].text[-200:].strip(), chunks[1].text)
 
 
+class TestMarkdownSectionChunking(unittest.TestCase):
+    def make_md(self, body: str) -> KbDocument:
+        return KbDocument(
+            source_type="doc_markdown",
+            source_id="md:wiki",
+            url="",
+            title="t",
+            body=body,
+        )
+
+    def test_markdown_sections_injected(self):
+        """Markdown 按 # 标题切章节，chunk 前缀注入章节名（命中即知所属章节）。"""
+        doc = self.make_md(
+            "# GLM5.1 崩溃三板斧\n\n引言段落\n\n## 第一步\n检查 halMemCreate 日志\n"
+            "## 第二步\n调小 mega_moe_max_tokens\n")
+        chunks = chunk_doc(doc, max_chunk_chars=4000, overlap_chars=0)
+        self.assertGreater(len(chunks), 1)
+        sections = {c.section for c in chunks}
+        self.assertIn("GLM5.1 崩溃三板斧", sections)  # 引言前标题
+        self.assertIn("第一步", sections)
+        self.assertIn("第二步", sections)
+        # 章节文本前缀注入标题（参与匹配）
+        step2 = next(c for c in chunks if c.section == "第二步")
+        self.assertTrue(step2.text.startswith("【第二步】"))
+        self.assertIn("mega_moe_max_tokens", step2.text)
+
+    def test_markdown_no_heading_fallback(self):
+        """无 # 标题的 md 回退普通分块（section 为空）。"""
+        doc = self.make_md("段落一\n\n段落二 " + "x" * 2000)
+        chunks = chunk_doc(doc, max_chunk_chars=1000, overlap_chars=0)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(c.section == "" for c in chunks))
+
+
 if __name__ == "__main__":
     unittest.main()

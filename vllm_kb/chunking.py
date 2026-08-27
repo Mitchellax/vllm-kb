@@ -6,7 +6,8 @@
 - 相邻块间用前一 block 尾部 overlap_chars 字符做重叠，保留上下文；
 - **PDF 手册（doc_pdf）带章节结构**：识别章节标题（如 "2.34 获取network版本号信息"），
   每个 chunk 记录所属 section 并在文本前缀注入标题行——命中正文可同时看到所属章节，
-  标题文本也参与向量/FTS 匹配。
+  标题文本也参与向量/FTS 匹配；
+- **Markdown（doc_markdown）带章节结构**：按 `#` 标题切分（与标签提取同源复用标题结构）。
 """
 from __future__ import annotations
 
@@ -19,6 +20,9 @@ _PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
 # PDF 手册章节标题：编号 + 空格 + 标题（如 "2.34 获取network版本号信息"、"1 用户指南"）。
 # 排除目录页的"....."点线填充行与超长行（正文标题行短）。
 _SECTION_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(\S.{0,60}?)\s*$")
+
+# Markdown 标题行：^#{1,6} 标题（可带结尾 #）
+_MD_HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 
 
 def _is_section_line(line: str) -> bool:
@@ -67,9 +71,11 @@ def chunk_doc(
     if not text:
         return []
 
-    # PDF 手册：带章节结构切分；其他来源保持原逻辑（section 为空）
+    # PDF 手册：带章节结构切分；Markdown：按 # 标题切分；其他来源保持原逻辑（section 为空）
     if doc.source_type == "doc_pdf":
-        return _chunk_sections(doc, text, max_chunk_chars, overlap_chars)
+        return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, _split_sections)
+    if doc.source_type == "doc_markdown":
+        return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, _split_markdown_sections)
 
     if len(text) <= max_chunk_chars:
         return [KbChunk(chunk_id=f"{doc.source_id}#0", doc_id=doc.source_id, seq=0, text=text)]
@@ -107,16 +113,40 @@ def chunk_doc(
     return chunks
 
 
+def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
+    """按 Markdown 标题行（#/##/###）切成 (section, 段落文本) 段；标题行本身作章节名。
+
+    与 tagging.headings_from_markdown 同源（标签提取与检索章节共用标题结构）。
+    标题前的引言归入 ''；连续标题时前一标题下无内容则不产生空段。
+    """
+    sections: list[tuple[str, str]] = []
+    cur_title = ""
+    cur_lines: list[str] = []
+    for line in (text or "").splitlines():
+        m = _MD_HEADING_LINE_RE.match(line)
+        if m:
+            if cur_lines:
+                sections.append((cur_title, "\n".join(cur_lines)))
+            cur_title = m.group(1).strip()
+            cur_lines = []
+        else:
+            cur_lines.append(line)
+    if cur_lines:
+        sections.append((cur_title, "\n".join(cur_lines)))
+    return sections
+
+
 def _chunk_sections(
     doc: KbDocument,
     text: str,
     max_chunk_chars: int,
     overlap_chars: int,
+    splitter,
 ) -> list[KbChunk]:
-    """带章节的 PDF 手册分块：每段正文按章节分组，chunk 注入所属标题。"""
+    """带章节的文档分块：每段正文按章节分组，chunk 注入所属标题。"""
     chunks: list[KbChunk] = []
     seq = 0
-    for section, section_text in _split_sections(text):
+    for section, section_text in splitter(text):
         if not section_text:
             continue
         # 章节内分块：前缀注入标题（标题参与匹配，命中即知所属章节）
