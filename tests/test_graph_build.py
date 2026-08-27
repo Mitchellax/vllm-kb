@@ -63,16 +63,17 @@ CANONICAL = [
                 "命令格式\nhccn_tool [-i %d] -roce_test %s\n"
                 "命令格式\nhccn_tool -h\n",
         "status": "open",
+        "tags": ["hccn", "命令参考"],  # 文档级自动标签（两级分类）
         "extra": {"verification": "expert",
-                  "asset": {"path": "assets/pdf/npu_hccn_tool_guide.pdf"},
-                  "structure": {"tables": ["parsed/pdf/npu_hccn_tool_guide.tables.json"]}},
+                  "asset": {"asset_id": "abcd1234abcd1234", "sha256": "abcd1234abcd1234"},
+                  "structure": {"tables": ["parsed/pdf/abcd1234abcd1234.tables.json"]}},
         "version_span": {},
     },
 ]
 
-# 手册表格产物（错误码表）
+# 手册表格产物（错误码表；以 asset_id 命名——不暴露文件名/路径）
 TABLES_JSON = {
-    "source": "assets/pdf/npu_hccn_tool_guide.pdf",
+    "source": "pdf:abcd1234abcd1234",
     "tables": [
         {"page": 1, "index": 0, "rows": [
             ["错误码", "含义"],
@@ -93,10 +94,10 @@ def write_canonical(tmp: Path) -> Path:
 
 
 def write_parsed(tmp: Path) -> Path:
-    """造 parsed/pdf 表格产物（接口指南错误码表）。"""
+    """造 parsed/pdf 表格产物（接口指南错误码表，asset_id 命名）。"""
     parsed = tmp / "parsed" / "pdf"
     parsed.mkdir(parents=True)
-    (parsed / "npu_hccn_tool_guide.tables.json").write_text(
+    (parsed / "abcd1234abcd1234.tables.json").write_text(
         json.dumps(TABLES_JSON, ensure_ascii=False), encoding="utf-8")
     return tmp / "parsed"
 
@@ -172,6 +173,9 @@ class TestGraphBuildAndQuery(unittest.TestCase):
         # DOCUMENTS：手册表格提取的 3 个错误码 + 命令格式段的 Interface
         self.assertEqual(s.rels["DOCUMENTS"], 3 + 2)
         self.assertEqual(s.nodes["Interface"], 2)
+        # 文档级标签：Tag 节点 + TAGGED_WITH 边（doc_pdf 两个标签）
+        self.assertEqual(s.nodes["Tag"], 2)
+        self.assertEqual(s.rels["TAGGED_WITH"], 2)
 
     def test_chain_issue(self):
         r = self.builder.chain_issue("github:vllm-project-vllm-ascend:issue:10700")
@@ -238,6 +242,48 @@ class TestGraphBuildAndQuery(unittest.TestCase):
         kinds = {d["entity_type"] for d in r["docs"]}
         # 手册 Doc 通过 DOCUMENTS 边、issue 通过 MENTIONS 边都能触达同一 ErrorCode 节点
         self.assertEqual(r["entity_type"], "error_code")
+
+    def test_tags_lookup(self):
+        """标签 → 打标文档（Doc 节点）；标签带 tier。"""
+        r = self.builder.tags_lookup("hccn")
+        self.assertEqual(r["tier"], "domain")
+        self.assertEqual(r["count"], 1)
+        self.assertEqual(r["docs"][0]["doc_id"], "pdf:npu_hccn_tool_guide")
+        self.assertEqual(r["docs"][0]["doc_type"], "Doc")
+        # 不存在的标签 → 空
+        r2 = self.builder.tags_lookup("不存在标签")
+        self.assertEqual(r2["count"], 0)
+
+    def test_doc_neighbors_has_tags(self):
+        r = self.builder.doc_neighbors("pdf:npu_hccn_tool_guide")
+        names = {t["name"] for t in r.get("tags", [])}
+        self.assertEqual(names, {"hccn", "命令参考"})
+
+    def test_registry_full_tags_in_graph(self):
+        """registry 全量标签建 Tag 节点（暂无文档关联也入图）+ github 标题词典提取。"""
+        from vllm_kb.tagging import TagEntry, TagRegistry
+
+        reg = TagRegistry(entries=[
+            TagEntry("HCCL", "domain"),
+            TagEntry("超时排查", "purpose"),
+        ])
+        b = GraphBuilder(Path(self.tmp.name) / "graph2")
+        b.create_schema()
+        b.build_from_canonical(self.canonical, calendars={"vllm-project/vllm-ascend": CAL},
+                               parsed_root=self.parsed, registry=reg)
+        try:
+            # 词典全量节点（即使无文档关联）
+            rows = b.query("MATCH (t:Tag {id:'HCCL'}) RETURN t.tier")
+            self.assertEqual(rows[0][0], "domain")
+            rows = b.query("MATCH (t:Tag {id:'超时排查'}) RETURN t.tier")
+            self.assertEqual(rows[0][0], "purpose")
+            # canonical tags（hccn/命令参考）仍在
+            rows = b.query("MATCH (t:Tag {id:'hccn'}) RETURN t.tier")
+            self.assertEqual(rows[0][0], "domain")
+            s = b.stats()
+            self.assertEqual(s.nodes["Tag"], 4)  # 2 canonical + 2 registry 全量
+        finally:
+            b.close()
 
 
 if __name__ == "__main__":

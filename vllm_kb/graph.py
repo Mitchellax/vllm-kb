@@ -62,6 +62,8 @@ _NODE_DDL = [
     "CREATE NODE TABLE Version(id STRING, PRIMARY KEY(id))",
     # 接口/命令（如 hccn_tool）：从手册表格/正文提取
     "CREATE NODE TABLE Interface(id STRING, PRIMARY KEY(id))",
+    # 文档级标签（两级分类：主题/领域 domain、具体作用 purpose）
+    "CREATE NODE TABLE Tag(id STRING, tier STRING, PRIMARY KEY(id))",
 ]
 
 _REL_DDL = [
@@ -73,6 +75,8 @@ _REL_DDL = [
     "FROM Doc TO Model, FROM Doc TO Version)",
     # 文档化关系：接口指南/手册等文档记录某错误码/接口（可回答"这个错误码在哪个手册定义"）
     "CREATE REL TABLE DOCUMENTS(FROM Doc TO ErrorCode, FROM Doc TO Interface)",
+    # 文档级标签关系：Doc/Issue/PR → Tag（最终标签 = (auto − excluded) ∪ manual）
+    "CREATE REL TABLE TAGGED_WITH(FROM Doc TO Tag, FROM Issue TO Tag, FROM PR TO Tag)",
 ]
 
 # 实体类型 → 节点表名
@@ -131,29 +135,28 @@ def _extract_doc_interfaces(doc: dict) -> set[str]:
 
 
 def _extract_doc_table_codes(doc: dict, parsed_root: Path) -> set[str]:
-    """从文档的 parsed 表格产物（data/parsed/pdf/<name>.tables.json）提取错误码。
+    """从文档的 parsed 表格产物（data/parsed/pdf/<asset_id>.tables.json）提取错误码。
 
     接口指南的错误码表 → ErrorCode 节点 + DOCUMENTS 边（"这个错误码在哪个手册定义"）。
-    无表格产物时返回空集。
+    无表格产物时返回空集。parsed 产物以 asset_id 命名（不暴露文件名/路径）。
     """
     codes: set[str] = set()
     asset = (doc.get("extra") or {}).get("asset") or {}
-    stem = Path(str(asset.get("path", ""))).stem
-    if not stem:
+    asset_id = str(asset.get("asset_id", ""))
+    if not asset_id:
         return codes
-    for name in (f"{stem}.tables.json", f"{stem}.table.json"):
-        p = parsed_root / "pdf" / name
-        if not p.exists():
-            continue
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        for tab in data.get("tables") or []:
-            for row in tab.get("rows") or []:
-                for cell in row:
-                    for m in _ERRCODE_IN_TEXT_RE.finditer(str(cell)):
-                        codes.add(m.group(1))
+    p = parsed_root / "pdf" / f"{asset_id}.tables.json"
+    if not p.exists():
+        return codes
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return codes
+    for tab in data.get("tables") or []:
+        for row in tab.get("rows") or []:
+            for cell in row:
+                for m in _ERRCODE_IN_TEXT_RE.finditer(str(cell)):
+                    codes.add(m.group(1))
     return codes
 
 
@@ -186,8 +189,9 @@ class GraphBuilder:
 
     def create_schema(self, drop_existing: bool = False) -> None:
         if drop_existing:
-            for name in ("DOCUMENTS", "MENTIONS", "MERGED_IN", "FIXES", "Interface",
-                         "Version", "Model", "ErrorCode", "Operator", "Doc", "Release", "PR", "Issue"):
+            for name in ("TAGGED_WITH", "DOCUMENTS", "MENTIONS", "MERGED_IN", "FIXES",
+                         "Tag", "Interface", "Version", "Model", "ErrorCode", "Operator",
+                         "Doc", "Release", "PR", "Issue"):
                 try:
                     self.conn.execute(f"DROP TABLE {name}")
                 except Exception:
@@ -205,15 +209,37 @@ class GraphBuilder:
         calendars: Optional[dict[str, list]] = None,
         limit: int = 0,
         parsed_root: Optional[str | os.PathLike] = None,
+        kb_path: Optional[str | os.PathLike] = None,
+        registry=None,
     ) -> GraphStats:
         """遍历 canonical.jsonl 建图。limit>0 时只处理前 limit 条（试跑）。
 
         calendars: {repo: [ReleaseInfo]}，None 时自动从 data/compatibility 加载。
         parsed_root: data/parsed 目录（None 时跳过文档表格 → ErrorCode 的 DOCUMENTS 提取）。
+        kb_path: kb.sqlite3（含 doc_tags 覆盖层）；None 时无人工标签覆盖（仅自动标签）。
+        registry: TagRegistry（config.tags.registry）——github 源标题标签提取 + 词典全量 Tag 节点。
         """
         calendars = calendars if calendars is not None else load_release_calendars()
         canonical_path = Path(canonical_path)
         parsed_root = Path(parsed_root) if parsed_root else None
+
+        # 人工标签覆盖层（doc_tags：excluded/manual）——最终标签 = (auto − excluded) ∪ manual
+        overlay: dict[str, dict] = {}
+        if kb_path is not None and Path(kb_path).exists():
+            try:
+                from .review import load_doc_tags_conn
+                import sqlite3 as _sqlite3
+
+                conn = _sqlite3.connect(f"file:{Path(kb_path).as_posix()}?mode=ro", uri=True)
+                try:
+                    overlay = load_doc_tags_conn(conn)
+                finally:
+                    conn.close()
+            except Exception as e:
+                print(f"[graph] 覆盖层读取失败（仅自动标签建图）: {e}")
+        from .tagging import TagRegistry, merge_final
+
+        registry = registry if registry is not None else TagRegistry()
 
         # 收集节点与边
         issue_rows: dict[str, dict] = {}
@@ -222,10 +248,12 @@ class GraphBuilder:
         release_rows: dict[str, dict] = {}
         entity_vals: dict[str, set[str]] = {k: set() for k in _ENTITY_TABLE}
         interface_vals: set[str] = set()
+        tag_vals: dict[str, str] = {}  # tag 名 -> tier
         fixes_edges: set[tuple[str, str]] = set()      # (pr_id, issue_id)
         merged_edges: set[tuple[str, str]] = set()     # (pr_id, release_id)
         mention_edges: set[tuple[str, str, str]] = set()  # (doc_id, entity_kind, value)
         documents_edges: set[tuple[str, str, str]] = set()  # (doc_id, target_kind, target_id)
+        tagged_edges: set[tuple[str, str]] = set()  # (doc_id, tag)
 
         with canonical_path.open(encoding="utf-8") as f:
             # 总行数（进度分母）；66K 文档全量建图约分钟级，节流打印避免刷屏
@@ -244,8 +272,9 @@ class GraphBuilder:
                 except json.JSONDecodeError:
                     continue
                 self._ingest_doc(doc, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
-                                 interface_vals, fixes_edges, merged_edges, mention_edges,
-                                 documents_edges, calendars, parsed_root)
+                                 interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,
+                                 documents_edges, tagged_edges, calendars, parsed_root,
+                                 overlay, registry)
                 if i and i % step == 0:
                     elapsed = time.time() - start_ts
                     rate = (i + 1) / elapsed if elapsed > 0 else 0.0
@@ -270,21 +299,29 @@ class GraphBuilder:
             if a in doc_ids and (k == "error_code" and v in entity_vals["error_code"]
                                  or k == "interface" and v in interface_vals)
         }
+        tagged_edges = {(a, t) for a, t in tagged_edges if a in doc_ids and t in tag_vals}
+        # 词典全量标签也建 Tag 节点（暂无文档关联的标签同样入图，保证"新增标签建图时入图"）
+        for e in registry.entries:
+            tag_vals.setdefault(e.name, e.tier)
 
         # 写入 CSV 并 COPY
         copy_start = time.time()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             self._copy_nodes(tmp_path, issue_rows, pr_rows, doc_rows, release_rows,
-                             entity_vals, interface_vals)
-            self._copy_rels(tmp_path, fixes_edges, merged_edges, mention_edges, documents_edges)
+                             entity_vals, interface_vals, tag_vals)
+            self._copy_rels(tmp_path, fixes_edges, merged_edges, mention_edges, documents_edges,
+                            tagged_edges)
         print(f"[graph] COPY 完成（{time.time() - copy_start:.0f}s）", flush=True)
 
         return self.stats()
 
     def _ingest_doc(self, doc: dict, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
-                    interface_vals, fixes_edges, merged_edges, mention_edges, documents_edges,
-                    calendars, parsed_root: Optional[Path] = None) -> None:
+                    interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,
+                    documents_edges, tagged_edges, calendars, parsed_root: Optional[Path] = None,
+                    overlay: Optional[dict] = None, registry=None) -> None:
+        from .tagging import merge_final
+
         st = doc.get("source_type", "")
         sid = doc.get("source_id", "")
         if not sid:
@@ -302,7 +339,18 @@ class GraphBuilder:
             doc.get("body") or "",
             version_span_min=vs.get("min"),
             version_span_max=vs.get("max"),
+            title=title,
+            registry=registry,
         )
+
+        # 文档级标签：自动 = canonical tags ∪ 标题词典命中（github 源），
+        # 最终 = (auto − excluded) ∪ manual（覆盖层见 kb.sqlite3 doc_tags）
+        auto_tags = list(dict.fromkeys((doc.get("tags") or []) + (ex.tags or [])))
+        ov = (overlay or {}).get(sid, {})
+        final_tags = merge_final(auto_tags, ov.get("excluded", []), ov.get("manual", []))
+        for t in final_tags:
+            tag_vals.setdefault(t, registry.tier(t) if registry else "domain")
+            tagged_edges.add((sid, t))
 
         if st == "github_issue":
             issue_rows[sid] = {
@@ -371,7 +419,7 @@ class GraphBuilder:
         return str(p).replace("\\", "/")
 
     def _copy_nodes(self, tmp: Path, issue_rows, pr_rows, doc_rows, release_rows,
-                    entity_vals, interface_vals) -> None:
+                    entity_vals, interface_vals, tag_vals) -> None:
         def _node_csv(name, rows):
             if not rows:
                 return None
@@ -384,6 +432,11 @@ class GraphBuilder:
             if p:
                 print(f"[graph]   COPY {table}（{len(rows)} 节点）…", flush=True)
                 self.conn.execute(f"COPY {table} FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
+        if tag_vals:
+            p = self._write_csv(tmp, "Tag.csv", ["id", "tier"],
+                                ([name, tier] for name, tier in sorted(tag_vals.items())))
+            print(f"[graph]   COPY Tag（{len(tag_vals)} 节点）…", flush=True)
+            self.conn.execute(f"COPY Tag FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
         if interface_vals:
             p = self._write_csv(tmp, "Interface.csv", ["id"], ([v] for v in sorted(interface_vals)))
             print(f"[graph]   COPY Interface（{len(interface_vals)} 节点）…", flush=True)
@@ -397,7 +450,7 @@ class GraphBuilder:
             self.conn.execute(f"COPY {table} FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
 
     def _copy_rels(self, tmp: Path, fixes_edges, merged_edges, mention_edges,
-                   documents_edges) -> None:
+                   documents_edges, tagged_edges) -> None:
         if fixes_edges:
             p = self._write_csv(tmp, "FIXES.csv", ["PR_id", "Issue_id"], fixes_edges)
             print(f"[graph]   COPY FIXES（{len(fixes_edges)} 边）…", flush=True)
@@ -442,6 +495,27 @@ class GraphBuilder:
                 if doc_edges:
                     p = self._write_csv(tmp, f"MENTIONS_D_{table}.csv", ["Doc_id", f"{table}_id"], doc_edges)
                     self.conn.execute(f"COPY MENTIONS FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='Doc', TO='{table}')")
+        if tagged_edges:
+            # TAGGED_WITH 多 label 源端：按 Doc/Issue/PR 拆分 CSV
+            issue_edges = [(a, b) for a, b in tagged_edges if ":issue:" in a]
+            pr_edges = [(a, b) for a, b in tagged_edges if ":pr:" in a]
+            doc_edges = [(a, b) for a, b in tagged_edges
+                         if ":issue:" not in a and ":pr:" not in a]
+            print(f"[graph]   COPY TAGGED_WITH（{len(tagged_edges)} 边，"
+                  f"Issue {len(issue_edges)} / PR {len(pr_edges)} / Doc {len(doc_edges)}）…",
+                  flush=True)
+            if issue_edges:
+                p = self._write_csv(tmp, "TAGGED_WITH_I.csv", ["Issue_id", "Tag_id"], issue_edges)
+                self.conn.execute(
+                    f"COPY TAGGED_WITH FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='Issue', TO='Tag')")
+            if pr_edges:
+                p = self._write_csv(tmp, "TAGGED_WITH_P.csv", ["PR_id", "Tag_id"], pr_edges)
+                self.conn.execute(
+                    f"COPY TAGGED_WITH FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='PR', TO='Tag')")
+            if doc_edges:
+                p = self._write_csv(tmp, "TAGGED_WITH_D.csv", ["Doc_id", "Tag_id"], doc_edges)
+                self.conn.execute(
+                    f"COPY TAGGED_WITH FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='Doc', TO='Tag')")
 
     # ---------- 查询与统计 ----------
 
@@ -555,13 +629,17 @@ class GraphBuilder:
         }
 
     def doc_neighbors(self, doc_id: str) -> dict:
-        """文档邻接视图（调试/详情）：MENTIONS 实体 + DOCUMENTS（手册定义了什么）。"""
+        """文档邻接视图（调试/详情）：MENTIONS 实体 + DOCUMENTS（手册定义了什么）+ tags。"""
         mentions = self.query(
             "MATCH (d {id: $id})-[:MENTIONS]->(e) RETURN label(e) AS etype, e.id",
             {"id": doc_id},
         )
         documents = self.query(
             "MATCH (d:Doc {id: $id})-[:DOCUMENTS]->(e) RETURN label(e) AS etype, e.id",
+            {"id": doc_id},
+        )
+        tags = self.query(
+            "MATCH (d {id: $id})-[:TAGGED_WITH]->(t:Tag) RETURN t.id, t.tier",
             {"id": doc_id},
         )
         out = {
@@ -575,7 +653,33 @@ class GraphBuilder:
                  "value": r[1]}
                 for r in documents
             ]
+        if tags:
+            out["tags"] = [{"name": r[0], "tier": r[1]} for r in tags]
         return out
+
+    def tags_lookup(self, tag: str, limit: int = 50) -> dict:
+        """标签 → 打标文档（Doc/Issue/PR）列表（能力目录的图侧查询）。"""
+        limit = max(1, min(int(limit), 200))
+        rows = self.query(
+            "MATCH (d)-[:TAGGED_WITH]->(t:Tag {id: $tag}) "
+            "RETURN label(d) AS dlabel, d.id, d.title ORDER BY d.id LIMIT " + str(limit),
+            {"tag": tag},
+        )
+        docs = [
+            {"doc_type": r[0], "doc_id": r[1], "title": r[2]}
+            for r in rows if r[1]
+        ]
+        tier = None
+        tr = self.query("MATCH (t:Tag {id: $tag}) RETURN t.tier", {"tag": tag})
+        if tr:
+            tier = tr[0][0]
+        return {
+            "tag": tag,
+            "tier": tier,
+            "docs": docs,
+            "count": len(docs),
+            "note": "doc_type: Issue/PR/Doc（Doc=业务文档）；打标文档为最终标签（含人工治理）",
+        }
 
     def docs_for_error_code(self, code: str) -> list[dict]:
         """错误码 → 定义它的文档（DOCUMENTS 反向）："这个错误码在哪个手册定义"。"""
@@ -589,7 +693,7 @@ class GraphBuilder:
         s = GraphStats()
         for row in self.query("MATCH (n) RETURN label(n), count(*) ORDER BY count(*) DESC"):
             s.nodes[str(row[0])] = int(row[1])
-        for rel in ("FIXES", "MERGED_IN", "MENTIONS", "DOCUMENTS"):
+        for rel in ("FIXES", "MERGED_IN", "MENTIONS", "DOCUMENTS", "TAGGED_WITH"):
             try:
                 s.rels[rel] = int(self.query(f"MATCH ()-[:{rel}]->() RETURN count(*)")[0][0])
             except Exception:

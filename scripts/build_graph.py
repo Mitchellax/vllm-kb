@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vllm_kb.config import AppConfig
 from vllm_kb.graph import GraphBuilder, default_graph_path
+from vllm_kb.tagging import TagRegistry
 
 
 def main() -> None:
@@ -39,7 +40,11 @@ def main() -> None:
         canonical = cfg.resolve(cfg.storage.canonical_file)
         # parsed 目录用于提取文档表格（错误码表 → ErrorCode 节点 + DOCUMENTS 边）
         parsed_root = cfg.resolve("data/parsed")
-        s = builder.build_from_canonical(canonical, limit=args.limit, parsed_root=parsed_root)
+        # kb.sqlite3 提供人工标签覆盖层（doc_tags）；registry 提供词典全量 Tag 节点 + 标题标签提取
+        kb_path = cfg.resolve(cfg.storage.sqlite_path)
+        registry = TagRegistry.load(cfg)
+        s = builder.build_from_canonical(canonical, limit=args.limit, parsed_root=parsed_root,
+                                         kb_path=kb_path, registry=registry)
         print("[graph] 构建完成：")
         print(s.summary())
     finally:
