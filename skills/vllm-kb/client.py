@@ -359,7 +359,9 @@ def fmt_tags_match(data: dict) -> str:
         return "\n".join(lines)
     for m in matched:
         tier_label = "领域" if m.get("tier") == "domain" else "作用"
-        lines.append(f"[{tier_label}] {m['name']}（{m.get('docs', 0)} 篇）")
+        n = m.get("docs", 0)
+        zero_note = "" if n else "（词典已注册、暂无打标文档——可 search 语义检索该主题确认）"
+        lines.append(f"[{tier_label}] {m['name']}（{n} 篇）{zero_note}")
         for d in m.get("top", []):
             lines.append(f"    → {d['doc_id']}  {d['title']}（验证={d.get('verification') or '-'}）")
     lines.append("提示: 同时命中领域×作用的文档交集最相关；读取全文 doc <id>；按标签列表 tags docs <标签>")
