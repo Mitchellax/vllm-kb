@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -164,6 +164,22 @@ class VerifyCfg(BaseModel):
     queries: list[str] = Field(default_factory=list)
 
 
+class TagCfg(BaseModel):
+    """文档级标签（两级分类）配置。
+
+    - registry: 标签词典（全局唯一事实源），条目形态 {"name": "...", "tier": "domain|purpose"}
+      （兼容裸字符串，tier 走启发式判定）；审核页新增/改名/改 tier 后同步回本段；
+    - stopwords: 拉丁词 token 过滤（如 guide/manual/doc 等文档形态词）；
+    - min_len: token 成为标签候选的最小长度；
+    - heading_max_chars: 标题直接作为候选的最大字符数（超长标题只参与词典子串匹配）。
+    """
+
+    registry: list[Any] = Field(default_factory=list)  # {"name","tier"} 或裸字符串（tier 启发式）
+    stopwords: list[str] = Field(default_factory=list)
+    min_len: int = 2
+    heading_max_chars: int = 12
+
+
 class LoggingCfg(BaseModel):
     """总日志：打屏（默认）+ 可选落盘分卷（RotatingFileHandler）。"""
 
@@ -187,6 +203,7 @@ class AppConfig(BaseModel):
     verify: VerifyCfg = Field(default_factory=VerifyCfg)
     code: CodeCfg = Field(default_factory=CodeCfg)
     logging: LoggingCfg = Field(default_factory=LoggingCfg)
+    tags: TagCfg = Field(default_factory=TagCfg)
 
     @classmethod
     def load(cls, path: Optional[str | os.PathLike] = None, require_keys: bool = True) -> "AppConfig":

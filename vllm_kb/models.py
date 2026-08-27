@@ -30,6 +30,9 @@ class KbDocument(BaseModel):
     resolved_at: Optional[str] = None  # closed_at / 修复合并时间；None = 未解决
     status: str = "open"  # open | closed | merged | archived
     labels: list[str] = Field(default_factory=list)
+    # 文档级自动标签（两级分类：主题/领域 domain、具体作用 purpose），入库时确定性提取；
+    # 最终生效标签 = (auto − doc_tags.excluded) ∪ doc_tags.manual（见 tagging.merge_final）
+    tags: list[str] = Field(default_factory=list)
     version_span: VersionSpan = Field(default_factory=VersionSpan)
     component: str = ""  # 主组件：vllm | vllm-ascend | cann | pytorch | pytorch-ascend | npu-driver | 其他
     component_versions: dict[str, str] = Field(default_factory=dict)  # 正文提到的其他组件版本

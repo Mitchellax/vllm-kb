@@ -166,5 +166,17 @@
     "file_path": "logs/vllm-kb.log",
     "max_bytes": 10485760,
     "backup_count": 5
+  },
+  "_comment_tags": "文档级标签（两级分类：主题/领域 domain、具体作用 purpose）。registry=标签词典（全局唯一事实源，条目 {\"name\":..., \"tier\":\"domain|purpose\"}，兼容裸字符串），审核页新增/改名/改 tier 后同步回本段；stopwords=拉丁词 token 过滤（guide/manual 等文档形态词）；min_len=token 成为候选的最小长度；heading_max_chars=标题直接作为候选的最大字符数（超长标题只参与词典子串匹配）。",
+  "tags": {
+    "registry": [
+      {"name": "HCCL", "tier": "domain"},
+      {"name": "超时排查", "tier": "purpose"},
+      {"name": "命令参考", "tier": "purpose"},
+      {"name": "错误码表", "tier": "purpose"}
+    ],
+    "stopwords": ["guide", "manual", "doc", "docs", "reference", "user", "users", "operation", "vllm-kb"],
+    "min_len": 2,
+    "heading_max_chars": 12
   }
 }
