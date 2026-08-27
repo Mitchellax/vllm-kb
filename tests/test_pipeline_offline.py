@@ -459,5 +459,53 @@ class TestOfflinePipeline(unittest.TestCase):
             engine.close()
 
 
+class TestCanonicalUpsert(unittest.TestCase):
+    """统一 canonical upsert：新增 / 更新（修改的 PDF 回写）/ 跳过（幂等）/ 不覆盖其他来源。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = make_cfg(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def path(self):
+        return Path(self.cfg.storage.canonical_file)
+
+    def test_add_skip_update(self):
+        from vllm_kb.pipeline import upsert_unified_canonical
+
+        # 新增 2 条
+        r = upsert_unified_canonical(self.cfg, [CUDA_ISSUE, OOM_ISSUE])
+        self.assertEqual(r, {"added": 2, "updated": 0, "skipped": 0})
+        lines = self.path().read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        # 幂等：内容相同 → 全部跳过（不重写）
+        r2 = upsert_unified_canonical(self.cfg, [CUDA_ISSUE, OOM_ISSUE])
+        self.assertEqual(r2, {"added": 0, "updated": 0, "skipped": 2})
+        self.assertEqual(len(self.path().read_text(encoding="utf-8").splitlines()), 2)
+        # 更新：标题变化（模拟修改过的 PDF 重新解析）→ updated，行内容回写
+        changed = CUDA_ISSUE.model_copy(update={"title": "修改后的标题"})
+        r3 = upsert_unified_canonical(self.cfg, [changed])
+        self.assertEqual(r3, {"added": 0, "updated": 1, "skipped": 0})
+        first = json.loads(self.path().read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(first["title"], "修改后的标题")
+
+    def test_preserves_other_sources(self):
+        """逐来源处理：upsert 本来源时，canonical 中其他来源的行必须保留。"""
+        from vllm_kb.pipeline import upsert_unified_canonical
+
+        self.path().write_text(
+            '{"source_id": "github:issue:999", "source_type": "github_issue", "title": "旧", "body": "x"}\n',
+            encoding="utf-8",
+        )
+        r = upsert_unified_canonical(self.cfg, [FEATURE_ISSUE])
+        self.assertEqual(r["added"], 1)
+        lines = self.path().read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)  # 旧行 + 新行
+        ids = {json.loads(x)["source_id"] for x in lines}
+        self.assertEqual(ids, {"github:issue:999", "github:issue:10003"})
+
+
 if __name__ == "__main__":
     unittest.main()

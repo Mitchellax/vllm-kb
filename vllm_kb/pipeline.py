@@ -66,32 +66,56 @@ def write_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> int:
     return len(seen)
 
 
-def append_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> int:
-    """把单来源文档去重追加到统一 canonical（逐来源处理时用，不覆盖已有来源）。"""
+def upsert_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> dict:
+    """把单来源文档按 source_id **upsert** 到统一 canonical（逐来源处理时用，不覆盖其他来源）。
+
+    - source_id 不存在 → 追加（新增）；
+    - 行内容与旧行相同 → 跳过（幂等，不重写）；
+    - 行内容不同（如**修改过的 PDF**）→ 覆盖更新——canonical 是 --rebuild 的唯一事实源，
+      修改必须回写，否则全量重建会回退旧内容。
+    返回 {"added": int, "updated": int, "skipped": int}。
+    """
     from .models import doc_to_json
 
     path = cfg.resolve(cfg.storage.canonical_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    seen: set[str] = set()
+    existing: dict[str, str] = {}  # source_id -> 行内容（保留原行序，新增追加末尾）
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                seen.add(json.loads(line).get("source_id", ""))
+                sid = json.loads(line).get("source_id", "")
             except Exception:
-                pass
-    added = 0
-    with open(path, "a", encoding="utf-8") as f:
-        for doc in docs:
-            if doc.source_id in seen:
-                continue
-            seen.add(doc.source_id)
-            f.write(doc_to_json(doc) + "\n")
+                sid = ""
+            if sid:
+                existing[sid] = line
+    added = updated = 0
+    changed: list[str] = []
+    for doc in docs:
+        new_line = doc_to_json(doc)
+        sid = doc.source_id
+        old = existing.get(sid)
+        if old is None:
+            existing[sid] = new_line
             added += 1
-    print(f"[build] canonical 追加 {added} 条（累计 {len(seen)}）-> {path}")
-    return added
+        elif old != new_line:
+            existing[sid] = new_line
+            updated += 1
+            changed.append(sid)
+        # 内容相同：跳过（幂等）
+    with open(path, "w", encoding="utf-8") as f:
+        for line in existing.values():
+            f.write(line + "\n")
+    skipped = max(0, len(docs) - added - updated)
+    note = ""
+    if changed:
+        shown = ", ".join(changed[:5])
+        note = f"（更新 {len(changed)} 条: {shown}{'…' if len(changed) > 5 else ''}）"
+    print(f"[build] canonical upsert：新增 {added} / 更新 {updated} / 跳过 {skipped}"
+          f"{note}（累计 {len(existing)}）-> {path}")
+    return {"added": added, "updated": updated, "skipped": skipped}
 
 
 def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | None) -> dict:
@@ -106,7 +130,7 @@ def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | Non
     print(f"[build] 来源 {src.id} ({src.type}) canonical {len(docs)} 条")
     if not docs:
         return {"pulled": 0, "docs": 0}
-    append_unified_canonical(cfg, docs)
+    upsert_unified_canonical(cfg, docs)
     embed_client = EmbeddingClient(cfg.embedding)
     vector_store = build_vector_store(cfg)
     stats = ingest_docs(cfg, docs, embed_client, vector_store)
