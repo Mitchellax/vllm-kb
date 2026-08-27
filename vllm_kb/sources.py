@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 import shutil
 import time
@@ -380,28 +381,58 @@ class PdfSource(BaseSource):
         for i, p in enumerate(pdfs, 1):
             t0 = time.time()
             try:
-                doc = self._parse_pdf(p, parsed_dir)
+                result = self._parse_pdf(p, parsed_dir)
             except Exception as e:
                 print(f"[sources:{self.id}] [{i}/{total}] 解析失败 {p.name}: {e}（跳过）",
                       flush=True)
                 continue
-            if doc is None:
+            if result is None:
                 continue
+            doc, cached = result
             docs.append(doc)
             pages = (doc.extra.get("asset") or {}).get("pages", "?")
+            cache_tag = "，缓存命中" if cached else ""
             print(f"[sources:{self.id}] [{i}/{total}] 解析完成 {p.name}（{pages} 页，"
-                  f"{time.time() - t0:.1f}s）", flush=True)
+                  f"{time.time() - t0:.1f}s{cache_tag}）", flush=True)
         print(f"[sources:{self.id}] 解析完成：成功 {len(docs)}/{total}（耗时 "
               f"{time.time() - start_ts:.0f}s）", flush=True)
         return docs
 
-    def _parse_pdf(self, p: Path, parsed_dir: Path) -> Optional[KbDocument]:
-        import pymupdf
+    def _parse_pdf(self, p: Path, parsed_dir: Path):
+        """解析单篇 PDF，返回 (KbDocument | None, 是否缓存命中)。
 
+        **缓存优先**：耗时大头是 PyMuPDF 逐页提取（大手册 200+ 页约数秒~数十秒）；
+        解析中间产物（文字层 body + 表格 + 首行/页数）按 asset_id（sha256 前缀，内容寻址）
+        缓存到 `parsed/pdf/<asset_id>.extract.json`——PDF 未变（sha256 一致）时直接复用缓存，
+        仅重跑确定性提取（标签/元数据，毫秒级），提取规则升级后**无需清缓存**即可生效；
+        删除 `parsed/pdf/` 目录即强制全量重解析。
+        """
         sha = _sha256(p)
-        # 资产唯一标识：sha256 前缀（不可变、不暴露存储路径；管理员侧经 asset_registry 映射）
         asset_id = sha[:16]
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
+        cache = parsed_dir / f"{asset_id}.extract.json"
+        if cache.exists():
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+                if data.get("sha256") == sha:
+                    return self._doc_from_extract(p, sha, asset_id, data, registry), True
+            except (OSError, ValueError):
+                pass  # 缓存损坏 → 重新解析
+        parsed = self._extract_pdf(p)
+        if parsed is None:
+            return None, False
+        cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
+        self._write_tables(parsed_dir, asset_id, parsed.get("tables") or [])
+        return self._doc_from_extract(p, sha, asset_id, parsed, registry), False
+
+    def _extract_pdf(self, p: Path):
+        """PyMuPDF 逐页提取（慢，结果可缓存）：文字层 → Markdown 正文 + 结构化表格。
+
+        返回 {"sha256", "asset_id", "pages", "first_text", "body", "tables"}；
+        加密/无文字层返回 None（调用方跳过）。
+        """
+        import pymupdf
+
         pdf = pymupdf.open(str(p))
         try:
             if pdf.needs_pass:
@@ -431,40 +462,60 @@ class PdfSource(BaseSource):
             if not body:
                 print(f"[sources:{self.id}] 跳过无文字层 PDF（可能为扫描件，待 OCR）: {p.name}")
                 return None
-            title = first_text or p.stem
-            # 文档级自动标签：文件名 + 内部编号标题（两级分类，见 tagging.py）
-            tags, cands = extract_tags(p.stem, headings_from_pdf(body), registry=registry)
-            # 结构化表格落盘（可重跑产物，以 asset_id 命名——不暴露文件名/路径）
-            tables_rel = []
-            if tables:
-                tpath = parsed_dir / f"{asset_id}.tables.json"
-                tpath.write_text(
-                    __import__("json").dumps({"source": f"pdf:{asset_id}", "tables": tables},
-                                             ensure_ascii=False, indent=1),
-                    encoding="utf-8",
-                )
-                tables_rel.append(f"parsed/pdf/{tpath.name}")
-            return KbDocument(
-                source_type="doc_pdf",
-                source_id=f"pdf:{p.stem}",
-                url="",
-                title=title,
-                body=body,
-                created_at=None,
-                component="",
-                tags=[t.name for t in tags],
-                extra={
-                    "asset": {"asset_id": asset_id, "sha256": sha,
-                              "format": "pdf", "pages": pdf.page_count},
-                    "quality": {"text_source": "text_layer", "parsed_with": "pymupdf"},
-                    "verification": "expert",  # 官方操作手册默认专家验证
-                    "structure": {"tables": tables_rel},
-                    # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
-                    "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
-                },
-            )
+            return {
+                "sha256": _sha256(p),
+                "asset_id": _sha256(p)[:16],
+                "pages": pdf.page_count,
+                "first_text": first_text,
+                "body": body,
+                "tables": tables,
+            }
         finally:
             pdf.close()
+
+    def _write_tables(self, parsed_dir: Path, asset_id: str, tables: list[dict]) -> list[str]:
+        """结构化表格落盘（可重跑产物，以 asset_id 命名——不暴露文件名/路径）。"""
+        if not tables:
+            return []
+        tpath = parsed_dir / f"{asset_id}.tables.json"
+        tpath.write_text(
+            json.dumps({"source": f"pdf:{asset_id}", "tables": tables},
+                       ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        return [f"parsed/pdf/{tpath.name}"]
+
+    def _doc_from_extract(self, p: Path, sha: str, asset_id: str, parsed: dict,
+                          registry: TagRegistry) -> KbDocument:
+        """用解析中间产物构造 KbDocument（确定性提取，毫秒级，每次运行重算）。
+
+        缓存命中与首次解析共用本函数——标签/元数据提取始终以最新规则执行，
+        解析器升级（pymupdf 版本/提取逻辑）不影响提取结果的一致性。
+        """
+        body = str(parsed.get("body") or "")
+        title = str(parsed.get("first_text") or "").strip() or p.stem
+        tags, cands = extract_tags(p.stem, headings_from_pdf(body), registry=registry)
+        # tables.json 由 _parse_pdf 首次解析时写入；缓存命中时文件已存在，rel 引用直接构造
+        tables_rel = [f"parsed/pdf/{asset_id}.tables.json"] if parsed.get("tables") else []
+        return KbDocument(
+            source_type="doc_pdf",
+            source_id=f"pdf:{p.stem}",
+            url="",
+            title=title,
+            body=body,
+            created_at=None,
+            component="",
+            tags=[t.name for t in tags],
+            extra={
+                "asset": {"asset_id": asset_id, "sha256": sha,
+                          "format": "pdf", "pages": int(parsed.get("pages") or 0)},
+                "quality": {"text_source": "text_layer", "parsed_with": "pymupdf"},
+                "verification": "expert",  # 官方操作手册默认专家验证
+                "structure": {"tables": tables_rel},
+                # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+                "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
+            },
+        )
 
 
 def _table_to_markdown(rows: list[list]) -> str:

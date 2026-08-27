@@ -179,6 +179,35 @@ class TestPdfSource(unittest.TestCase):
         finally:
             os.environ.pop("VLLM_KB_DATA_ROOT", None)
 
+    def test_parse_cache_reused(self):
+        """资产未变时二次 canonicalize 复用解析缓存（不触发 PyMuPDF 逐页提取）。"""
+        import unittest.mock as mock
+
+        self.src.pull()
+        docs1 = self.src.canonicalize()
+        self.assertEqual(len(docs1), 1)
+        parsed_dir = self.root / "data" / "parsed" / "pdf"
+        self.assertTrue(list(parsed_dir.glob("*.extract.json")), "应生成解析缓存")
+        # 第二次：pymupdf.open 不应被调用（缓存命中，跳过逐页提取）
+        with mock.patch("pymupdf.open", side_effect=AssertionError("缓存命中不应重新解析")):
+            docs2 = self.src.canonicalize()
+        self.assertEqual(len(docs2), 1)
+        self.assertEqual(docs2[0].body, docs1[0].body)
+        self.assertEqual(docs2[0].tags, docs1[0].tags)
+        self.assertEqual(docs2[0].extra["asset"]["asset_id"],
+                         docs1[0].extra["asset"]["asset_id"])
+
+    def test_parse_cache_corrupt_reparses(self):
+        """缓存损坏（非法 JSON）→ 自动重新解析并重建缓存。"""
+        self.src.pull()
+        self.src.canonicalize()
+        cache = list((self.root / "data" / "parsed" / "pdf").glob("*.extract.json"))[0]
+        cache.write_text("{broken json", encoding="utf-8")
+        docs = self.src.canonicalize()
+        self.assertEqual(len(docs), 1)
+        # 缓存已重建为合法 JSON
+        self.assertIn("body", json.loads(cache.read_text(encoding="utf-8")))
+
     def test_tables_json_written(self):
         self.src.pull()
         self.src.canonicalize()
