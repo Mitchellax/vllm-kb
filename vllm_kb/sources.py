@@ -20,6 +20,7 @@ import base64
 import hashlib
 import re
 import shutil
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -200,6 +201,10 @@ class MarkdownSource(BaseSource):
             if assets.exists():
                 md_files = [(p, False) for p in sorted(assets.glob("*.md"))
                             + sorted(assets.glob("*.markdown"))]
+        total = len(md_files)
+        start_ts = time.time()
+        if total:
+            print(f"[sources:{self.id}] 解析 {total} 个 Markdown …", flush=True)
         for p, from_imports in md_files:
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
@@ -234,6 +239,9 @@ class MarkdownSource(BaseSource):
                 tags=[t.name for t in tags],
                 extra=extra,
             ))
+        if total:
+            print(f"[sources:{self.id}] 解析完成：{len(docs)}/{total} 篇（耗时 "
+                  f"{time.time() - start_ts:.0f}s）", flush=True)
         return docs
 
     # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
@@ -346,7 +354,10 @@ class PdfSource(BaseSource):
         """从资产层 PDF 解析出 KbDocument（每篇一个，body=Markdown 全文）。
 
         表格策略：页面表格转 Markdown 表格拼入正文（错误码/命令可被 FTS 检索），
-        同时写入 parsed/pdf/{stem}.tables.json 供结构化消费（图/查询）。
+        同时写入 parsed/pdf/{asset_id}.tables.json 供结构化消费（图/查询）。
+
+        PyMuPDF 逐页提取文字与表格较耗时（大手册如 200+ 页需数秒~数十秒）——
+        逐篇打印进度（序号/页数/耗时），recanonicalize / 重新入库时可见进展。
         """
         try:
             import pymupdf  # PyMuPDF 1.28+（旧名 fitz 已弃用）
@@ -359,15 +370,29 @@ class PdfSource(BaseSource):
             return docs
         parsed_dir = self._parsed_dir()
         parsed_dir.mkdir(parents=True, exist_ok=True)
-        for p in sorted(assets.glob("*.pdf")):
+        pdfs = sorted(assets.glob("*.pdf"))
+        if not pdfs:
+            return docs
+        total = len(pdfs)
+        start_ts = time.time()
+        print(f"[sources:{self.id}] 解析 {total} 个 PDF（PyMuPDF 逐页提取，大手册耗时较长）…",
+              flush=True)
+        for i, p in enumerate(pdfs, 1):
+            t0 = time.time()
             try:
                 doc = self._parse_pdf(p, parsed_dir)
             except Exception as e:
-                print(f"[sources:{self.id}] 解析失败 {p.name}: {e}（跳过）")
+                print(f"[sources:{self.id}] [{i}/{total}] 解析失败 {p.name}: {e}（跳过）",
+                      flush=True)
                 continue
             if doc is None:
                 continue
             docs.append(doc)
+            pages = (doc.extra.get("asset") or {}).get("pages", "?")
+            print(f"[sources:{self.id}] [{i}/{total}] 解析完成 {p.name}（{pages} 页，"
+                  f"{time.time() - t0:.1f}s）", flush=True)
+        print(f"[sources:{self.id}] 解析完成：成功 {len(docs)}/{total}（耗时 "
+              f"{time.time() - start_ts:.0f}s）", flush=True)
         return docs
 
     def _parse_pdf(self, p: Path, parsed_dir: Path) -> Optional[KbDocument]:
