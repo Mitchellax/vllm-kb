@@ -92,6 +92,23 @@ class BaseSource(ABC):
         """该来源原始数据的独立目录（默认 data/raw/{source_id}）。"""
         return self.resolve(self.cfg.get("raw_dir", f"data/raw/{self.id}"))
 
+    def _register_asset_mappings(self, items: list[tuple[str, str, str]]) -> None:
+        """注册资产到审核侧 asset_registry（管理员路径映射；不进 canonical/检索库）。
+
+        items: [(assets相对路径, sha256, source_type)]。app_cfg 缺失（纯解析测试）时跳过。
+        幂等 upsert；失败仅提示，不影响入库。
+        """
+        if self.app_cfg is None or not items:
+            return
+        try:
+            from .review import register_asset
+
+            db = self.app_cfg.resolve(self.app_cfg.storage.review_path)
+            for rel, sha, stype in items:
+                register_asset(db, sha[:16], rel, sha256=sha, source_type=stype)
+        except Exception as e:
+            print(f"[sources:{self.id}] asset_registry 注册失败（不影响入库）: {e}")
+
     @abstractmethod
     def pull(self) -> int:
         """把原始数据拉取到 raw_dir（幂等、断点续传），返回本次新增条数。"""
@@ -153,10 +170,13 @@ class MarkdownSource(BaseSource):
             print(f"[sources:{self.id}] 导入目录不存在: {self.import_dir}")
             return 0
         added = 0
+        registered: list[tuple[str, str, str]] = []
         for p in sorted(self.import_dir.rglob("*.md")) + sorted(self.import_dir.rglob("*.markdown")):
-            _, _, copied = _copy_asset(p, self.resolve("data/assets"), "md")
+            rel, sha, copied = _copy_asset(p, self.resolve("data/assets"), "md")
+            registered.append((rel, sha, "doc_markdown"))
             if copied:
                 added += 1
+        self._register_asset_mappings(registered)
         print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 md）")
         return added
 
@@ -310,10 +330,13 @@ class PdfSource(BaseSource):
             print(f"[sources:{self.id}] 导入目录不存在: {self.import_dir}")
             return 0
         added = 0
+        registered: list[tuple[str, str, str]] = []
         for p in sorted(self.import_dir.rglob("*.pdf")):
-            _, _, copied = _copy_asset(p, self.resolve("data/assets"), "pdf")
+            rel, sha, copied = _copy_asset(p, self.resolve("data/assets"), "pdf")
+            registered.append((rel, sha, "doc_pdf"))
             if copied:
                 added += 1
+        self._register_asset_mappings(registered)
         print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 pdf）")
         return added
 

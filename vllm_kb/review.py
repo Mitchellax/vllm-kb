@@ -40,6 +40,37 @@ STATUSES = ("pending", "approved", "suspected", "deleted")
 # 队列排序权重：未审核最先，存疑其次，已处理最后
 _STATUS_ORDER = {"pending": 0, "suspected": 1, "approved": 2, "deleted": 3}
 
+# 资产注册表（review.sqlite3，管理员侧）：资产路径**不进 canonical/检索库**（安全约束）；
+# 审核页显示/预览/待删除列表经 asset_id → rel_path 找回文件；检索 API 全程不碰审核库。
+_ASSET_REGISTRY_DDL = """
+CREATE TABLE IF NOT EXISTS asset_registry (
+  asset_id TEXT PRIMARY KEY,
+  rel_path TEXT NOT NULL,
+  sha256 TEXT,
+  size INTEGER,
+  source_type TEXT
+);
+"""
+
+# 文档级标签覆盖层（kb.sqlite3，ingest 建表；本模块读写函数独立可用时幂等补建）
+_DOC_TAGS_DDL = """
+CREATE TABLE IF NOT EXISTS doc_tags (
+  source_id TEXT PRIMARY KEY,
+  auto_snapshot TEXT,
+  excluded TEXT,
+  manual TEXT,
+  updated_at TEXT,
+  reviewer TEXT
+);
+"""
+
+
+def _ensure_doc_tags(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("SELECT 1 FROM doc_tags LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.executescript(_DOC_TAGS_DDL)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS review_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +84,7 @@ CREATE TABLE IF NOT EXISTS review_items (
     result TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_review_status ON review_items(status, category);
-"""
+""" + _ASSET_REGISTRY_DDL
 
 
 def _now() -> str:
@@ -395,6 +426,160 @@ def delete_external_doc(kb_path: str | Path, source_id: str,
         except Exception as e:
             print(f"[review] 向量删除失败（不影响 SQLite 删除）: {e}")
     return {"chunks_deleted": len(chunk_ids)}
+
+
+# ---------------- 文档级标签覆盖层（doc_tags 表，kb.sqlite3，ingest 建表） ----------------
+# 最终标签 = (auto − excluded) ∪ manual（tagging.merge_final，ingest 与 build_graph 共用）。
+# 覆盖层函数统一接受 sqlite3.Connection：ingest 传自己的写连接，审核页开短连接传入。
+
+def load_doc_tags_conn(conn: sqlite3.Connection) -> dict[str, dict]:
+    """批量读取覆盖层：{source_id: {"excluded": [...], "manual": [...]}}（ingest/建图预读）。"""
+    out: dict[str, dict] = {}
+    _ensure_doc_tags(conn)
+    try:
+        rows = conn.execute("SELECT source_id, excluded, manual FROM doc_tags").fetchall()
+    except sqlite3.OperationalError:
+        return out  # 旧库尚无 doc_tags 表（ingest 首次写入时创建）
+    for sid, excluded, manual in rows:
+        out[sid] = {
+            "excluded": json.loads(excluded) if excluded else [],
+            "manual": json.loads(manual) if manual else [],
+        }
+    return out
+
+
+def get_doc_tags_conn(conn: sqlite3.Connection, source_id: str) -> dict:
+    """单篇覆盖层（审核页展示用）。"""
+    _ensure_doc_tags(conn)
+    row = conn.execute(
+        "SELECT auto_snapshot, excluded, manual, updated_at, reviewer "
+        "FROM doc_tags WHERE source_id=?", (source_id,),
+    ).fetchone()
+    if row is None:
+        return {"source_id": source_id, "auto_snapshot": [], "excluded": [], "manual": [],
+                "updated_at": None, "reviewer": None}
+    return {
+        "source_id": source_id,
+        "auto_snapshot": json.loads(row[0]) if row[0] else [],
+        "excluded": json.loads(row[1]) if row[1] else [],
+        "manual": json.loads(row[2]) if row[2] else [],
+        "updated_at": row[3],
+        "reviewer": row[4],
+    }
+
+
+def upsert_auto_snapshot_conn(conn: sqlite3.Connection, source_id: str, auto_tags: list[str]) -> None:
+    """回写自动标签快照（入库时刷新；不影响 excluded/manual/reviewer）。"""
+    _ensure_doc_tags(conn)
+    row = conn.execute("SELECT excluded, manual, reviewer FROM doc_tags WHERE source_id=?",
+                       (source_id,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO doc_tags(source_id, auto_snapshot, excluded, manual, updated_at, reviewer) "
+            "VALUES(?,?,?,?,?,?)",
+            (source_id, json.dumps(auto_tags, ensure_ascii=False), "[]", "[]", _now(), ""),
+        )
+    else:
+        conn.execute(
+            "UPDATE doc_tags SET auto_snapshot=?, updated_at=? WHERE source_id=?",
+            (json.dumps(auto_tags, ensure_ascii=False), _now(), source_id),
+        )
+
+
+def set_doc_tags_conn(conn: sqlite3.Connection, source_id: str,
+                      excluded: Optional[list[str]] = None,
+                      manual: Optional[list[str]] = None,
+                      reviewer: Optional[str] = None) -> dict:
+    """更新覆盖层（excluded/manual 整体替换；None=保持不变），并**同步最终标签到 docs.tags**
+    （检索侧立即生效；图侧重建时按同一公式再算，两处结果一致）。审核页调用。"""
+    from .tagging import merge_final
+
+    _ensure_doc_tags(conn)
+    row = conn.execute("SELECT excluded, manual FROM doc_tags WHERE source_id=?",
+                       (source_id,)).fetchone()
+    cur_ex = json.loads(row[0]) if row and row[0] else []
+    cur_ma = json.loads(row[1]) if row and row[1] else []
+    if excluded is not None:
+        cur_ex = [t for t in excluded if t]
+    if manual is not None:
+        cur_ma = [t for t in manual if t]
+    if row is None:
+        conn.execute(
+            "INSERT INTO doc_tags(source_id, auto_snapshot, excluded, manual, updated_at, reviewer) "
+            "VALUES(?,?,?,?,?,?)",
+            (source_id, "[]", json.dumps(cur_ex, ensure_ascii=False),
+             json.dumps(cur_ma, ensure_ascii=False), _now(), reviewer or ""),
+        )
+    else:
+        conn.execute(
+            "UPDATE doc_tags SET excluded=?, manual=?, updated_at=?, reviewer=? WHERE source_id=?",
+            (json.dumps(cur_ex, ensure_ascii=False), json.dumps(cur_ma, ensure_ascii=False),
+             _now(), reviewer or "", source_id),
+        )
+    # 同步最终标签到 docs.tags：基准 = auto_snapshot（无则回退当前 docs.tags）
+    auto_row = conn.execute("SELECT auto_snapshot FROM doc_tags WHERE source_id=?",
+                            (source_id,)).fetchone()
+    auto = json.loads(auto_row[0]) if auto_row and auto_row[0] else []
+    if not auto:
+        trow = conn.execute("SELECT tags FROM docs WHERE source_id=?", (source_id,)).fetchone()
+        if trow and trow[0]:
+            auto = json.loads(trow[0])
+    final = merge_final(auto, cur_ex, cur_ma)
+    conn.execute("UPDATE docs SET tags=? WHERE source_id=?",
+                 (json.dumps(final, ensure_ascii=False), source_id))
+    return {"source_id": source_id, "excluded": cur_ex, "manual": cur_ma, "final": final}
+
+
+# ---------------- 资产注册表（asset_registry，review.sqlite3，管理员侧） ----------------
+# 表结构见顶部 _ASSET_REGISTRY_DDL（ReviewStore._SCHEMA 与 register_asset 共用）。
+
+def register_asset(db_path: str | Path, asset_id: str, rel_path: str,
+                   sha256: str = "", size: int = 0, source_type: str = "") -> None:
+    """注册资产映射（幂等 upsert，已有记录保留未提供的字段）。db_path=review.sqlite3。"""
+    if not asset_id or not rel_path:
+        return
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_ASSET_REGISTRY_DDL)
+        row = conn.execute(
+            "SELECT sha256, size, source_type FROM asset_registry WHERE asset_id=?",
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO asset_registry(asset_id, rel_path, sha256, size, source_type) "
+                "VALUES(?,?,?,?,?)",
+                (asset_id, rel_path, sha256 or "", int(size or 0), source_type or ""),
+            )
+        else:
+            conn.execute(
+                "UPDATE asset_registry SET rel_path=?, sha256=?, size=?, source_type=? WHERE asset_id=?",
+                (rel_path, sha256 or row[0] or "", int(size or row[1] or 0),
+                 source_type or row[2] or "", asset_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_assets(db_path: str | Path) -> dict[str, dict]:
+    """全部资产映射：{asset_id: {rel_path, sha256, size, source_type}}（审核页用）。"""
+    out: dict[str, dict] = {}
+    if not Path(db_path).exists():
+        return out
+    conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT asset_id, rel_path, sha256, size, source_type FROM asset_registry"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    finally:
+        conn.close()
+    for aid, rel, sha, size, stype in rows:
+        out[aid] = {"rel_path": rel, "sha256": sha or "", "size": size or 0,
+                    "source_type": stype or ""}
+    return out
 
 
 # ---------------- 审核项生成（seed，幂等） ----------------

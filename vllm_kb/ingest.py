@@ -24,6 +24,7 @@ from .confidence import reliability_score
 from .config import AppConfig
 from .embed import EmbeddingClient
 from .models import KbDocument
+from .tagging import merge_final
 from .vectorstore import BaseVectorStore, VectorItem
 
 _SCHEMA = """
@@ -42,7 +43,8 @@ CREATE TABLE IF NOT EXISTS docs (
   component TEXT,
   content_hash TEXT,
   embed_hash TEXT,
-  extra TEXT
+  extra TEXT,
+  tags TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   chunk_id UNINDEXED, doc_id UNINDEXED, text
@@ -52,6 +54,18 @@ CREATE TABLE IF NOT EXISTS chunks_meta (
   doc_id TEXT NOT NULL,
   seq INTEGER,
   section TEXT
+);
+-- 文档级标签覆盖层（人工治理状态）：
+--   auto_snapshot = 最近一次入库的自动标签快照（审核页展示，随入库刷新）；
+--   excluded = 人工排除的自动标签（可恢复）；manual = 人工添加的标签。
+-- 最终标签 = (auto − excluded) ∪ manual（见 tagging.merge_final，ingest 与 build_graph 共用）。
+CREATE TABLE IF NOT EXISTS doc_tags (
+  source_id TEXT PRIMARY KEY,
+  auto_snapshot TEXT,
+  excluded TEXT,
+  manual TEXT,
+  updated_at TEXT,
+  reviewer TEXT
 );
 """
 
@@ -66,6 +80,7 @@ def _connect(sqlite_path: Path) -> sqlite3.Connection:
         ("content_hash", "ALTER TABLE docs ADD COLUMN content_hash TEXT"),
         ("embed_hash", "ALTER TABLE docs ADD COLUMN embed_hash TEXT"),
         ("component", "ALTER TABLE docs ADD COLUMN component TEXT"),
+        ("tags", "ALTER TABLE docs ADD COLUMN tags TEXT"),
     ):
         if col not in cols:
             conn.execute(ddl)
@@ -152,7 +167,7 @@ def _window_rate(
     return processed / elapsed if elapsed > 0 else 0.0
 
 
-def chunk_meta(doc: KbDocument, reliability: float) -> dict[str, Any]:
+def chunk_meta(doc: KbDocument, reliability: float, tags: Optional[list[str]] = None) -> dict[str, Any]:
     return {
         "doc_id": doc.source_id,
         "source_type": doc.source_type,
@@ -162,6 +177,7 @@ def chunk_meta(doc: KbDocument, reliability: float) -> dict[str, Any]:
         "resolved_at": doc.resolved_at,
         "status": doc.status,
         "labels": doc.labels,
+        "tags": list(tags if tags is not None else doc.tags),
         # version_span_max 不再写入（历史列含旧版日历推导的跨仓库错配值；修复落地上界
         # 一律查询期按仓库日历现算，不落库、不随 meta/API 返回）
         "version_span_min": doc.version_span.min,
@@ -172,13 +188,14 @@ def chunk_meta(doc: KbDocument, reliability: float) -> dict[str, Any]:
 
 
 def _upsert_docs_row(conn: sqlite3.Connection, doc: KbDocument, rel: float,
-                     embed_hash: str, meta_hash: str) -> None:
+                     embed_hash: str, meta_hash: str,
+                     tags: Optional[list[str]] = None) -> None:
     conn.execute(
         """INSERT OR REPLACE INTO docs
            (source_id, source_type, url, title, created_at, resolved_at, status,
             labels, version_span_min, version_span_max, reliability, component,
-            content_hash, embed_hash, extra)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            content_hash, embed_hash, extra, tags)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             doc.source_id,
             doc.source_type,
@@ -195,6 +212,7 @@ def _upsert_docs_row(conn: sqlite3.Connection, doc: KbDocument, rel: float,
             meta_hash,
             embed_hash,
             json.dumps(doc.extra, ensure_ascii=False),
+            json.dumps(list(tags if tags is not None else doc.tags), ensure_ascii=False),
         ),
     )
 
@@ -209,6 +227,10 @@ def ingest_docs(
     """入库（幂等 + 增量断点续传）。返回统计。"""
     sqlite_path = sqlite_path or cfg.resolve(cfg.storage.sqlite_path)
     conn = _connect(sqlite_path)
+    # 人工标签覆盖层（doc_tags：excluded/manual）——最终标签 = (auto − excluded) ∪ manual
+    from .review import load_doc_tags_conn, upsert_auto_snapshot_conn
+
+    overlay = load_doc_tags_conn(conn)
     stats = {"docs": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0, "meta_refresh": 0, "skipped_empty": 0}
 
     total = len(docs)
@@ -252,12 +274,15 @@ def ingest_docs(
                 doc.source_type, doc.status, doc.resolved_at, doc.reliability, cfg.confidence,
                 kind=doc.extra.get("kind", ""),
             )
+            # 最终标签 = (自动 − 排除) ∪ 人工（覆盖层见 doc_tags 表）
+            ov = overlay.get(doc.source_id, {})
+            final_tags = merge_final(doc.tags or [], ov.get("excluded", []), ov.get("manual", []))
             # 幂等：先删旧（攒批，flush 时先删后加）
             pending_deletes.append(doc.source_id)
             conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc.source_id,))
             conn.execute("DELETE FROM chunks_meta WHERE doc_id = ?", (doc.source_id,))
-            # 写向量（攒批）：chunk meta 带 section（所属章节标题）
-            base_meta = chunk_meta(doc, rel)
+            # 写向量（攒批）：chunk meta 带 section（所属章节标题）+ tags（最终标签）
+            base_meta = chunk_meta(doc, rel, tags=final_tags)
             items = []
             for c, v in zip(chunks, doc_vecs):
                 m = dict(base_meta)
@@ -266,7 +291,8 @@ def ingest_docs(
                 items.append(VectorItem(id=c.chunk_id, vector=v, meta=m, text=c.text))
             pending_adds.extend(items)
             # 写 SQLite
-            _upsert_docs_row(conn, doc, rel, eh, mh)
+            _upsert_docs_row(conn, doc, rel, eh, mh, tags=final_tags)
+            upsert_auto_snapshot_conn(conn, doc.source_id, doc.tags or [])
             for c in chunks:
                 conn.execute(
                     "INSERT INTO chunks_fts (chunk_id, doc_id, text) VALUES (?,?,?)",
@@ -327,8 +353,12 @@ def ingest_docs(
                         doc.source_type, doc.status, doc.resolved_at, doc.reliability,
                         cfg.confidence, kind=doc.extra.get("kind", ""),
                     )
-                    _upsert_docs_row(conn, doc, rel, eh, mh)
-                    vector_store.update_doc_meta(doc.source_id, chunk_meta(doc, rel))
+                    ov = overlay.get(doc.source_id, {})
+                    final_tags = merge_final(doc.tags or [], ov.get("excluded", []),
+                                             ov.get("manual", []))
+                    _upsert_docs_row(conn, doc, rel, eh, mh, tags=final_tags)
+                    vector_store.update_doc_meta(doc.source_id, chunk_meta(doc, rel, tags=final_tags))
+                    upsert_auto_snapshot_conn(conn, doc.source_id, doc.tags or [])
                     stats["meta_refresh"] += 1
                     continue
 
@@ -340,7 +370,11 @@ def ingest_docs(
             chunks = chunk_doc(doc, cfg.chunking.max_chunk_chars, cfg.chunking.overlap_chars)
             if not chunks:
                 # 空正文文档：仍记录哈希（含元数据），下次预扫描直接跳过，不重扫
-                _upsert_docs_row(conn, doc, rel, eh, mh)
+                ov = overlay.get(doc.source_id, {})
+                final_tags = merge_final(doc.tags or [], ov.get("excluded", []),
+                                         ov.get("manual", []))
+                _upsert_docs_row(conn, doc, rel, eh, mh, tags=final_tags)
+                upsert_auto_snapshot_conn(conn, doc.source_id, doc.tags or [])
                 stats["skipped_empty"] += 1
                 continue
             pending_embed.append((doc, chunks))
