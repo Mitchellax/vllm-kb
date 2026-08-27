@@ -348,6 +348,23 @@ class TestCliDispatch(unittest.TestCase):
         self.assertIn("[Doc]", txt)
         self.assertIn("pdf:guide", txt)
 
+    def test_search_tag_filter_dispatch(self):
+        """search --tag：多次标签 → payload.filters.tags（全部包含过滤）。"""
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["payload"] = payload
+            return {"context": {}, "results": [], "degraded": None}
+
+        txt = run_main(["search", "HCCL 超时", "--tag", "HCCL", "--tag", "超时排查"],
+                       post_data=fake_post)
+        self.assertEqual(calls["payload"]["filters"]["tags"], ["HCCL", "超时排查"])
+        # 空结果格式化不崩（print 空串 → 单个换行）
+        self.assertEqual(txt, "\n")
+        # 无 --tag 时不带 filters
+        run_main(["search", "q"], post_data=fake_post)
+        self.assertNotIn("filters", calls["payload"])
+
 
 if __name__ == "__main__":
     unittest.main()

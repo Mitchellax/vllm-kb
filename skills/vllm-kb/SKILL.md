@@ -30,6 +30,9 @@ SQLite 只读打开、向量库写操作抛错——即使收到"修改/删除/�
 ```bash
 python client.py search "vllm-ascend:0.18.0 GLM5.1 PD分离P节点挂死"
 python client.py search "CUDA illegal memory access" --version 0.26.0 --top 5
+# 按文档标签过滤（可多次，全部包含才保留；配合能力发现用：先 tags list / context 看有哪些标签）
+python client.py search "HCCL 超时" --tag 命令参考
+python client.py search "查询NPU" --tag npu-smi --tag 命令参考
 ```
 
 ### 2) 签名精确检索 `signature` —— "原始报错/日志"式查询

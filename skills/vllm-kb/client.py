@@ -380,6 +380,8 @@ def main() -> None:
     p.add_argument("--component", default=None)
     p.add_argument("--version-of-component", dest="comp_version", default=None, help="组件版本")
     p.add_argument("--top", type=int, default=None)
+    p.add_argument("--tag", action="append", default=None, metavar="TAG",
+                   help="按文档标签过滤（可多次，全部包含才保留，如 --tag HCCL --tag 超时排查）")
 
     p = sub.add_parser("signature", help="签名精确检索：从原始报错提取签名并精确匹配")
     p.add_argument("text", help="原始报错文本/日志片段")
@@ -475,6 +477,8 @@ def main() -> None:
             payload["component"] = args.component
         if args.comp_version:
             payload["version"] = args.comp_version
+        if args.tag:
+            payload["filters"] = {"tags": list(dict.fromkeys(args.tag))}
         data = _post(base, "/search", payload)
         print(fmt_search(data))
     elif args.cmd == "signature":
