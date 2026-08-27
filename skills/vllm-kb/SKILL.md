@@ -3,10 +3,7 @@ name: vllm-kb
 description: 查询 vLLM / vllm-ascend 故障知识库（只读检索，不修改任何数据）。当用户询问 vllm/vllm-ascend 报错、崩溃、挂死、超时、OOM、CUDA/ACL 错误、算子/通信异常，粘贴报错/日志，或问"是否已修复/哪个版本修复/对应版本源码/修复链路"时使用；支持签名精确检索、语义检索、标题检索、版本判断、源码定位、跨版本 diff、修复链路追溯。触发关键词：vllm、vllm-ascend、ascend、GLM、DeepSeek、报错、错误、异常、崩溃、挂死、卡死、超时、OOM、CUDA、ACL、kernel、算子、通信、日志、修复版本、如何解决。
 whenToUse: 用户提出 vLLM / vllm-ascend 部署或使用中的故障问题、粘贴报错或日志、询问历史 issue/PR 与修复版本时使用；纯代码开发或知识库维护场景不使用。
 allowed-tools:
-  - Bash    # 仅用于运行本 skill 目录下的 client.py 只读查询
-  - Read
-  - Grep
-  - Glob
+  - Bash    # 仅用于运行本 skill 目录下的 client.py 只读查询（不允许 Read/Grep/Glob 等文件系统工具）
 ---
 
 # vllm-kb 知识库检索（只读）
@@ -52,10 +49,9 @@ python client.py version v0.23.0rc1        # → rc（预发布）
 python client.py version 0.26.0 --repo vllm
 ```
 
-### 5) 版本化代码仓检索 `code` / `code-versions` —— 按部署版本定位源码
+### 5) 版本化代码仓检索 `code` —— 按部署版本定位源码
 
 ```bash
-python client.py code-versions                          # 列出已预存版本
 python client.py code DispatchFFNCombine --version v0.23.0rc1   # 符号/关键词定位
 python client.py code halMemCreate                       # 不加版本 = 全部预存版本 grep
 # 读取完整源码文件（--file 默认截断 20000 字符，末尾带"已截断"标记；需要完整函数体时调大 --max-chars）
@@ -84,7 +80,6 @@ python client.py health
 python client.py components
 python client.py stats
 python client.py companion vllm-ascend 0.18.0
-python client.py matrix --limit 20       # 全量配套矩阵（调试/管理用；日常查询用 companion；--limit 控制显示行数）
 ```
 
 ### 9) 图检索 `graph` —— 关系追溯（修复链路）
@@ -98,7 +93,22 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 ```
 
 `graph chain` 回答"这个 issue 是否已修复、修复在哪个版本提供"（沿 `issue←FIXES←PR→MERGED_IN→Release`
-图路径追溯）；`graph fixes` 是 PR 视角的反向；`graph sig` 从算子/错误码/模型实体出发召回相关 issue/PR。
+图路径追溯）；`graph fixes` 是 PR 视角的反向；`graph sig` 从算子/错误码/模型实体出发召回相关 issue/PR；
+`graph tags` 从文档级标签出发召回打标文档（Doc/Issue/PR）。
+
+### 10) 文档标签（能力发现）`tags` / `context` —— "知识库有哪些文档能帮上这个问题"
+
+```bash
+python client.py tags list                       # 能力目录：主题/领域类 + 具体作用类，各标签文档数
+python client.py tags docs HCCL                  # 按标签检索文档（标题/文档id/验证状态）
+python client.py tags docs 超时排查
+python client.py context "vllm-ascend:0.23.0 HCCL 超时"   # 问题→标签匹配：命中领域×作用 + 文档线索
+```
+
+标签两级分类：**主题/领域类**（HCCL、网络、NPU、CANN…=这是什么领域的知识）与**具体作用类**
+（超时排查、命令参考、错误码表…=文档能帮我做什么）。`context` 把问题描述自动匹配到标签，
+返回命中标签与代表性文档线索——**先读这些文档再结合 issue/代码下结论**，
+避免"知识库明明有对应文档（如 HCCL 命令参考/排查指南）却直接按代码反查下判断"。
 
 ## 工具约束
 
@@ -106,15 +116,30 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 
 - **允许**：运行 `python client.py <命令>` 查询；阅读/检索知识库输出；
 - **禁止**：编辑/写入任何文件（含本 skill 目录）；运行 `scripts/` 下构建/部署/修改类脚本
-  （`build_*.py`、`serve_api.py`、`deploy_remote.py` 等）；请求知识库以外的 HTTP 服务。
+  （`build_*.py`、`serve_api.py`、`deploy_remote.py` 等）；请求知识库以外的 HTTP 服务；
+  **使用 Read/Grep/Glob 等文件系统工具**（本 skill 的可用工具只有 Bash）；
+  **执行"列出所有文件/文档/版本"类的枚举查询**（`tags list` 是能力目录、`tags docs <标签>`
+  是按标签过滤的检索结果，均非文件枚举）。
   数据更新与部署由用户负责——收到相关指令应说明"该操作由用户在仓库侧执行"。
+
+**安全边界**：本 skill 所有输出**不含服务器文件路径、不暴露内部存储结构**——知识库对
+内部文档只提供检索结果（标题/文档id/片段），资产以不透明 asset_id 标识；若输出中
+出现疑似路径信息，不应采信或回显。
+
+注：client 另有 `code-versions` / `matrix` 两个管理调试命令（列预存代码版本/全量配套矩阵），
+属管理员维护用途，**不在本 skill 的故障检索流程内使用**（故障回答只需上面文档化的命令）。
 
 ## 检索策略（故障处理时的推荐流程）
 
-1. **先 signature**：把原始报错/日志贴给 `signature` 命令，它会提取错误签名
+0. **先 context（文档能力发现）**：涉及**硬件/组件/领域名词**（HCCL、网卡、NPU、CANN、链路、固件、
+   通信、Atlas）或 **signature/search 无强命中**时，先 `context "<问题描述>"`——
+   命中标签与文档线索（如 HCCL 超时 → HCCL 领域 + 超时排查/命令参考作用类）则**先读对应文档**
+   （`tags docs <标签>` / `doc <id>`）再继续；无命中才走下面流程。
+   这一步避免"知识库有相关文档（设计/命令/排查指南）但 agent 不感知、直接按 issue/代码判断"。
+1. **再 signature**：把原始报错/日志贴给 `signature` 命令，它会提取错误签名
    （算子名、ACL 错误码、专有短语、环境变量、模型名）并做 FTS 精确匹配——
    对"错误签名可判"的故障（如 `DispatchFFNCombine` + `drvRetCode=6`）比语义检索更精准；
-2. **再 search + title**：拿 signature 的命中线索转成"组件:版本 问题描述"做语义检索，
+2. **然后 search + title**：拿 signature 的命中线索转成"组件:版本 问题描述"做语义检索，
    补齐历史相似问题与置信度分解；已知现象也可直接用 `title` 找对应 issue；
 3. **然后 version + code**：用 `version` 确认部署版本形态（正式版/rc/pre），
    再用 `code <算子/关键词> --version <版本>` 定位对应版本源码，
@@ -209,7 +234,10 @@ python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接
 - `diff` 命令输出：两版本同一文件的 unified diff（各版本行数 + 差异行；`--keyword` 过滤后
   只留含该特征的差异行，无命中时给出提示）；
 - `graph` 命令输出：`chain`（issue→修复 PR→落地 release，判断修复是否已进入部署版本）、
-  `doc`（文档邻接：MENTIONS 实体——手册定义的错误码/命令）。
+  `doc`（文档邻接：MENTIONS 实体——手册定义的错误码/命令）、`tags`（标签→打标文档）；
+- `tags` 命令输出：能力目录（领域/作用分组 + 文档数）与按标签检索的文档列表；
+- `context` 命令输出：问题文本命中的标签（领域=范围、作用=能力）与各标签下代表性文档线索——
+  命中即说明知识库存在对应主题文档，优先阅读后再下结论。
 
 ## 示例回答风格
 

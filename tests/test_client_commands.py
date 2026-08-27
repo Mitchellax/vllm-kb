@@ -295,6 +295,59 @@ class TestCliDispatch(unittest.TestCase):
         self.assertIn("共 5 行", txt)
         self.assertIn("显示前 3", txt)
 
+    def test_tags_list_dispatch(self):
+        """tags list：能力目录（两级分组 + 文档数；docs=0 不出现）。"""
+        data = {"groups": {"domain": [{"name": "HCCL", "docs": 12}],
+                           "purpose": [{"name": "超时排查", "docs": 8}]},
+                "total_tags": 2}
+        txt = run_main(["tags", "list"], get_data=lambda *a, **k: data)
+        self.assertIn("主题/领域类", txt)
+        self.assertIn("HCCL(12篇)", txt)
+        self.assertIn("超时排查(8篇)", txt)
+        self.assertIn("tags docs", txt)
+
+    def test_tags_docs_dispatch(self):
+        calls = {}
+
+        def fake_get(base, path, params=None):
+            calls["path"] = path
+            return {"tag": "HCCL", "docs": [{"doc_id": "pdf:guide", "title": "HCCL 指南",
+                                             "verification": "expert"}], "count": 1, "note": "n"}
+
+        txt = run_main(["tags", "docs", "HCCL"], get_data=fake_get)
+        self.assertIn("/tags/HCCL/docs", calls["path"])
+        self.assertIn("pdf:guide", txt)
+        self.assertIn("HCCL 指南", txt)
+
+    def test_context_dispatch(self):
+        """context：问题→标签匹配输出（领域=范围、作用=能力 + 文档线索）。"""
+        data = {"matched": [
+            {"name": "HCCL", "tier": "domain", "docs": 12,
+             "top": [{"doc_id": "pdf:guide", "title": "HCCL 超时排查指南", "verification": "expert"}]},
+            {"name": "超时排查", "tier": "purpose", "docs": 8,
+             "top": [{"doc_id": "md:case", "title": "网络超时案例", "verification": ""}]},
+        ]}
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["payload"] = payload
+            return data
+
+        txt = run_main(["context", "vllm-ascend HCCL 超时"], post_data=fake_post)
+        self.assertEqual(calls["payload"]["text"], "vllm-ascend HCCL 超时")
+        self.assertIn("[领域]", txt)
+        self.assertIn("[作用]", txt)
+        self.assertIn("HCCL 超时排查指南", txt)
+        self.assertIn("交集", txt)
+
+    def test_graph_tags_dispatch(self):
+        data = {"tag": "HCCL", "tier": "domain",
+                "docs": [{"doc_type": "Doc", "doc_id": "pdf:guide", "title": "HCCL 指南"}],
+                "count": 1, "note": "n"}
+        txt = run_main(["graph", "tags", "HCCL"], get_data=lambda *a, **k: data)
+        self.assertIn("[Doc]", txt)
+        self.assertIn("pdf:guide", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

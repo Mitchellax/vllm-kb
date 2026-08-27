@@ -543,6 +543,11 @@ def create_app(config_path: Optional[str] = None):
         """文档邻接视图：MENTIONS 实体（调试/详情）。"""
         return _require_graph().doc_neighbors(doc)
 
+    @app.get("/graph/tags")
+    def graph_tags(tag: str, limit: int = 50):
+        """标签 → 打标文档（Doc/Issue/PR）——图侧标签查询。"""
+        return _require_graph().tags_lookup(tag, limit=limit)
+
     # ---------------- 文档级标签（能力目录 / 标签检索 / 问题匹配） ----------------
 
     def _tag_counts() -> dict[str, int]:

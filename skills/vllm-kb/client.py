@@ -316,6 +316,56 @@ def fmt_graph_stats(data: dict) -> str:
             f"MENTIONS {rels.get('MENTIONS', 0)}）")
 
 
+def fmt_graph_tags(data: dict) -> str:
+    lines = [f"标签 '{data['tag']}'（tier={data.get('tier') or '-'}）→ 图内 {data['count']} 个节点:"]
+    if not data.get("docs"):
+        lines.append("(图中无打标文档——标签可能仅在词典中，重建图后生效)")
+    for d in data.get("docs", []):
+        lines.append(f"  [{d['doc_type']}] {d['doc_id']}  {d['title']}")
+    lines.append(f"提示: {data.get('note', '')}")
+    return "\n".join(lines)
+
+
+def fmt_tags(data: dict) -> str:
+    lines = ["文档标签能力目录（主题/领域类=有什么知识可查；具体作用类=文档能帮我做什么）:"]
+    for tier, label in (("domain", "主题/领域类"), ("purpose", "具体作用类")):
+        items = (data.get("groups") or {}).get(tier) or []
+        if items:
+            lines.append(f"[{label}] " + "  ".join(f"{x['name']}({x['docs']}篇)" for x in items))
+        else:
+            lines.append(f"[{label}] (暂无)")
+    lines.append("按标签检索文档: tags docs <标签>；问题→标签匹配: context <问题描述>")
+    return "\n".join(lines)
+
+
+def fmt_tags_docs(data: dict) -> str:
+    lines = [f"标签 '{data['tag']}' 下的文档（{data['count']} 篇）:"]
+    if not data.get("docs"):
+        lines.append("(无文档——标签可能仅在词典中)")
+    for d in data.get("docs", []):
+        ver = f"  验证={d['verification']}" if d.get("verification") else ""
+        lines.append(f"  {d['doc_id']}  {d['title']}{ver}")
+        if d.get("url"):
+            lines.append(f"    {d['url']}")
+    lines.append(f"提示: {data.get('note', '')}")
+    return "\n".join(lines)
+
+
+def fmt_tags_match(data: dict) -> str:
+    lines = ["知识领域命中（文档能力发现——先读相关文档，再结合 issue/代码下结论）:"]
+    matched = data.get("matched") or []
+    if not matched:
+        lines.append("(未命中任何标签：知识库暂无对应主题文档——走 signature/search/code 流程)")
+        return "\n".join(lines)
+    for m in matched:
+        tier_label = "领域" if m.get("tier") == "domain" else "作用"
+        lines.append(f"[{tier_label}] {m['name']}（{m.get('docs', 0)} 篇）")
+        for d in m.get("top", []):
+            lines.append(f"    → {d['doc_id']}  {d['title']}（验证={d.get('verification') or '-'}）")
+    lines.append("提示: 同时命中领域×作用的文档交集最相关；读取全文 doc <id>；按标签列表 tags docs <标签>")
+    return "\n".join(lines)
+
+
 def main() -> None:
     _force_utf8_stdio()
     ap = argparse.ArgumentParser(description="vllm-kb 只读检索客户端")
@@ -398,7 +448,19 @@ def main() -> None:
     g.add_argument("--limit", type=int, default=10)
     g = gsub.add_parser("doc", help="文档邻接视图（MENTIONS 实体，调试用）")
     g.add_argument("doc", help="source_id 或 repo#number")
+    g = gsub.add_parser("tags", help="标签 → 打标文档（Doc/Issue/PR）")
+    g.add_argument("tag", help="标签名（如 HCCL、超时排查）")
     gsub.add_parser("stats", help="图统计")
+
+    # 文档标签（能力目录 / 标签检索 / 问题匹配）
+    p = sub.add_parser("tags", help="文档标签能力目录（两级分类）与标签检索")
+    tsub = p.add_subparsers(dest="tags_cmd", required=True)
+    tsub.add_parser("list", help="能力目录：主题/领域 + 具体作用，各标签文档数")
+    g = tsub.add_parser("docs", help="按标签检索文档")
+    g.add_argument("tag", help="标签名（如 HCCL、超时排查）")
+
+    p = sub.add_parser("context", help="问题→标签匹配（文档能力发现：知识库有哪些文档能帮上这个问题）")
+    p.add_argument("text", help="问题描述（如 vllm-ascend HCCL 超时）")
 
     args = ap.parse_args()
     base = args.base
@@ -483,6 +545,16 @@ def main() -> None:
             print(fmt_graph_sig(_get(base, "/graph/sig", {"sig": args.sig, "limit": args.limit})))
         elif args.graph_cmd == "doc":
             print(json.dumps(_get(base, "/graph/doc", {"doc": args.doc}), ensure_ascii=False, indent=2))
+        elif args.graph_cmd == "tags":
+            print(fmt_graph_tags(_get(base, "/graph/tags", {"tag": args.tag})))
+    elif args.cmd == "tags":
+        if args.tags_cmd == "list":
+            print(fmt_tags(_get(base, "/tags")))
+        elif args.tags_cmd == "docs":
+            print(fmt_tags_docs(_get(base, f"/tags/{urllib.parse.quote(args.tag, safe='')}/docs")))
+    elif args.cmd == "context":
+        data = _post(base, "/tags/match", {"text": args.text})
+        print(fmt_tags_match(data))
 
 
 if __name__ == "__main__":
