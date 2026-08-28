@@ -43,7 +43,9 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 - **平稳降级**：embedding 服务不可用时检索自动降级为全文检索——查询用快速失败客户端（5s）+ 熔断器
   （连续失败 3 次熔断 60s，零等待降级，到期自动探测恢复）；`/health` 暴露 embedding 状态
 - **内网部署支持**：所有联网脚本（代码快照/版本日历/配套矩阵）支持 `--insecure` 跳过 SSL 校验 +
-  `--github-base/--quay-base/--base-url` 换内网 http 镜像，环境变量统一配置
+  `--github-base/--quay-base/--base-url` 换内网 http 镜像，环境变量统一配置；
+  **注意：Kùzu 图库路径（`data/graph` / `VLLM_KB_DATA_ROOT`）不能含非 ASCII 字符**（中文/emoji，
+  中文部署根会打不开图库——数据根放纯 ASCII 路径，详见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）
 - **存算分离**：skill 仅 ~34KB，数据（向量库/索引/图，约 0.8GB 干净库）放远程服务器，本地只发 HTTP 查询；
   `scripts/pack_migrate.py` 打包迁移（业务环境重新嵌入，不传向量库）
 - **结构只读**：SQLite `mode=ro` + 向量库只读包装 + 无写端点，Agent 提示注入也无法修改知识库
