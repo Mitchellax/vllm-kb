@@ -295,10 +295,12 @@ def fmt_graph_fixes(data: dict) -> str:
 
 
 def fmt_graph_sig(data: dict) -> str:
-    lines = [f"签名 '{data['signature']}'（实体类型: {data.get('entity_type') or '未命中'}）"]
+    ent = data.get("entity_id")
+    ent_txt = f"，实际实体: {ent}" if ent else ""
+    lines = [f"签名 '{data['signature']}'（实体类型: {data.get('entity_type') or '未命中'}{ent_txt}）"]
     docs = data.get("docs") or []
     if not docs:
-        lines.append("(图中无提及此签名的 issue/PR —— 可试小写/大小写变体，或用 search 语义检索)")
+        lines.append("(图中无提及此签名的 issue/PR —— 实体可能未被任何文档提及，或数据未积累)")
     for d in docs:
         lines.append(f"  [{d['status']}] {d['doc_id']}  {d['title']}")
     lines.append(f"提示: {data.get('note', '')}")

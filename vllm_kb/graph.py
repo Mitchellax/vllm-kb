@@ -607,25 +607,30 @@ class GraphBuilder:
     def sig_lookup(self, sig: str, limit: int = 10) -> dict:
         """签名实体（算子/错误码/模型/版本）→ 提及它的 issue/PR + 实体类型。
 
-        通用查询不限定实体 label：MENTIONS 的 TO 端多 label，WHERE e.id 过滤即可。
+        大小写不敏感（lower(e.id) = lower($s)）：实体 id 提取时小写化
+        （如 dispatchffncombine），用户按标题大小写输入（DispatchFFNCombine）也能命中；
+        返回实际实体名 entity_id，避免"实体在库中却因大小写查不到"的误判。
         """
         limit = max(1, min(int(limit), 100))
         rows = self.query(
-            "MATCH (d)-[:MENTIONS]->(e) WHERE e.id = $s "
-            "RETURN label(e) AS etype, d.id, d.title, d.status ORDER BY d.id LIMIT " + str(limit),
+            "MATCH (d)-[:MENTIONS]->(e) WHERE lower(e.id) = lower($s) "
+            "RETURN e.id, label(e) AS etype, d.id, d.title, d.status "
+            "ORDER BY d.id LIMIT " + str(limit),
             {"s": sig},
         )
         docs = [
-            {"entity_type": _ENTITY_KIND_BY_TABLE.get(r[0], r[0]), "doc_id": r[1],
-             "title": r[2], "status": r[3]} for r in rows
+            {"entity_type": _ENTITY_KIND_BY_TABLE.get(r[1], r[1]), "doc_id": r[2],
+             "title": r[3], "status": r[4]}
+            for r in rows
         ]
         return {
             "signature": sig,
+            "entity_id": rows[0][0] if rows else None,  # 实际实体名（大小写规范化后）
             "entity_type": docs[0]["entity_type"] if docs else None,
             "docs": docs,
             "count": len(docs),
             "note": "实体类型: operator=算子 error_code=错误码 model=模型 version=版本；"
-                    "doc 状态 open/closed/merged",
+                    "doc 状态 open/closed/merged；大小写不敏感，entity_id 为实际实体名",
         }
 
     def doc_neighbors(self, doc_id: str) -> dict:

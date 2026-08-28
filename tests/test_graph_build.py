@@ -206,6 +206,16 @@ class TestGraphBuildAndQuery(unittest.TestCase):
         self.assertGreater(r2["count"], 0)
         self.assertEqual(r2["entity_type"], "error_code")
 
+    def test_sig_lookup_case_insensitive(self):
+        """实体 id 提取时小写化——按标题大小写输入也能命中，返回实际实体名。"""
+        r = self.builder.sig_lookup("DispatchFFNCombine")
+        self.assertGreater(r["count"], 0)
+        self.assertEqual(r["entity_type"], "operator")
+        self.assertEqual(r["entity_id"], "dispatchffncombine")
+        r2 = self.builder.sig_lookup("DISPATCHFFNCOMBINE")
+        self.assertGreater(r2["count"], 0)
+        self.assertEqual(r2["entity_id"], "dispatchffncombine")
+
     def test_doc_neighbors(self):
         r = self.builder.doc_neighbors("github:vllm-project-vllm:issue:1")
         kinds = {m["entity_type"] for m in r["mentions"]}
