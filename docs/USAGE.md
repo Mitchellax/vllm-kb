@@ -85,6 +85,10 @@ python scripts/build_companion_matrix.py
 # FTS5 全文索引重建（jieba 中文分词——可选，不重嵌向量；装 jieba 或升级分词规则后重跑）
 python scripts/build_fts.py                     # 读现有 chunk 原文重新分词重建 chunks_fts
 python scripts/build_fts.py --limit 1000        # 试跑前 N 个 chunk
+
+# 正文 TF-IDF 标签候选导出（jieba——输出文件，人工审阅后手动写入 config.tags.registry）
+python scripts/build_tag_candidates.py          # 业务文档（doc_*）正文候选 → data/tag_candidates_manual.json
+python scripts/build_tag_candidates.py --include-github   # 也处理 github issue/PR（默认仅业务文档）
 ```
 
 **FTS5 中文分词说明（`jieba` 可选依赖）**：SQLite FTS5 默认把连续中文整段当一个 token

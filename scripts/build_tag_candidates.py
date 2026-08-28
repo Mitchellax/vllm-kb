@@ -62,6 +62,8 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=15, help="每篇文档候选数（默认 15）")
     ap.add_argument("--min-count", type=int, default=1, help="候选至少被 N 篇文档提及才保留（默认 1）")
     ap.add_argument("--out", default=None, help="输出路径（默认 data/tag_candidates_manual.json）")
+    ap.add_argument("--include-github", action="store_true",
+                    help="也处理 github issue/PR（默认只处理业务文档 doc_*）")
     args = ap.parse_args()
 
     try:
@@ -75,8 +77,10 @@ def main() -> None:
     register_words([e.name for e in registry.entries])  # 标签词防拆分，稳定 TF-IDF 候选
     stopwords = {s.lower() for s in (cfg.tags.stopwords or [])}
     docs = _load_canonical(cfg)
+    if not args.include_github:
+        docs = [d for d in docs if str(d.get("source_type", "")).startswith("doc_")]
     if not docs:
-        print("[tag-candidates] canonical 无正文文档")
+        print("[tag-candidates] canonical 无业务文档（doc_*）；加 --include-github 处理全部")
         return
 
     out_path = Path(args.out) if args.out else cfg.resolve("data/tag_candidates_manual.json")
