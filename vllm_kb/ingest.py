@@ -23,8 +23,9 @@ from .chunking import chunk_doc
 from .confidence import reliability_score
 from .config import AppConfig
 from .embed import EmbeddingClient
+from .fts_tokenizer import register_words, tokenize_text
 from .models import KbDocument
-from .tagging import merge_final
+from .tagging import TagRegistry, merge_final
 from .vectorstore import BaseVectorStore, VectorItem
 
 _SCHEMA = """
@@ -47,7 +48,9 @@ CREATE TABLE IF NOT EXISTS docs (
   tags TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  chunk_id UNINDEXED, doc_id UNINDEXED, text
+  chunk_id UNINDEXED, doc_id UNINDEXED,
+  indexed_text,
+  text UNINDEXED
 );
 CREATE TABLE IF NOT EXISTS chunks_meta (
   chunk_id TEXT PRIMARY KEY,
@@ -87,6 +90,17 @@ def _connect(sqlite_path: Path) -> sqlite3.Connection:
     mcols = [r[1] for r in conn.execute("PRAGMA table_info(chunks_meta)")]
     if "section" not in mcols:
         conn.execute("ALTER TABLE chunks_meta ADD COLUMN section TEXT")
+    # FTS 表升级：旧版 (chunk_id, doc_id, text) 无分词列 → 重建新 schema（内容需 reindex）。
+    # 分词只影响 FTS 索引（indexed_text），向量库（原文嵌入）不受影响——无需重嵌。
+    try:
+        fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(chunks_fts)")]
+    except sqlite3.OperationalError:
+        fts_cols = []
+    if fts_cols and "indexed_text" not in fts_cols:
+        conn.execute("DROP TABLE chunks_fts")
+        conn.executescript(_SCHEMA)  # 重建新 schema（含 indexed_text 列）
+        print("[ingest] FTS 表结构升级（新增分词列 indexed_text），旧全文索引已清空——"
+              "请运行 scripts/build_fts.py 重建全文索引（jieba 中文分词，不重嵌向量）")
     conn.commit()
     return conn
 
@@ -227,6 +241,8 @@ def ingest_docs(
     """入库（幂等 + 增量断点续传）。返回统计。"""
     sqlite_path = sqlite_path or cfg.resolve(cfg.storage.sqlite_path)
     conn = _connect(sqlite_path)
+    # 标签词典词注册进 jieba（复合标签如"超时排查"不被拆散；jieba 未装时无副作用）
+    register_words([e.name for e in TagRegistry.load(cfg).entries])
     # 人工标签覆盖层（doc_tags：excluded/manual）——最终标签 = (auto − excluded) ∪ manual
     from .review import load_doc_tags_conn, upsert_auto_snapshot_conn
 
@@ -294,9 +310,10 @@ def ingest_docs(
             _upsert_docs_row(conn, doc, rel, eh, mh, tags=final_tags)
             upsert_auto_snapshot_conn(conn, doc.source_id, doc.tags or [])
             for c in chunks:
+                # FTS 索引列存 jieba 分词文本（中文词可独立命中）；text 列存原文（snippet 展示）
                 conn.execute(
-                    "INSERT INTO chunks_fts (chunk_id, doc_id, text) VALUES (?,?,?)",
-                    (c.chunk_id, doc.source_id, c.text),
+                    "INSERT INTO chunks_fts (chunk_id, doc_id, indexed_text, text) VALUES (?,?,?,?)",
+                    (c.chunk_id, doc.source_id, tokenize_text(c.text), c.text),
                 )
                 conn.execute(
                     "INSERT INTO chunks_meta (chunk_id, doc_id, seq, section) VALUES (?,?,?,?)",

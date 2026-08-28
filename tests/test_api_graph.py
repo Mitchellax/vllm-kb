@@ -181,7 +181,9 @@ class GraphEndpointsTest(unittest.TestCase):
         self.assertIn("code", r.json()["detail"].lower())
 
     def test_search_verification_field(self):
-        r = self.client.post("/search", json={"query": "GLM5.1 崩溃"})
+        # 查询用 body 实含的词（halMemCreate）——FTS 命中；"GLM5.1 崩溃" 只在标题，
+        # 不参与 FTS（索引的是 chunk 正文），无强命中属预期
+        r = self.client.post("/search", json={"query": "halMemCreate"})
         self.assertEqual(r.status_code, 200)
         results = r.json().get("results") or []
         self.assertTrue(results)

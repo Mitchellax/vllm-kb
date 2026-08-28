@@ -387,9 +387,14 @@ class SearchEngine:
     # ---------------- FTS ----------------
 
     def _fts_search(self, query: str, limit: int, conn: Optional[sqlite3.Connection] = None) -> dict[str, tuple[float, str]]:
-        """FTS5 短语匹配；失败则退化为单 token 前缀。返回 {chunk_id: (bm25_sim, text)}。"""
+        """FTS5 短语匹配（查询侧 jieba 分词）；失败则退化为单 token 前缀。
+
+        分词只作用于查询串与索引列（indexed_text），返回文本为原文（snippet 展示）。
+        """
+        from .fts_tokenizer import query_tokens
+
         conn = conn or self.conn
-        toks = _FTS_TOKEN_RE.findall(query.lower())
+        toks = query_tokens(query)
         if not toks:
             return {}
         phrase = '"' + " ".join(toks) + '"'
