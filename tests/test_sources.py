@@ -44,12 +44,10 @@ class TestSources(unittest.TestCase):
             _s._REGISTRY.pop("custom")
 
     def test_unimplemented_source_raises_not_implemented(self):
-        # markdown/pdf 已实现；excel 表头不固定暂不实现（仍抛 NotImplementedError）
-        src = create_source(SourceCfg(id="xlsx", type="excel", path="x"))
-        with self.assertRaises(NotImplementedError):
-            src.pull()
-        with self.assertRaises(NotImplementedError):
-            src.canonicalize()
+        # markdown/pdf/excel 已实现；excel 导入目录不存在时返回 0/空（schema-free，不抛错）
+        src = create_source(SourceCfg(id="xlsx", type="excel", path="data/imports/nonexist"))
+        self.assertEqual(src.pull(), 0)
+        self.assertEqual(src.canonicalize(), [])
         # markdown 现在可用（导入目录不存在时返回 0/空，不抛错）
         md = create_source(SourceCfg(id="md", type="markdown", path="data/imports/nonexist"))
         self.assertEqual(md.pull(), 0)

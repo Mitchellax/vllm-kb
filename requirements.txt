@@ -11,10 +11,11 @@ fastapi>=0.110          # 检索 API + 审核工作台
 uvicorn>=0.29
 pillow>=9.0             # 图片处理（md 图片收集 / OCR 测试图）
 
-# ---- 业务来源解析（PDF/Markdown 导入，可选——按需安装）----
+# ---- 业务来源解析（PDF/Markdown/Excel 导入，可选——按需安装）----
 pymupdf>=1.23           # PDF 文字层 + 表格提取
 python-docx>=1.1        # Word 案例（业务环境启用）
 trafilatura>=1.6        # 网页案例（业务环境启用）
+openpyxl>=3.0           # Excel（schema-free：任意列/sheet，行 cell 拼接入库）
 
 # ---- 中文分词（FTS5 中文检索，可选——不装则 FTS 中文按整段匹配，行为同旧版）----
 jieba>=0.42             # 入库侧/查询侧分词（scripts/build_fts.py 重建全文索引，不重嵌向量）

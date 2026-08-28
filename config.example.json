@@ -4,7 +4,7 @@
     "name": "vllm-kb",
     "data_root": "data"
   },
-  "_comment_sources": "数据源列表（多来源可配置）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments。markdown/excel 接口已预留，实现待 Phase 4。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
+  "_comment_sources": "数据源列表（多来源可配置）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列，每行 cell 拼接入库，见 vllm_kb/sources.py)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
   "sources": [
     {
       "id": "vllm",
@@ -49,8 +49,6 @@
       "id": "troubleshooting-excel",
       "type": "excel",
       "path": "data/imports/engineer/问题定位记录.xlsx",
-      "sheet": "Sheet1",
-      "columns": {"title": "问题标题", "body": "定位过程", "version": "版本", "date": "日期"},
       "enabled": false
     },
     {

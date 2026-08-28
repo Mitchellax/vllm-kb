@@ -664,21 +664,118 @@ class ImageSource(BaseSource):
 
 
 class ExcelSource(BaseSource):
-    """Excel 表格来源（工程师导出的问题定位记录等）。接口已预留，实现见 Phase 4。
+    """Excel 表格来源（工程师问题定位记录/已知问题登记表等，**格式未知**）。
 
     配置示例：
         {"id": "engineer-troubleshooting", "type": "excel",
-         "path": "data/imports/engineer/问题定位记录.xlsx",
-         "sheet": "Sheet1", "columns": {"title": "问题标题", "body": "定位过程", "version": "版本", "date": "日期"}}
+         "path": "data/imports/engineer/问题定位记录.xlsx", "enabled": true}
+
+    **schema-free 设计（不写死任何列名/sheet 名/行号）**：
+    - pull：把配置 path（文件或目录）下的 .xlsx/.xlsm 复制到资产层；
+    - canonicalize：遍历**所有 sheet、所有行**，把每行的非空 cell **按列序拼接成一段
+      自由文本**作为 body——不依赖表头/列语义；每行一条 KbDocument（source_id 用
+      `excel:{stem}:{sheet序号}:{行号}` 保证唯一，行号仅作标识、非解析依赖）；
+    - **实体提取复用现有线路**：body 进入 canonical 后，错误码/算子/模型/版本由
+      signature 三层提取自动入图（scheme-free：图构建只依赖 canonical）；
+    - **脱敏**：cell 值经 sanitize_text（内部 IP → &lt;IP&gt;、内部路径 → &lt;PATH&gt;，
+      默认路径/日志路径白名单保留），防止内部数据经检索外泄；
+    - 验证状态：登记表默认 `unverified`、status=open（低优先级，按未解决 issue 处理）。
     """
 
     type = "excel"
+    _EXCEL_SUFFIXES = (".xlsx", ".xlsm")
 
-    def pull(self) -> int:
-        raise NotImplementedError("excel 来源尚未实现（计划 Phase 4）：请先用 github 来源，或联系开发补充该 adapter")
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        super().__init__(cfg, project_root, app_cfg=app_cfg)
+        self.import_path = self.resolve(self.cfg.get("path", f"data/imports/{self.id}"))
+
+    def _assets_dir(self) -> Path:
+        return self.resolve("data/assets/excel")
+
+    def _excel_files(self) -> list[Path]:
+        p = self.import_path
+        if p.is_dir():
+            out = []
+            for suffix in self._EXCEL_SUFFIXES:
+                out.extend(sorted(p.rglob(f"*{suffix}")))
+            return out
+        if p.is_file() and p.suffix in self._EXCEL_SUFFIXES:
+            return [p]
+        return []
+
+    def pull(self, max_issues: Optional[int] = None) -> int:
+        """把 excel 文件复制到资产层（幂等）。返回新增条数。"""
+        files = self._excel_files()
+        if not files:
+            print(f"[sources:{self.id}] 导入路径无 excel 文件: {self.import_path}")
+            return 0
+        added = 0
+        registered: list[tuple[str, str, str]] = []
+        for f in files:
+            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"), "excel")
+            registered.append((rel, sha, "doc_excel"))
+            if copied:
+                added += 1
+        self._register_asset_mappings(registered)
+        print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 excel）")
+        return added
 
     def canonicalize(self) -> list[KbDocument]:
-        raise NotImplementedError("excel 来源尚未实现（计划 Phase 4）")
+        """遍历所有 sheet/行，行 cell 拼接为 body（schema-free），脱敏后产出 KbDocument。"""
+        from .sanitize import sanitize_text
+
+        try:
+            import openpyxl
+        except ImportError as e:
+            print(f"[sources:{self.id}] 未安装 openpyxl：pip install openpyxl（{e}）")
+            return []
+        docs: list[KbDocument] = []
+        assets = self._assets_dir()
+        if not assets.exists():
+            return docs
+        n_files = 0
+        for suffix in self._EXCEL_SUFFIXES:
+            for p in sorted(assets.glob(f"*{suffix}")):
+                n_files += 1
+                sha = _sha256(p)
+                asset_id = sha[:16]
+                try:
+                    wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+                except Exception as e:
+                    print(f"[sources:{self.id}] 读取失败 {p.name}: {e}（跳过）")
+                    continue
+                try:
+                    for sheet_idx, ws in enumerate(wb.worksheets, 1):
+                        for row_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
+                            cells = [str(c).strip() for c in row
+                                     if c is not None and str(c).strip()]
+                            if not cells:
+                                continue  # 空行跳过（不依赖行号语义）
+                            body = sanitize_text(" ".join(cells))
+                            if not body.strip():
+                                continue
+                            title = sanitize_text(cells[0])[:80]
+                            docs.append(KbDocument(
+                                source_type="doc_excel",
+                                source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",
+                                url="",
+                                title=title or f"{p.stem} {sheet_idx} 行 {row_idx}",
+                                body=body,
+                                created_at=None,
+                                component="",
+                                tags=[],  # Excel 不做文件名/标题标签（正文候选走 build_tag_candidates）
+                                extra={
+                                    "asset": {"asset_id": asset_id, "sha256": sha,
+                                              "format": "excel"},
+                                    "quality": {"text_source": "table", "parsed_with": "openpyxl"},
+                                    "verification": "unverified",  # 登记表低优先级
+                                },
+                            ))
+                finally:
+                    wb.close()
+        print(f"[sources:{self.id}] canonical {len(docs)} 条（{n_files} 个 excel）")
+        return docs
 
 
 _REGISTRY: dict[str, type[BaseSource]] = {
