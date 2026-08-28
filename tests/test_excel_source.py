@@ -99,6 +99,29 @@ class TestExcelSource(unittest.TestCase):
         # 有 body 的文档都能被 canonical/ingest 接受
         self.assertTrue(doc.body)
 
+    def test_sanitize_log_written(self):
+        """被脱敏命中的 IP/路径落盘 data/sanitize_log.json（维护用，含被脱敏值）。"""
+        import json
+        import os
+
+        from vllm_kb.config import AppConfig
+
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        try:
+            cfg = AppConfig.model_validate({})
+            src = ExcelSource(self.cfg, project_root=self.root, app_cfg=cfg)
+            src.pull()
+            src.canonicalize()
+            log = self.root / "data" / "sanitize_log.json"
+            self.assertTrue(log.exists())
+            data = json.loads(log.read_text(encoding="utf-8"))
+            self.assertIn("10.0.0.5", data["ips"])          # 被脱敏的 IP
+            self.assertIn("/home/user/logs/oom.log", data["paths"])  # 被脱敏的路径
+            # 保留项不进入日志
+            self.assertNotIn("/var/log/npu/", data["paths"])
+        finally:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
     def test_sanitize_config_from_app_cfg(self):
         """config.sanitize 配置生效：keep_paths 覆盖默认（保留业务路径、脱敏默认路径）。"""
         import os

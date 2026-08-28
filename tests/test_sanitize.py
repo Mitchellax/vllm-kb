@@ -66,6 +66,47 @@ class TestSanitize(unittest.TestCase):
         """相对路径（无盘符、非 / 开头）低风险保留。"""
         self.assertIn("a/b/c", sanitize_text("见 a/b/c 说明"))
 
+    def test_collector_gathers_masked_values(self):
+        """collector 收集被脱敏的原始值（白名单内不收集）。"""
+        col = {}
+        out = sanitize_text("10.0.0.5 与 /home/user/x.log 与 /var/log/npu/ 与 127.0.0.1",
+                            collector=col)
+        self.assertIn("<IP>", out)
+        self.assertIn("<PATH>", out)
+        self.assertIn("/var/log/npu/", out)   # 默认路径保留
+        self.assertIn("127.0.0.1", out)       # 回环保留
+        # 收集：被脱敏的 IP/路径（不含保留项）
+        self.assertEqual(col.get("ips"), {"10.0.0.5"})
+        self.assertEqual(col.get("paths"), {"/home/user/x.log"})
+
+    def test_save_sanitize_log(self):
+        """save_sanitize_log 合并写入维护文件（幂等、累积）。"""
+        import json
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from vllm_kb.config import AppConfig
+        from vllm_kb.sanitize import save_sanitize_log
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            os.environ["VLLM_KB_DATA_ROOT"] = str(root / "data_root")
+            try:
+                cfg = AppConfig.model_validate({})
+                p = save_sanitize_log(cfg, {"ips": {"10.0.0.5"}, "paths": {"/home/u/a"}})
+                data = json.loads(p.read_text(encoding="utf-8"))
+                self.assertEqual(data["ips"], ["10.0.0.5"])
+                self.assertEqual(data["paths"], ["/home/u/a"])
+                # 幂等合并：再次写入新值，旧值保留
+                save_sanitize_log(cfg, {"ips": {"192.168.1.1"}, "paths": {"/home/u/a"}})
+                data = json.loads(p.read_text(encoding="utf-8"))
+                self.assertEqual(set(data["ips"]), {"10.0.0.5", "192.168.1.1"})
+                self.assertEqual(data["count"]["paths"], 1)
+                self.assertIn("updated_at", data)
+            finally:
+                os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
     def test_empty(self):
         self.assertEqual(sanitize_text(""), "")
         self.assertEqual(sanitize_text(None), None)

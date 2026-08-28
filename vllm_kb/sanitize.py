@@ -12,10 +12,16 @@
 - `keep_paths` / `keep_ips` 为 `None` → 使用默认（本模块常量）；
   显式空列表 `[]` → 全部脱敏（不保留任何路径/IP）。
   业务侧可在 config.json 的 `sanitize` 段配置覆盖。
+
+**维护日志**：`collector`（可选）收集本次被脱敏命中的原始 IP/路径，调用方可
+`save_sanitize_log` 合并写入 `data/sanitize_log.json`（本地维护文件，**不进库、
+不返回给 agent**）——方便维护者查看"哪些内部值被脱敏"，据此调整白名单。
 """
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 # 默认保留路径前缀（昇腾/系统默认，诊断价值高、不含内部机器信息）
@@ -47,12 +53,15 @@ _PATH_RE = re.compile(
 
 def sanitize_text(text: str,
                   keep_paths: Optional[list[str]] = None,
-                  keep_ips: Optional[list[str]] = None) -> str:
+                  keep_ips: Optional[list[str]] = None,
+                  collector: Optional[dict] = None) -> str:
     """对文本中的 IP 与路径脱敏。
 
     - IP：`10.0.0.5` → `<IP>`；`10.0.0.5:8000` → `<IP>:8000`（端口保留）；
     - 路径：白名单外绝对路径 → `<PATH>`（盘符或 `/` 开头）；白名单内保留；
-    - keep_paths/keep_ips 为 None → 默认白名单；显式 [] → 全部脱敏。
+    - keep_paths/keep_ips 为 None → 默认白名单；显式 [] → 全部脱敏；
+    - collector（可选 dict）：就地收集被脱敏的原始值
+      （collector["ips"]/["paths"] 为 set），供 save_sanitize_log 落盘维护。
     """
     if not text:
         return text
@@ -61,13 +70,48 @@ def sanitize_text(text: str,
 
     def _ip(m: re.Match) -> str:
         ip = m.group(0)
-        return ip if ip in keep_ip else "<IP>"
+        if ip in keep_ip:
+            return ip
+        if collector is not None:
+            collector.setdefault("ips", set()).add(ip)
+        return "<IP>"
 
     def _path(m: re.Match) -> str:
         path = m.group(0)
         for p in keep:
             if path.startswith(p):
                 return path  # 默认路径/日志路径保留（诊断价值）
+        if collector is not None:
+            collector.setdefault("paths", set()).add(path)
         return "<PATH>"
 
     return _PATH_RE.sub(_path, _IPV4_RE.sub(_ip, text))
+
+
+def save_sanitize_log(cfg, collector: Optional[dict] = None):
+    """把被脱敏命中的原始 IP/路径合并写入 data/sanitize_log.json（本地维护文件）。
+
+    - 幂等合并（累积历史被脱敏值，便于维护白名单）；文件在 data/ 下（gitignore，不进库、
+      不返回给 agent）；
+    - 返回写入的路径。collector 为空时也刷新 updated_at。
+    """
+    path = cfg.resolve("data/sanitize_log.json")
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    ips = set(data.get("ips", [])) | set((collector or {}).get("ips", []))
+    paths = set(data.get("paths", [])) | set((collector or {}).get("paths", []))
+    out = {
+        "ips": sorted(ips),
+        "paths": sorted(paths),
+        "count": {"ips": len(ips), "paths": len(paths)},
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "note": "被脱敏命中的原始 IP/路径（本地维护用，不进库、不返回给 agent）；"
+                "据此调整 config.json sanitize.keep_ips / keep_paths 白名单",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path

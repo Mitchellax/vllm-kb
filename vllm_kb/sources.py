@@ -723,13 +723,14 @@ class ExcelSource(BaseSource):
 
     def canonicalize(self) -> list[KbDocument]:
         """遍历所有 sheet/行，行 cell 拼接为 body（schema-free），脱敏后产出 KbDocument。"""
-        from .sanitize import sanitize_text
+        from .sanitize import sanitize_text, save_sanitize_log
 
         # 脱敏配置（config.sanitize：keep_paths/keep_ips；None=默认白名单，[]=全脱敏）
         keep_paths = keep_ips = None
         if self.app_cfg is not None:
             keep_paths = self.app_cfg.sanitize.keep_paths
             keep_ips = self.app_cfg.sanitize.keep_ips
+        collector: dict = {}  # 被脱敏命中的原始 IP/路径（落盘维护，不进库）
 
         try:
             import openpyxl
@@ -759,12 +760,14 @@ class ExcelSource(BaseSource):
                             if not cells:
                                 continue  # 空行跳过（不依赖行号语义）
                             body = sanitize_text(" ".join(cells),
-                                                 keep_paths=keep_paths, keep_ips=keep_ips)
+                                                 keep_paths=keep_paths, keep_ips=keep_ips,
+                                                 collector=collector)
                             if not body.strip():
                                 continue
                             title = sanitize_text(cells[0],
                                                  keep_paths=keep_paths,
-                                                 keep_ips=keep_ips)[:80]
+                                                 keep_ips=keep_ips,
+                                                 collector=collector)[:80]
                             docs.append(KbDocument(
                                 source_type="doc_excel",
                                 source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",
@@ -783,6 +786,12 @@ class ExcelSource(BaseSource):
                             ))
                 finally:
                     wb.close()
+        # 被脱敏命中的 IP/路径落盘维护文件（data/sanitize_log.json，幂等合并；app_cfg 缺失时跳过）
+        if collector and self.app_cfg is not None:
+            try:
+                save_sanitize_log(self.app_cfg, collector)
+            except Exception as e:
+                print(f"[sources:{self.id}] sanitize_log 写入失败（不影响入库）: {e}")
         print(f"[sources:{self.id}] canonical {len(docs)} 条（{n_files} 个 excel）")
         return docs
 
