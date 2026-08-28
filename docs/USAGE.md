@@ -23,9 +23,11 @@ export GITHUB_TOKEN=ghp_xxx
 export EMBEDDING_API_KEY=sk-xxx
 ```
 
-`config.json` 中 `sources` 定义了数据源（默认 vllm-ascend + vllm 两个 GitHub 仓库），
-`embedding` 定义嵌入端点，`storage` 定义数据目录（含 `code_root`：版本化代码仓根），
-`code` 定义代码仓快照来源与预存版本列表。所有路径相对 `data/`，可整体迁移。
+`config.json` 中 `sources` 定义了数据源（默认 vllm-ascend + vllm 两个 GitHub 仓库；可加
+`type: pdf/markdown/excel/image` 业务来源，见 §2.3/§2.4），`embedding` 定义嵌入端点，
+`storage` 定义数据目录（含 `code_root`：版本化代码仓根），`code` 定义代码仓快照来源与预存版本列表，
+`tags` 定义标签词典（两级分类，见 §4.7），`sanitize` 定义内部数据脱敏白名单（后置，见 §2.4）。
+所有路径相对 `data/`，可整体迁移。
 
 > **URL 可写裸地址**：`embedding.base_url` / OCR `ocr_api_base` 可写 `10.0.0.5:8000/v1` 这种
 > 裸 ip:port（内网 vLLM/OCR 服务），配置加载时自动补 `http://` 前缀并告警；https 需显式写全。
@@ -238,7 +240,33 @@ python scripts/build_kb.py --skip-pull        # 触发 image source 的 canonica
   低质量 OCR 不污染向量库——图片靠"签名可达 + 原图可回看"；
 - 与 md 文档的 `evidence` 联动：图文互证（正文签名 ↔ OCR 签名）在后续图/审核环节消费。
 
-> Excel 导入暂不支持（表头不固定）；Word/HTML 适配在业务环境阶段开发。
+### 2.4 Excel 登记表导入（schema-free）—— 完整实操
+
+工程师问题定位记录 / 已知问题登记表等（**表头/列不固定**）：
+
+```jsonc
+// config.json sources 启用（path 可以是单个文件或目录）
+{"id": "engineer", "type": "excel", "path": "data/imports/engineer/问题定位记录.xlsx", "enabled": true}
+```
+
+```bash
+pip install openpyxl          # 依赖（可选组，离线 wheel 可装）
+python scripts/build_kb.py    # 导入：每行一条文档入库 + 嵌入
+python scripts/build_graph.py # 建图：错误码/算子等实体自动入图（先停 serve_api）
+python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
+```
+
+- **schema-free**：不写死任何列名 / sheet 名 / 行号——遍历所有 sheet/行，每行**非空 cell 按列序拼接为自由文本**入库（每行一条文档，`excel:{文件名}:{sheet序号}:{行号}`）；空行跳过；
+- 错误码/算子/模型/版本由 signature 三层提取**自动入图**（建图只依赖 canonical，无需图侧适配）；
+- 验证状态 `unverified`（登记表低优先级，按未解决 issue 处理）。
+
+**内部数据脱敏（后置，Excel/Markdown 源生效）**：
+
+- **库中存原文、出口统一脱敏**：serve_api 返回给 agent 的正文/标题（/doc 全文、/search snippet、/title、/tags、/graph 等）按 `config.sanitize` 白名单脱敏（内部 IP → `<IP>`、内部路径 → `<PATH>`，默认路径如 `/var/log/npu/` 保留）——**内部检索用原文**（可按原 IP 检索），**改脱敏配置即时生效、无需重嵌**；
+- `config.sanitize`：`keep_paths`（保留的默认路径前缀）、`keep_ips`（保留的 IP，默认回环/通配）、`sources`（入库时扫描维护日志的源，默认 `["excel","markdown"]`）；`None`=用默认、显式 `[]`=全部脱敏/全部关闭；
+- **被脱敏的原始 IP/路径落盘 `data/sanitize_log.json`**（维护文件，不进库/不返回给 agent）——据此调整白名单；审核页（管理员）显示原文。
+
+> Word/HTML 适配在业务环境阶段开发。
 
 ## 3. 启动检索服务
 
@@ -617,5 +645,7 @@ A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.ex
 删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。
 
 **Q: 想加自己的故障记录（excel/markdown）？**
-A: config.json 的 `sources` 加 `engineer-troubleshooting` 条目（markdown/excel 接口已预留，
-Phase 4 实现；当前可用 github 源或 `--recanonicalize` 流程）。
+A: config.json 的 `sources` 加条目即可：`{"id":"engineer-troubleshooting","type":"excel",
+"path":"data/imports/...xlsx","enabled":true}`（schema-free 导入，见 §2.4）或
+`{"id":"mynotes","type":"markdown","path":"data/mynotes","enabled":true}`；github 源
+支持 `--incremental` 增量拉取（见 §2.2）。

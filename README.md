@@ -28,12 +28,16 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、PTA 从对应 tag 的 `requirements.txt`
   提取（0day 模型经 vllm 版本关联）；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
+  Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）；
   入库自动打**文档级两级标签**（主题/领域类 + 具体作用类，确定性提取自文件名+内部标题，
   词典 `config.tags.registry` 驱动）——经 skill 的 `tags`/`context` 命令做**能力发现**
   （agent 先知道"知识库有哪些文档类别可提供知识"，如 HCCL 超时 → 命中 HCCL 领域 +
   超时排查/命令参考作用类，先读文档再下结论）；**资产路径不进库**（asset_id 标识 + API 出口白名单清理，
   管理员侧路径仅存审核库）
+- **内部数据脱敏（后置）**：库中存原文（原文检索）、serve_api 出口统一脱敏（内部 IP → `<IP>`、内部路径 → `<PATH>`，
+  默认路径如 `/var/log/npu/` 保留）——改 `config.sanitize`（keep_paths/keep_ips/sources）**即时生效、无需重嵌**；
+  被脱敏的原始 IP/路径落盘 `data/sanitize_log.json` 供维护白名单
 - **审核工作台**（Web UI）：人工确认统一入口（认证 / 存疑 / 删除+撤回，删除只动数据库记录、原始文件保留）、
   **两层标签治理**（自动标签排除/恢复、人工添加、词典管理——新增/改名/改 tier 同步 config.json，
   重建图后入图；tag_candidate 候选采纳；同 stem 重名告警）、
@@ -187,8 +191,10 @@ python scripts/build_fts.py
 
 > 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
 
-**业务来源导入**（PDF 手册 / Markdown / 截图 OCR）：文件放 `data/imports/{pdf,md}/`，启用 config 对应 source
-后跑 `python scripts/build_kb.py`；详见 [使用指南 §2.3](docs/USAGE.md#23-业务来源导入pdf-手册--markdown-文档--完整实操)。
+**业务来源导入**（PDF 手册 / Markdown / Excel 登记表 / 截图 OCR）：文件放 `data/imports/{pdf,md,xlsx}/`，
+启用 config 对应 source 后跑 `python scripts/build_kb.py`；详见
+[使用指南 §2.3](docs/USAGE.md#23-业务来源导入pdf-手册--markdown-文档--完整实操) /
+[§2.4 Excel 导入](docs/USAGE.md#24-excel-登记表导入schema-free--完整实操)。
 
 ## 🧠 知识库结构
 
@@ -203,12 +209,13 @@ data/
 │   ├── vllm/               # 对应 vllm 主仓源码（repo 隔离）
 │   ├── index.sqlite3       # 符号索引（算子名→文件:行号）
 │   └── symbols.json        # 三层签名提取的符号表
-├── graph/                  # Kùzu 图（Issue/PR/Release/Doc/Interface + FIXES/MERGED_IN/MENTIONS/DOCUMENTS）
+├── graph/                  # Kùzu 图（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）
 ├── assets/                 # 业务来源原始资产（pdf/md/images，不可变，sha256）
 ├── parsed/                 # 解析产物（PDF 表格 JSON、OCR 结果，可重跑）
-├── imports/                # 业务数据放置目录（pdf/md）
+├── imports/                # 业务数据放置目录（pdf/md/xlsx）
 ├── review.sqlite3          # 审核工作台队列（认证/存疑/删除）
 ├── checkpoints/            # 采集断点（续传）
+├── sanitize_log.json       # 脱敏维护日志（被脱敏的原始 IP/路径，供调整白名单）
 └── compatibility/          # 组件配套矩阵 + 版本日历
 ```
 
@@ -217,16 +224,17 @@ data/
 ```
 采集/导入层
    ├─ GitHub REST + GraphQL（issues/PRs/comments/releases）
-   ├─ PdfSource / MarkdownSource（业务来源：资产层 + 解析层）
+   ├─ PdfSource / MarkdownSource / ExcelSource（业务来源：资产层 + 解析层；Excel schema-free）
    └─ ImageSource（签名导向 OCR，provider 可插拔）
    ▼
 Canonical 规范化（统一中间格式，可重放可重嵌）
    ▼
 入库流水线（幂等 + 断点续传）
    ├─ LanceDB 向量库（批量写入，ETA 优化 40×）
-   ├─ SQLite（docs + FTS5 全文）
+   ├─ SQLite（docs + FTS5 全文，jieba 中文分词）
    ├─ 版本化代码仓（zip 快照 + 符号索引）
-   └─ Kùzu 图（Issue/PR/Release/Doc/Interface + FIXES/MERGED_IN/MENTIONS/DOCUMENTS）
+   ├─ 脱敏日志收集（原始 IP/路径 → data/sanitize_log.json）
+   └─ Kùzu 图（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）
    ▼
 检索层（只读 API / skill）
    ├─ signature   签名精确检索（三层提取）
@@ -234,7 +242,9 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
    ├─ title       标题精确检索
    ├─ version     版本形态判断
    ├─ code        对应版本源码定位（--in-file/--per-version）
-   └─ graph       修复链路追溯 + 手册定义查询
+   ├─ graph       修复链路追溯 + 手册定义查询
+   └─ tags       文档标签能力发现（领域/作用过滤 + 证据互证）
+   出口统一脱敏（_out/_sanitize_graph：内部 IP/路径 → 占位，改配置即时生效）
 ```
 
 **存算分离**：数据可在远程服务器，本地 skill 通过 `VLLM_KB_BASE` 环境变量寻址；服务端数据路径由 `VLLM_KB_DATA_ROOT` 重定向。详见 [使用指南](docs/USAGE.md#远程部署存算分离)。
@@ -243,14 +253,15 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 
 | 模块 | 职责 |
 |---|---|
-| `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联） |
+| `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量） |
 | `models.py` / `config.py` | Canonical 统一中间格式 + 唯一配置入口（旧版单源折叠兼容；secrets 自动加载） |
 | `chunking.py` / `embed.py` | 讨论线按段切块 + 批量嵌入（攒批降 API 调用） |
 | `ingest.py` / `vectorstore.py` / `pipeline.py` | 幂等入库流水线：SQLite+FTS5、LanceDB 批量写入、`build_kb.py` 入口 |
 | `signature.py` / `error_parse.py` / `symbol_table.py` | 三层签名提取（源码符号表 → 结构化解析 → 社区信号词） |
 | `tagging.py` | 文档级标签（两级分类）确定性提取：词典 registry 子串命中 + 文件名/标题 token；tier 启发式；合并公式唯一实现 `final=(auto−excluded)∪manual`（ingest 与建图共用） |
 | `search.py` / `confidence.py` | 混合检索（向量+FTS+标题）+ 查询时置信度（时间衰退/版本区间/来源可靠度/验证状态） |
-| `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS，含手册表格→错误码、命令格式→Interface）+ 链路查询 |
+| `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH，含手册表格→错误码、命令格式→Interface、文档互证）+ 链路查询（tags/evidence/sig 大小写不敏感） |
+| `sanitize.py` | 内部数据脱敏（后置）：出口统一脱敏（IP/路径白名单 keep_paths/keep_ips）+ 入库命中收集（sources）→ `data/sanitize_log.json` |
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔 |
@@ -264,15 +275,15 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 |---|---|---|
 | 0 | 最小链路（拉取→规范化→嵌入→检索→置信度） | ✅ 完成 |
 | 1 | 全量采集 + 版本日历 | ✅ 完成 |
-| 2 | 图 + 向量双存储（Kùzu，修复链路/手册定义） | ✅ 核心完成（Issue/PR/Release/Doc/Interface + FIXES/MERGED_IN/MENTIONS/DOCUMENTS）；多来源（PDF/MD/OCR/审核工作台）✅；Evidence/等价合并等依赖业务数据 🔲 |
+| 2 | 图 + 向量双存储（Kùzu，修复链路/手册定义） | ✅ 核心完成（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）；多来源（PDF/MD/Excel/OCR/审核工作台）✅；Evidence 互证 ✅；等价合并 🔲 |
 | 3 | MCP Server 封装（任意 MCP 客户端接入） | 🔲 规划 |
-| 4 | wiki/文档通用 adapter（word/html/excel 等） | 🔲 规划 |
+| 4 | wiki/文档通用 adapter（word/html 等） | 🔲 规划（excel 已提前完成：schema-free 导入 ✅） |
 | 5 | 评估集 + 置信度参数调优（真实故障案例） | 🔲 规划 |
 
 ## 🧪 测试
 
 ```bash
-python -m unittest discover tests    # 321 个测试（含文档-命令一致性核验）
+python -m unittest discover tests    # 439 个测试（含文档-命令一致性核验、API 无路径泄漏审计）
 ```
 
 ## 📄 文档

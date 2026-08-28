@@ -48,7 +48,7 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 
 | # | 项 | 说明 | 验证点 | 状态 |
 |---|---|---|---|---|
-| A1 | 解析层 adapter | `PdfSource`（PyMuPDF 文字层 + 表格→Markdown/JSON）/ `MarkdownSource`（标题提取 + 全文）；**Excel 明确不做**（表头不固定）；Word/HTML 待业务环境 | 1 份接口指南 PDF → md + tables.json；1 份 Word 案例 → 标题层级保留 | 🚧 PDF/Markdown ✅，Word/HTML 🔲 |
+| A1 | 解析层 adapter | `PdfSource`（PyMuPDF 文字层 + 表格→Markdown/JSON）/ `MarkdownSource`（标题提取 + 全文）/ `ExcelSource`（**schema-free**：任意 sheet/列序逐行拼接入库，每行一条文档 `excel:{文件}:{sheet}:{行}`）；Word/HTML 待业务环境 | 1 份接口指南 PDF → md + tables.json；1 份 Word 案例 → 标题层级保留 | 🚧 PDF/Markdown/Excel ✅，Word/HTML 🔲 |
 | A2 | 图片链路 | `ImageSource` + 签名导向 OCR：**预留 API**（`ocr_provider: api`，POST {base}/ocr 协议）+ 本地 paddle；**无 API 时交互询问本地/跳过**（ask 默认，非 tty 自动跳过）；md 图片自动收集重写资产路径 + evidence；sha256 幂等 | 10 张真实截图签名召回率（**业务环境用 paddle 标定 B/C 阈值**）；OCR API 服务对接 | 🚧 框架 ✅（ask/api/paddle/none 决策 + 收集/重写/产物/幂等），paddle 实测 🔲 |
 | A3 | canonical 扩展落地 | `extra.asset/quality/verification/evidence` 字段 + 验证状态默认规则（官方手册=expert / 案例标题解析 待审核·审核通过·待修改 / 表格=低优先级按 open issue / wiki=unverified 待补标） | 混合来源 canonical 行数 + 质量字段完整性 | 🚧 asset/quality/verification/evidence ✅（检索结果透传 verification），案例标题解析 🔲 |
 | A4 | 置信度融合 | `verification_factor`（expert 0.95 / tested 0.85 / unverified 0.5，可配置）并入 `w_rel`（max 下限提升）；向量路径 meta 补全 verification | 手册检索 w_rel 0.4→0.95（✅ 实测）；样例置信度分解可见 verification | ✅ 完成 |

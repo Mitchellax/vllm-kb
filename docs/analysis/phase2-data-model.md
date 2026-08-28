@@ -64,8 +64,8 @@ canonical 仍统一单文件，仅扩展字段（§7）。
 | PDF 扫描件 | 整页 OCR | PaddleOCR（本地，中文强） | 少见；接口指南一般有文字层，扫描件才走 OCR |
 | Word 案例 | 正文 → Markdown + 表格 | python-docx / pandoc | 保留标题层级（案例模板：现象/根因/修复版本/规避方案 → 段落级元数据） |
 | 网页案例 | 正文抽取 → Markdown | trafilatura / readability | 保留 URL + 抓取时间；正文引用的截图单独下载进 assets |
-| markdown wiki | 直接读取 + 标题结构切分 | 现有 `MarkdownSource` | 接口已预留（Phase 4 实现） |
-| Excel 登记表 | 行 → 记录，列 → 字段 | 现有 `ExcelSource` | 接口已预留；列"版本/修复PR/URL"可与 GitHub 节点 join |
+| markdown wiki | 直接读取 + 标题结构切分 | 现有 `MarkdownSource` | ✅ 已实现（§USAGE 2.3）；正文带图片自动收集 + 占位 |
+| Excel 登记表 | 行 → 记录，列 → 字段 | 现有 `ExcelSource` | ✅ 已实现（schema-free：任意 sheet/列序逐行拼接，每行一条文档）；列"版本/修复PR/URL"可与 GitHub 节点 join |
 | 日志截图/拍照 | 签名导向 OCR（§5） | PaddleOCR + 预处理 | 不追求全文，只追求**错误签名可达** |
 
 ## 5. 图片/截图专项策略（签名导向 OCR）
@@ -212,7 +212,8 @@ class PdfSource(BaseSource):    type = "pdf"    # 华为接口指南等：pull=�
 class WordSource(BaseSource):   type = "word"   # 对外案例
 class HtmlSource(BaseSource):   type = "html"   # 网页案例（trafilatura 正文抽取）
 class ImageSource(BaseSource):  type = "image"  # 截图/拍照：pull=复制进 assets，canonicalize=签名导向 OCR
-# markdown / excel 已在 Phase 4 预留（现有 MarkdownSource / ExcelSource 骨架）
+# markdown / excel ✅ 已实现（MarkdownSource / ExcelSource：schema-free 逐行拼接入库）；
+# word / html 待业务环境（WordSource / HtmlSource）
 ```
 
 每个 adapter 实现 `pull()`（原始资产落 `data/raw/{source_id}/` 或直接 `data/assets/`）+ `canonicalize()`，
