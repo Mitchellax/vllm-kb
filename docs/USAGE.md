@@ -81,7 +81,17 @@ python scripts/build_vllm_snapshots.py             # 全部下载 + 建索引
 
 # 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配）
 python scripts/build_companion_matrix.py
+
+# FTS5 全文索引重建（jieba 中文分词——可选，不重嵌向量；装 jieba 或升级分词规则后重跑）
+python scripts/build_fts.py                     # 读现有 chunk 原文重新分词重建 chunks_fts
+python scripts/build_fts.py --limit 1000        # 试跑前 N 个 chunk
 ```
+
+**FTS5 中文分词说明（`jieba` 可选依赖）**：SQLite FTS5 默认把连续中文整段当一个 token
+（"超时"无法命中"超时排查"）。安装 `jieba`（`pip install jieba`，离线 wheel 可装）后，
+入库自动对 chunk 文本分词写入 FTS 索引、查询侧同步分词——中文词可独立命中；
+**向量库不受影响**（原文嵌入，无需重嵌）。升级 jieba/分词规则后跑一次
+`scripts/build_fts.py` 重建索引即可。未装 jieba 时 FTS 行为与旧版一致（无需重建）。
 
 **内网（SSL 被禁/镜像源）**：以上联网脚本均支持 `--insecure`（跳过 SSL 校验）与镜像源参数，
 也可用环境变量统一配置（多脚本共享）：

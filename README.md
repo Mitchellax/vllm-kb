@@ -174,6 +174,9 @@ python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本
 
 # 7. 图存储重建（修复链路/手册定义；需先停检索服务）
 python scripts/build_graph.py
+
+# 8. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
+python scripts/build_fts.py
 ```
 
 > 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
