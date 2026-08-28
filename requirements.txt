@@ -16,6 +16,9 @@ pymupdf>=1.23           # PDF 文字层 + 表格提取
 python-docx>=1.1        # Word 案例（业务环境启用）
 trafilatura>=1.6        # 网页案例（业务环境启用）
 
+# ---- 中文分词（FTS5 中文检索，可选——不装则 FTS 中文按整段匹配，行为同旧版）----
+jieba>=0.42             # 入库侧/查询侧分词（scripts/build_fts.py 重建全文索引，不重嵌向量）
+
 # ---- OCR（可选——按需安装；不装则 ocr_provider=ask 时询问/跳过）----
 # paddleocr>=2.7         # 本地 OCR（首次运行下载模型；离线需预置模型目录）
 # paddlepaddle>=2.6
