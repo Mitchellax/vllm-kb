@@ -144,14 +144,14 @@ class GithubPuller:
     # ---------------- 采集（GraphQL 游标分页，无 10k 上限） ----------------
 
     _ISSUES_QUERY = """
-    query($owner: String!, $repo: String!, $states: [IssueState!], $after: String, $withComments: Boolean!) {
+    query($owner: String!, $repo: String!, $states: [IssueState!], $after: String,
+          $withComments: Boolean!, $filter: IssueFilters, $order: IssueOrder!) {
       repository(owner: $owner, name: $repo) {
-        issues(first: 100, after: $after, states: $states,
-               orderBy: {field: CREATED_AT, direction: DESC}) {
+        issues(first: 100, after: $after, states: $states, filterBy: $filter, orderBy: $order) {
           totalCount
           pageInfo { hasNextPage endCursor }
           nodes {
-            number title body state createdAt closedAt url
+            number title body state createdAt updatedAt closedAt url
             author { login }
             labels(first: 20) { nodes { name } }
             comments(first: 100) @include(if: $withComments) {
@@ -165,14 +165,14 @@ class GithubPuller:
     """
 
     _PRS_QUERY = """
-    query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: String, $withComments: Boolean!) {
+    query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: String,
+          $withComments: Boolean!, $order: IssueOrder!) {
       repository(owner: $owner, name: $repo) {
-        pullRequests(first: 100, after: $after, states: $states,
-                     orderBy: {field: CREATED_AT, direction: DESC}) {
+        pullRequests(first: 100, after: $after, states: $states, orderBy: $order) {
           totalCount
           pageInfo { hasNextPage endCursor }
           nodes {
-            number title body state createdAt closedAt url merged mergedAt
+            number title body state createdAt updatedAt closedAt url merged mergedAt
             mergeCommit { oid }
             author { login }
             labels(first: 20) { nodes { name } }
@@ -309,10 +309,15 @@ class GithubPuller:
 
         返回 (本轮新增, 本轮跳过)。进度行带 totalCount 完成度与新增/跳过计数。
 
-        **增量模式**（incremental=True，由 --incremental 触发）：done 后从头重新枚举
-        （created desc，新 issue 编号在前），已有编号（已拉且评论齐）跳过，
-        **连续 3 页无新增即提前停止**——拉入社区新增条目，不必全扫。
-        默认（incremental=False）：从 checkpoint 游标续拉（断点续传），
+        **增量模式**（incremental=True，由 --incremental 触发）：
+        - 窗口起点 = checkpoint 的 `{kind}_since`（上次增量看到的 max createdAt，
+          updatedAt ≥ since 的新条目必在窗口内——新增的 updatedAt=createdAt 天然满足；
+          被更新过的旧条目也会进入窗口，靠已拉编号跳过，无副作用）；
+        - 无 since（首次增量 / 旧 checkpoint）→ 从头枚举（created desc），兼容旧行为；
+        - 排序 UPDATED_AT DESC：新更新在前，翻过有更新的区域后**连续 3 页无新增
+          即提前停止**——增量翻页数与"自上次以来有更新的条目数"成正比，
+          不再全量扫描（issues 同时带 filterBy.since 服务端过滤）。
+        默认（incremental=False）：从 checkpoint 游标续拉（断点续传，created desc 不变），
         done 后由 pull() 跳过（不重复拉取）。
 
         游标异常（endCursor 与上一页相同，活跃仓库分页窗口滑动所致）先自动重试
@@ -328,11 +333,18 @@ class GithubPuller:
         skip_count = 0
         pages = 0
         total = 0
-        # 增量：done 后从头枚举（新 issue 在 created desc 前端）
+        max_created: str | None = None  # 增量窗口跟踪：本轮看到的 max createdAt
+        since: str | None = None
+        # 增量：窗口起点 = 上次 max createdAt；无则从头（首次/旧 checkpoint）
         if incremental:
             cursor = None
-            print(f"[github:{self.id}] {kind} 增量拉取（--incremental：从头，连续 3 页无新增停止）",
-                  flush=True)
+            since = g.get(f"{kind}_since") or None
+            if since:
+                print(f"[github:{self.id}] {kind} 增量拉取（--incremental：时间窗口 "
+                      f"since={since}，UPDATED_AT DESC，连续 3 页无新增停止）", flush=True)
+            else:
+                print(f"[github:{self.id}] {kind} 增量拉取（--incremental：无历史窗口，"
+                      f"从头枚举，连续 3 页无新增停止）", flush=True)
         stale_pages = 0
         # 本类已收集数 = 原始目录里的条目数（跨 REST/GraphQL 累计）
         raw_kind_dir = self.raw_dir / kind
@@ -340,11 +352,18 @@ class GithubPuller:
         while True:
             if self.max_issues and len(cp["issues"]) >= self.max_issues:
                 break
-            data = self._graphql_request(
-                query,
-                {"owner": owner, "repo": repo, "states": states, "after": cursor,
-                 "withComments": self.fetch_comments},
-            )
+            variables = {
+                "owner": owner, "repo": repo, "states": states, "after": cursor,
+                "withComments": self.fetch_comments,
+                # 增量按更新时间排序（新更新在前，提前停止）；断点续传保持创建时间
+                # 排序不变（checkpoint 游标兼容）。
+                "order": {"field": "UPDATED_AT" if incremental else "CREATED_AT",
+                          "direction": "DESC"},
+            }
+            if not is_pr:
+                # issues 支持服务端时间过滤（filterBy.since 语义 = updatedAt ≥ T）
+                variables["filter"] = {"since": since} if since else None
+            data = self._graphql_request(query, variables)
             collection = data["pullRequests" if is_pr else "issues"]
             total = collection.get("totalCount") or 0
             pinfo = collection["pageInfo"]
@@ -359,17 +378,15 @@ class GithubPuller:
                     print(f"[github:{self.id}] {kind} 游标未前进（endCursor 重复），"
                           f"第 {attempt + 1}/{self.STALL_RETRIES} 次重试同一游标 ...", flush=True)
                     time.sleep(self.STALL_RETRY_SECONDS)
-                    data = self._graphql_request(
-                        query,
-                        {"owner": owner, "repo": repo, "states": states, "after": cursor,
-                         "withComments": self.fetch_comments},
-                    )
+                    data = self._graphql_request(query, variables)
                     collection = data["pullRequests" if is_pr else "issues"]
                     pinfo = collection["pageInfo"]
                     if not pinfo.get("endCursor") or pinfo["endCursor"] != g.get(f"{kind}_last_cursor"):
                         recovered = True
                         break
                 if not recovered:
+                    if incremental and max_created:
+                        g[f"{kind}_since"] = max_created  # 窗口推进不丢失
                     print(f"[github:{self.id}] {kind} 游标持续重复（分页窗口滑动未恢复），"
                           f"保留已拉数据并保存 checkpoint，本轮跳过 {kind} 继续其他采集；"
                           f"下次运行自动从 checkpoint 续传。若持续卡住，可删除 checkpoint 全量重拉。",
@@ -384,6 +401,10 @@ class GithubPuller:
             for node in nodes:
                 if self.max_issues and len(cp["issues"]) >= self.max_issues:
                     break
+                # 增量窗口跟踪：记录本轮看到的 max createdAt（作为下次 since）
+                created = node.get("createdAt") or ""
+                if created and (max_created is None or created > max_created):
+                    max_created = created
                 number = node["number"]
                 rec = cp["issues"].get(str(number))
                 comments_done = bool(rec and rec.get("comments"))
@@ -430,6 +451,8 @@ class GithubPuller:
                 if page_new == 0:
                     stale_pages += 1
                     if stale_pages >= 3:
+                        if max_created:
+                            g[f"{kind}_since"] = max_created  # 窗口推进
                         print(f"[github:{self.id}] {kind} 增量完成"
                               f"（连续 {stale_pages} 页无新增）", flush=True)
                         break
@@ -437,6 +460,8 @@ class GithubPuller:
                     stale_pages = 0
             if g.get(f"{kind}_done"):
                 break
+        if incremental and max_created and not g.get(f"{kind}_since"):
+            g[f"{kind}_since"] = max_created  # 正常翻完（hasNextPage=false）也推进窗口
         if not g.get(f"{kind}_done"):
             self._save_checkpoint(cp)
         return new_count, skip_count
@@ -447,9 +472,10 @@ class GithubPuller:
         - **默认（断点续传）**：从 checkpoint 游标续拉；一次拉完后置 done——
           之后默认**不再拉取**（日志打印"done 已设置，跳过；如需增量用 --incremental"）；
           拉取中断后重跑同一命令自动续传；
-        - **incremental=True（--incremental）**：done 后仍增量拉取——从头枚举
-          （created desc，新 issue 编号在前），跳过已有编号，连续 3 页无新增停止，
-          把社区新增条目刷入；
+        - **incremental=True（--incremental）**：done 后仍增量拉取——时间窗口：
+          从 checkpoint 的 `{kind}_since`（上次增量 max createdAt）起，issues 走
+          filterBy.since 服务端过滤、PR 走 UPDATED_AT DESC 排序，跳过已有编号，
+          连续 3 页无新增停止，把社区新增条目刷入并推进窗口；
         - **全量重拉**：删除 data/raw/{source_id}/ 与 checkpoint 后重跑（见 USAGE）。
         """
         if not self.session.headers.get("Authorization"):
@@ -465,11 +491,17 @@ class GithubPuller:
             or cp.get("direction") != self.direction
         ):
             print(f"[github:{self.id}] 查询参数变化，重置 GraphQL 游标（已拉编号保留）")
+            # 增量时间窗口与查询参数无关，保留（否则下次增量退化回从头全扫）
+            since_issues, since_prs = g.get("issues_since"), g.get("prs_since")
             g.clear()
             g.update(
                 {"issues_cursor": None, "prs_cursor": None,
                  "issues_done": False, "prs_done": False}
             )
+            if since_issues:
+                g["issues_since"] = since_issues
+            if since_prs:
+                g["prs_since"] = since_prs
 
         new_count = 0
         skip_count = 0

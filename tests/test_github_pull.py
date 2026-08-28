@@ -569,7 +569,7 @@ class TestPullIncremental(unittest.TestCase):
             self.assertIn("--incremental", out.getvalue())
 
     def test_pull_incremental_fetches_new_and_stops(self):
-        """--incremental：done 后从头拉，新编号落盘、已有跳过、连续 3 页无新增停止。"""
+        """--incremental：无历史窗口时从头拉，新编号落盘、已有跳过、连续 3 页无新增停止。"""
         import tempfile
         from contextlib import redirect_stdout
         from io import StringIO
@@ -600,6 +600,11 @@ class TestPullIncremental(unittest.TestCase):
             ])
 
             def fake_request(query, variables):
+                # 无历史窗口：issues 不带 filter（since=None）；增量排序 UPDATED_AT DESC
+                if "issues" in query:
+                    self.assertIsNone(variables["filter"])
+                self.assertEqual(variables["order"],
+                                 {"field": "UPDATED_AT", "direction": "DESC"})
                 return next(issues_pages) if "issues" in query else next(prs_pages)
 
             puller._graphql_request = fake_request
@@ -612,6 +617,46 @@ class TestPullIncremental(unittest.TestCase):
             self.assertIn("2", cp["issues"])
             self.assertIn("3", cp["issues"])
             self.assertTrue(cp["graphql"]["issues_done"])  # done 状态保持
+            # 窗口推进：记录本轮 max createdAt（_node 固定 createdAt=2026-01-01T00:00:00Z）
+            self.assertEqual(cp["graphql"].get("issues_since"), "2026-01-01T00:00:00Z")
+
+    def test_pull_incremental_uses_time_window_since(self):
+        """--incremental 且已有 since：issues 带 filterBy.since 服务端过滤，PR 不带。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            cp["graphql"]["issues_since"] = "2026-01-15T00:00:00Z"
+            cp["graphql"]["prs_since"] = "2026-01-20T00:00:00Z"
+            puller._save_checkpoint(cp)
+            seen = {"issues": [], "prs": []}
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    seen["issues"].append(variables)
+                    return {"issues": {"totalCount": 0,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       "nodes": []}}
+                seen["prs"].append(variables)
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 0)
+            # issues：filterBy.since 生效（服务端时间窗口）
+            self.assertEqual(seen["issues"][0]["filter"], {"since": "2026-01-15T00:00:00Z"})
+            self.assertEqual(seen["issues"][0]["order"],
+                             {"field": "UPDATED_AT", "direction": "DESC"})
+            # PR：连接无 filterBy 参数（不传 filter），排序 UPDATED_AT DESC
+            self.assertNotIn("filter", seen["prs"][0])
+            self.assertEqual(seen["prs"][0]["order"],
+                             {"field": "UPDATED_AT", "direction": "DESC"})
 
 
 if __name__ == "__main__":

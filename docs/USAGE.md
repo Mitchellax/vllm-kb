@@ -66,7 +66,10 @@ python scripts/build_kb.py --limit 100
 
 > **GitHub 拉取策略**：首次拉取完成后置 `done`（checkpoint），此后默认**不再拉取**（日志打印
 > "已拉取完成（done），默认跳过——如需增量请用 --incremental"）；中断后重跑同一命令自动
-> **断点续传**。`--incremental` 从头拉取社区新增 issue/PR（跳过已有，连续 3 页无新增停止）；
+> **断点续传**。`--incremental` 增量拉取社区新增 issue/PR——**时间窗口**：从 checkpoint 记录的
+> 上次增量 `max createdAt` 起，issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走
+> `UPDATED_AT DESC` 排序，跳过已有编号、连续 3 页无新增停止，并把窗口推进到本次所见
+> `max createdAt`（首次增量无历史窗口时从头枚举一次）；无 `--incremental` 且 done 时跳过。
 > **全量重拉**（数据刷新/补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
 > `data/checkpoints/{source_id}.json` 后重跑 `build_kb.py`。
 
