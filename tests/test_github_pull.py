@@ -281,24 +281,68 @@ class TestGithubConvert(unittest.TestCase):
             self.assertTrue(g["issues_done"])
             self.assertEqual(sorted(cp["issues"]), ["1", "2", "3"])
 
-    def test_graphql_dead_loop_guard(self):
-        """endCursor 重复（分页卡死）时必须报错而非无限循环。"""
+    def test_graphql_stalled_cursor_retries_then_skips(self):
+        """endCursor 重复：先重试 STALL_RETRIES 次；仍重复则跳过该 kind（不中断、不报错、不无限循环）。"""
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
             src = make_source(repo="vllm-project/vllm-ascend", raw_dir=str(Path(td) / "raw"),
                               fetch_comments=False)
             puller = GithubPuller(src, PROJECT_ROOT)
+            requests = {"n": 0}
 
             def stuck_request(query, variables):
+                requests["n"] += 1
                 return {"issues": {"totalCount": 250,
                                    "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
                                    "nodes": [_node(1)]}}
 
             puller._graphql_request = stuck_request
-            with self.assertRaises(RuntimeError) as ctx:
-                puller._collect_graphql({"issues": {}}, {}, kind="issues")
-            self.assertIn("游标未前进", str(ctx.exception))
+            cp = {"issues": {}}
+            g = {}
+            new_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
+            # 首页已收 1 条；此后 endCursor 恒为 C1：首页 1 次 + 检测到重复 1 次 +
+            # 重试 STALL_RETRIES 次后跳过，不再发请求、不抛异常、kind 不置 done（下次续传）。
+            self.assertEqual(new_count, 1)
+            self.assertEqual(requests["n"], 2 + GithubPuller.STALL_RETRIES)
+            self.assertFalse(g.get("issues_done"))
+            self.assertEqual(g.get("issues_cursor"), "C1")  # 停在本游标，续传不重复
+
+    def test_graphql_stalled_cursor_recovers_on_retry(self):
+        """endCursor 重复但重试后前进：正常继续（活跃仓库窗口滑动自愈，不误跳过）。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            src = make_source(repo="vllm-project/vllm-ascend", raw_dir=str(Path(td) / "raw"),
+                              fetch_comments=False)
+            puller = GithubPuller(src, PROJECT_ROOT)
+            requests = {"n": 0}
+
+            def flaky_request(query, variables):
+                requests["n"] += 1
+                n = requests["n"]
+                if n == 1:  # 首页
+                    return {"issues": {"totalCount": 250,
+                                       "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                                       "nodes": [_node(1), _node(2)]}}
+                if n == 2:  # 窗口滑动：返回与上一页相同的 endCursor
+                    return {"issues": {"totalCount": 250,
+                                       "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                                       "nodes": [_node(1)]}}
+                # 重试后恢复前进
+                return {"issues": {"totalCount": 250,
+                                   "pageInfo": {"hasNextPage": False, "endCursor": "C2"},
+                                   "nodes": [_node(3)]}}
+
+            puller._graphql_request = flaky_request
+            cp = {"issues": {}}
+            g = {}
+            new_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
+            self.assertEqual(new_count, 3)  # 1、2、3 全部入库
+            self.assertEqual(requests["n"], 3)  # 首页 + 滑动页 + 重试恢复页
+            self.assertTrue(g["issues_done"])
+            self.assertEqual(g["issues_cursor"], "C2")
+            self.assertEqual(sorted(cp["issues"]), ["1", "2", "3"])
 
     def test_recanonicalize_from_raw(self):
         """从原始 JSON 重新生成 canonical（含 PR），无需重新拉取。"""

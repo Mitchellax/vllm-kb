@@ -54,6 +54,11 @@ def _split_environment(body: str) -> tuple[str, str]:
 
 
 class GithubPuller:
+    # endCursor 重复（活跃仓库分页窗口滑动，GitHub GraphQL 已知行为）时的恢复参数：
+    # 重试同一游标 STALL_RETRIES 次、间隔 STALL_RETRY_SECONDS；仍重复则跳过该 kind（不中断）。
+    STALL_RETRIES = 2
+    STALL_RETRY_SECONDS = 1.0
+
     def __init__(self, source: SourceCfg, project_root: Path = PROJECT_ROOT):
         self.source = source
         self.id = source.id
@@ -303,6 +308,10 @@ class GithubPuller:
         **连续 3 页无新增即提前停止**——拉入社区新增条目，不必全扫。
         默认（incremental=False）：从 checkpoint 游标续拉（断点续传），
         done 后由 pull() 跳过（不重复拉取）。
+
+        游标异常（endCursor 与上一页相同，活跃仓库分页窗口滑动所致）先自动重试
+        STALL_RETRIES 次；仍重复则保留已拉数据 + checkpoint 并跳过本 kind（不中断全流程），
+        下次运行从 checkpoint 续传。
         """
         is_pr = kind == "prs"
         query = self._PRS_QUERY if is_pr else self._ISSUES_QUERY
@@ -332,6 +341,35 @@ class GithubPuller:
             )
             collection = data["pullRequests" if is_pr else "issues"]
             total = collection.get("totalCount") or 0
+            pinfo = collection["pageInfo"]
+            # 游标前进检查：endCursor 与上一页相同。活跃仓库分页期间新条目持续创建
+            # （created desc 排序窗口滑动），GitHub GraphQL 可能返回与上一页相同的
+            # endCursor —— 属已知行为，不是死循环。先按相同 after 重试恢复；
+            # 重试仍重复则保留已拉数据、保存 checkpoint，本轮跳过该 kind（不中断其他
+            # 采集），下次运行自动从 checkpoint 续传。
+            if pinfo.get("endCursor") and pinfo["endCursor"] == g.get(f"{kind}_last_cursor"):
+                recovered = False
+                for attempt in range(self.STALL_RETRIES):
+                    print(f"[github:{self.id}] {kind} 游标未前进（endCursor 重复），"
+                          f"第 {attempt + 1}/{self.STALL_RETRIES} 次重试同一游标 ...", flush=True)
+                    time.sleep(self.STALL_RETRY_SECONDS)
+                    data = self._graphql_request(
+                        query,
+                        {"owner": owner, "repo": repo, "states": states, "after": cursor,
+                         "withComments": self.fetch_comments},
+                    )
+                    collection = data["pullRequests" if is_pr else "issues"]
+                    pinfo = collection["pageInfo"]
+                    if not pinfo.get("endCursor") or pinfo["endCursor"] != g.get(f"{kind}_last_cursor"):
+                        recovered = True
+                        break
+                if not recovered:
+                    print(f"[github:{self.id}] {kind} 游标持续重复（分页窗口滑动未恢复），"
+                          f"保留已拉数据并保存 checkpoint，本轮跳过 {kind} 继续其他采集；"
+                          f"下次运行自动从 checkpoint 续传。若持续卡住，可删除 checkpoint 全量重拉。",
+                          flush=True)
+                    self._save_checkpoint(cp)
+                    break
             nodes = collection["nodes"] or []
             if not nodes:
                 g[f"{kind}_done"] = True
@@ -365,15 +403,8 @@ class GithubPuller:
                 new_count += 1
                 page_new += 1
                 collected_kind += 1
-            pinfo = collection["pageInfo"]
             pages += 1
-            # 游标必须前进：连续两页拿到相同的 endCursor 说明分页卡死（此前有过该 bug），
-            # 立即报错而非无限循环刷同一页。
-            if pinfo["endCursor"] == g.get(f"{kind}_last_cursor"):
-                raise RuntimeError(
-                    f"[github:{self.id}] {kind} 游标未前进（endCursor 重复），疑似分页死循环，"
-                    "已中止保护数据。请检查后重跑续传。"
-                )
+            # 游标推进（已确认与上一页不同或首页）
             g[f"{kind}_last_cursor"] = pinfo["endCursor"]
             cursor = pinfo["endCursor"]
             g[f"{kind}_cursor"] = cursor
