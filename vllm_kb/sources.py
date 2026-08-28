@@ -111,6 +111,44 @@ class BaseSource(ABC):
         except Exception as e:
             print(f"[sources:{self.id}] asset_registry 注册失败（不影响入库）: {e}")
 
+    # ---------------- 内部数据脱敏（config.sanitize 控制启用范围） ----------------
+
+    # 默认启用脱敏的业务来源（github 公开数据不脱敏；PDF 手册默认不启用，config 加 "pdf" 即开）
+    DEFAULT_SANITIZE_SOURCES = ("excel", "markdown")
+
+    def sanitize_enabled(self) -> bool:
+        """该来源是否启用脱敏（config.sanitize.sources 控制；None=默认业务来源，[]=全关）。"""
+        if self.app_cfg is None:
+            return self.type in self.DEFAULT_SANITIZE_SOURCES
+        cfg_sources = self.app_cfg.sanitize.sources
+        if cfg_sources is None:
+            return self.type in self.DEFAULT_SANITIZE_SOURCES
+        return self.type in cfg_sources
+
+    def sanitize_params(self) -> tuple[bool, Optional[list], Optional[list]]:
+        """返回 (enabled, keep_paths, keep_ips)。
+
+        - enabled=False：该来源未启用脱敏，调用方应**跳过** sanitize（原文入库）；
+        - enabled=True：keep_paths/keep_ips 为 None=默认白名单、[]=全脱敏
+          （app_cfg 缺失时用默认白名单脱敏，但不写日志）。
+        """
+        if not self.sanitize_enabled():
+            return False, None, None
+        if self.app_cfg is None:
+            return True, None, None
+        return True, self.app_cfg.sanitize.keep_paths, self.app_cfg.sanitize.keep_ips
+
+    def save_sanitize_log(self, collector: Optional[dict]) -> None:
+        """把被脱敏命中的 IP/路径落盘维护文件（data/sanitize_log.json，幂等合并，不进库）。"""
+        if not collector or self.app_cfg is None:
+            return
+        try:
+            from .sanitize import save_sanitize_log
+
+            save_sanitize_log(self.app_cfg, collector)
+        except Exception as e:
+            print(f"[sources:{self.id}] sanitize_log 写入失败（不影响入库）: {e}")
+
     @abstractmethod
     def pull(self) -> int:
         """把原始数据拉取到 raw_dir（幂等、断点续传），返回本次新增条数。"""
@@ -189,10 +227,17 @@ class MarkdownSource(BaseSource):
           （md 复制到 assets 后相对路径会失锚）；imports 被清空时回退 assets 副本；
         - 正文图片引用改为**不透明占位**（`[图片]`），原引用只进 evidence（含资产 asset_id），
           **正文与 canonical 不暴露任何服务器路径**；
+        - **内部数据脱敏**（config.sanitize，markdown 默认启用）：body/title 中的
+          内部 IP/路径 → `<IP>`/`<PATH>`（默认路径白名单保留），防案例记录中的
+          内部信息经检索外泄；
         - evidence 记录图片清单（供 ImageSource OCR 与图文互证消费）。
         """
+        from .sanitize import sanitize_text
+
         docs: list[KbDocument] = []
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
+        sanitize_on, keep_paths, keep_ips = self.sanitize_params()
+        collector: dict = {}  # 被脱敏命中的原始 IP/路径（落盘维护，不进库）
         md_files: list[tuple[Path, bool]] = []
         if self.import_dir.exists():
             md_files = [(p, True) for p in sorted(self.import_dir.rglob("*.md"))
@@ -213,8 +258,14 @@ class MarkdownSource(BaseSource):
                 print(f"[sources:{self.id}] 跳过 {p.name}: {e}")
                 continue
             body, evidence = self._resolve_images(p, text) if from_imports else (text, [])
-            title = self._title_re.search(text)
-            title = title.group(1).strip() if title else p.stem
+            if sanitize_on:
+                body = sanitize_text(body, keep_paths=keep_paths, keep_ips=keep_ips,
+                                     collector=collector)
+            title_raw = self._title_re.search(text)
+            title = title_raw.group(1).strip() if title_raw else p.stem
+            if sanitize_on:
+                title = sanitize_text(title, keep_paths=keep_paths, keep_ips=keep_ips,
+                                      collector=collector)[:80]
             sha = _sha256(p)
             asset_id = sha[:16]
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
@@ -243,6 +294,7 @@ class MarkdownSource(BaseSource):
         if total:
             print(f"[sources:{self.id}] 解析完成：{len(docs)}/{total} 篇（耗时 "
                   f"{time.time() - start_ts:.0f}s）", flush=True)
+        self.save_sanitize_log(collector)
         return docs
 
     # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
@@ -723,13 +775,9 @@ class ExcelSource(BaseSource):
 
     def canonicalize(self) -> list[KbDocument]:
         """遍历所有 sheet/行，行 cell 拼接为 body（schema-free），脱敏后产出 KbDocument。"""
-        from .sanitize import sanitize_text, save_sanitize_log
+        from .sanitize import sanitize_text
 
-        # 脱敏配置（config.sanitize：keep_paths/keep_ips；None=默认白名单，[]=全脱敏）
-        keep_paths = keep_ips = None
-        if self.app_cfg is not None:
-            keep_paths = self.app_cfg.sanitize.keep_paths
-            keep_ips = self.app_cfg.sanitize.keep_ips
+        sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 被脱敏命中的原始 IP/路径（落盘维护，不进库）
 
         try:
@@ -761,13 +809,15 @@ class ExcelSource(BaseSource):
                                 continue  # 空行跳过（不依赖行号语义）
                             body = sanitize_text(" ".join(cells),
                                                  keep_paths=keep_paths, keep_ips=keep_ips,
-                                                 collector=collector)
+                                                 collector=collector) if sanitize_on \
+                                else " ".join(cells)
                             if not body.strip():
                                 continue
                             title = sanitize_text(cells[0],
                                                  keep_paths=keep_paths,
                                                  keep_ips=keep_ips,
-                                                 collector=collector)[:80]
+                                                 collector=collector)[:80] if sanitize_on \
+                                else cells[0][:80]
                             docs.append(KbDocument(
                                 source_type="doc_excel",
                                 source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",
@@ -787,11 +837,7 @@ class ExcelSource(BaseSource):
                 finally:
                     wb.close()
         # 被脱敏命中的 IP/路径落盘维护文件（data/sanitize_log.json，幂等合并；app_cfg 缺失时跳过）
-        if collector and self.app_cfg is not None:
-            try:
-                save_sanitize_log(self.app_cfg, collector)
-            except Exception as e:
-                print(f"[sources:{self.id}] sanitize_log 写入失败（不影响入库）: {e}")
+        self.save_sanitize_log(collector)
         print(f"[sources:{self.id}] canonical {len(docs)} 条（{n_files} 个 excel）")
         return docs
 

@@ -124,6 +124,53 @@ class TestMarkdownSource(unittest.TestCase):
         self.assertTrue(ev["asset_id"])
         self.assertNotIn("path", ev)
 
+    def test_markdown_sanitized(self):
+        """Markdown 源默认启用脱敏：内部 IP/路径 → 占位，默认路径保留。"""
+        import os
+
+        from vllm_kb.config import AppConfig
+
+        (self.root / "data" / "imports" / "md" / "案例.md").write_text(
+            "# 案例\n\n节点 10.0.0.5 超时，日志在 /home/user/logs/x.log，"
+            "默认路径 /var/log/npu/ 保留。\n", encoding="utf-8")
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        try:
+            cfg = AppConfig.model_validate({})
+            src = MarkdownSource(self.cfg, project_root=self.root, app_cfg=cfg)
+            docs = src.canonicalize()
+            d = next(x for x in docs if "案例" in x.source_id)
+            self.assertNotIn("10.0.0.5", d.body)
+            self.assertIn("<IP>", d.body)
+            self.assertNotIn("/home/user/logs/x.log", d.body)
+            self.assertIn("<PATH>", d.body)
+            self.assertIn("/var/log/npu/", d.body)  # 默认路径保留
+            # 脱敏日志落盘（维护文件）
+            log = self.root / "data" / "sanitize_log.json"
+            self.assertTrue(log.exists())
+            data = json.loads(log.read_text(encoding="utf-8"))
+            self.assertIn("10.0.0.5", data["ips"])
+            self.assertIn("/home/user/logs/x.log", data["paths"])
+        finally:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
+    def test_markdown_sanitize_sources_config(self):
+        """config.sanitize.sources 关闭 markdown 时，md 正文不脱敏。"""
+        import os
+
+        from vllm_kb.config import AppConfig
+
+        (self.root / "data" / "imports" / "md" / "案例2.md").write_text(
+            "# 案例2\n\n节点 10.0.0.5 超时。\n", encoding="utf-8")
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        try:
+            cfg = AppConfig.model_validate({"sanitize": {"sources": ["excel"]}})
+            src = MarkdownSource(self.cfg, project_root=self.root, app_cfg=cfg)
+            docs = src.canonicalize()
+            d = next(x for x in docs if "案例2" in x.source_id)
+            self.assertIn("10.0.0.5", d.body)  # markdown 未启用脱敏
+        finally:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
 
 class TestPdfSource(unittest.TestCase):
     def setUp(self):

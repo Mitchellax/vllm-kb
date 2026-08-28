@@ -165,17 +165,21 @@ class VerifyCfg(BaseModel):
 
 
 class SanitizeCfg(BaseModel):
-    """内部数据脱敏配置（IP / 路径，Excel 等业务来源入库时应用）。
+    """内部数据脱敏配置（IP / 路径，业务来源入库时应用）。
 
     - keep_paths: 保留的**默认路径前缀**（白名单内绝对路径保留——昇腾默认安装/系统日志/
       配置目录诊断价值高；白名单外内部路径 → <PATH>）。空列表 = 全部绝对路径脱敏；
     - keep_ips: 保留的 IP（默认回环/通配）；其余 IPv4（内网段/公网）→ <IP>。
-      空列表 = 全部 IP 脱敏。
-    **None = 使用默认（vllm_kb.sanitize.DEFAULT_KEEP_PATHS / DEFAULT_KEEP_IPS）；
-    显式 [] = 全部脱敏**——未配置与有意清空语义不同。
+      空列表 = 全部 IP 脱敏；
+    - sources: **启用脱敏的源 type 列表**（excel/markdown/pdf...；github 公开数据不脱敏）。
+      None = 默认业务来源 ["excel", "markdown"]（PDF 手册默认不脱敏，加 "pdf" 即启用）；
+      显式列表 = 仅列出的源启用；空列表 [] = 全部关闭。
+    **None 与显式值语义不同**：keep_paths/keep_ips/sources 的 None = 用默认，
+    显式空数组 = 清空（全部脱敏 / 全部不启用）。
     """
     keep_paths: Optional[list[str]] = None
     keep_ips: Optional[list[str]] = None
+    sources: Optional[list[str]] = None
 
 
 class TagCfg(BaseModel):

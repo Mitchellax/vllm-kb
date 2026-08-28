@@ -177,8 +177,9 @@
     "min_len": 2,
     "heading_max_chars": 12
   },
-  "_comment_sanitize": "内部数据脱敏（Excel 等业务来源入库时应用）：keep_paths=保留的默认路径前缀（白名单内绝对路径保留——昇腾默认安装/系统日志/配置目录诊断价值高；其余内部路径→<PATH>）；keep_ips=保留的 IP（默认回环/通配；其余 IPv4→<IP>）。不配置=用默认；显式空数组=全部脱敏。",
+  "_comment_sanitize": "内部数据脱敏（业务来源入库时应用）：keep_paths=保留的默认路径前缀（白名单内绝对路径保留——昇腾默认安装/系统日志/配置目录诊断价值高；其余内部路径→<PATH>）；keep_ips=保留的 IP（默认回环/通配；其余 IPv4→<IP>）；sources=启用脱敏的源 type（默认 excel/markdown；github 公开数据不脱敏，PDF 手册默认不启用——加\"pdf\"即开）。不配置=用默认；显式空数组=全部脱敏/全部关闭。被脱敏的原始 IP/路径落盘 data/sanitize_log.json 供维护。",
   "sanitize": {
+    "sources": ["excel", "markdown"],
     "keep_paths": ["/usr/local/Ascend", "/var/log/", "/etc/ascend", "/etc/npu", "/tmp/", "/usr/bin/", "/usr/lib/"],
     "keep_ips": ["127.0.0.1", "0.0.0.0", "255.255.255.255", "::1"]
   }
