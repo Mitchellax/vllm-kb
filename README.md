@@ -153,8 +153,12 @@ python skills/vllm-kb/client.py graph sig dispatch_ffn_combine
 ## 📦 数据更新
 
 ```bash
-# 1. 日常更新：拉取新数据 + 增量入库（断点续传）
+# 1. 日常更新（增量入库；GitHub 首次全量后默认不再拉取——日志打印 done 跳过说明）
 python scripts/build_kb.py
+
+# 1b. 拉取 GitHub 社区增量（新增 issue/PR；跳过已有，连续 3 页无新增停止）
+python scripts/build_kb.py --incremental
+#    全量重拉（数据刷新）：删除 data/raw/{source_id}/ 与 data/checkpoints/{source_id}.json 后重跑
 
 # 2. 只重新入库，不拉取（改配置/规则后）
 python scripts/build_kb.py --skip-pull

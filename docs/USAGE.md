@@ -55,7 +55,8 @@ python scripts/build_kb.py --limit 100
 
 | 场景 | 命令 |
 |---|---|
-| 日常更新（拉新数据 + 增量入库） | `python scripts/build_kb.py` |
+| 日常更新（增量入库；GitHub 默认不重拉） | `python scripts/build_kb.py` |
+| 拉取 GitHub 社区增量（新增 issue/PR） | `python scripts/build_kb.py --incremental` |
 | 只重入库不拉取 | `python scripts/build_kb.py --skip-pull` |
 | 提取逻辑升级后重生成 canonical | `python scripts/build_kb.py --recanonicalize` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
