@@ -293,10 +293,16 @@ class GithubPuller:
             if c
         ]
 
-    def _collect_graphql(self, cp: dict, g: dict, kind: str) -> tuple[int, int]:
+    def _collect_graphql(self, cp: dict, g: dict, kind: str, incremental: bool = False) -> tuple[int, int]:
         """按游标枚举一类集合（issues/prs），落原始 JSON + checkpoint。
 
         返回 (本轮新增, 本轮跳过)。进度行带 totalCount 完成度与新增/跳过计数。
+
+        **增量模式**（incremental=True，由 --incremental 触发）：done 后从头重新枚举
+        （created desc，新 issue 编号在前），已有编号（已拉且评论齐）跳过，
+        **连续 3 页无新增即提前停止**——拉入社区新增条目，不必全扫。
+        默认（incremental=False）：从 checkpoint 游标续拉（断点续传），
+        done 后由 pull() 跳过（不重复拉取）。
         """
         is_pr = kind == "prs"
         query = self._PRS_QUERY if is_pr else self._ISSUES_QUERY
@@ -307,6 +313,12 @@ class GithubPuller:
         skip_count = 0
         pages = 0
         total = 0
+        # 增量：done 后从头枚举（新 issue 在 created desc 前端）
+        if incremental:
+            cursor = None
+            print(f"[github:{self.id}] {kind} 增量拉取（--incremental：从头，连续 3 页无新增停止）",
+                  flush=True)
+        stale_pages = 0
         # 本类已收集数 = 原始目录里的条目数（跨 REST/GraphQL 累计）
         raw_kind_dir = self.raw_dir / kind
         collected_kind = len(list(raw_kind_dir.glob("*.json"))) if raw_kind_dir.exists() else 0
@@ -324,6 +336,7 @@ class GithubPuller:
             if not nodes:
                 g[f"{kind}_done"] = True
                 break
+            page_new = 0
             for node in nodes:
                 if self.max_issues and len(cp["issues"]) >= self.max_issues:
                     break
@@ -332,7 +345,7 @@ class GithubPuller:
                 comments_done = bool(rec and rec.get("comments"))
                 if rec and (not self.fetch_comments or comments_done):
                     skip_count += 1
-                    continue  # 已拉且评论已齐
+                    continue  # 已拉且评论已齐（断点续传/增量均跳过）
                 item = self._item_from_node(node, is_pr)
                 comments = (
                     self._comments_from_node(node)
@@ -350,6 +363,7 @@ class GithubPuller:
                     "comments": comments_done or self.fetch_comments,
                 }
                 new_count += 1
+                page_new += 1
                 collected_kind += 1
             pinfo = collection["pageInfo"]
             pages += 1
@@ -374,18 +388,32 @@ class GithubPuller:
                 f"{kind} 已收 {pct} | 全部已收 {len(cp['issues'])} | 游标 {pinfo['endCursor'][:12]}...",
                 flush=True,
             )
+            if incremental:
+                # 连续 3 页无新增 → 新数据区已拉完，提前停止（避免每次全扫）
+                if page_new == 0:
+                    stale_pages += 1
+                    if stale_pages >= 3:
+                        print(f"[github:{self.id}] {kind} 增量完成"
+                              f"（连续 {stale_pages} 页无新增）", flush=True)
+                        break
+                else:
+                    stale_pages = 0
             if g.get(f"{kind}_done"):
                 break
         if not g.get(f"{kind}_done"):
             self._save_checkpoint(cp)
         return new_count, skip_count
 
-    def pull(self) -> int:
-        """全量拉取（issue + PR + 评论）原始 JSON 落盘，返回新增条数。
+    def pull(self, incremental: bool = False) -> int:
+        """拉取 GitHub 原始数据（issue + PR + 评论），返回新增条数。
 
-        用 GraphQL 游标分页枚举（REST page 分页有 10,000 条上限，vllm/vllm-ascend
-        均超过，第 100 页会 422）；评论仍走 REST（按条，无上限）。
-        checkpoint 记录两类游标 + 每类是否完成 + 每条评论状态，支持断点续传。
+        - **默认（断点续传）**：从 checkpoint 游标续拉；一次拉完后置 done——
+          之后默认**不再拉取**（日志打印"done 已设置，跳过；如需增量用 --incremental"）；
+          拉取中断后重跑同一命令自动续传；
+        - **incremental=True（--incremental）**：done 后仍增量拉取——从头枚举
+          （created desc，新 issue 编号在前），跳过已有编号，连续 3 页无新增停止，
+          把社区新增条目刷入；
+        - **全量重拉**：删除 data/raw/{source_id}/ 与 checkpoint 后重跑（见 USAGE）。
         """
         if not self.session.headers.get("Authorization"):
             raise RuntimeError(
@@ -409,15 +437,22 @@ class GithubPuller:
         new_count = 0
         skip_count = 0
         # 1) issues（先）
-        if not g.get("issues_done"):
-            n, s = self._collect_graphql(cp, g, kind="issues")
+        if g.get("issues_done") and not incremental:
+            print(f"[github:{self.id}] issues 已拉取完成（done），默认跳过——"
+                  f"如需拉取社区增量请用 --incremental；全量重拉请删除 raw 与 checkpoint")
+        else:
+            n, s = self._collect_graphql(cp, g, kind="issues", incremental=incremental)
             new_count += n
             skip_count += s
         # 2) PRs（后）
-        if self.include_prs and not g.get("prs_done"):
-            n, s = self._collect_graphql(cp, g, kind="prs")
-            new_count += n
-            skip_count += s
+        if self.include_prs:
+            if g.get("prs_done") and not incremental:
+                print(f"[github:{self.id}] prs 已拉取完成（done），默认跳过——"
+                      f"如需拉取社区增量请用 --incremental")
+            else:
+                n, s = self._collect_graphql(cp, g, kind="prs", incremental=incremental)
+                new_count += n
+                skip_count += s
 
         cp["state"] = self.issue_state
         cp["sort"] = self.sort

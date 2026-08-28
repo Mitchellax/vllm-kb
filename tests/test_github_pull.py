@@ -447,5 +447,86 @@ class TestGithubConvert(unittest.TestCase):
         self.assertEqual(sleeps, [puller.retry_backoff_seconds * 3])
 
 
+class TestPullIncremental(unittest.TestCase):
+    """pull 的 done 跳过 / --incremental 增量拉取（mock GraphQL，不触网）。"""
+
+    def _make_puller(self, td: str, issues_done: bool = True):
+        from vllm_kb.github_pull import GithubPuller
+
+        src = make_source(token="fake-token",
+                          raw_dir=f"{td}/raw", checkpoint_file=f"{td}/cp.json",
+                          fetch_comments=False)
+        puller = GithubPuller(src, PROJECT_ROOT)
+        puller._save_checkpoint({
+            "issues": {"1": {"fetched_at": "x", "comments": False}},
+            "state": "all", "sort": "created", "direction": "desc",
+            "graphql": {"issues_done": issues_done, "prs_done": issues_done},
+        })
+        return puller
+
+    def test_pull_done_skips_with_message(self):
+        """done=True 默认跳过拉取（打印说明），不发起 GraphQL 请求。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            calls = []
+            puller._graphql_request = lambda *a, **k: calls.append(a) or {}
+            out = StringIO()
+            with redirect_stdout(out):
+                n = puller.pull()
+            self.assertEqual(n, 0)
+            self.assertEqual(calls, [])  # 未发起任何请求
+            self.assertIn("跳过", out.getvalue())
+            self.assertIn("--incremental", out.getvalue())
+
+    def test_pull_incremental_fetches_new_and_stops(self):
+        """--incremental：done 后从头拉，新编号落盘、已有跳过、连续 3 页无新增停止。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            issues_pages = iter([
+                # issues 第 1 页：新 issue 2、3（created desc 在前）+ 已有 1 跳过
+                {"issues": {"totalCount": 100,
+                            "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                            "nodes": [_node(3), _node(2), _node(1)]}},
+                # issues 第 2/3/4 页：全是已有 1 → 连续无新增提前停止
+                {"issues": {"totalCount": 100,
+                            "pageInfo": {"hasNextPage": True, "endCursor": "C2"},
+                            "nodes": [_node(1)]}},
+                {"issues": {"totalCount": 100,
+                            "pageInfo": {"hasNextPage": True, "endCursor": "C3"},
+                            "nodes": [_node(1)]}},
+                {"issues": {"totalCount": 100,
+                            "pageInfo": {"hasNextPage": True, "endCursor": "C4"},
+                            "nodes": [_node(1)]}},
+            ])
+            prs_pages = iter([
+                # prs 增量：空页（无新增，立即结束）
+                {"pullRequests": {"totalCount": 0,
+                                  "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                  "nodes": []}},
+            ])
+
+            def fake_request(query, variables):
+                return next(issues_pages) if "issues" in query else next(prs_pages)
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 2)  # 新增 2、3
+            self.assertTrue((Path(td) / "raw" / "issues" / "2.json").exists())
+            self.assertTrue((Path(td) / "raw" / "issues" / "3.json").exists())
+            cp = puller._load_checkpoint()
+            self.assertIn("2", cp["issues"])
+            self.assertIn("3", cp["issues"])
+            self.assertTrue(cp["graphql"]["issues_done"])  # done 状态保持
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,13 @@ python scripts/build_kb.py --limit 100
 | 只重入库不拉取 | `python scripts/build_kb.py --skip-pull` |
 | 提取逻辑升级后重生成 canonical | `python scripts/build_kb.py --recanonicalize` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
+| **GitHub 社区增量拉取**（首次全量已完成后再拉新 issue/PR） | `python scripts/build_kb.py --incremental` |
+
+> **GitHub 拉取策略**：首次拉取完成后置 `done`（checkpoint），此后默认**不再拉取**（日志打印
+> "已拉取完成（done），默认跳过——如需增量请用 --incremental"）；中断后重跑同一命令自动
+> **断点续传**。`--incremental` 从头拉取社区新增 issue/PR（跳过已有，连续 3 页无新增停止）；
+> **全量重拉**（数据刷新/补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
+> `data/checkpoints/{source_id}.json` 后重跑 `build_kb.py`。
 
 > **`--rebuild` 高危确认**：会清空向量库 + 删除 kb.sqlite3 后全量重嵌（66K 文档约数小时）。
 > 执行前强制确认——TTY 交互输入 `y/yes`；**非交互环境（agent/CI）必须加 `--yes`**，否则拒绝执行。

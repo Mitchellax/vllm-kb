@@ -29,7 +29,8 @@ from .sources import BaseSource, GithubSource, build_sources
 from .vectorstore import build_vector_store
 
 
-def collect_docs(cfg: AppConfig, pull: bool, limit: int | None) -> list[KbDocument]:
+def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
+                 incremental: bool = False) -> list[KbDocument]:
     """遍历生效数据源：pull（可选）+ canonicalize，合并所有来源的文档。"""
     sources = build_sources(cfg)
     all_docs: list[KbDocument] = []
@@ -37,7 +38,7 @@ def collect_docs(cfg: AppConfig, pull: bool, limit: int | None) -> list[KbDocume
         try:
             if pull:
                 if isinstance(src, GithubSource):
-                    n = src.pull(max_issues=limit)
+                    n = src.pull(max_issues=limit, incremental=incremental)
                 else:
                     n = src.pull()
                 print(f"[build] 来源 {src.id} ({src.type}) 拉取新增 {n} 条")
@@ -118,11 +119,12 @@ def upsert_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> dict:
     return {"added": added, "updated": updated, "skipped": skipped}
 
 
-def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | None) -> dict:
+def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | None,
+                   incremental: bool = False) -> dict:
     """处理单个来源：拉取(可选) -> canonical -> 追加统一 canonical -> 增量入库。"""
     if pull:
         if isinstance(src, GithubSource):
-            n = src.pull(max_issues=limit)
+            n = src.pull(max_issues=limit, incremental=incremental)
         else:
             n = src.pull()
         print(f"[build] 来源 {src.id} ({src.type}) 拉取新增 {n} 条")
@@ -139,12 +141,13 @@ def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | Non
     return stats
 
 
-def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None) -> dict:
+def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
+              incremental: bool = False) -> dict:
     """逐来源处理（先配置在前的来源）。全量马拉松期间，先完成的来源立即可用。"""
     grand = {"pulled": 0, "ingested_docs": 0}
     for src in build_sources(cfg):
         try:
-            stats = process_source(src, cfg, pull, limit)
+            stats = process_source(src, cfg, pull, limit, incremental)
             grand["pulled"] += stats.get("pulled", 0)
             grand["ingested_docs"] += stats.get("docs", 0)
         except NotImplementedError as e:
@@ -157,6 +160,9 @@ def main() -> None:
     ap.add_argument("--config", default=None, help="config.json 路径（默认项目根 config.json）")
     ap.add_argument("--skip-pull", action="store_true", help="跳过拉取，用现有原始数据再生并入库")
     ap.add_argument("--limit", type=int, default=None, help="本次拉取条数上限（覆盖 github 来源配置）")
+    ap.add_argument("--incremental", action="store_true",
+                    help="GitHub 增量拉取：已拉取完成（done）后仍从头拉取社区新增 issue/PR"
+                         "（跳过已有，连续 3 页无新增停止）；默认 done 后跳过拉取")
     ap.add_argument("--rebuild", action="store_true",
                     help="高危：清空向量库与 SQLite 后全量重建（需交互确认，或加 --yes）")
     ap.add_argument("--yes", action="store_true",
@@ -173,7 +179,8 @@ def main() -> None:
         stats = rebuild(cfg)
         print(f"[build] 全量重建完成: {stats}")
         return
-    grand = run_build(cfg, pull=not (args.skip_pull or args.recanonicalize), limit=args.limit)
+    grand = run_build(cfg, pull=not (args.skip_pull or args.recanonicalize), limit=args.limit,
+                      incremental=args.incremental)
     print(f"[build] 本轮汇总: {grand}")
     print("[build] 提示：中途 Ctrl-C 后重跑同一命令即断点续传；逐来源处理，先完成的来源已可用。")
 
