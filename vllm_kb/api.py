@@ -548,6 +548,11 @@ def create_app(config_path: Optional[str] = None):
         """标签 → 打标文档（Doc/Issue/PR）——图侧标签查询。"""
         return _require_graph().tags_lookup(tag, limit=limit)
 
+    @app.get("/graph/evidence")
+    def graph_evidence(doc: str):
+        """文档互证（Evidence）：与目标文档共享 ≥2 个实体的其他文档（多来源互证）。"""
+        return _require_graph().evidence_for(doc)
+
     # ---------------- 文档级标签（能力目录 / 标签检索 / 问题匹配） ----------------
 
     def _tag_counts() -> dict[str, int]:

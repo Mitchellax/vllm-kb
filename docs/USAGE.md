@@ -490,6 +490,8 @@ python skills/vllm-kb/client.py graph doc github:vllm-project-vllm:issue:10700
 python skills/vllm-kb/client.py graph stats
 # 标签 → 打标文档（Doc/Issue/PR）
 python skills/vllm-kb/client.py graph tags HCCL
+# 文档互证（Evidence）：与目标文档共享 ≥2 个实体（算子/错误码/模型/版本/接口/标签）的其他文档
+python skills/vllm-kb/client.py graph evidence pdf:Atlas A3 中心推理和训练硬件 26.1.x npu-smi 命令参考 02
 ```
 
 **图内容说明**：Issue/PR/Release（修复链路）+ Operator/ErrorCode/Model/Version（签名实体）+

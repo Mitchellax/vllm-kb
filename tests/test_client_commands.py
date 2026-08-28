@@ -348,6 +348,22 @@ class TestCliDispatch(unittest.TestCase):
         self.assertIn("[Doc]", txt)
         self.assertIn("pdf:guide", txt)
 
+    def test_graph_evidence_dispatch(self):
+        """graph evidence：文档互证输出（共享实体清单）。"""
+        data = {"doc_id": "pdf:guide", "found": True, "title": "HCCL 指南",
+                "corroborated_by": [{"doc_id": "pdf:install", "title": "安装指南",
+                                     "shared": ["hccn", "107020"]}],
+                "count": 1, "note": "n"}
+        txt = run_main(["graph", "evidence", "pdf:guide"], get_data=lambda *a, **k: data)
+        self.assertIn("文档互证", txt)
+        self.assertIn("pdf:install", txt)
+        self.assertIn("hccn", txt)
+        self.assertIn("107020", txt)
+        # 未命中
+        txt2 = run_main(["graph", "evidence", "x:1"],
+                        get_data=lambda *a, **k: {"doc_id": "x:1", "found": False})
+        self.assertIn("不存在于图中", txt2)
+
     def test_search_tag_filter_dispatch(self):
         """search --tag：多次标签 → payload.filters.tags（全部包含过滤）。"""
         calls = {}

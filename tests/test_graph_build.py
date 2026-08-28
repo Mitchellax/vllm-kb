@@ -69,6 +69,20 @@ CANONICAL = [
                   "structure": {"tables": ["parsed/pdf/abcd1234abcd1234.tables.json"]}},
         "version_span": {},
     },
+    {
+        # 与上一本共享实体（hccn 标签 / 107020 错误码 / hccn_tool.bandwidth 接口）——互证边
+        "source_type": "doc_pdf",
+        "source_id": "pdf:install_guide",
+        "url": "",
+        "title": "NPU HCCN Tool 安装指南",
+        "body": "hccn_tool 安装与排查。错误码 107020 memory allocation failed。\n"
+                "命令格式\nhccn_tool [-i %d] -bandwidth -g\n",
+        "status": "open",
+        "tags": ["hccn", "安装部署"],
+        "extra": {"verification": "expert",
+                  "asset": {"asset_id": "efgh5678efgh5678", "sha256": "efgh5678efgh5678"}},
+        "version_span": {},
+    },
 ]
 
 # 手册表格产物（错误码表；以 asset_id 命名——不暴露文件名/路径）
@@ -166,16 +180,18 @@ class TestGraphBuildAndQuery(unittest.TestCase):
         self.assertEqual(s.nodes["PR"], 1)
         # Release 节点只建被 MERGED_IN 引用的（无边的 release 不入图）
         self.assertEqual(s.nodes["Release"], 1)
-        self.assertEqual(s.nodes["Doc"], 1)  # doc_pdf
+        self.assertEqual(s.nodes["Doc"], 2)  # doc_pdf × 2
         self.assertEqual(s.rels["FIXES"], 1)
         self.assertEqual(s.rels["MERGED_IN"], 1)
         self.assertGreater(s.rels["MENTIONS"], 0)
-        # DOCUMENTS：手册表格提取的 3 个错误码 + 命令格式段的 Interface
-        self.assertEqual(s.rels["DOCUMENTS"], 3 + 2)
+        # DOCUMENTS：两本手册表格/命令格式段（第一本 3 错误码 + 2 接口，第二本 1 接口）
+        self.assertEqual(s.rels["DOCUMENTS"], 3 + 3)
         self.assertEqual(s.nodes["Interface"], 2)
-        # 文档级标签：Tag 节点 + TAGGED_WITH 边（doc_pdf 两个标签）
-        self.assertEqual(s.nodes["Tag"], 2)
-        self.assertEqual(s.rels["TAGGED_WITH"], 2)
+        # 文档级标签：Tag 节点 + TAGGED_WITH 边（两本手册各自 2 个标签）
+        self.assertEqual(s.nodes["Tag"], 3)
+        self.assertEqual(s.rels["TAGGED_WITH"], 4)
+        # 文档互证（Evidence）：两本手册共享实体 → CORROBORATES 边
+        self.assertEqual(s.rels["CORROBORATES"], 1)
 
     def test_chain_issue(self):
         r = self.builder.chain_issue("github:vllm-project-vllm-ascend:issue:10700")
@@ -257,12 +273,25 @@ class TestGraphBuildAndQuery(unittest.TestCase):
         """标签 → 打标文档（Doc 节点）；标签带 tier。"""
         r = self.builder.tags_lookup("hccn")
         self.assertEqual(r["tier"], "domain")
-        self.assertEqual(r["count"], 1)
-        self.assertEqual(r["docs"][0]["doc_id"], "pdf:npu_hccn_tool_guide")
+        self.assertEqual(r["count"], 2)  # 两本手册都含 hccn 标签
         self.assertEqual(r["docs"][0]["doc_type"], "Doc")
         # 不存在的标签 → 空
         r2 = self.builder.tags_lookup("不存在标签")
         self.assertEqual(r2["count"], 0)
+
+    def test_evidence_for(self):
+        """文档互证：共享 ≥2 个实体（标签/错误码/接口）的文档互为证据。"""
+        r = self.builder.evidence_for("pdf:npu_hccn_tool_guide")
+        self.assertTrue(r["found"])
+        self.assertEqual(r["count"], 1)
+        c = r["corroborated_by"][0]
+        self.assertEqual(c["doc_id"], "pdf:install_guide")
+        shared = set(c["shared"])
+        self.assertIn("hccn", shared)     # 共享标签
+        self.assertIn("107020", shared)   # 共享错误码
+        # 无共享实体的文档 → 空
+        r2 = self.builder.evidence_for("pdf:install_guide")
+        self.assertEqual(r2["count"], 1)
 
     def test_doc_neighbors_has_tags(self):
         r = self.builder.doc_neighbors("pdf:npu_hccn_tool_guide")
@@ -291,7 +320,7 @@ class TestGraphBuildAndQuery(unittest.TestCase):
             rows = b.query("MATCH (t:Tag {id:'hccn'}) RETURN t.tier")
             self.assertEqual(rows[0][0], "domain")
             s = b.stats()
-            self.assertEqual(s.nodes["Tag"], 4)  # 2 canonical + 2 registry 全量
+            self.assertEqual(s.nodes["Tag"], 5)  # 3 canonical + 2 registry 全量
         finally:
             b.close()
 

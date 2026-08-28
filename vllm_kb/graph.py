@@ -77,6 +77,9 @@ _REL_DDL = [
     "CREATE REL TABLE DOCUMENTS(FROM Doc TO ErrorCode, FROM Doc TO Interface)",
     # 文档级标签关系：Doc/Issue/PR → Tag（最终标签 = (auto − excluded) ∪ manual）
     "CREATE REL TABLE TAGGED_WITH(FROM Doc TO Tag, FROM Issue TO Tag, FROM PR TO Tag)",
+    # 文档互证（Evidence）：共享 ≥2 个实体（算子/错误码/模型/版本/接口/标签）的文档互为证据——
+    # 多来源互证成为置信度信号（phase2 §9 三角验证提权）；shared 记录共享实体（逗号分隔）
+    "CREATE REL TABLE CORROBORATES(FROM Doc TO Doc, shared STRING)",
 ]
 
 # 实体类型 → 节点表名
@@ -189,8 +192,8 @@ class GraphBuilder:
 
     def create_schema(self, drop_existing: bool = False) -> None:
         if drop_existing:
-            for name in ("TAGGED_WITH", "DOCUMENTS", "MENTIONS", "MERGED_IN", "FIXES",
-                         "Tag", "Interface", "Version", "Model", "ErrorCode", "Operator",
+            for name in ("CORROBORATES", "TAGGED_WITH", "DOCUMENTS", "MENTIONS", "MERGED_IN",
+                         "FIXES", "Tag", "Interface", "Version", "Model", "ErrorCode", "Operator",
                          "Doc", "Release", "PR", "Issue"):
                 try:
                     self.conn.execute(f"DROP TABLE {name}")
@@ -254,6 +257,7 @@ class GraphBuilder:
         mention_edges: set[tuple[str, str, str]] = set()  # (doc_id, entity_kind, value)
         documents_edges: set[tuple[str, str, str]] = set()  # (doc_id, target_kind, target_id)
         tagged_edges: set[tuple[str, str]] = set()  # (doc_id, tag)
+        doc_entities: dict[str, set[str]] = {}  # Doc 实体集（互证计算用：mentions+documents+tags）
 
         with canonical_path.open(encoding="utf-8") as f:
             # 总行数（进度分母）；66K 文档全量建图约分钟级，节流打印避免刷屏
@@ -273,7 +277,7 @@ class GraphBuilder:
                     continue
                 self._ingest_doc(doc, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
                                  interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,
-                                 documents_edges, tagged_edges, calendars, parsed_root,
+                                 documents_edges, tagged_edges, doc_entities, calendars, parsed_root,
                                  overlay, registry)
                 if i and i % step == 0:
                     elapsed = time.time() - start_ts
@@ -303,6 +307,15 @@ class GraphBuilder:
         # 词典全量标签也建 Tag 节点（暂无文档关联的标签同样入图，保证"新增标签建图时入图"）
         for e in registry.entries:
             tag_vals.setdefault(e.name, e.tier)
+        # 文档互证（Evidence）：共享 ≥2 个实体的 Doc 两两连边（O(n²)，业务 Doc 数量少可接受）
+        corroborates_edges: set[tuple[str, str, str]] = set()  # (doc_a, doc_b, shared_csv)
+        doc_ids_list = [sid for sid in doc_entities if sid in doc_ids]
+        for i in range(len(doc_ids_list)):
+            for j in range(i + 1, len(doc_ids_list)):
+                a, b = doc_ids_list[i], doc_ids_list[j]
+                shared = doc_entities[a] & doc_entities[b]
+                if len(shared) >= 2:
+                    corroborates_edges.add((a, b, ",".join(sorted(shared)[:8])))
 
         # 写入 CSV 并 COPY
         copy_start = time.time()
@@ -311,14 +324,15 @@ class GraphBuilder:
             self._copy_nodes(tmp_path, issue_rows, pr_rows, doc_rows, release_rows,
                              entity_vals, interface_vals, tag_vals)
             self._copy_rels(tmp_path, fixes_edges, merged_edges, mention_edges, documents_edges,
-                            tagged_edges)
+                            tagged_edges, corroborates_edges)
         print(f"[graph] COPY 完成（{time.time() - copy_start:.0f}s）", flush=True)
 
         return self.stats()
 
     def _ingest_doc(self, doc: dict, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
                     interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,
-                    documents_edges, tagged_edges, calendars, parsed_root: Optional[Path] = None,
+                    documents_edges, tagged_edges, doc_entities, calendars,
+                    parsed_root: Optional[Path] = None,
                     overlay: Optional[dict] = None, registry=None) -> None:
         from .tagging import merge_final
 
@@ -405,6 +419,17 @@ class GraphBuilder:
                 entity_vals[kind].add(v)
                 mention_edges.add((sid, kind, v))
 
+        # Doc 实体集（互证 Evidence：共享 ≥2 实体的文档互为证据；仅业务文档参与）
+        if st not in ("github_issue", "github_pr"):
+            ents: set[str] = set()
+            for kind, vals in (ex.mentions or {}).items():
+                ents.update(vals)
+            for a, k, v in documents_edges:
+                if a == sid:
+                    ents.add(v)
+            ents.update(final_tags)
+            doc_entities[sid] = ents
+
     # ---------- CSV + COPY ----------
 
     def _write_csv(self, tmp: Path, name: str, header: list[str], rows) -> str:
@@ -450,7 +475,7 @@ class GraphBuilder:
             self.conn.execute(f"COPY {table} FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
 
     def _copy_rels(self, tmp: Path, fixes_edges, merged_edges, mention_edges,
-                   documents_edges, tagged_edges) -> None:
+                   documents_edges, tagged_edges, corroborates_edges) -> None:
         if fixes_edges:
             p = self._write_csv(tmp, "FIXES.csv", ["PR_id", "Issue_id"], fixes_edges)
             print(f"[graph]   COPY FIXES（{len(fixes_edges)} 边）…", flush=True)
@@ -516,6 +541,13 @@ class GraphBuilder:
                 p = self._write_csv(tmp, "TAGGED_WITH_D.csv", ["Doc_id", "Tag_id"], doc_edges)
                 self.conn.execute(
                     f"COPY TAGGED_WITH FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='Doc', TO='Tag')")
+        if corroborates_edges:
+            p = self._write_csv(tmp, "CORROBORATES.csv",
+                                ["Doc_id", "Doc_id", "shared"], corroborates_edges)
+            print(f"[graph]   COPY CORROBORATES（{len(corroborates_edges)} 边，文档互证）…",
+                  flush=True)
+            self.conn.execute(
+                f"COPY CORROBORATES FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='Doc', TO='Doc')")
 
     # ---------- 查询与统计 ----------
 
@@ -694,11 +726,33 @@ class GraphBuilder:
         )
         return [{"doc_id": r[0], "source_type": r[1], "title": r[2]} for r in rows]
 
+    def evidence_for(self, doc_id: str) -> dict:
+        """文档互证（Evidence）：与目标文档共享 ≥2 个实体的其他文档——多来源互证信号。
+
+        互证为对称关系，无向匹配（任一端命中即返回）。
+        """
+        head = self.query("MATCH (d:Doc {id: $id}) RETURN d.title", {"id": doc_id})
+        rows = self.query(
+            "MATCH (a:Doc {id: $id})-[c:CORROBORATES]-(b:Doc) "
+            "RETURN b.id, b.title, c.shared ORDER BY b.id",
+            {"id": doc_id},
+        )
+        return {
+            "doc_id": doc_id,
+            "found": bool(head),
+            "title": head[0][0] if head else "",
+            "corroborated_by": [
+                {"doc_id": r[0], "title": r[1], "shared": r[2].split(",")} for r in rows
+            ],
+            "count": len(rows),
+            "note": "共享 ≥2 个实体（算子/错误码/模型/版本/接口/标签）的文档互为证据（多来源互证）",
+        }
+
     def stats(self) -> GraphStats:
         s = GraphStats()
         for row in self.query("MATCH (n) RETURN label(n), count(*) ORDER BY count(*) DESC"):
             s.nodes[str(row[0])] = int(row[1])
-        for rel in ("FIXES", "MERGED_IN", "MENTIONS", "DOCUMENTS", "TAGGED_WITH"):
+        for rel in ("FIXES", "MERGED_IN", "MENTIONS", "DOCUMENTS", "TAGGED_WITH", "CORROBORATES"):
             try:
                 s.rels[rel] = int(self.query(f"MATCH ()-[:{rel}]->() RETURN count(*)")[0][0])
             except Exception:

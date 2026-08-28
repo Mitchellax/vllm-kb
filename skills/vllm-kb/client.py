@@ -328,6 +328,19 @@ def fmt_graph_tags(data: dict) -> str:
     return "\n".join(lines)
 
 
+def fmt_graph_evidence(data: dict) -> str:
+    if not data.get("found"):
+        return f"[graph] 文档不存在于图中（或不是业务文档）: {data.get('doc_id')}"
+    lines = [f"文档互证（Evidence）: {data['title']} → {data['count']} 篇佐证文档:"]
+    if not data.get("corroborated_by"):
+        lines.append("(无共享 ≥2 个实体的其他文档——多来源互证尚未建立，可导入更多同主题手册)")
+    for d in data.get("corroborated_by", []):
+        lines.append(f"  {d['doc_id']}  {d['title']}")
+        lines.append(f"    共享实体: {', '.join(d['shared'])}")
+    lines.append(f"提示: {data.get('note', '')}")
+    return "\n".join(lines)
+
+
 def fmt_tags(data: dict) -> str:
     lines = ["文档标签能力目录（主题/领域类=有什么知识可查；具体作用类=文档能帮我做什么）:"]
     for tier, label in (("domain", "主题/领域类"), ("purpose", "具体作用类")):
@@ -456,6 +469,8 @@ def main() -> None:
     g.add_argument("doc", help="source_id 或 repo#number")
     g = gsub.add_parser("tags", help="标签 → 打标文档（Doc/Issue/PR）")
     g.add_argument("tag", help="标签名（如 HCCL、超时排查）")
+    g = gsub.add_parser("evidence", help="文档互证（Evidence）：共享实体的其他文档")
+    g.add_argument("doc", help="业务文档 source_id（如 pdf:xxx）")
     gsub.add_parser("stats", help="图统计")
 
     # 文档标签（能力目录 / 标签检索 / 问题匹配）
@@ -555,6 +570,8 @@ def main() -> None:
             print(json.dumps(_get(base, "/graph/doc", {"doc": args.doc}), ensure_ascii=False, indent=2))
         elif args.graph_cmd == "tags":
             print(fmt_graph_tags(_get(base, "/graph/tags", {"tag": args.tag})))
+        elif args.graph_cmd == "evidence":
+            print(fmt_graph_evidence(_get(base, "/graph/evidence", {"doc": args.doc})))
     elif args.cmd == "tags":
         if args.tags_cmd == "list":
             print(fmt_tags(_get(base, "/tags")))

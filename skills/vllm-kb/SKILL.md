@@ -101,11 +101,15 @@ python client.py graph chain vllm-ascend#10700      # 核心链路：issue→修
 python client.py graph fixes vllm#50241             # PR 修复的 issues + 落地 release
 python client.py graph sig dispatch_ffn_combine     # 签名实体→提及它的 issue/PR
 python client.py graph doc github:vllm-project-vllm:issue:10700   # 文档邻接（手册错误码/命令定义入口）
+python client.py graph tags HCCL                    # 标签 → 打标文档
+python client.py graph evidence pdf:xxx             # 文档互证（Evidence）：共享实体的其他文档
 ```
 
 `graph chain` 回答"这个 issue 是否已修复、修复在哪个版本提供"（沿 `issue←FIXES←PR→MERGED_IN→Release`
 图路径追溯）；`graph fixes` 是 PR 视角的反向；`graph sig` 从算子/错误码/模型实体出发召回相关 issue/PR；
-`graph tags` 从文档级标签出发召回打标文档（Doc/Issue/PR）。
+`graph tags` 从文档级标签出发召回打标文档（Doc/Issue/PR）；
+`graph evidence` 返回与目标文档**共享 ≥2 个实体**（算子/错误码/模型/版本/接口/标签）的其他文档——
+多来源互证信号（同一结论被多本手册佐证，可提高采信度）。
 
 ### 10) 文档标签（能力发现）`tags` / `context` —— "知识库有哪些文档能帮上这个问题"
 
