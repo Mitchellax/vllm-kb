@@ -54,6 +54,48 @@ class TestGithubConvert(unittest.TestCase):
         self.assertEqual(doc.extra.get("repo"), "vllm-project/vllm")
         self.assertEqual(doc.component, "vllm")  # 仓库推断主组件
 
+    def test_insecure_from_env(self):
+        """VLLM_KB_INSECURE=1 时 session 跳过 SSL 校验（内网增量拉取依赖）。"""
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"VLLM_KB_INSECURE": "1"}, clear=False):
+            puller = GithubPuller(make_source(), PROJECT_ROOT)
+            self.assertTrue(puller.insecure)
+            self.assertFalse(puller.session.verify)  # requests verify=False
+
+    def test_insecure_from_source_config(self):
+        """来源配置 insecure: true 同样生效（优先级低于环境变量无需区分，任一为真即可）。"""
+        puller = GithubPuller(make_source(insecure=True), PROJECT_ROOT)
+        self.assertTrue(puller.insecure)
+        self.assertFalse(puller.session.verify)
+
+    def test_api_base_and_graphql_follow_config(self):
+        """api_base 配置/环境变量：REST base 与 GraphQL 端点均跟随（不再硬编码 api.github.com）。"""
+        import os
+        from unittest.mock import patch
+
+        # 配置显式指定（优先于环境变量）
+        puller = GithubPuller(make_source(api_base="http://gh-mirror.internal:8080"), PROJECT_ROOT)
+        self.assertEqual(puller.base, "http://gh-mirror.internal:8080")
+        self.assertEqual(puller.graphql_url, "http://gh-mirror.internal:8080/graphql")
+        # 仅环境变量（无配置字段）
+        with patch.dict(os.environ, {"VLLM_KB_GITHUB_BASE": "http://gh-env.internal"}, clear=False):
+            puller2 = GithubPuller(make_source(), PROJECT_ROOT)
+            self.assertEqual(puller2.base, "http://gh-env.internal")
+            self.assertEqual(puller2.graphql_url, "http://gh-env.internal/graphql")
+
+    def test_default_base_is_github_com(self):
+        """无任何配置/环境变量时保持默认 api.github.com。"""
+        import os
+        from unittest.mock import patch
+
+        env = {k: v for k, v in os.environ.items() if k != "VLLM_KB_GITHUB_BASE"}
+        with patch.dict(os.environ, env, clear=True):
+            puller = GithubPuller(make_source(), PROJECT_ROOT)
+            self.assertEqual(puller.base, "https://api.github.com")
+            self.assertEqual(puller.graphql_url, "https://api.github.com/graphql")
+
     def test_vllm_ascend_component_and_versions(self):
         """vllm-ascend 仓库：主组件 vllm-ascend，正文提取的配套版本进 component_versions。"""
         body = (

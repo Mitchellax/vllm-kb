@@ -1,4 +1,4 @@
-"""GitHub 数据采集（REST）：全量历史数据拉取。数据源之一（type=github）。
+"""GitHub 数据采集（REST + GraphQL）：全量历史数据拉取。数据源之一（type=github）。
 
 设计（三段分离，支持全量/增量/断点续传）：
   拉取阶段只把原始 JSON 落盘（issues/{n}.json、prs/{n}.json、comments/{n}.json）+ checkpoint，
@@ -9,7 +9,9 @@
 - issue_state 支持 open/closed/all（all = 历史全量）；max_issues=0 表示全量；
 - source_id 带 repo 命名空间（如 github:vllm-project-vllm:issue:123），多仓库不冲突；
 - checkpoint 记录已拉编号 + 评论是否已拉 + 最后页 + 当时的查询参数，
-  查询参数（state/sort/direction）变化时自动重置分页起点，避免新旧排序错位漏拉。
+  查询参数（state/sort/direction）变化时自动重置分页起点，避免新旧排序错位漏拉；
+- 内网模式：VLLM_KB_INSECURE=1（或来源 insecure: true）跳过 SSL 校验，
+  api_base / VLLM_KB_GITHUB_BASE 换镜像（REST 与 GraphQL 端点均跟随）。
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ import requests
 from .components import default_component_for_repo, extract_component_versions
 from .config import PROJECT_ROOT, SourceCfg
 from .models import KbDocument, VersionSpan
+from .net import github_api_base, get_session, insecure_from_env
 
 _LABEL_VERSION_RE = re.compile(r"v?(0\.\d+(?:\.\d+)?)")  # vLLM/vllm-ascend 均为 0.x.y 系，排除 3.5/26.1.0 等噪音
 _BODY_VERSION_RE = re.compile(r"(?i)vllm\s+version[^0-9]*(\d+\.\d+(?:\.\d+)?)")
@@ -66,7 +69,10 @@ class GithubPuller:
         self.repo_slug = self.repo.replace("/", "-")  # source_id 命名空间
         # 主组件：来源显式指定优先，否则按仓库推断（vllm / vllm-ascend / ...）
         self.component = source.get("component", "") or default_component_for_repo(self.repo)
-        self.api_base = source.get("api_base", "https://api.github.com")
+        # 内网模式（SSL 被禁/自签证书）：VLLM_KB_INSECURE=1 或来源配置 insecure: true。
+        # 与 build_companion_matrix / build_release_calendar 等共用 net 统一入口。
+        self.insecure = insecure_from_env() or bool(source.get("insecure", False))
+        self.api_base = github_api_base(source.get("api_base") or None)
         self.per_page = source.get("per_page", 100)
         self.max_issues = source.get("max_issues", 0)  # 0 = 全量
         self.issue_state = source.get("issue_state", "all")
@@ -82,7 +88,7 @@ class GithubPuller:
             "checkpoint_file", f"data/checkpoints/{source.id}.json"
         )
 
-        self.session = requests.Session()
+        self.session = get_session(self.insecure)
         self.session.headers.update(
             {"Accept": "application/vnd.github+json", "User-Agent": "vllm-kb/0.1"}
         )
@@ -92,6 +98,8 @@ class GithubPuller:
         if token:
             self.session.headers.update({"Authorization": f"Bearer {token}"})
         self.base = self.api_base.rstrip("/")
+        # GraphQL 端点跟随 api_base（GitHub Enterprise / 内网镜像同样走 GraphQL）
+        self.graphql_url = f"{self.base}/graphql"
 
     # ---------------- HTTP 与限流 ----------------
 
@@ -134,8 +142,6 @@ class GithubPuller:
         self.checkpoint_path.write_text(json.dumps(cp, ensure_ascii=False, indent=1), encoding="utf-8")
 
     # ---------------- 采集（GraphQL 游标分页，无 10k 上限） ----------------
-
-    GRAPHQL_URL = "https://api.github.com/graphql"
 
     _ISSUES_QUERY = """
     query($owner: String!, $repo: String!, $states: [IssueState!], $after: String, $withComments: Boolean!) {
@@ -192,7 +198,7 @@ class GithubPuller:
         for attempt in range(self.max_retries + 1):
             try:
                 r = self.session.post(
-                    self.GRAPHQL_URL,
+                    self.graphql_url,
                     json={"query": query, "variables": variables},
                     timeout=self.request_timeout_seconds,
                 )

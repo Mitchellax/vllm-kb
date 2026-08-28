@@ -169,7 +169,20 @@ def main() -> None:
                     help="跳过 --rebuild 的确认提示（自动化/无人值守用）")
     ap.add_argument("--recanonicalize", action="store_true",
                     help="跳过拉取，从原始 JSON 再生统一 canonical 并重新入库（逐来源）")
+    from .net import DEFAULT_GITHUB_BASE
+
+    ap.add_argument("--insecure", action="store_true",
+                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+    ap.add_argument("--github-base", default=None,
+                    help=f"GitHub API 镜像前缀（默认 {DEFAULT_GITHUB_BASE}；亦可用环境变量 VLLM_KB_GITHUB_BASE）")
     args = ap.parse_args()
+    # CLI 参数 > 环境变量（与 net 统一入口语义一致）：注入环境变量，让后续构造的
+    # GithubPuller（读 insecure_from_env / VLLM_KB_GITHUB_BASE）生效。
+    if args.insecure:
+        os.environ["VLLM_KB_INSECURE"] = "1"
+        print("[build] --insecure：跳过 SSL 证书校验（内网模式）")
+    if args.github_base:
+        os.environ["VLLM_KB_GITHUB_BASE"] = args.github_base
 
     cfg = AppConfig.load(args.config)
     if args.rebuild:
