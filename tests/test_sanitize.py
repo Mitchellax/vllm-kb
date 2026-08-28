@@ -107,6 +107,19 @@ class TestSanitize(unittest.TestCase):
             finally:
                 os.environ.pop("VLLM_KB_DATA_ROOT", None)
 
+    def test_collect_sanitize_hits(self):
+        """collect_sanitize_hits：只收集会被脱敏的值（不替换文本）。"""
+        from vllm_kb.sanitize import collect_sanitize_hits
+
+        ips, paths = collect_sanitize_hits(
+            "10.0.0.5 与 127.0.0.1 与 /home/user/x.log 与 /var/log/npu/"
+        )
+        self.assertEqual(ips, {"10.0.0.5"})           # 回环不收集
+        self.assertEqual(paths, {"/home/user/x.log"})  # 默认路径不收集
+        ips2, paths2 = collect_sanitize_hits("8.8.8.8 /data/a.b", keep_ips=["8.8.8.8"])
+        self.assertEqual(ips2, set())                  # keep_ips 白名单不收集
+        self.assertEqual(paths2, {"/data/a.b"})
+
     def test_empty(self):
         self.assertEqual(sanitize_text(""), "")
         self.assertEqual(sanitize_text(None), None)

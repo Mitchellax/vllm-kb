@@ -124,8 +124,8 @@ class TestMarkdownSource(unittest.TestCase):
         self.assertTrue(ev["asset_id"])
         self.assertNotIn("path", ev)
 
-    def test_markdown_sanitized(self):
-        """Markdown 源默认启用脱敏：内部 IP/路径 → 占位，默认路径保留。"""
+    def test_markdown_raw_stored_sanitize_log_collected(self):
+        """后置脱敏：md 正文原文入库；会被脱敏的 IP/路径落盘维护日志。"""
         import os
 
         from vllm_kb.config import AppConfig
@@ -139,22 +139,22 @@ class TestMarkdownSource(unittest.TestCase):
             src = MarkdownSource(self.cfg, project_root=self.root, app_cfg=cfg)
             docs = src.canonicalize()
             d = next(x for x in docs if "案例" in x.source_id)
-            self.assertNotIn("10.0.0.5", d.body)
-            self.assertIn("<IP>", d.body)
-            self.assertNotIn("/home/user/logs/x.log", d.body)
-            self.assertIn("<PATH>", d.body)
-            self.assertIn("/var/log/npu/", d.body)  # 默认路径保留
-            # 脱敏日志落盘（维护文件）
+            # 原文入库（出口脱敏由 serve_api 返回时做）
+            self.assertIn("10.0.0.5", d.body)
+            self.assertIn("/home/user/logs/x.log", d.body)
+            self.assertIn("/var/log/npu/", d.body)
+            # 维护日志：会被脱敏的 IP/路径（不含保留项）
             log = self.root / "data" / "sanitize_log.json"
             self.assertTrue(log.exists())
             data = json.loads(log.read_text(encoding="utf-8"))
             self.assertIn("10.0.0.5", data["ips"])
             self.assertIn("/home/user/logs/x.log", data["paths"])
+            self.assertNotIn("/var/log/npu/", data["paths"])
         finally:
             os.environ.pop("VLLM_KB_DATA_ROOT", None)
 
     def test_markdown_sanitize_sources_config(self):
-        """config.sanitize.sources 关闭 markdown 时，md 正文不脱敏。"""
+        """config.sanitize.sources 关闭 markdown 时，不收集维护日志（原文入库不变）。"""
         import os
 
         from vllm_kb.config import AppConfig
@@ -167,7 +167,12 @@ class TestMarkdownSource(unittest.TestCase):
             src = MarkdownSource(self.cfg, project_root=self.root, app_cfg=cfg)
             docs = src.canonicalize()
             d = next(x for x in docs if "案例2" in x.source_id)
-            self.assertIn("10.0.0.5", d.body)  # markdown 未启用脱敏
+            self.assertIn("10.0.0.5", d.body)  # 原文始终入库
+            # 未启用收集：日志不含该 IP
+            log = self.root / "data" / "sanitize_log.json"
+            if log.exists():
+                data = json.loads(log.read_text(encoding="utf-8"))
+                self.assertNotIn("10.0.0.5", data.get("ips", []))
         finally:
             os.environ.pop("VLLM_KB_DATA_ROOT", None)
 

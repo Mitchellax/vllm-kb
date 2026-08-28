@@ -56,13 +56,13 @@ def sanitize_text(text: str,
                   keep_paths: Optional[list[str]] = None,
                   keep_ips: Optional[list[str]] = None,
                   collector: Optional[dict] = None) -> str:
-    """对文本中的 IP 与路径脱敏。
+    """对文本中的 IP 与路径脱敏（**出口脱敏用**：返回给 agent 的正文/标题字段）。
 
     - IP：`10.0.0.5` → `<IP>`；`10.0.0.5:8000` → `<IP>:8000`（端口保留）；
     - 路径：白名单外绝对路径 → `<PATH>`（盘符或 `/` 开头）；白名单内保留；
     - keep_paths/keep_ips 为 None → 默认白名单；显式 [] → 全部脱敏；
     - collector（可选 dict）：就地收集被脱敏的原始值
-      （collector["ips"]/["paths"] 为 set），供 save_sanitize_log 落盘维护。
+      （collector["ips"]/["paths"] 为 set）。
     """
     if not text:
         return text
@@ -87,6 +87,38 @@ def sanitize_text(text: str,
         return "<PATH>"
 
     return _PATH_RE.sub(_path, _IPV4_RE.sub(_ip, text))
+
+
+def collect_sanitize_hits(text: str,
+                          keep_paths: Optional[list[str]] = None,
+                          keep_ips: Optional[list[str]] = None) -> tuple[set, set]:
+    """只收集会被脱敏的原始 IP/路径（**不替换文本**）——入库侧维护日志用。
+
+    后置脱敏：库中存原文（原文检索），本函数在入库时扫描一次正文，
+    把按当前白名单**会被脱敏**的值落盘 sanitize_log.json，供维护者调整白名单。
+    返回 (ips set, paths set)。
+    """
+    if not text:
+        return set(), set()
+    keep = DEFAULT_KEEP_PATHS if keep_paths is None else tuple(keep_paths)
+    keep_ip = DEFAULT_KEEP_IPS if keep_ips is None else tuple(keep_ips)
+    ips: set = set()
+    paths: set = set()
+
+    def _ip(m: re.Match) -> str:
+        ip = m.group(0)
+        if ip not in keep_ip:
+            ips.add(ip)
+        return ip
+
+    def _path(m: re.Match) -> str:
+        path = m.group(0)
+        if not any(path.startswith(p) for p in keep):
+            paths.add(path)
+        return path
+
+    _PATH_RE.sub(_path, _IPV4_RE.sub(_ip, text))
+    return ips, paths
 
 
 def save_sanitize_log(cfg, collector: Optional[dict] = None):

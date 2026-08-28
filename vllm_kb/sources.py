@@ -227,17 +227,16 @@ class MarkdownSource(BaseSource):
           （md 复制到 assets 后相对路径会失锚）；imports 被清空时回退 assets 副本；
         - 正文图片引用改为**不透明占位**（`[图片]`），原引用只进 evidence（含资产 asset_id），
           **正文与 canonical 不暴露任何服务器路径**；
-        - **内部数据脱敏**（config.sanitize，markdown 默认启用）：body/title 中的
-          内部 IP/路径 → `<IP>`/`<PATH>`（默认路径白名单保留），防案例记录中的
-          内部信息经检索外泄；
+        - **后置脱敏**：body/title 以**原文入库**（原文检索）；仅按 config.sanitize 扫描
+          会被脱敏的 IP/路径落盘 sanitize_log.json（出口脱敏由 serve_api 返回时统一做）；
         - evidence 记录图片清单（供 ImageSource OCR 与图文互证消费）。
         """
-        from .sanitize import sanitize_text
+        from .sanitize import collect_sanitize_hits
 
         docs: list[KbDocument] = []
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
-        collector: dict = {}  # 被脱敏命中的原始 IP/路径（落盘维护，不进库）
+        collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
         md_files: list[tuple[Path, bool]] = []
         if self.import_dir.exists():
             md_files = [(p, True) for p in sorted(self.import_dir.rglob("*.md"))
@@ -259,13 +258,13 @@ class MarkdownSource(BaseSource):
                 continue
             body, evidence = self._resolve_images(p, text) if from_imports else (text, [])
             if sanitize_on:
-                body = sanitize_text(body, keep_paths=keep_paths, keep_ips=keep_ips,
-                                     collector=collector)
+                ips, paths = collect_sanitize_hits(body, keep_paths, keep_ips)
+                if ips:
+                    collector.setdefault("ips", set()).update(ips)
+                if paths:
+                    collector.setdefault("paths", set()).update(paths)
             title_raw = self._title_re.search(text)
             title = title_raw.group(1).strip() if title_raw else p.stem
-            if sanitize_on:
-                title = sanitize_text(title, keep_paths=keep_paths, keep_ips=keep_ips,
-                                      collector=collector)[:80]
             sha = _sha256(p)
             asset_id = sha[:16]
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
@@ -774,11 +773,15 @@ class ExcelSource(BaseSource):
         return added
 
     def canonicalize(self) -> list[KbDocument]:
-        """遍历所有 sheet/行，行 cell 拼接为 body（schema-free），脱敏后产出 KbDocument。"""
-        from .sanitize import sanitize_text
+        """遍历所有 sheet/行，行 cell 拼接为 body（schema-free）。
+
+        **后置脱敏**：body 以**原文入库**（原文检索）；仅按 config.sanitize 扫描会被脱敏的
+        IP/路径，落盘 sanitize_log.json 供维护白名单（出口脱敏由 serve_api 返回时统一做）。
+        """
+        from .sanitize import collect_sanitize_hits
 
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
-        collector: dict = {}  # 被脱敏命中的原始 IP/路径（落盘维护，不进库）
+        collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
 
         try:
             import openpyxl
@@ -807,17 +810,16 @@ class ExcelSource(BaseSource):
                                      if c is not None and str(c).strip()]
                             if not cells:
                                 continue  # 空行跳过（不依赖行号语义）
-                            body = sanitize_text(" ".join(cells),
-                                                 keep_paths=keep_paths, keep_ips=keep_ips,
-                                                 collector=collector) if sanitize_on \
-                                else " ".join(cells)
+                            body = " ".join(cells)
+                            if sanitize_on:
+                                ips, paths = collect_sanitize_hits(body, keep_paths, keep_ips)
+                                if ips:
+                                    collector.setdefault("ips", set()).update(ips)
+                                if paths:
+                                    collector.setdefault("paths", set()).update(paths)
                             if not body.strip():
                                 continue
-                            title = sanitize_text(cells[0],
-                                                 keep_paths=keep_paths,
-                                                 keep_ips=keep_ips,
-                                                 collector=collector)[:80] if sanitize_on \
-                                else cells[0][:80]
+                            title = cells[0][:80]
                             docs.append(KbDocument(
                                 source_type="doc_excel",
                                 source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",

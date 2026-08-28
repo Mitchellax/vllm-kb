@@ -97,6 +97,17 @@ def create_app(config_path: Optional[str] = None):
     cfg = AppConfig.load(config_path, require_keys=False)
     engine = SearchEngine(cfg, read_only=True)
 
+    # 出口脱敏：内部检索用原文（库/向量/FTS 存原文），返回给 agent 的正文/标题字段统一脱敏
+    # （config.sanitize 白名单；改配置即时生效、无需重嵌）。serve_api 保持结构只读——纯函数，不写文件。
+    from .sanitize import sanitize_text as _sanitize_text
+
+    def _out(s: Any) -> Any:
+        """出口脱敏：非字符串原样返回；字符串按 config.sanitize 白名单脱敏 IP/路径。"""
+        if not isinstance(s, str) or not s:
+            return s
+        return _sanitize_text(s, keep_paths=cfg.sanitize.keep_paths,
+                              keep_ips=cfg.sanitize.keep_ips)
+
     # 版本化代码仓（懒加载：未预存时端点返回可用版本提示，不崩溃）
     try:
         from .code_index import VersionedCode
@@ -144,7 +155,7 @@ def create_app(config_path: Optional[str] = None):
             "results": [
                 {
                     "doc_id": r.doc_id,
-                    "title": r.title,
+                    "title": _out(r.title),
                     "url": r.url,
                     "component": r.component,
                     "resolved": r.resolved,
@@ -165,7 +176,7 @@ def create_app(config_path: Optional[str] = None):
                         "target_version": r.confidence.target_version,
                         "verification": r.confidence.extras.get("verification", ""),
                     },
-                    "snippet": r.text[:500],
+                    "snippet": _out(r.text[:500]),
                 }
                 for r in results
             ],
@@ -194,7 +205,7 @@ def create_app(config_path: Optional[str] = None):
             ).fetchall()
             return {
                 "source_id": source_id,
-                "title": row[0],
+                "title": _out(row[0]),
                 "url": row[1],
                 "created_at": row[2],
                 "resolved_at": row[3],
@@ -202,7 +213,7 @@ def create_app(config_path: Optional[str] = None):
                 "component": row[5],
                 "tags": json.loads(row[7]) if row[7] else [],
                 "extra": _sanitize_extra(json.loads(row[6] or "{}")),
-                "body": "\n\n".join(c[0] for c in chunks),
+                "body": _out("\n\n".join(c[0] for c in chunks)),
             }
         finally:
             conn.close()
@@ -302,14 +313,21 @@ def create_app(config_path: Optional[str] = None):
             "results": [
                 {
                     "doc_id": h.doc_id,
-                    "title": h.title,
+                    "title": _out(h.title),
                     "url": h.url,
                     "hit_signatures": h.hit_signatures,
                     "score": h.score,
                 }
                 for h in hits
             ],
-            "title_hits": title_hits[:10],
+            "title_hits": [
+                {
+                    "doc_id": th.doc_id, "title": _out(th.title), "url": th.url,
+                    "component": th.component, "resolved": th.resolved,
+                    "signal": th.signal,
+                }
+                for th in title_hits[:10]
+            ],
         }
 
     @app.get("/version")
@@ -361,7 +379,7 @@ def create_app(config_path: Optional[str] = None):
             "results": [
                 {
                     "doc_id": h.doc_id,
-                    "title": h.title,
+                    "title": _out(h.title),
                     "url": h.url,
                     "component": h.component,
                     "resolved": h.resolved,
@@ -523,20 +541,29 @@ def create_app(config_path: Optional[str] = None):
         return {"built": True, "nodes": s.nodes, "rels": s.rels,
                 "summary": s.summary()}
 
+    def _sanitize_graph(d: Any) -> Any:
+        """图检索结果出口脱敏：递归脱敏所有 title 字段（内部原文检索，出口统一脱敏）。"""
+        if isinstance(d, dict):
+            return {k: (_out(v) if k == "title" and isinstance(v, str) else _sanitize_graph(v))
+                    for k, v in d.items()}
+        if isinstance(d, list):
+            return [_sanitize_graph(x) for x in d]
+        return d
+
     @app.get("/graph/chain")
     def graph_chain(doc: str):
         """issue → 修复 PR → 落地 release 链路（doc=完整 source_id，如 github:vllm-project-vllm:issue:10700）。"""
-        return _require_graph().chain_issue(doc)
+        return _sanitize_graph(_require_graph().chain_issue(doc))
 
     @app.get("/graph/fixes")
     def graph_fixes(doc: str):
         """PR 视角：该 PR 修复的 issues + 落地 release。"""
-        return _require_graph().fixes_pr(doc)
+        return _sanitize_graph(_require_graph().fixes_pr(doc))
 
     @app.get("/graph/sig")
     def graph_sig(sig: str, limit: int = 10):
         """签名实体（算子/错误码/模型/版本）→ 提及它的 issue/PR。"""
-        return _require_graph().sig_lookup(sig, limit=limit)
+        return _sanitize_graph(_require_graph().sig_lookup(sig, limit=limit))
 
     @app.get("/graph/doc")
     def graph_doc(doc: str):
@@ -546,12 +573,12 @@ def create_app(config_path: Optional[str] = None):
     @app.get("/graph/tags")
     def graph_tags(tag: str, limit: int = 50):
         """标签 → 打标文档（Doc/Issue/PR）——图侧标签查询。"""
-        return _require_graph().tags_lookup(tag, limit=limit)
+        return _sanitize_graph(_require_graph().tags_lookup(tag, limit=limit))
 
     @app.get("/graph/evidence")
     def graph_evidence(doc: str):
         """文档互证（Evidence）：与目标文档共享 ≥2 个实体的其他文档（多来源互证）。"""
-        return _require_graph().evidence_for(doc)
+        return _sanitize_graph(_require_graph().evidence_for(doc))
 
     # ---------------- 文档级标签（能力目录 / 标签检索 / 问题匹配） ----------------
 
@@ -627,7 +654,7 @@ def create_app(config_path: Optional[str] = None):
             out.append({
                 "doc_id": sid,
                 "source_type": st,
-                "title": title or "",
+                "title": _out(title or ""),
                 "url": url or "",
                 "verification": ex.get("verification", ""),
                 "tags": tags,
@@ -697,7 +724,7 @@ def create_app(config_path: Optional[str] = None):
                     except (TypeError, json.JSONDecodeError):
                         ex = {}
                     docs_by_tag[e.name].append({
-                        "doc_id": sid, "title": title or "",
+                        "doc_id": sid, "title": _out(title or ""),
                         "verification": ex.get("verification", ""), "url": url or "",
                     })
         # 交集排序：同时命中 domain+purpose 标签的文档线索排前

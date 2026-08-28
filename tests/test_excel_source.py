@@ -71,20 +71,15 @@ class TestExcelSource(unittest.TestCase):
         self.assertTrue(all(d.source_type == "doc_excel" for d in docs))
         self.assertTrue(all(d.extra["verification"] == "unverified" for d in docs))
 
-    def test_sanitize_ip_and_path(self):
-        """内部 IP/路径脱敏；默认路径与回环 IP 保留。"""
+    def test_raw_text_stored_sanitize_log_collected(self):
+        """后置脱敏：body 原文入库（原文检索）；会被脱敏的 IP/路径落盘维护日志。"""
         self.src.pull()
         docs = self.src.canonicalize()
         body = "\n".join(d.body for d in docs)
-        # 内部 IP 脱敏
-        self.assertNotIn("10.0.0.5", body)
-        self.assertIn("<IP>", body)
-        # 内部路径脱敏
-        self.assertNotIn("/home/user/logs/oom.log", body)
-        self.assertIn("<PATH>", body)
-        # 默认路径（/var/log/ 白名单）保留（诊断价值）
+        # 原文入库（不脱敏——出口脱敏由 serve_api 返回时做）
+        self.assertIn("10.0.0.5", body)
+        self.assertIn("/home/user/logs/oom.log", body)
         self.assertIn("/var/log/npu/", body)
-        # 回环 IP 保留
         self.assertIn("127.0.0.1", body)
 
     def test_entities_reuse_existing_pipeline(self):
@@ -123,7 +118,8 @@ class TestExcelSource(unittest.TestCase):
             os.environ.pop("VLLM_KB_DATA_ROOT", None)
 
     def test_sanitize_config_from_app_cfg(self):
-        """config.sanitize 配置生效：keep_paths 覆盖默认（保留业务路径、脱敏默认路径）。"""
+        """config.sanitize 控制**收集范围**（后置脱敏：body 始终原文入库）。"""
+        import json
         import os
 
         from vllm_kb.config import AppConfig
@@ -131,20 +127,22 @@ class TestExcelSource(unittest.TestCase):
         os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
         try:
             cfg = AppConfig.model_validate({"sanitize": {
-                "keep_paths": ["/home/user/logs"],  # 覆盖默认：业务日志目录保留
-                "keep_ips": ["10.0.0.5"],           # 覆盖默认：该内网 IP 保留
+                "keep_paths": ["/home/user/logs"],  # 覆盖默认：业务日志目录保留（不收集）
+                "keep_ips": ["10.0.0.5"],           # 覆盖默认：该内网 IP 保留（不收集）
             }})
             src = ExcelSource(self.cfg, project_root=self.root, app_cfg=cfg)
             src.pull()
             docs = src.canonicalize()
             body = "\n".join(d.body for d in docs)
-            # 业务配置的保留路径/IP 生效
-            self.assertIn("/home/user/logs/oom.log", body)
+            # 原文始终入库（出口脱敏由 serve_api 做）
             self.assertIn("10.0.0.5", body)
-            # 默认路径（未配置保留）与默认白名单（未配置）——覆盖后不保留
-            self.assertNotIn("/var/log/npu/", body)
-            self.assertIn("<PATH>", body)
-            self.assertIn("<IP>", body)
+            self.assertIn("/home/user/logs/oom.log", body)
+            # 维护日志按配置收集：keep 的不收集；覆盖后默认路径不再保留 → 被收集
+            log = self.root / "data" / "sanitize_log.json"
+            data = json.loads(log.read_text(encoding="utf-8"))
+            self.assertNotIn("10.0.0.5", data["ips"])
+            self.assertNotIn("/home/user/logs/oom.log", data["paths"])
+            self.assertIn("/var/log/npu/", data["paths"])
         finally:
             os.environ.pop("VLLM_KB_DATA_ROOT", None)
 

@@ -28,10 +28,24 @@ _PATH_PATTERNS = [
     re.compile(r"\\assets\\"),
     re.compile(r"\\parsed\\"),
 ]
+# 内部数据形态（后置脱敏：出口不得出现内部 IP/路径原文）
+_INTERNAL_PATTERNS = [
+    re.compile(r"10\.0\.0\.5"),
+    re.compile(r"/home/user/"),
+    re.compile(r"192\.168\."),
+]
 
 
 def _contains_path(text: str) -> str | None:
     for pat in _PATH_PATTERNS:
+        m = pat.search(text or "")
+        if m:
+            return m.group(0)
+    return None
+
+
+def _contains_internal(text: str) -> str | None:
+    for pat in _INTERNAL_PATTERNS:
         m = pat.search(text or "")
         if m:
             return m.group(0)
@@ -63,14 +77,16 @@ def build_env(tmp: Path) -> AppConfig:
     return AppConfig.load(str(cfg_path), require_keys=False)
 
 
-# 脏数据：extra 含历史路径字段（模拟旧库残留），正文为占位后的干净形态
+# 脏数据：extra 含历史路径字段（模拟旧库残留），正文含内部 IP/路径（后置脱敏验证出口）
 DIRTY_DOCS = [
     KbDocument(
         source_type="doc_pdf",
         source_id="pdf:guide",
         url="",
         title="HCCL 超时排查指南",
-        body="命令格式\nhccn_tool [-i %d] -bandwidth -g\n错误码 107020 memory allocation failed",
+        body=("命令格式\nhccn_tool [-i %d] -bandwidth -g\n"
+              "错误码 107020 memory allocation failed\n"
+              "节点 10.0.0.5 超时，日志 /home/user/logs/oom.log，默认 /var/log/npu/"),
         tags=["HCCL", "超时排查"],
         extra={
             "verification": "expert",
@@ -88,7 +104,7 @@ DIRTY_DOCS = [
         source_id="md:wiki",
         url="",
         title="网络超时案例",
-        body="节点间通信超时，检查 HCCL 配置。[图片:拓扑]",
+        body="节点间通信超时，检查 192.168.1.100 配置。[图片:拓扑]",
         tags=["超时排查"],
         extra={"verification": "unverified"},
     ),
@@ -119,6 +135,14 @@ class TestNoPathLeak(unittest.TestCase):
         if hit is not None:
             pos = max(0, text.find(hit) - 60)
             self.fail(f"{where} 泄漏服务器路径 {hit!r}: ...{text[pos:pos + 120]}...")
+
+    def _assert_no_internal(self, payload, where: str):
+        """后置脱敏：出口响应不得出现内部 IP/路径原文。"""
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        hit = _contains_internal(text)
+        if hit is not None:
+            pos = max(0, text.find(hit) - 60)
+            self.fail(f"{where} 泄漏内部数据 {hit!r}: ...{text[pos:pos + 120]}...")
 
     def test_all_readonly_endpoints_no_path(self):
         """遍历全部只读端点，响应无服务器路径（图/code 未建时 503 提示也不泄漏）。"""
@@ -160,6 +184,7 @@ class TestNoPathLeak(unittest.TestCase):
                 except Exception:
                     self.fail(f"{path} 返回非 JSON")
                 self._assert_no_path(payload, f"{method} {path}")
+                self._assert_no_internal(payload, f"{method} {path}")
                 if r.status_code == 200:
                     # 200 的 JSON 里不允许出现任何路径特征（404/503 提示也不应泄漏，已统一检查）
                     pass
@@ -214,6 +239,33 @@ class TestNoPathLeak(unittest.TestCase):
         self._assert_no_path(d, "/tags/match")
         for m in d["matched"]:
             self.assertEqual(set(m.keys()) & {"path", "rel_path"}, set())
+
+    def test_outbound_sanitization_but_raw_stored(self):
+        """后置脱敏：库中存原文（可原文检索），出口（/doc、/search snippet）统一脱敏。"""
+        # 库中原文（内部检索用）
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{self.cfg.resolve('data/kb.sqlite3').as_posix()}?mode=ro",
+                               uri=True)
+        try:
+            row = conn.execute(
+                "SELECT text FROM chunks_fts WHERE doc_id='pdf:guide' LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        self.assertIn("10.0.0.5", row[0])  # 原文入库
+        # 出口：/doc body 脱敏（<IP>/<PATH>，保留默认路径）
+        r = self.client.get("/doc/pdf:guide")
+        d = r.json()
+        self.assertNotIn("10.0.0.5", d["body"])
+        self.assertIn("<IP>", d["body"])
+        self.assertNotIn("/home/user/logs/oom.log", d["body"])
+        self.assertIn("<PATH>", d["body"])
+        self.assertIn("/var/log/npu/", d["body"])  # 默认路径保留（诊断价值）
+        # 出口：/search snippet 脱敏
+        r2 = self.client.post("/search", json={"query": "hccn_tool", "top_k": 5})
+        blob = json.dumps(r2.json(), ensure_ascii=False)
+        self.assertNotIn("10.0.0.5", blob)
+        self.assertNotIn("/home/user/logs/", blob)
 
 
 if __name__ == "__main__":
