@@ -99,6 +99,32 @@ class TestExcelSource(unittest.TestCase):
         # 有 body 的文档都能被 canonical/ingest 接受
         self.assertTrue(doc.body)
 
+    def test_sanitize_config_from_app_cfg(self):
+        """config.sanitize 配置生效：keep_paths 覆盖默认（保留业务路径、脱敏默认路径）。"""
+        import os
+
+        from vllm_kb.config import AppConfig
+
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        try:
+            cfg = AppConfig.model_validate({"sanitize": {
+                "keep_paths": ["/home/user/logs"],  # 覆盖默认：业务日志目录保留
+                "keep_ips": ["10.0.0.5"],           # 覆盖默认：该内网 IP 保留
+            }})
+            src = ExcelSource(self.cfg, project_root=self.root, app_cfg=cfg)
+            src.pull()
+            docs = src.canonicalize()
+            body = "\n".join(d.body for d in docs)
+            # 业务配置的保留路径/IP 生效
+            self.assertIn("/home/user/logs/oom.log", body)
+            self.assertIn("10.0.0.5", body)
+            # 默认路径（未配置保留）与默认白名单（未配置）——覆盖后不保留
+            self.assertNotIn("/var/log/npu/", body)
+            self.assertIn("<PATH>", body)
+            self.assertIn("<IP>", body)
+        finally:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
 
 if __name__ == "__main__":
     unittest.main()

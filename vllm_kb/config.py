@@ -164,6 +164,20 @@ class VerifyCfg(BaseModel):
     queries: list[str] = Field(default_factory=list)
 
 
+class SanitizeCfg(BaseModel):
+    """内部数据脱敏配置（IP / 路径，Excel 等业务来源入库时应用）。
+
+    - keep_paths: 保留的**默认路径前缀**（白名单内绝对路径保留——昇腾默认安装/系统日志/
+      配置目录诊断价值高；白名单外内部路径 → <PATH>）。空列表 = 全部绝对路径脱敏；
+    - keep_ips: 保留的 IP（默认回环/通配）；其余 IPv4（内网段/公网）→ <IP>。
+      空列表 = 全部 IP 脱敏。
+    **None = 使用默认（vllm_kb.sanitize.DEFAULT_KEEP_PATHS / DEFAULT_KEEP_IPS）；
+    显式 [] = 全部脱敏**——未配置与有意清空语义不同。
+    """
+    keep_paths: Optional[list[str]] = None
+    keep_ips: Optional[list[str]] = None
+
+
 class TagCfg(BaseModel):
     """文档级标签（两级分类）配置。
 
@@ -204,6 +218,7 @@ class AppConfig(BaseModel):
     code: CodeCfg = Field(default_factory=CodeCfg)
     logging: LoggingCfg = Field(default_factory=LoggingCfg)
     tags: TagCfg = Field(default_factory=TagCfg)
+    sanitize: SanitizeCfg = Field(default_factory=SanitizeCfg)
 
     @classmethod
     def load(cls, path: Optional[str | os.PathLike] = None, require_keys: bool = True) -> "AppConfig":

@@ -41,6 +41,27 @@ class TestSanitize(unittest.TestCase):
         out = sanitize_text("/opt/internal/x", keep_paths=["/opt/internal"])
         self.assertEqual(out, "/opt/internal/x")
 
+    def test_keep_paths_empty_masks_all(self):
+        """显式空列表 = 全部绝对路径脱敏（含默认路径）。"""
+        out = sanitize_text("/var/log/npu/x.log 与 /usr/local/Ascend",
+                            keep_paths=[], keep_ips=None)
+        self.assertNotIn("/var/log", out)
+        self.assertNotIn("/usr/local/Ascend", out)
+        self.assertIn("<PATH>", out)
+
+    def test_keep_ips_override(self):
+        """keep_ips 白名单内保留，其余脱敏。"""
+        out = sanitize_text("8.8.8.8 与 10.0.0.5", keep_ips=["8.8.8.8"])
+        self.assertIn("8.8.8.8", out)
+        self.assertNotIn("10.0.0.5", out)
+        self.assertIn("<IP>", out)
+
+    def test_keep_ips_empty_masks_all(self):
+        """显式空列表 = 全部 IP 脱敏（含回环）。"""
+        out = sanitize_text("127.0.0.1 与 10.0.0.5", keep_ips=[])
+        self.assertNotIn("127.0.0.1", out)
+        self.assertIn("<IP>", out)
+
     def test_relative_path_kept(self):
         """相对路径（无盘符、非 / 开头）低风险保留。"""
         self.assertIn("a/b/c", sanitize_text("见 a/b/c 说明"))

@@ -725,6 +725,12 @@ class ExcelSource(BaseSource):
         """遍历所有 sheet/行，行 cell 拼接为 body（schema-free），脱敏后产出 KbDocument。"""
         from .sanitize import sanitize_text
 
+        # 脱敏配置（config.sanitize：keep_paths/keep_ips；None=默认白名单，[]=全脱敏）
+        keep_paths = keep_ips = None
+        if self.app_cfg is not None:
+            keep_paths = self.app_cfg.sanitize.keep_paths
+            keep_ips = self.app_cfg.sanitize.keep_ips
+
         try:
             import openpyxl
         except ImportError as e:
@@ -752,10 +758,13 @@ class ExcelSource(BaseSource):
                                      if c is not None and str(c).strip()]
                             if not cells:
                                 continue  # 空行跳过（不依赖行号语义）
-                            body = sanitize_text(" ".join(cells))
+                            body = sanitize_text(" ".join(cells),
+                                                 keep_paths=keep_paths, keep_ips=keep_ips)
                             if not body.strip():
                                 continue
-                            title = sanitize_text(cells[0])[:80]
+                            title = sanitize_text(cells[0],
+                                                 keep_paths=keep_paths,
+                                                 keep_ips=keep_ips)[:80]
                             docs.append(KbDocument(
                                 source_type="doc_excel",
                                 source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",
