@@ -333,11 +333,16 @@ class GithubPuller:
         skip_count = 0
         pages = 0
         total = 0
-        max_created: str | None = None  # 增量窗口跟踪：本轮看到的 max createdAt
+        # 增量窗口跟踪：本轮看到的 max createdAt（窗口只前进不后退——
+        # 若窗口内全是被更新的旧条目，其 createdAt 可能比 since 更早，不能回退窗口）
+        max_created: str | None = g.get(f"{kind}_since")
         since: str | None = None
         # 增量：窗口起点 = 上次 max createdAt；无则从头（首次/旧 checkpoint）
         if incremental:
             cursor = None
+            # 增量每次从头枚举，游标序列与上次断点续传无关：清掉残留 last_cursor，
+            # 否则第一页 endCursor 若恰好等于上次中断时的游标会被误判"卡住"整轮放弃。
+            g.pop(f"{kind}_last_cursor", None)
             since = g.get(f"{kind}_since") or None
             if since:
                 print(f"[github:{self.id}] {kind} 增量拉取（--incremental：时间窗口 "
@@ -401,7 +406,8 @@ class GithubPuller:
             for node in nodes:
                 if self.max_issues and len(cp["issues"]) >= self.max_issues:
                     break
-                # 增量窗口跟踪：记录本轮看到的 max createdAt（作为下次 since）
+                # 增量窗口跟踪：记录本轮看到的 max createdAt（作为下次 since）。
+                # ISO-8601 UTC 等宽（YYYY-MM-DDTHH:MM:SSZ），字典序即时间序，字符串比较安全。
                 created = node.get("createdAt") or ""
                 if created and (max_created is None or created > max_created):
                     max_created = created
@@ -440,6 +446,10 @@ class GithubPuller:
             # 每页落 checkpoint：可断点续传
             self._save_checkpoint(cp)
             pct = f"{collected_kind}/{total}" if total else f"{collected_kind}"
+            if incremental:
+                # 增量带 filterBy.since 后 totalCount 是**窗口内**条目数（非全量），
+                # collected_kind 是历史累计——两者不可比，分开显示避免倒挂误导
+                pct = f"累计 {collected_kind} / 窗口 {total}" if total else f"累计 {collected_kind}"
             print(
                 f"[github:{self.id}] {kind} 第 {pages} 页完成 | "
                 f"本轮 新增 {new_count} / 跳过 {skip_count} | "
@@ -452,7 +462,7 @@ class GithubPuller:
                     stale_pages += 1
                     if stale_pages >= 3:
                         if max_created:
-                            g[f"{kind}_since"] = max_created  # 窗口推进
+                            g[f"{kind}_since"] = max_created  # 窗口推进（单调不后退）
                         print(f"[github:{self.id}] {kind} 增量完成"
                               f"（连续 {stale_pages} 页无新增）", flush=True)
                         break
@@ -460,7 +470,7 @@ class GithubPuller:
                     stale_pages = 0
             if g.get(f"{kind}_done"):
                 break
-        if incremental and max_created and not g.get(f"{kind}_since"):
+        if incremental and max_created:
             g[f"{kind}_since"] = max_created  # 正常翻完（hasNextPage=false）也推进窗口
         if not g.get(f"{kind}_done"):
             self._save_checkpoint(cp)

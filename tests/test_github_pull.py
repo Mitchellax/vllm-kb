@@ -31,11 +31,11 @@ def make_item(number=1, body="", labels=None, state="closed", closed_at="2026-08
     }
 
 
-def _node(number):
+def _node(number, created_at="2026-01-01T00:00:00Z"):
     """构造最小 GraphQL issues 节点。"""
     return {
         "number": number, "title": "t", "body": "b", "state": "OPEN",
-        "createdAt": "2026-01-01T00:00:00Z", "closedAt": None,
+        "createdAt": created_at, "closedAt": None,
         "url": f"https://github.com/x/issues/{number}",
         "author": None, "labels": {"nodes": []},
     }
@@ -657,6 +657,98 @@ class TestPullIncremental(unittest.TestCase):
             self.assertNotIn("filter", seen["prs"][0])
             self.assertEqual(seen["prs"][0]["order"],
                              {"field": "UPDATED_AT", "direction": "DESC"})
+
+    def test_pull_incremental_window_advances_on_normal_completion(self):
+        """Bug B：已有 since 且正常翻完（hasNextPage=false）时窗口必须推进到本轮 max createdAt。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            cp["graphql"]["issues_since"] = "2026-01-10T00:00:00Z"
+            puller._save_checkpoint(cp)
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 5,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       # 新条目（createdAt 2026-02-01 > since 2026-01-10）
+                                       "nodes": [_node(99, created_at="2026-02-01T00:00:00Z")]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 1)
+            cp2 = puller._load_checkpoint()
+            # 窗口推进：max(旧 since, 本轮 max createdAt) = 2026-02-01
+            self.assertEqual(cp2["graphql"]["issues_since"], "2026-02-01T00:00:00Z")
+
+    def test_pull_incremental_window_never_regresses(self):
+        """窗口只前进不后退：窗口内全是被更新的旧条目（createdAt < since）时 since 不变。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            cp["graphql"]["issues_since"] = "2026-01-10T00:00:00Z"
+            puller._save_checkpoint(cp)
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 5,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       # 只有 createdAt 比 since 更早的条目（被更新过，进来跳过）
+                                       "nodes": [_node(5, created_at="2026-01-01T00:00:00Z")]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 1)  # 5 号是新的（cp 里没有），仍入库
+            cp2 = puller._load_checkpoint()
+            # 本轮 max createdAt（2026-01-01）< 旧 since（2026-01-10）→ 窗口不能回退
+            self.assertEqual(cp2["graphql"]["issues_since"], "2026-01-10T00:00:00Z")
+
+    def test_pull_incremental_resets_stale_last_cursor(self):
+        """Bug A：增量从头拉时清掉残留 last_cursor——否则第一页 endCursor 恰好等于
+        上次中断时的游标会被误判"卡住"整轮放弃（第一页不触发停滞检测）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            # 模拟上次断点续传中断：last_cursor 恰好等于本次第一页 endCursor
+            cp["graphql"]["issues_last_cursor"] = "C1"
+            puller._save_checkpoint(cp)
+            calls = []
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    calls.append(1)
+                    return {"issues": {"totalCount": 10,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "C1"},
+                                       "nodes": [_node(7)]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 1)  # 7 号正常入库，未被误判停滞
+            self.assertEqual(len(calls), 1)  # 只发一次请求（无停滞重试）
+            self.assertTrue((Path(td) / "raw" / "issues" / "7.json").exists())
 
 
 if __name__ == "__main__":
