@@ -23,6 +23,7 @@ import ast
 import json
 import re
 import sqlite3
+import warnings
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -365,9 +366,17 @@ def _extract_python_ast(text: str, lines: list[str], syms: set) -> None:
     - 字符串/注释里的"def xxx(" 不会误命中（正则会）；
     - 报错字面量（raise/assert/logger.error 的字符串参数）→ kind=msg；
     - ast 解析失败（语法错误/非 Python 内容）→ 退回行级正则（保底，不丢符号）。
+
+    第三方源码含大量 `"\d"` 这类 invalid escape：Python 3.12 起 ast.parse 对
+    其发 SyntaxWarning 且默认显示（3.14 起直接 SyntaxError）——建索引时刷屏。
+    这里只做符号提取、不改第三方代码，故屏蔽该警告（SyntaxError 仍由调用方
+    兜底到行级正则）。本模块自身代码均为合法转义，不受影响。
     """
     try:
-        tree = ast.parse(text)
+        with warnings.catch_warnings():
+            # 第三方源码的 invalid escape 与我们无关：仅屏蔽 ast.parse 期间警告
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(text)
     except (SyntaxError, ValueError):
         # 保底：行级正则（只提取 def/class，算子等由 _extract_pattern_symbols 负责）
         for m in _PY_DEF_RE.finditer(text):
