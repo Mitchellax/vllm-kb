@@ -87,7 +87,6 @@ def download(repo: str, version: str, dest: Path, insecure: bool = False,
     print(f"[vllm] v{version} 下载完成 ({dest.stat().st_size / 1e6:.1f} MB)")
     return True
 
-
 def ensure_snapshot(root: Path, version: str) -> Path:
     snap = root / "snapshots" / version
     if snap.is_dir() and any(snap.iterdir()):
@@ -184,12 +183,13 @@ def main() -> None:
     if args.list:
         stored = sorted(d.stem for d in (root / "zips").glob("*.zip")) if (root / "zips").exists() else []
         need = sorted(set(versions) - set(stored))
-        print(f"[vllm] 需要拉取的 vllm 版本（{len(versions)} 个，已预存 {len(stored)} / 缺失 {len(need)}）:")
+        print(f"[vllm] vllm 主仓版本对比（companion 对应 {len(versions)} 个，"
+              f"已预存 {len(stored)} / 缺失 {len(need)}）:")
         if need:
-            print("  缺失（未预存）:")
+            print(f"  缺失 {len(need)} 个（未预存，可 --version 或重跑自动补）:")
             for v in need:
-                print(f"    {v}")
-        print("  已预存:")
+                print(f"    v{v}")
+        print(f"  已预存 {len(stored)} 个:")
         for v in stored:
             print(f"    v{v}")
         return
@@ -198,7 +198,7 @@ def main() -> None:
         for v in versions:
             if (root / "zips" / f"{v}.zip").exists():
                 n = build_index(root, v)
-                print(f"[vllm] v{v} 索引 {n} 符号")
+                print(f"[vllm] v{v} 符号索引 {n} 个符号")
         return
 
     # 1) 下载
@@ -207,16 +207,16 @@ def main() -> None:
         if download(VLLM_REPO, v, root / "zips" / f"{v}.zip", insecure=insecure, base_url=base_url):
             downloaded += 1
     if downloaded:
-        print(f"[vllm] 本轮新下载 {downloaded} 个")
+        print(f"[vllm] 本轮新下载 {downloaded} 个版本")
 
     # 2) 解压 + 索引
     for v in versions:
         if (root / "zips" / f"{v}.zip").exists():
             n = build_index(root, v)
-            print(f"[vllm] v{v} 索引 {n} 符号")
+            print(f"[vllm] v{v} 符号索引 {n} 个符号")
 
     print(f"[vllm] 完成。vllm 主仓可用版本: "
-          f"{sorted(d.name for d in (root / 'zips').glob('*.zip')) if (root / 'zips').exists() else '(无)'}")
+          f"{sorted(d.stem for d in (root / 'zips').glob('*.zip')) if (root / 'zips').exists() else '(无)'}")
 
 
 if __name__ == "__main__":
