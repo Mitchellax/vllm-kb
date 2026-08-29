@@ -252,6 +252,37 @@ class TestCliDispatch(unittest.TestCase):
         self.assertEqual(calls["payload"]["path"], "worker/model_runner_v1.py")
         self.assertTrue(calls["payload"]["per_version"])
 
+    def test_code_file_without_keyword(self):
+        """code --file <路径> --version <版本>：读文件模式不需要 keyword（文档两种写法均可用）。"""
+        calls = {}
+
+        def fake_get(base, path, params=None):
+            calls["path"] = path
+            calls["params"] = params
+            return {"version": "v0.23.0rc1", "path": "csrc/mc2/a.cpp",
+                    "content": "int main() {}"}
+
+        txt = run_main(["code", "--file", "csrc/mc2/a.cpp", "--version", "v0.23.0rc1",
+                        "--max-chars", "100000"], get_data=fake_get)
+        self.assertEqual(calls["path"], "/code/file")
+        self.assertEqual(calls["params"]["path"], "csrc/mc2/a.cpp")
+        self.assertEqual(calls["params"]["version"], "v0.23.0rc1")
+        self.assertEqual(calls["params"]["max_chars"], 100000)
+        self.assertIn("v0.23.0rc1:csrc/mc2/a.cpp", txt)
+
+    def test_code_file_requires_version(self):
+        """code --file 缺 --version：明确报错。"""
+        calls = {}
+        txt = run_main(["code", "--file", "csrc/mc2/a.cpp"], get_data=lambda *a, **k: calls.setdefault("n", 1))
+        self.assertIn("--version", txt)
+        self.assertNotIn("n", calls)  # 未发请求
+
+    def test_code_search_requires_keyword(self):
+        """code 检索模式缺 keyword：明确提示两种用法（非 --file 不静默报错）。"""
+        txt = run_main(["code", "--kind", "msg"])
+        self.assertIn("关键词", txt)
+        self.assertIn("--file", txt)
+
     def test_diff_dispatch(self):
         calls = {}
 

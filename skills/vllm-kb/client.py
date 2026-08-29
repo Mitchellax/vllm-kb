@@ -414,12 +414,13 @@ def main() -> None:
     p.add_argument("--repo", default="vllm-ascend", help="仓库（vllm-ascend 默认 | vllm）")
 
     p = sub.add_parser("code", help="版本化代码仓检索")
-    p.add_argument("keyword", help="符号/关键词（如 DispatchFFNCombine、halMemCreate）")
+    p.add_argument("keyword", nargs="?", default=None,
+                   help="符号/关键词（如 DispatchFFNCombine、halMemCreate；--file 读取文件模式可省略）")
     p.add_argument("--version", default=None, help="限定版本（默认全部已预存版本）")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
     p.add_argument("--file", dest="code_file", metavar="PATH", default=None,
-                   help="直接读取指定版本源码文件（需配合 --version）")
+                   help="直接读取指定版本源码文件（需配合 --version；此时忽略 keyword）")
     p.add_argument("--max-chars", dest="code_max_chars", type=int, default=20000,
                    help="--file 读取的最大字符数（默认 20000；函数体较长时可调大，截断会明确标注）")
     p.add_argument("--in-file", dest="in_file", metavar="SUBSTR", default=None,
@@ -523,6 +524,10 @@ def main() -> None:
                          "max_chars": args.code_max_chars})
             print(fmt_code_file(data))
         else:
+            if not args.keyword:
+                print("[client] code 检索需要关键词：code <关键词> [选项]；"
+                      "读取文件用 code --file <路径> --version <版本>")
+                sys.exit(2)
             payload = {"keyword": args.keyword, "version": args.version,
                        "limit": args.limit, "repo": args.repo,
                        "path": args.in_file, "per_version": args.per_version}
