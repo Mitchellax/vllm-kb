@@ -151,7 +151,6 @@ def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: 
             time.sleep(wait)
     return []
 
-
 def extract_from_env(env: list[str]) -> dict[str, str]:
     """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本 / vllm tag。
 
@@ -240,26 +239,36 @@ def fetch_pta_from_requirements(tag: str, insecure: bool = False,
     """从 vllm-ascend 指定 tag 的 requirements.txt 提取 pytorch-ascend（torch-npu）版本。
 
     返回 ""（无法获取）。GitHub API contents 端点（走内网镜像 gbase）。
+    带 2 次重试：内网环境单次请求可能超时，避免逐 tag 长时间静默。
     """
+    import time as _t
+
     from vllm_kb.net import get_session
 
     url = (f"{gbase.rstrip('/')}/repos/vllm-project/vllm-ascend/"
            f"contents/requirements.txt?ref={tag}")
-    try:
-        r = get_session(insecure).get(url, headers={"User-Agent": "vllm-kb", "Accept": "application/vnd.github.raw"},
-                                      timeout=30)
-        if r.status_code == 404:
-            print(f"[matrix] {tag} 无 requirements.txt（跳过 PTA 提取）", flush=True)
+    session = get_session(insecure)
+    for attempt in range(3):
+        try:
+            r = session.get(url, headers={"User-Agent": "vllm-kb", "Accept": "application/vnd.github.raw"},
+                            timeout=15)
+            if r.status_code == 404:
+                print(f"[matrix] {tag} 无 requirements.txt（跳过 PTA 提取）", flush=True)
+                return ""
+            r.raise_for_status()
+            for line in r.text.splitlines():
+                m = _TORCH_NPU_RE.match(line.strip())
+                if m:
+                    return m.group(1)
             return ""
-        r.raise_for_status()
-        for line in r.text.splitlines():
-            m = _TORCH_NPU_RE.match(line.strip())
-            if m:
-                return m.group(1)
-        return ""
-    except Exception as e:
-        print(f"[matrix] {tag} requirements.txt 拉取失败: {e}", flush=True)
-        return ""
+        except Exception as e:
+            if attempt == 2:
+                print(f"[matrix] {tag} requirements.txt 拉取失败: {e}", flush=True)
+                return ""
+            wait = 2 ** attempt
+            print(f"[matrix] {tag} requirements.txt 拉取失败({e})，{wait}s 后重试", flush=True)
+            _t.sleep(wait)
+    return ""
 
 
 def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:
@@ -298,10 +307,15 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
                gbase: str = "https://api.github.com") -> list[dict]:
     # 第一遍：收齐所有组的 env 信息（同基础版本的组共享 cann 用于回退）
     infos: dict[str, dict] = {}  # base(group key) -> extract_from_env 结果
-    for base in groups:
+    total = len(groups)
+    for i, base in enumerate(sorted(groups), 1):
         rep = pick_representative(groups[base])
+        print(f"[matrix] 镜像 env {i}/{total}：{base}（代表 tag {rep['name']}）...", flush=True)
         env = fetch_image_env(rep, token, insecure=insecure, qbase=qbase)
         infos[base] = extract_from_env(env)
+        got = infos[base]
+        print(f"[matrix]    cann={got['cann'] or '(空)'} vllm_tag={got['vllm_tag'] or '(空)'} "
+              f"soc={got['soc'] or '(空)'} python={got['python'] or '(空)'}", flush=True)
     # 基础版本号 -> 该系列任一非空 cann（首个遇到即用，确定性依赖排序）
     cann_by_base: dict[str, str] = {}
     for base in sorted(groups):
@@ -311,19 +325,21 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
 
     # 版本型 tag：从各自 requirements.txt 提取 PTA（pytorch-ascend）
     pta_by_tag: dict[str, str] = {}
-    for base in sorted(groups):
-        if base_version_key(base):
-            p = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase)
-            if p:
-                pta_by_tag[base] = p
+    versioned = [b for b in sorted(groups) if base_version_key(b)]
+    for i, base in enumerate(versioned, 1):
+        print(f"[matrix] PTA 提取 {i}/{len(versioned)}：{base} ...", flush=True)
+        p = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase)
+        if p:
+            pta_by_tag[base] = p
+            print(f"[matrix]    {base} -> pytorch-ascend {p}", flush=True)
     # 基础版本号 -> PTA（同系列回退用）
     pta_by_base: dict[str, str] = {}
     for base in sorted(pta_by_tag):
         pta_by_base.setdefault(base_version_key(base), pta_by_tag[base])
 
     rows = []
-    total = len(groups)
     for i, base in enumerate(sorted(groups), 1):
+        print(f"[matrix] 生成行 {i}/{total}：{base}", flush=True)
         info = infos[base]
         cann = info["cann"]
         cann_src = "镜像env"
