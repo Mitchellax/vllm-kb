@@ -84,16 +84,16 @@ $('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card"><label>类别
 async function showItem(id){const i=await j('/api/item/'+id);const p=i.payload||{};
 $('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 返回队列</button><h3>#${i.id} ${esc(i.category)} <span class="badge ${i.status}">${i.status}</span></h3>
 <p><b>item_ref:</b> <span class="mono">${esc(i.item_ref)}</span></p>
-${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（来源文档: ${esc(p.title||'')}）</p>`:''}
+${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（提及文档 <b>${p.doc_count||1}</b> 篇：${esc((p.docs||[p]).map(d=>d.title||d.source_id||'').slice(0,5).join('、')||'')}${(p.doc_count||1)>5?' …':''}）</p>`:''}
 <pre>${esc(JSON.stringify(p,null,2))}</pre>
 <h4>审核（只做判定，不修改原始内容）</h4><input id="rev" placeholder="审核人（必填）" style="width:180px">
 <textarea id="rvnote" rows="2" style="width:100%" placeholder="备注（可选）"></textarea><br><br>
 ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
-<button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+打标，立即生效）</button><br><br>`:''}
+<button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button><br><br>`:''}
 <button class="ok" onclick="review(${i.id},'approved')">✓ 认证</button>
 <button onclick="review(${i.id},'suspected')">？ 存疑（重新排队靠后）</button>
 <button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除（只删数据库记录，原始文件手动删）</button>
-<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 忽略不记录（可再次出现）</span></div>`}
+<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条），忽略/采纳后不再出现</span></div>`}
 async function adoptCandidate(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
 async function review(id,action){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}let result={note:document.getElementById('rvnote').value};try{result=JSON.parse(result.note||'{}')}catch(e){}

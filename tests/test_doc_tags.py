@@ -223,6 +223,53 @@ class TagManagementTest(unittest.TestCase):
         it = self.store.get_item(q[0]["id"])
         self.assertEqual(it["status"], "approved")
 
+    def test_seed_tag_candidates_aggregates_by_word(self):
+        """同词跨文档聚合：一条审核项带 doc_count，采纳时全部提及文档打标。"""
+        from vllm_kb.review import adopt_tag_candidate, seed_tag_candidates
+
+        self._ingest(source_id="pdf:a", cands=[{"name": "拓扑", "tier": "domain"}])
+        self._ingest(source_id="pdf:b", cands=[{"name": "拓扑", "tier": "domain"}])
+        self._ingest(source_id="pdf:c", cands=[{"name": "单独词", "tier": "purpose"}])
+        added = seed_tag_candidates(self.cfg, self.store)
+        self.assertEqual(added, 2)  # 拓扑（2 篇）+ 单独词（1 篇），而非 3 条
+        q = self.store.list_items(category="tag_candidate")
+        by_name = {i["payload"]["candidate"]: i for i in q}
+        self.assertEqual(by_name["拓扑"]["payload"]["doc_count"], 2)
+        self.assertEqual(len(by_name["拓扑"]["payload"]["docs"]), 2)
+        self.assertEqual(by_name["单独词"]["payload"]["doc_count"], 1)
+        # 采纳"拓扑" → 两篇文档 manual 都写入（立即生效）
+        r = adopt_tag_candidate(self.cfg, self.store, by_name["拓扑"]["id"], "tester",
+                                config_path=self.cfg_path)
+        self.assertEqual(r["docs_count"], 2)
+        conn = sqlite3.connect(self.kb)
+        try:
+            for sid in ("pdf:a", "pdf:b"):
+                row = conn.execute("SELECT tags FROM docs WHERE source_id=?", (sid,)).fetchone()
+                self.assertIn("拓扑", json.loads(row[0]))
+            row = conn.execute("SELECT tags FROM docs WHERE source_id='pdf:c'").fetchone()
+            self.assertNotIn("拓扑", json.loads(row[0]))
+        finally:
+            conn.close()
+        # 忽略过的候选（approved 任意状态）不再重复生成
+        self.assertEqual(seed_tag_candidates(self.cfg, self.store), 0)
+
+    def test_seed_cleans_old_format_tag_candidates(self):
+        """旧格式（source_id::name）审核项在 seed 时清理，新聚合格式重建。"""
+        from vllm_kb.review import seed_tag_candidates
+
+        self._ingest(source_id="pdf:x", cands=[{"name": "带宽", "tier": "domain"}])
+        # 手工制造旧格式项（模拟升级前遗留）
+        self.store.add_item("tag_candidate", "pdf:x::带宽", {
+            "source_id": "pdf:x", "title": "pdf:x",
+            "candidate": "带宽", "suggested_tier": "domain",
+        })
+        added = seed_tag_candidates(self.cfg, self.store)
+        q = self.store.list_items(category="tag_candidate")
+        self.assertEqual(added, 1)  # 旧格式被清理，新聚合格式生成 1 条
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["item_ref"], "tag:带宽")
+        self.assertEqual(q[0]["payload"]["doc_count"], 1)
+
     def test_tag_dict_management(self):
         from vllm_kb.review import (
             add_tag_to_registry,

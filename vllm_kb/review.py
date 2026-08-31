@@ -227,6 +227,24 @@ class ReviewStore:
         finally:
             conn.close()
 
+    def cleanup_old_tag_candidates(self) -> int:
+        """删除旧版 tag_candidate 格式残留（item_ref = 'source_id::name'，无 'tag:' 前缀）。
+
+        聚合版 item_ref 为 'tag:{name}'；旧格式项在新版 seed 前删除，未处理的候选
+        由 seed 按聚合格式重建（已忽略/采纳的因其词已收录或 dedupe 不再打扰）。
+        返回删除条数。
+        """
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "DELETE FROM review_items WHERE category='tag_candidate' "
+                "AND item_ref NOT LIKE 'tag:%'"
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
     def list_items(self, category: Optional[str] = None, status: Optional[str] = None,
                    limit: int = 50, offset: int = 0) -> list[dict]:
         """审核队列：未审核（pending）优先、存疑（suspected）其次，已处理最后。"""
@@ -888,17 +906,24 @@ def seed_case_title_flags(cfg: "AppConfig", store: ReviewStore) -> int:
 def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
     """扫描 kb.sqlite3 中 extra.tag_candidates（未收录强候选）→ tag_candidate 审核项（幂等）。
 
-    词典已收录的候选不生成（避免重复打扰）；item_ref 用 f"{source_id}::{candidate}"
-    保证同一候选只出现一次（含已处理状态——dedupe 语义）。
+    **按候选词聚合**：同一候选词在多篇文档出现只生成一条审核项（item_ref = `tag:{name}`），
+    payload 带提及文档数 + 文档列表——人工审一次 = 全部提及文档生效。
+    词典已收录的候选不生成；忽略/认证过的候选因 item_ref 已存在（任意状态）不再重复打扰。
+
+    兼容升级：旧版按 (source_id::name) 生成，升级后自动清理旧格式残留（其词已收录/忽略的
+    不重建，未处理的按新聚合格式重建）。
     """
     from .tagging import TagRegistry
 
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
         return 0
+    # 清理旧格式（source_id::name）残留：item_ref 含 "::" 且非 "tag:" 前缀
+    store.cleanup_old_tag_candidates()
     registry = TagRegistry.load(cfg)
     conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
-    added = 0
+    # candidate -> {docs: [(source_id, title)], tier}
+    agg: dict[str, dict] = {}
     try:
         rows = conn.execute("SELECT source_id, title, extra FROM docs").fetchall()
         for source_id, title, extra in rows:
@@ -912,13 +937,25 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
                 if not name or registry.contains(name):
                     continue
                 tier = c.get("tier") if isinstance(c, dict) else None
-                if store.add_item("tag_candidate", f"{source_id}::{name}", {
-                    "source_id": source_id, "title": title or source_id,
-                    "candidate": name, "suggested_tier": tier,
-                }):
-                    added += 1
+                entry = agg.setdefault(name, {"docs": [], "tier": tier})
+                entry["docs"].append((source_id, title or source_id))
+                if tier and not entry["tier"]:
+                    entry["tier"] = tier
     finally:
         conn.close()
+    added = 0
+    for name, info in sorted(agg.items()):
+        docs = info["docs"]
+        if store.add_item("tag_candidate", f"tag:{name}", {
+            "candidate": name,
+            "suggested_tier": info["tier"],
+            "doc_count": len(docs),
+            "docs": [{"source_id": s, "title": t} for s, t in docs[:20]],  # 展示用，截断
+            # 兼容旧单文档展示：首个文档的 title/source_id
+            "source_id": docs[0][0],
+            "title": docs[0][1],
+        }):
+            added += 1
     return added
 
 
@@ -926,7 +963,10 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
                         reviewer: str, tier: Optional[str] = None,
                         config_path: Optional[str | Path] = None) -> dict:
     """采纳候选：① 入词典（config.tags.registry，tier 取审核选择或启发式）
-    ② 写入该文档 manual（立即生效，无需等下次入库）；③ 审核项标记 approved。"""
+    ② 写入提及该候选的**全部文档** manual（立即生效，无需等下次入库）；③ 审核项标记 approved。
+
+    聚合后一条审核项对应多篇提及文档（payload.docs）；兼容旧数据单文档（payload.source_id）。
+    """
     from .tagging import TagRegistry, save_registry_to_config
 
     it = store.get_item(item_id)
@@ -937,25 +977,32 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
     payload = it["payload"] or {}
     source_id = payload.get("source_id", "")
     name = payload.get("candidate", "")
-    if not source_id or not name:
-        raise ValueError("审核项缺少 source_id/candidate")
+    if not name:
+        raise ValueError("审核项缺少 candidate")
     registry = TagRegistry.load_from_config_file(config_path)
     entry = registry.add(name, tier)  # tier=None → 启发式
     save_registry_to_config(cfg, registry, config_path=config_path)
+    # 提及该候选的全部文档（聚合）；旧单文档审核项回退到 source_id
+    docs = [d["source_id"] for d in (payload.get("docs") or []) if d.get("source_id")]
+    if not docs and source_id:
+        docs = [source_id]
     kb = cfg.resolve(cfg.storage.sqlite_path)
     conn = sqlite3.connect(str(kb))
     try:
-        ov = get_doc_tags_conn(conn, source_id)
-        manual = list(ov["manual"])
-        if name not in manual:
-            manual.append(name)
-        set_doc_tags_conn(conn, source_id, manual=manual, reviewer=reviewer)
+        for sid in docs:
+            ov = get_doc_tags_conn(conn, sid)
+            manual = list(ov["manual"])
+            if name not in manual:
+                manual.append(name)
+            set_doc_tags_conn(conn, sid, manual=manual, reviewer=reviewer)
         conn.commit()
     finally:
         conn.close()
     store.review(item_id, "approved", reviewer,
-                 result={"action": "adopt", "tag": name, "tier": entry.tier})
-    return {"ok": True, "tag": name, "tier": entry.tier, "source_id": source_id}
+                 result={"action": "adopt", "tag": name, "tier": entry.tier,
+                         "docs_count": len(docs)})
+    return {"ok": True, "tag": name, "tier": entry.tier, "source_id": source_id,
+            "docs_count": len(docs)}
 
 
 def seed_all(cfg: "AppConfig", store: ReviewStore) -> dict[str, int]:
