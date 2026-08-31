@@ -39,13 +39,20 @@
 
 ### 2.1 GitHub 社区来源（issue / PR / comment）
 
-触发命令：`python scripts/build_kb.py`（可加 `--limit N` / `--incremental`）。
+触发命令：`python scripts/build_kb.py`（可加 `--limit N` / `--incremental` / `--pull-missing` / `--numbers`）。
+拉取模式（互斥）：**断点续传**（默认，done 后跳过）/ **`--incremental` 时间窗增量**（近期新增）/
+**`--pull-missing` 补差**（从头枚举，跳过 raw/checkpoint 已有，只拉缺失——补历史旧条目）/
+**`--numbers` REST 单条**（指定编号走 `/pulls/{n}`→`/issues/{n}`，无需 GraphQL token）。
 
 | 阶段 | 处理 | 产物 |
 |---|---|---|
-| 1. 拉取 | `GithubSource.pull()`：REST issues（含 PR）+ GraphQL 内联评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`）原始 JSON 快照（**事实源**，可重放） |
+| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR）+ 评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/`）原始 JSON 快照（**事实源**，可重放） |
 | 2. 规范化 | `src.canonicalize()`：原始 JSON → 统一 `KbDocument`（source_id / title / body / 组件 / 版本区间 / status / extra） | 追加/upsert 到统一 `data/raw/canonical.jsonl`（按 source_id 幂等） |
 | 3. 入库 | `ingest_docs()`（见 2.6） | LanceDB 向量 + kb.sqlite3 |
+
+> **只再生 canonical（不入库）**：`scripts/build_canonical.py` 遍历来源 canonicalize → upsert
+> canonical.jsonl，不 ingest——提取逻辑（版本/kind/组件/标签规则）升级后先跑它再 `build_graph.py`
+> 建图，无需重嵌向量；`build_kb.py` 内部复用同一 canonical 处理（`pipeline.upsert_unified_canonical`）。
 
 ### 2.2 业务来源（PDF 手册 / Markdown / Excel 登记表 / 截图 OCR）
 

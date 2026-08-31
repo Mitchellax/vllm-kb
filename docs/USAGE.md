@@ -59,19 +59,29 @@ python scripts/build_kb.py --limit 100
 |---|---|
 | 日常更新（增量入库；GitHub 默认不重拉） | `python scripts/build_kb.py` |
 | 拉取 GitHub 社区增量（新增 issue/PR） | `python scripts/build_kb.py --incremental` |
+| **GitHub 补差拉取**（补历史缺失条目，跳过已有） | `python scripts/build_kb.py --pull-missing` |
+| **REST 单条补拉**（指定编号，无需 GraphQL token） | `python scripts/build_kb.py --numbers 9749,9750` |
 | 只重入库不拉取 | `python scripts/build_kb.py --skip-pull` |
-| 提取逻辑升级后重生成 canonical | `python scripts/build_kb.py --recanonicalize` |
+| 只再生 canonical（不入库，供建图） | `python scripts/build_canonical.py` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
-| **GitHub 社区增量拉取**（首次全量已完成后再拉新 issue/PR） | `python scripts/build_kb.py --incremental` |
 
 > **GitHub 拉取策略**：首次拉取完成后置 `done`（checkpoint），此后默认**不再拉取**（日志打印
 > "已拉取完成（done），默认跳过——如需增量请用 --incremental"）；中断后重跑同一命令自动
-> **断点续传**。`--incremental` 增量拉取社区新增 issue/PR——**时间窗口**：从 checkpoint 记录的
-> 上次增量 `max createdAt` 起，issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走
-> `UPDATED_AT DESC` 排序，跳过已有编号、连续 3 页无新增停止，并把窗口推进到本次所见
-> `max createdAt`（首次增量无历史窗口时从头枚举一次）；无 `--incremental` 且 done 时跳过。
+> **断点续传**。三种拉取模式（互斥）：
+> - **`--incremental`（时间窗增量）**：从 checkpoint 记录的上次增量 `max createdAt` 起，
+>   issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走 `UPDATED_AT DESC` 排序，跳过已有编号、
+>   连续 3 页无新增停止，并把窗口推进到本次所见 `max createdAt`（首次增量无历史窗口时从头枚举
+>   一次）——**只覆盖近期新增/更新，补不到历史旧条目**；
+> - **`--pull-missing`（补差拉取）**：从头枚举（created desc），**跳过 raw 目录与 checkpoint 中
+>   已有的编号，只拉缺失条目**——补历史旧条目（如内网数据缺失的单条 PR），翻到最新后置 done；
+> - **`--numbers N1,N2,...`（REST 单条补拉）**：对指定编号先试 `/pulls/{n}`（404 则 `/issues/{n}`）
+>   + 评论落 raw（隐含 missing 语义，**走 REST 不需要 GraphQL token**）——已知缺失编号时最精准。
 > **全量重拉**（数据刷新/补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
 > `data/checkpoints/{source_id}.json` 后重跑 `build_kb.py`。
+
+> **只再生 canonical（`build_canonical.py`）**：提取逻辑（版本/kind/组件/标签规则）升级后，
+> 只需重新生成 canonical.jsonl 再跑 `build_graph.py` 建图——**不重嵌向量、不碰 kb.sqlite3**；
+> 如需连带重入库（重嵌向量）再跑 `build_kb.py --skip-pull`（与旧参数 `--recanonicalize` 等价）。
 
 > **`--rebuild` 高危确认**：会清空向量库 + 删除 kb.sqlite3 后全量重嵌（66K 文档约数小时）。
 > 执行前强制确认——TTY 交互输入 `y/yes`；**非交互环境（agent/CI）必须加 `--yes`**，否则拒绝执行。
@@ -427,7 +437,7 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 
 自动补单规则：`verification=unverified` 的文档 → verification_pending；标题含"待审核/待修改"→
 case_title_flag；`extra.tag_candidates`（未收录强候选）→ tag_candidate。
-审核结果回写 canonical 依赖重跑 `--recanonicalize`（后续版本支持热更新）。
+审核结果回写 canonical 依赖重跑 `build_canonical.py`（或 `build_kb.py --skip-pull`，后续版本支持热更新）。
 
 **与只读检索 API 的关系**：分离端口（检索 8000 / 审核 8010）、分离数据（kb.sqlite3 只读 /
 review.sqlite3 可写）；审核库检索 API 不碰。权限（谁能标注专家认证）由部署方加 nginx basic auth 等。
@@ -704,7 +714,7 @@ A: 能。采集完成后全部检索离线；嵌入可用 `echo` provider 离线
 A: 典型的 **kb↔canonical 不同步**：`canonical.jsonl` 是 `build_graph` 与 `--rebuild` 的
 **唯一事实源**——kb 有、canonical 无的文档，图里没有（图从 canonical 建）、全量重建也会丢
 （rebuild 从 canonical 重嵌）。常规增量入库不会漂移（pipeline 先 upsert canonical 再 ingest）；
-历史旧版流程 / `--recanonicalize`（raw 快照不全）可能造成。
+历史旧版流程 / 早期 `--recanonicalize` 参数（raw 快照不全）可能造成。
 修复（`scripts/backfill_canonical.py`，从 kb.sqlite3 重建缺失的 canonical 行，无需网络）：
 
 ```bash
@@ -730,7 +740,7 @@ A: Kùzu 图库路径**不能含非 ASCII 字符**（中文、emoji 等）——
 `VLLM_KB_DATA_ROOT` 若在中文路径下（如 `C:\Users\张三\...`），建图/图查询会失败。
 把数据根移到纯 ASCII 路径（如 `D:\vllm-kb-data`）后重建图（`scripts/build_graph.py`）。
 
-**Q: PDF 重新入库/`--recanonicalize` 很慢，怎么跳过已解析的？**
+**Q: PDF 重新入库很慢，怎么跳过已解析的？**
 A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.extract.json`），
 资产未变时自动复用（进度行标注"缓存命中"）；想强制重新解析（如 PyMuPDF 升级），
 删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。

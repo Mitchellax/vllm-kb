@@ -167,11 +167,16 @@ python scripts/build_kb.py
 python scripts/build_kb.py --incremental
 #    全量重拉（数据刷新）：删除 data/raw/{source_id}/ 与 data/checkpoints/{source_id}.json 后重跑
 
+# 1c. 其他拉取模式（与 --incremental 互斥）：
+python scripts/build_kb.py --pull-missing         # 补差：从头枚举，跳过已有（raw/checkpoint），只拉缺失（补历史旧条目）
+python scripts/build_kb.py --numbers 9749,9750    # REST 单条补拉指定编号（走 REST，无需 GraphQL token）
+
 # 2. 只重新入库，不拉取（改配置/规则后）
 python scripts/build_kb.py --skip-pull
 
-# 3. 代码升级后重新生成 canonical 并入库（不重拉 GitHub）
-python scripts/build_kb.py --recanonicalize
+# 3. 只再生 canonical（提取逻辑升级后更新 canonical 供建图用，不入库、不重嵌向量）
+python scripts/build_canonical.py
+#    （build_graph 用新 canonical 建图前先跑本脚本；如需连带重入库再跑 build_kb.py --skip-pull）
 
 # 4. 换 embedding 模型 / 全量重建（高危，需 TTY 确认或 --yes）
 python scripts/build_kb.py --rebuild
@@ -210,6 +215,7 @@ python scripts/build_tag_candidates.py
 |---|---|
 | `scripts/verify.py` | 验收：对真实故障报错跑查询，打印排序结果与置信度分解（默认查询见 config `verify.queries`） |
 | `scripts/check_readonly.py` | 验证知识库只读姿态（SQLite mode=ro / 向量库只读包装，结构层面，不依赖提示词） |
+| `scripts/build_canonical.py` | 只再生统一 canonical（不入库）：提取逻辑升级后更新 canonical 供建图/重建，不重嵌向量 |
 | `scripts/backfill_canonical.py` | 修复 kb↔canonical 不同步：从 kb.sqlite3 重建 canonical 缺失文档（默认 dry-run 打印清单，`--write` 回填，`--doc` 可只补指定条）——kb 检索命中但 graph/rebuild 缺文档时用 |
 | `scripts/diff_code_versions.py` | 跨版本源码 diff 的仓库侧等价实现（client `diff` 走只读 API 即可） |
 | `scripts/deploy_remote.py` | 远程部署辅助：本地 skill（算）+ 远程数据/API（存）落地 |

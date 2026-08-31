@@ -1,6 +1,8 @@
 # Phase 2 数据布局：多来源统一存储与质量分级设计
 
 > 状态：设计草案（V1），作为 Phase 2 数据工程的起点。
+> 注（2026 更新）：正文提及的 `--recanonicalize` 参数已更名为独立脚本
+> `scripts/build_canonical.py`（只再生 canonical 不入库），语义不变。
 > 关联：[总体建设方案](vllm-knowledge-base-plan.md)（Phase 2 图+向量）、[验收报告](vllm-kb-acceptance-report.md)。
 >
 > 背景：知识库后期将不只包含 GitHub 仓库记录，还会接入：
