@@ -40,7 +40,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   被脱敏的原始 IP/路径落盘 `data/sanitize_log.json` 供维护白名单
 - **审核工作台**（Web UI）：人工确认统一入口（认证 / 存疑 / 删除+撤回，删除只动数据库记录、原始文件保留）、
   **两层标签治理**（自动标签排除/恢复、人工添加、词典管理——新增/改名/改 tier 同步 config.json，
-  重建图后入图；tag_candidate 候选采纳；同 stem 重名告警）、
+  重建图后入图；tag_candidate 候选按词聚合、采纳即入词典 + 全部提及文档批量打标（检索侧立即生效，
+  图侧重建后入图，向量侧重入库后一致）；同 stem 重名告警）、
   **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）、
   **文档管理**（外源文档列表 + 彻底删除：docs+chunks+向量四层，本地文件保留可重新入库）——
   启动与操作见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)
@@ -50,8 +51,9 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   `--github-base/--quay-base/--base-url` 换内网 http 镜像，环境变量统一配置；
   **注意：Kùzu 图库路径（`data/graph` / `VLLM_KB_DATA_ROOT`）不能含非 ASCII 字符**（中文/emoji，
   中文部署根会打不开图库——数据根放纯 ASCII 路径，详见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）
-- **存算分离**：skill 仅 ~34KB，数据（向量库/索引/图，约 0.8GB 干净库）放远程服务器，本地只发 HTTP 查询；
-  `scripts/pack_migrate.py` 打包迁移（业务环境重新嵌入，不传向量库）
+- **存算分离**：skill 仅两个文件（`SKILL.md` + `client.py`，约 50KB，标准库实现零依赖），
+  数据（向量库/索引/图，本仓库样例 ~1GB，全量构建 4~6GB）放远程服务器，本地只发 HTTP 查询；
+  `scripts/pack_migrate.py` 打包迁移（业务环境重新嵌入，不传向量库）、`scripts/deploy_remote.py` 远程部署辅助
 - **结构只读**：SQLite `mode=ro` + 向量库只读包装 + 无写端点，Agent 提示注入也无法修改知识库
 - **高危操作防护**：`build_kb.py --rebuild` 执行前强制确认（TTY 交互 y/yes，非交互需 `--yes`），
   防止误触发全量重嵌
@@ -63,8 +65,9 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 ### 环境要求
 
 - Python 3.10+
-- 磁盘：数据约 4~6GB（canonical/原始快照/代码快照/向量库/图；若曾用旧版库反复增量入库，
-  LanceDB 会累积历史版本致体积膨胀数十 GB，可用 `cleanup_old_versions()` 清理，见 [使用指南 §7](docs/USAGE.md#7-常见问题)）
+- 磁盘：全量构建（vllm + vllm-ascend 双仓社区数据 + 代码快照 + 图）约 4~6GB；
+  本仓库 `data/` 为已构建样例（~1GB：16k+ 文档 / 31k+ chunks）。若曾用旧版库反复增量入库，
+  LanceDB 会累积历史版本致体积膨胀数十 GB，可用 `cleanup_old_versions()` 清理，见 [使用指南 §7](docs/USAGE.md#7-常见问题)
 - 外部依赖：GitHub token（采集）、Embedding API key（**强制 API**：OpenAI 兼容端点，可指向其他服务器的 vLLM 部署；`echo` 仅离线演示）
 
 ### 安装与配置
@@ -105,8 +108,7 @@ python scripts/build_graph.py
 ### 启动检索服务
 
 ```bash
-pip install fastapi uvicorn
-python scripts/serve_api.py            # http://127.0.0.1:8000
+python scripts/serve_api.py            # http://127.0.0.1:8000（fastapi/uvicorn 已含在 requirements.txt）
 ```
 
 > 更新图（`build_graph.py`）前必须先停止检索服务（Kùzu 单写者，见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）。
@@ -171,26 +173,48 @@ python scripts/build_kb.py --skip-pull
 # 3. 代码升级后重新生成 canonical 并入库（不重拉 GitHub）
 python scripts/build_kb.py --recanonicalize
 
-# 4. 换 embedding 模型 / 全量重建
+# 4. 换 embedding 模型 / 全量重建（高危，需 TTY 确认或 --yes）
 python scripts/build_kb.py --rebuild
 
-# 5. 版本日历（GitHub Releases → 版本形态 + 置信度上界）
+# 5. 版本日历（GitHub Releases → 版本形态 + 置信度上界；--all-repos 生成 vllm/vllm-ascend 分仓日历）
 python scripts/build_release_calendar.py --all-repos
 
-# 6. 版本化代码仓快照
+# 6. 版本化代码仓快照（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json）
 python scripts/build_code_snapshots.py          # vllm-ascend 版本
-python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本
+python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本（配套矩阵映射，自动跟随）
 #    符号索引（index.sqlite3）是派生数据：提取规则/schema 升级后重建
 #    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
 
-# 7. 图存储重建（修复链路/手册定义；需先停检索服务）
+# 7. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
+python scripts/build_companion_matrix.py        # 生成/更新 data/compatibility/vllm-ascend.json
+python scripts/fetch_quay_tags.py               # 拉 quay.io 镜像 tag（看护策略过滤日构建/分支/主干）
+
+# 8. 图存储重建（修复链路/手册定义；需先停检索服务，Kùzu 单写者）
 python scripts/build_graph.py
 
-# 8. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
+# 9. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
 python scripts/build_fts.py
+
+# 10. 社区高频信号词统计（issue 标题 TF-IDF → data/code/signal_words.json，供 agent 判断）
+python scripts/build_signal_words.py
+
+# 11. 正文 TF-IDF 标签候选导出（jieba → candidates.json 文件，人工审阅后手动同步 config.tags.registry）
+python scripts/build_tag_candidates.py
 ```
 
 > 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
+
+**维护/验证脚本**：
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/verify.py` | 验收：对真实故障报错跑查询，打印排序结果与置信度分解（默认查询见 config `verify.queries`） |
+| `scripts/check_readonly.py` | 验证知识库只读姿态（SQLite mode=ro / 向量库只读包装，结构层面，不依赖提示词） |
+| `scripts/backfill_canonical.py` | 修复 kb↔canonical 不同步：从 kb.sqlite3 重建 canonical 缺失文档（默认 dry-run 打印清单，`--write` 回填，`--doc` 可只补指定条）——kb 检索命中但 graph/rebuild 缺文档时用 |
+| `scripts/diff_code_versions.py` | 跨版本源码 diff 的仓库侧等价实现（client `diff` 走只读 API 即可） |
+| `scripts/deploy_remote.py` | 远程部署辅助：本地 skill（算）+ 远程数据/API（存）落地 |
+| `scripts/pack_migrate.py` | 迁移打包：业务环境重新嵌入的最小集（canonical + 业务数据，不传向量库） |
+| `scripts/seed_demo.py` | 离线演示：写入模拟 GitHub 原始数据（配 `config.offline.json` 跑通全链路） |
 
 **业务来源导入**（PDF 手册 / Markdown / Excel 登记表 / 截图 OCR）：文件放 `data/imports/{pdf,md,xlsx}/`，
 启用 config 对应 source 后跑 `python scripts/build_kb.py`；详见
@@ -201,23 +225,28 @@ python scripts/build_fts.py
 
 ```
 data/
-├── raw/                    # GitHub 原始快照（JSON，事实源，可重放）
-│   └── canonical.jsonl     # 统一 Canonical 中间格式（66k+ 条）
-├── lancedb/                # 向量库（bge-m3，122k+ chunks）
-├── kb.sqlite3              # 文档元数据 + FTS5 全文索引
-├── code/                   # 版本化代码仓（zips + 符号索引 + 符号表）
+├── raw/                    # 采集原始快照（JSON，事实源，可重放，按来源分目录）
+│   └── canonical.jsonl     # 统一 Canonical 中间格式（全量构建 66k+ 条；本仓库样例 16k+ 条）
+├── lancedb/                # 向量库（bge-m3，全量 122k+ chunks；样例 31k+）
+├── kb.sqlite3              # SQLite：docs 元数据 + chunks_meta 分块 + chunks_fts 全文（jieba 分词）+ doc_tags 标签覆盖层
+├── code/                   # 版本化代码仓
 │   ├── zips/               # vllm-ascend 各版本源码 zip
-│   ├── vllm/               # 对应 vllm 主仓源码（repo 隔离）
-│   ├── index.sqlite3       # 符号索引（算子名→文件:行号）
-│   └── symbols.json        # 三层签名提取的符号表
+│   ├── snapshots/          # 解压后的源码快照（按需读取 / diff，版本子目录）
+│   ├── index.sqlite3       # 符号索引（算子名→文件:行号 + 报错字面量索引）
+│   ├── symbols.json        # 三层签名提取的符号表
+│   └── signal_words.json   # 社区高频信号词（build_signal_words.py 生成，供 agent 判断）
 ├── graph/                  # Kùzu 图（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）
 ├── assets/                 # 业务来源原始资产（pdf/md/images，不可变，sha256）
-├── parsed/                 # 解析产物（PDF 表格 JSON、OCR 结果，可重跑）
+├── parsed/                 # 解析产物（PDF 表格 JSON、OCR 结果，可重跑；建图时提取表格→错误码）
 ├── imports/                # 业务数据放置目录（pdf/md/xlsx）
 ├── review.sqlite3          # 审核工作台队列（认证/存疑/删除）
+├── tag_candidates_manual.json  # 标签候选人工审阅输出（可手动同步进 config.tags.registry）
 ├── checkpoints/            # 采集断点（续传）
 ├── sanitize_log.json       # 脱敏维护日志（被脱敏的原始 IP/路径，供调整白名单）
-└── compatibility/          # 组件配套矩阵 + 版本日历
+├── secrets.local.json      # 本地密钥（审核工作台写入；AppConfig 自动加载，不入库）
+└── compatibility/          # 组件配套矩阵 + 分仓版本日历
+    ├── vllm-ascend.json                        # 配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend）
+    └── release_calendar.{repo}.json            # 版本日历（--all-repos 按仓库分文件）
 ```
 
 ## 🔧 架构
@@ -250,7 +279,76 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 
 **存算分离**：数据可在远程服务器，本地 skill 通过 `VLLM_KB_BASE` 环境变量寻址；服务端数据路径由 `VLLM_KB_DATA_ROOT` 重定向。详见 [使用指南](docs/USAGE.md#远程部署存算分离)。
 
-### 模块结构（`vllm_kb/`）
+## 🔀 数据流（常规操作）
+
+两条主链路：**入库**（数据 → 落库）与 **查询**（agent → API → 存储）。详细版见 [docs/DATAFLOW.md](docs/DATAFLOW.md)。
+
+### 入库：数据从哪里来、如何处理、存到哪里
+
+```
+GitHub 社区（vllm / vllm-ascend issues/PRs/comments）
+   │  build_kb.py ── GithubSource.pull()（REST+GraphQL，限流/断点续传/增量）
+   ▼
+data/raw/{source_id}/（原始 JSON 快照，事实源，可重放）── canonicalize() ──▶ 统一 canonical.jsonl
+                                                                              （中间格式，可重放可重嵌）
+业务来源（PDF/MD/Excel/截图，放 data/imports/）
+   │  build_kb.py ── 资产层复制（data/assets/，sha256 不可变）＋ 解析（data/parsed/：表格 JSON / OCR 结果）
+   ▼
+   canonicalize()（文档级标签 tagging）──────────────▶ 同上 canonical.jsonl
+   ▼
+ingest_docs()（幂等双哈希增量 + 断点续传）
+   ├─ chunking 分段切块 ──▶ embed（OpenAI 兼容 /embeddings）──▶ LanceDB 向量库（data/lancedb）
+   └─ 写 SQLite（data/kb.sqlite3）：docs 元数据 + chunks_fts 全文（jieba 分词）+ chunks_meta + doc_tags 标签覆盖层
+
+版本化代码仓：build_code_snapshots.py / build_vllm_snapshots.py
+   ──▶ data/code/{zips,snapshots}/ 源码快照 + index.sqlite3 符号索引 + symbols.json / signal_words.json
+
+辅助数据：build_release_calendar.py ──▶ data/compatibility/release_calendar.{repo}.json
+        build_companion_matrix.py + fetch_quay_tags.py ──▶ data/compatibility/vllm-ascend.json
+
+图存储：build_graph.py（需先停检索服务，Kùzu 单写者）
+   ──▶ 读 canonical.jsonl + data/parsed/（表格→错误码）+ kb.sqlite3（人工标签覆盖层）──▶ Kùzu data/graph
+```
+
+各存储的写入方与内容：
+
+| 存储 | 写入方 | 内容 |
+|---|---|---|
+| `data/raw/{source_id}/` | `build_kb.py` 拉取阶段 | GitHub 原始 JSON 快照（按来源分目录；checkpoints 断点续传） |
+| `data/raw/canonical.jsonl` | `build_kb.py` canonicalize | 多来源统一中间格式（按 source_id upsert，幂等） |
+| `data/lancedb` | `ingest.py`（批量攒批写入） | chunk 向量 + 原文 + meta（title/组件/版本区间/标签/section…） |
+| `data/kb.sqlite3` | `ingest.py` | `docs`（文档元数据+哈希）、`chunks_fts`（jieba 分词全文）、`chunks_meta`（分块序号/章节）、`doc_tags`（人工标签覆盖层） |
+| `data/code/*` | `build_code_snapshots.py` / `build_vllm_snapshots.py` | 各版本源码 zip + 解压快照 + 符号/报错字面量索引 + 符号表/信号词 |
+| `data/compatibility/*` | `build_release_calendar.py` / `build_companion_matrix.py` / `fetch_quay_tags.py` | 分仓版本日历 + 组件配套矩阵 |
+| `data/graph` | `build_graph.py` | Kùzu 图（Issue/PR/Release/Doc/Interface/Tag 节点 + 6 类边） |
+| `data/review.sqlite3` | `review_ui.py` 审核操作 | 审核队列（认证/存疑/删除），不参与检索 |
+
+### 查询：agent 请求从哪个接口进来、查什么库
+
+Agent 只调用 skill（`skills/vllm-kb/client.py`，标准库零依赖）→ HTTP 打到 `scripts/serve_api.py`
+启动的**只读 FastAPI**（默认 `http://127.0.0.1:8000`，远程经 `VLLM_KB_BASE`）→ 各端点按需读
+对应存储。检索服务结构只读：SQLite `mode=ro`、向量库写操作抛错、无写端点。
+
+| client 命令 | HTTP 端点（方法） | 查询的存储 |
+|---|---|---|
+| `search` | `POST /search` | LanceDB 向量召回 + kb.sqlite3 FTS5 全文（BM25，jieba 分词）+ 配套矩阵/分仓版本日历（查询期现算置信度，不落库） |
+| `signature` | `POST /signature-search` | 现场提取签名（`data/code/symbols.json` 符号表 + `signal_words.json`）→ kb.sqlite3 FTS 短语匹配 + 标题匹配 |
+| `title` | `GET /title` | kb.sqlite3 `docs` 表（title/source_id SQL LIKE） |
+| `version` | `GET /version` | `data/compatibility/release_calendar.{repo}.json`（版本形态判断） |
+| `code` | `POST /code/search` | `data/code/index.sqlite3` 符号/报错字面量索引命中，未命中退 grep 版本快照（snapshots/ 或 zips/）；`kind=msg` 走报错字面量索引 |
+| `code --file` | `GET /code/file` | `data/code` 对应版本快照按需解压读取（截断带标记） |
+| `diff` | `GET /code/diff` | 两个版本快照同一文件的 unified diff |
+| `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单 |
+| `doc` | `GET /doc/{source_id}` | kb.sqlite3 `docs` + `chunks_meta` + `chunks_fts` 按序拼装全文 |
+| `components` / `stats` / `health` | `GET` | kb.sqlite3 聚合 / 向量库 count（`/health` 含 embedding 状态） |
+| `companion` / `matrix` | `GET /companion` `/matrix` | `data/compatibility/vllm-ascend.json` 配套矩阵 |
+| `graph chain/fixes/sig/doc/tags/evidence/stats` | `GET /graph/*` | Kùzu `data/graph`（只读查询，未构建返回引导提示） |
+| `tags list` / `tags docs` / `context` | `GET /tags` `/tags/{tag}/docs` `POST /tags/match` | kb.sqlite3 `docs.tags`（最终标签）+ `config.tags.registry` 词典 |
+
+所有出口统一后置脱敏（`sanitize.py`：内部 IP/路径 → 占位，白名单见 config `sanitize`）；
+embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（快速失败客户端 + 熔断器）。
+
+## 模块结构（`vllm_kb/`）
 
 | 模块 | 职责 |
 |---|---|
@@ -261,6 +359,7 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 | `signature.py` / `error_parse.py` / `symbol_table.py` | 三层签名提取（源码符号表 → 结构化解析 → 社区信号词） |
 | `tagging.py` | 文档级标签（两级分类）确定性提取：词典 registry 子串命中 + 文件名/标题 token；tier 启发式；合并公式唯一实现 `final=(auto−excluded)∪manual`（ingest 与建图共用） |
 | `search.py` / `confidence.py` | 混合检索（向量+FTS+标题）+ 查询时置信度（时间衰退/版本区间/来源可靠度/验证状态） |
+| `fts_tokenizer.py` | FTS5 中文分词（jieba 可选，未装降级原文）：入库侧分词写索引、查询侧分词构造 MATCH——中文词独立索引（"超时"可命中"超时排查"），词典词注册防拆分 |
 | `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH，含手册表格→错误码、命令格式→Interface、文档互证）+ 链路查询（tags/evidence/sig 大小写不敏感） |
 | `sanitize.py` | 内部数据脱敏（后置）：出口统一脱敏（IP/路径白名单 keep_paths/keep_ips）+ 入库命中收集（sources）→ `data/sanitize_log.json` |
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布 |
@@ -268,7 +367,7 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔 |
 | `net.py` | 网络统一入口：内网模式（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
-| `api.py` | 只读 FastAPI 检索服务（SQLite `mode=ro`、向量库只读包装、无写端点、/graph 端点、/health 含 embedding 状态） |
+| `api.py` | 只读 FastAPI 检索服务（SQLite `mode=ro`、向量库只读包装、无写端点、/graph/* 与 /tags/* 端点、/health 含 embedding 状态） |
 
 ## 🗺️ 版本计划
 
@@ -284,13 +383,14 @@ Canonical 规范化（统一中间格式，可重放可重嵌）
 ## 🧪 测试
 
 ```bash
-python -m unittest discover tests    # 439 个测试（含文档-命令一致性核验、API 无路径泄漏审计）
+python -m unittest discover tests    # 453 个测试（含文档-命令一致性核验、API 无路径泄漏审计）
 ```
 
 ## 📄 文档
 
 - [使用指南](docs/USAGE.md) —— 完整命令手册、业务来源导入、审核工作台、日志接口、远程部署
-- [故障分析案例](docs/analysis/) —— 社区问题定位的实战记录
+- [数据流说明](docs/DATAFLOW.md) —— 入库 / 查询两条主链路的数据走向、端点↔存储映射、SQLite 表结构
+- [故障分析案例](docs/analysis/) —— 社区问题定位的实战记录（comm-bind / mte-repeat / port-65536 / task2 等）
 - [Phase 2 数据布局](docs/analysis/phase2-data-model.md) —— 多来源统一存储与质量分级设计
 - [业务环境迁移清单](docs/analysis/business-migration-checklist.md) —— 迁移业务环境的差距清单与跟踪
 
