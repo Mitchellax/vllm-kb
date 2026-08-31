@@ -95,6 +95,9 @@ python scripts/build_kb.py --limit 100
 >
 > 注意：
 > - **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图；
+> - **FTS 全文索引不需要日常重建**：增量入库时新文档已实时写入 `chunks_fts`（含 jieba 分词）；
+>   仅当升级 jieba / 分词规则 / 标签词典（`tags.registry`）后，才跑 `build_fts.py` 让存量文档
+>   也用新分词（不重嵌向量；旧库无分词列升级时 ingest 会打印提示）；
 > - **`--incremental` 补不到历史单条**（窗口从上次 `max createdAt` 起、PR 按更新时间排序、
 >   连续 3 页无新增即停）——缺旧条目时用 §7 的 `backfill_canonical.py`（canonical 层、无需网络）
 >   或全量重拉（raw 层也要补时）；
