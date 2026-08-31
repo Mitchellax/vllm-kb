@@ -1,7 +1,7 @@
 """从 kb.sqlite3 回填 canonical.jsonl 缺失文档（修复 kb↔canonical 不同步）。
 
 背景：canonical.jsonl 是 --rebuild 与 build_graph 的唯一事实源。若 kb.sqlite3 含有
-canonical 缺失的文档（历史旧版流程 / --recanonicalize 时 raw 不全等导致漂移），
+canonical 缺失的文档（历史旧版流程 / 早期 --recanonicalize 参数（raw 快照不全）等导致漂移），
 图（从 canonical 建）与全量重建（从 canonical 重嵌）都会丢这些文档——
 典型症状：title/search 能命中（kb 有），graph chain/fixes 查不到（图里没有）。
 

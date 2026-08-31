@@ -1,6 +1,9 @@
 """GitHub 采集转换逻辑测试（不触网）：canonical 映射、版本提取、PR 处理、recanonicalize。"""
+import json
 import unittest
 from pathlib import Path
+
+import requests
 
 from vllm_kb.config import PROJECT_ROOT, SourceCfg
 from vllm_kb.github_pull import GithubPuller
@@ -749,6 +752,183 @@ class TestPullIncremental(unittest.TestCase):
             self.assertEqual(n, 1)  # 7 号正常入库，未被误判停滞
             self.assertEqual(len(calls), 1)  # 只发一次请求（无停滞重试）
             self.assertTrue((Path(td) / "raw" / "issues" / "7.json").exists())
+
+
+class TestPullMissing(unittest.TestCase):
+    """--pull-missing 补差拉取 / --numbers REST 单条补拉（mock，不触网）。"""
+
+    def _make_puller(self, td: str):
+        from vllm_kb.github_pull import GithubPuller
+
+        src = make_source(token="fake-token",
+                          raw_dir=f"{td}/raw", checkpoint_file=f"{td}/cp.json",
+                          fetch_comments=False)
+        puller = GithubPuller(src, PROJECT_ROOT)
+        puller._save_checkpoint({
+            "issues": {"2": {"fetched_at": "x", "comments": False}},
+            "state": "all", "sort": "created", "direction": "desc",
+            "graphql": {"issues_done": True, "prs_done": True},
+        })
+        return puller
+
+    def test_pull_missing_skips_existing_pulls_new(self):
+        """补差：raw 有 1、checkpoint 有 2，GraphQL 返回 1/2/3 → 只拉 3（done=True 也强制拉）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            # raw 已有编号 1（跳过基准以 raw 为准）
+            (Path(td) / "raw" / "issues").mkdir(parents=True)
+            (Path(td) / "raw" / "issues" / "1.json").write_text('{"number": 1}', encoding="utf-8")
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    # 补差：created desc 排序、不带 filterBy.since
+                    self.assertIsNone(variables["filter"])
+                    self.assertEqual(variables["order"],
+                                     {"field": "CREATED_AT", "direction": "DESC"})
+                    return {"issues": {"totalCount": 100,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "C1"},
+                                       "nodes": [_node(3), _node(2), _node(1)]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(missing=True)
+            self.assertEqual(n, 1)  # 只新增 3（1 raw 已有、2 checkpoint 已有）
+            self.assertTrue((Path(td) / "raw" / "issues" / "3.json").exists())
+            self.assertFalse((Path(td) / "raw" / "issues" / "2.json").exists())  # 未重复拉
+            cp = puller._load_checkpoint()
+            self.assertIn("3", cp["issues"])
+            # 补差不推进时间窗（与 --incremental 无关）
+            self.assertNotIn("issues_since", cp["graphql"])
+
+    def test_pull_missing_prs_also_enumerated(self):
+        """补差同时枚举 issues 与 prs（done=True 时两者都强制拉）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 1,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "C1"},
+                                       "nodes": []}}
+                return {"pullRequests": {"totalCount": 1,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": [_node(9)]}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(missing=True)
+            self.assertEqual(n, 1)
+            self.assertTrue((Path(td) / "raw" / "prs" / "9.json").exists())
+
+    @staticmethod
+    def _rest_pull(number=42):
+        return {
+            "number": number, "title": f"fix {number}", "body": "body",
+            "state": "closed", "created_at": "2026-05-01T00:00:00Z",
+            "closed_at": "2026-06-01T00:00:00Z",
+            "html_url": f"https://github.com/vllm-project/vllm/pull/{number}",
+            "labels": [{"name": "bug"}], "user": {"login": "alice"},
+            "merged": True, "merged_at": "2026-06-01T00:00:00Z",
+            "merge_commit_sha": "abc123",
+        }
+
+    @staticmethod
+    def _json_resp(data):
+        """构造带 json() 方法的假响应（lambda 需接受实例参数 self）。"""
+        return type("R", (), {"json": lambda self: data})()
+
+    def test_pull_numbers_rest_single(self):
+        """--numbers：REST 单条拉 PR（/pulls/{n} 成功），merged 信息进 item，无 GraphQL 请求。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            calls = []
+
+            def fake_get(url, params=None):
+                calls.append(url)
+                assert "pulls/42" in url
+                return self._json_resp(self._rest_pull(42))
+
+            puller._get = fake_get
+            with redirect_stdout(StringIO()):
+                n = puller.pull(numbers=[42])
+            self.assertEqual(n, 1)
+            self.assertTrue((Path(td) / "raw" / "prs" / "42.json").exists())
+            item = json.loads((Path(td) / "raw" / "prs" / "42.json").read_text(encoding="utf-8"))
+            self.assertTrue(item["pull_request"]["merged"])
+            self.assertEqual(item["pull_request"]["merged_at"], "2026-06-01T00:00:00Z")
+            self.assertEqual(item["user"]["login"], "alice")
+            cp = puller._load_checkpoint()
+            self.assertIn("42", cp["issues"])
+            self.assertEqual(len(calls), 1)  # 只发 pulls 一次（fetch_comments=False 不拉评论）
+
+    def test_pull_numbers_falls_back_to_issues_on_404(self):
+        """--numbers：/pulls/{n} 404 → /issues/{n}（issue 形态落盘）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            issue_data = {
+                "number": 77, "title": "issue 77", "body": "b", "state": "open",
+                "created_at": "2026-05-01T00:00:00Z", "closed_at": None,
+                "html_url": "https://github.com/vllm-project/vllm/issues/77",
+                "labels": [], "user": {"login": "bob"},
+            }
+
+            def fake_get(url, params=None):
+                if "pulls/77" in url:
+                    err = requests.HTTPError("404 Client Error")
+                    err.response = mock.Mock(status_code=404)
+                    raise err
+                assert "issues/77" in url
+                return self._json_resp(issue_data)
+
+            puller._get = fake_get
+            with redirect_stdout(StringIO()):
+                n = puller.pull(numbers=[77])
+            self.assertEqual(n, 1)
+            self.assertTrue((Path(td) / "raw" / "issues" / "77.json").exists())
+            item = json.loads((Path(td) / "raw" / "issues" / "77.json").read_text(encoding="utf-8"))
+            self.assertNotIn("pull_request", item)  # issue 形态
+
+    def test_pull_numbers_skips_existing_raw(self):
+        """--numbers：raw 已有编号直接跳过。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            (Path(td) / "raw" / "prs").mkdir(parents=True)
+            (Path(td) / "raw" / "prs" / "42.json").write_text('{"number": 42}', encoding="utf-8")
+            calls = []
+
+            def fake_get(url, params=None):
+                calls.append(url)
+                return self._json_resp(self._rest_pull(42))
+
+            puller._get = fake_get
+            with redirect_stdout(StringIO()):
+                n = puller.pull(numbers=[42])
+            self.assertEqual(n, 0)
+            self.assertEqual(calls, [])  # 未发请求
 
 
 if __name__ == "__main__":

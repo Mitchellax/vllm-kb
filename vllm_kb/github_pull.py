@@ -304,7 +304,8 @@ class GithubPuller:
             if c
         ]
 
-    def _collect_graphql(self, cp: dict, g: dict, kind: str, incremental: bool = False) -> tuple[int, int]:
+    def _collect_graphql(self, cp: dict, g: dict, kind: str, incremental: bool = False,
+                         missing: bool = False) -> tuple[int, int]:
         """按游标枚举一类集合（issues/prs），落原始 JSON + checkpoint。
 
         返回 (本轮新增, 本轮跳过)。进度行带 totalCount 完成度与新增/跳过计数。
@@ -319,6 +320,10 @@ class GithubPuller:
           不再全量扫描（issues 同时带 filterBy.since 服务端过滤）。
         默认（incremental=False）：从 checkpoint 游标续拉（断点续传，created desc 不变），
         done 后由 pull() 跳过（不重复拉取）。
+
+        **补差模式**（missing=True，由 --pull-missing 触发）：从头枚举（created desc，
+        清游标），跳过基准 = **raw 目录已有编号 ∪ checkpoint 编号**——只拉缺失条目
+        （补历史旧条目），翻到最新（hasNextPage=False）后置 done；不推进增量时间窗口。
 
         游标异常（endCursor 与上一页相同，活跃仓库分页窗口滑动所致）先自动重试
         STALL_RETRIES 次；仍重复则保留已拉数据 + checkpoint 并跳过本 kind（不中断全流程），
@@ -337,12 +342,12 @@ class GithubPuller:
         # 若窗口内全是被更新的旧条目，其 createdAt 可能比 since 更早，不能回退窗口）
         max_created: str | None = g.get(f"{kind}_since")
         since: str | None = None
-        # 增量：窗口起点 = 上次 max createdAt；无则从头（首次/旧 checkpoint）
-        if incremental:
+        # 增量/补差均从头枚举：游标序列与上次断点续传无关，清掉残留 last_cursor，
+        # 否则第一页 endCursor 若恰好等于上次中断时的游标会被误判"卡住"整轮放弃。
+        if incremental or missing:
             cursor = None
-            # 增量每次从头枚举，游标序列与上次断点续传无关：清掉残留 last_cursor，
-            # 否则第一页 endCursor 若恰好等于上次中断时的游标会被误判"卡住"整轮放弃。
             g.pop(f"{kind}_last_cursor", None)
+        if incremental:
             since = g.get(f"{kind}_since") or None
             if since:
                 print(f"[github:{self.id}] {kind} 增量拉取（--incremental：时间窗口 "
@@ -350,10 +355,17 @@ class GithubPuller:
             else:
                 print(f"[github:{self.id}] {kind} 增量拉取（--incremental：无历史窗口，"
                       f"从头枚举，连续 3 页无新增停止）", flush=True)
+        elif missing:
+            print(f"[github:{self.id}] {kind} 补差拉取（--pull-missing：从头枚举，"
+                  f"跳过 raw/checkpoint 已有编号，只拉缺失）", flush=True)
         stale_pages = 0
         # 本类已收集数 = 原始目录里的条目数（跨 REST/GraphQL 累计）
         raw_kind_dir = self.raw_dir / kind
         collected_kind = len(list(raw_kind_dir.glob("*.json"))) if raw_kind_dir.exists() else 0
+        # 补差模式：已拉集合 = raw 目录已有编号 ∪ checkpoint 编号（跳过基准以 raw 为准）
+        known: set[str] | None = None
+        if missing:
+            known = {p.stem for p in raw_kind_dir.glob("*.json")} | set(cp["issues"])
         while True:
             if self.max_issues and len(cp["issues"]) >= self.max_issues:
                 break
@@ -413,10 +425,18 @@ class GithubPuller:
                     max_created = created
                 number = node["number"]
                 rec = cp["issues"].get(str(number))
-                comments_done = bool(rec and rec.get("comments"))
-                if rec and (not self.fetch_comments or comments_done):
-                    skip_count += 1
-                    continue  # 已拉且评论已齐（断点续传/增量均跳过）
+                if missing:
+                    # 补差：raw 目录或 checkpoint 已有且评论齐 → 跳过（跳过基准以 raw 为准）
+                    comments_done = bool(rec and rec.get("comments")) or (
+                        self.raw_dir / "comments" / f"{number}.json").exists()
+                    if str(number) in known and (not self.fetch_comments or comments_done):
+                        skip_count += 1
+                        continue
+                else:
+                    comments_done = bool(rec and rec.get("comments"))
+                    if rec and (not self.fetch_comments or comments_done):
+                        skip_count += 1
+                        continue  # 已拉且评论已齐（断点续传/增量均跳过）
                 item = self._item_from_node(node, is_pr)
                 comments = (
                     self._comments_from_node(node)
@@ -476,7 +496,8 @@ class GithubPuller:
             self._save_checkpoint(cp)
         return new_count, skip_count
 
-    def pull(self, incremental: bool = False) -> int:
+    def pull(self, incremental: bool = False, missing: bool = False,
+             numbers: Optional[list[int]] = None) -> int:
         """拉取 GitHub 原始数据（issue + PR + 评论），返回新增条数。
 
         - **默认（断点续传）**：从 checkpoint 游标续拉；一次拉完后置 done——
@@ -486,11 +507,19 @@ class GithubPuller:
           从 checkpoint 的 `{kind}_since`（上次增量 max createdAt）起，issues 走
           filterBy.since 服务端过滤、PR 走 UPDATED_AT DESC 排序，跳过已有编号，
           连续 3 页无新增停止，把社区新增条目刷入并推进窗口；
+        - **missing=True（--pull-missing）**：补差拉取——从头枚举（created desc），
+          跳过 **raw 目录与 checkpoint 中已有的编号**，只拉缺失条目（补历史旧条目），
+          翻到最新后置 done；与时间窗增量互补（增量只覆盖近期，补差不限新旧）；
+        - **numbers=[...]（--numbers）**：REST 单条补拉——对指定编号先试
+          `/pulls/{n}`（404 则 `/issues/{n}`）+ 评论落 raw（隐含 missing 语义，
+          走 REST 不需要 GraphQL token，未认证限流 60 次/小时够单条场景）；
         - **全量重拉**：删除 data/raw/{source_id}/ 与 checkpoint 后重跑（见 USAGE）。
         """
+        if numbers is not None:
+            return self._pull_numbers(list(numbers))
         if not self.session.headers.get("Authorization"):
             raise RuntimeError(
-                "全量拉取（GraphQL）需要 GitHub token：config.github.token 或 GITHUB_TOKEN"
+                "拉取（GraphQL）需要 GitHub token：config.github.token 或 GITHUB_TOKEN"
             )
         cp = self._load_checkpoint()
         g = cp.setdefault("graphql", {})
@@ -516,20 +545,23 @@ class GithubPuller:
         new_count = 0
         skip_count = 0
         # 1) issues（先）
-        if g.get("issues_done") and not incremental:
+        if g.get("issues_done") and not incremental and not missing:
             print(f"[github:{self.id}] issues 已拉取完成（done），默认跳过——"
-                  f"如需拉取社区增量请用 --incremental；全量重拉请删除 raw 与 checkpoint")
+                  f"如需拉取社区增量请用 --incremental；补历史缺失用 --pull-missing；"
+                  f"全量重拉请删除 raw 与 checkpoint")
         else:
-            n, s = self._collect_graphql(cp, g, kind="issues", incremental=incremental)
+            n, s = self._collect_graphql(cp, g, kind="issues", incremental=incremental,
+                                         missing=missing)
             new_count += n
             skip_count += s
         # 2) PRs（后）
         if self.include_prs:
-            if g.get("prs_done") and not incremental:
+            if g.get("prs_done") and not incremental and not missing:
                 print(f"[github:{self.id}] prs 已拉取完成（done），默认跳过——"
-                      f"如需拉取社区增量请用 --incremental")
+                      f"如需拉取社区增量请用 --incremental；补历史缺失用 --pull-missing")
             else:
-                n, s = self._collect_graphql(cp, g, kind="prs", incremental=incremental)
+                n, s = self._collect_graphql(cp, g, kind="prs", incremental=incremental,
+                                             missing=missing)
                 new_count += n
                 skip_count += s
 
@@ -677,6 +709,87 @@ class GithubPuller:
         d = self.raw_dir / kind
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{number}.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    # ---------------- REST 单条补拉（--numbers） ----------------
+
+    @staticmethod
+    def _item_from_rest(data: dict, is_pr: bool) -> dict:
+        """REST 响应（/pulls/{n} 或 /issues/{n}）→ 与 _item_from_node 输出一致的 item 格式。"""
+        item = {
+            "number": data["number"],
+            "title": data.get("title") or "",
+            "body": data.get("body") or "",
+            "state": "open" if data.get("state") == "open" else "closed",
+            "created_at": data.get("created_at"),
+            "closed_at": data.get("closed_at"),
+            "html_url": data.get("html_url"),
+            "labels": [{"name": l["name"]} for l in data.get("labels") or [] if l.get("name")],
+            "user": {"login": (data.get("user") or {}).get("login") or "unknown"},
+        }
+        if is_pr:
+            item["pull_request"] = {
+                "merged": bool(data.get("merged")),
+                "merged_at": data.get("merged_at"),
+                "merge_commit_sha": data.get("merge_commit_sha"),
+            }
+        return item
+
+    def _pull_numbers(self, numbers: list[int]) -> int:
+        """REST 单条补拉（--numbers，隐含 missing 语义）：对每个编号先试 `/pulls/{n}`
+        （404 则 `/issues/{n}`）+ 评论落 raw，登记 checkpoint。已存在于 raw/checkpoint
+        的编号跳过；不要求 GraphQL token（未认证限流 60 次/小时够单条场景）。"""
+        import requests
+
+        cp = self._load_checkpoint()
+        new = 0
+        for n in numbers:
+            n = int(n)
+            sn = str(n)
+            if (self.raw_dir / "prs" / f"{n}.json").exists() or \
+               (self.raw_dir / "issues" / f"{n}.json").exists():
+                print(f"[github:{self.id}] #{n} raw 已有，跳过")
+                continue
+            if sn in cp["issues"]:
+                print(f"[github:{self.id}] #{n} checkpoint 已有，跳过")
+                continue
+            # 先试 pulls（含 merged/merged_at/merge_commit_sha），404 再试 issues
+            item: dict = {}
+            kind = ""
+            try:
+                data = self._get(f"{self.base}/repos/{self.repo}/pulls/{n}").json()
+                item = self._item_from_rest(data, is_pr=True)
+                kind = "prs"
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code != 404:
+                    raise
+                try:
+                    data = self._get(f"{self.base}/repos/{self.repo}/issues/{n}").json()
+                except requests.HTTPError as e2:
+                    if e2.response is not None and e2.response.status_code == 404:
+                        print(f"[github:{self.id}] #{n} 不存在（pulls/issues 均 404），跳过")
+                        continue
+                    raise
+                # issues 端点对 PR 也会返回（带 pull_request 字段）——补拉 pulls 拿 merged 信息
+                if data.get("pull_request"):
+                    try:
+                        data = self._get(f"{self.base}/repos/{self.repo}/pulls/{n}").json()
+                        item = self._item_from_rest(data, is_pr=True)
+                        kind = "prs"
+                    except requests.HTTPError:
+                        item = self._item_from_rest(data, is_pr=True)  # merged 信息缺失，降级
+                        kind = "prs"
+                else:
+                    item = self._item_from_rest(data, is_pr=False)
+                    kind = "issues"
+            comments = self._get_comments(n) if self.fetch_comments else []
+            self._save_raw(kind, n, item)
+            if comments:
+                self._save_raw("comments", n, comments)
+            cp["issues"][sn] = {"fetched_at": _now_iso(), "comments": self.fetch_comments}
+            new += 1
+            print(f"[github:{self.id}] #{n} 补拉完成（{kind}）")
+        self._save_checkpoint(cp)
+        return new
 
 
 def _now_iso() -> str:

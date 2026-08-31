@@ -12,8 +12,11 @@
     python -m vllm_kb.pipeline                # 全流程（拉取 + 再生 + 增量入库）
     python -m vllm_kb.pipeline --skip-pull    # 不拉取，只用现有原始数据
     python -m vllm_kb.pipeline --limit 100    # 本次拉取条数上限（作用于 github 来源）
-    python -m vllm_kb.pipeline --recanonicalize  # 只再生 canonical 并重新入库
+    python -m vllm_kb.pipeline --incremental  # 时间窗增量拉取社区新增（done 后仍拉）
+    python -m vllm_kb.pipeline --pull-missing # 补差拉取：跳过已有（raw/checkpoint），只拉缺失
+    python -m vllm_kb.pipeline --numbers 9749,9750  # REST 单条补拉指定编号（隐含 missing）
     python -m vllm_kb.pipeline --rebuild      # 清库后全量重建（换 embedding 模型时）
+    只再生 canonical（不入库）：scripts/build_canonical.py（提取逻辑升级后供建图用）
 """
 from __future__ import annotations
 
@@ -121,11 +124,13 @@ def upsert_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> dict:
 
 
 def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | None,
-                   incremental: bool = False) -> dict:
+                   incremental: bool = False, missing: bool = False,
+                   numbers: list[int] | None = None) -> dict:
     """处理单个来源：拉取(可选) -> canonical -> 追加统一 canonical -> 增量入库。"""
     if pull:
         if isinstance(src, GithubSource):
-            n = src.pull(max_issues=limit, incremental=incremental)
+            n = src.pull(max_issues=limit, incremental=incremental,
+                         missing=missing, numbers=numbers)
         else:
             n = src.pull()
         print(f"[build] 来源 {src.id} ({src.type}) 拉取新增 {n} 条")
@@ -143,12 +148,14 @@ def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | Non
 
 
 def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
-              incremental: bool = False) -> dict:
+              incremental: bool = False, missing: bool = False,
+              numbers: list[int] | None = None) -> dict:
     """逐来源处理（先配置在前的来源）。全量马拉松期间，先完成的来源立即可用。"""
     grand = {"pulled": 0, "ingested_docs": 0}
     for src in build_sources(cfg):
         try:
-            stats = process_source(src, cfg, pull, limit, incremental)
+            stats = process_source(src, cfg, pull, limit, incremental,
+                                   missing=missing, numbers=numbers)
             grand["pulled"] += stats.get("pulled", 0)
             grand["ingested_docs"] += stats.get("docs", 0)
         except NotImplementedError as e:
@@ -163,13 +170,17 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="本次拉取条数上限（覆盖 github 来源配置）")
     ap.add_argument("--incremental", action="store_true",
                     help="GitHub 增量拉取：已拉取完成（done）后仍从头拉取社区新增 issue/PR"
-                         "（跳过已有，连续 3 页无新增停止）；默认 done 后跳过拉取")
+                         "（时间窗口：上次增量 max createdAt 起；跳过已有，连续 3 页无新增停止）")
+    ap.add_argument("--pull-missing", action="store_true",
+                    help="GitHub 补差拉取：从头枚举，跳过 raw/checkpoint 已有编号，只拉缺失"
+                         "（补历史旧条目；与 --incremental 互斥）")
+    ap.add_argument("--numbers", default=None, metavar="N1,N2,...",
+                    help="REST 单条补拉指定编号（如 9749,9750；隐含 missing 语义，"
+                         "不需要 GraphQL token；与 --incremental 互斥）")
     ap.add_argument("--rebuild", action="store_true",
                     help="高危：清空向量库与 SQLite 后全量重建（需交互确认，或加 --yes）")
     ap.add_argument("--yes", action="store_true",
                     help="跳过 --rebuild 的确认提示（自动化/无人值守用）")
-    ap.add_argument("--recanonicalize", action="store_true",
-                    help="跳过拉取，从原始 JSON 再生统一 canonical 并重新入库（逐来源）")
     from .net import DEFAULT_GITHUB_BASE
 
     ap.add_argument("--insecure", action="store_true",
@@ -177,6 +188,19 @@ def main() -> None:
     ap.add_argument("--github-base", default=None,
                     help=f"GitHub API 镜像前缀（默认 {DEFAULT_GITHUB_BASE}；亦可用环境变量 VLLM_KB_GITHUB_BASE）")
     args = ap.parse_args()
+    # 互斥校验：增量（时间窗）与补差（缺失）是两种拉取策略
+    if args.incremental and (args.pull_missing or args.numbers):
+        ap.error("--incremental 与 --pull-missing / --numbers 互斥（拉取策略二选一）")
+    if args.numbers and args.skip_pull:
+        ap.error("--numbers 需要拉取，与 --skip-pull 互斥")
+    numbers: list[int] | None = None
+    if args.numbers:
+        try:
+            numbers = [int(x.strip()) for x in args.numbers.split(",") if x.strip()]
+        except ValueError:
+            ap.error(f"--numbers 需为逗号分隔的数字列表: {args.numbers}")
+        if not numbers:
+            ap.error("--numbers 不能为空")
     # CLI 参数 > 环境变量（与 net 统一入口语义一致）：注入环境变量，让后续构造的
     # GithubPuller（读 insecure_from_env / VLLM_KB_GITHUB_BASE）生效。
     if args.insecure:
@@ -193,8 +217,9 @@ def main() -> None:
         stats = rebuild(cfg)
         print(f"[build] 全量重建完成: {stats}")
         return
-    grand = run_build(cfg, pull=not (args.skip_pull or args.recanonicalize), limit=args.limit,
-                      incremental=args.incremental)
+    grand = run_build(cfg, pull=not args.skip_pull, limit=args.limit,
+                      incremental=args.incremental, missing=args.pull_missing,
+                      numbers=numbers)
     print(f"[build] 本轮汇总: {grand}")
     print("[build] 提示：中途 Ctrl-C 后重跑同一命令即断点续传；逐来源处理，先完成的来源已可用。")
 
