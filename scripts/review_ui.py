@@ -86,14 +86,15 @@ $('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 
 <p><b>item_ref:</b> <span class="mono">${esc(i.item_ref)}</span></p>
 ${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（提及文档 <b>${p.doc_count||1}</b> 篇：${esc((p.docs||[p]).map(d=>d.title||d.source_id||'').slice(0,5).join('、')||'')}${(p.doc_count||1)>5?' …':''}）</p>`:''}
 <pre>${esc(JSON.stringify(p,null,2))}</pre>
-<h4>审核（只做判定，不修改原始内容）</h4><input id="rev" placeholder="审核人（必填）" style="width:180px">
+<h4>审核（只做判定，不修改原始内容）</h4><input id="rev" placeholder="审核人（必填）" style="width:180px" oninput="saveReviewer(this.value)">
 <textarea id="rvnote" rows="2" style="width:100%" placeholder="备注（可选）"></textarea><br><br>
 ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
 <button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button><br><br>`:''}
 <button class="ok" onclick="review(${i.id},'approved')">✓ 认证</button>
 <button onclick="review(${i.id},'suspected')">？ 存疑（重新排队靠后）</button>
 <button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除（只删数据库记录，原始文件手动删）</button>
-<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条），忽略/采纳后不再出现</span></div>`}
+<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条），忽略/采纳后不再出现</span></div>`
+$('#rev').value=loadReviewer()}
 async function adoptCandidate(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
 async function review(id,action){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}let result={note:document.getElementById('rvnote').value};try{result=JSON.parse(result.note||'{}')}catch(e){}
@@ -118,7 +119,8 @@ ${groupRow(t.manual||[],'manual','remove','✕',d.source_id)}
 <div style="margin-top:6px"><input id="newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}" placeholder="添加标签" style="width:180px"><button onclick="tagAdd('${q(d.source_id)}',document.getElementById('newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}').value)">添加</button>
 <span class="muted">最终: ${(t.final||[]).map(esc).join(' · ')||'（无标签）'}</span></div>
 <div style="margin-top:4px"><button class="danger" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`}).join('')||'<div class="card muted">无外源文档</div>'}
-async function tagEdit(sid,action,tag){const reviewer=prompt('审核人（必填）');if(!reviewer)return;
+async function tagEdit(sid,action,tag){const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;
+if(reviewer!==loadReviewer())saveReviewer(reviewer);
 try{await j('/api/docs/tags/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,action,tag,reviewer})});loadDocs();toast('✓ 已更新标签')}catch(e){toast('✗ '+e.message)}}
 function tagAdd(sid,t){if(!t||!t.trim())return;tagEdit(sid,'add',t.trim())}
 async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？'))return
@@ -166,6 +168,9 @@ try{await j('/api/configs/save',{method:'POST',headers:{'Content-Type':'applicat
 document.getElementById('form-'+name).remove();await loadConfigs();toast('✓ 已保存（状态已刷新）')}
 catch(e){toast('✗ 保存失败: '+e.message)}}
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2500)}
+// 审核人记忆（localStorage，避免每条审核重复填写）
+function saveReviewer(v){try{localStorage.setItem('vllm_kb_reviewer',v||'')}catch(e){}}
+function loadReviewer(){try{return localStorage.getItem('vllm_kb_reviewer')||''}catch(e){return ''}}
 async function testApi(name,elId){const el=document.getElementById(elId);el.textContent='测试中…';try{const r=await j('/api/configs/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});el.textContent=' ✓ '+r.detail}catch(e){el.textContent=' ✗ '+e.message}}
 loadStats();
 </script></body></html>

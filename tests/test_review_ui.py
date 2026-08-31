@@ -71,6 +71,9 @@ class ReviewUiApiTest(unittest.TestCase):
         # 标签管理 tab / 文档标签编辑 / 候选采纳
         for token in ("loadTagDict", "tagEdit(", "adoptCandidate", "tagDictAdd", "标签管理"):
             self.assertIn(token, html, f"页面缺少 {token}")
+        # 审核人记忆（localStorage 回填，免每条重复填写）
+        for token in ("loadReviewer", "saveReviewer", "oninput=\"saveReviewer(this.value)\""):
+            self.assertIn(token, html, f"页面缺少 {token}")
 
     def test_docs_tags_edit_flow(self):
         """标签编辑端点：exclude/restore/add/remove + final 同步（检索侧立即生效）+ 词典同步。"""
