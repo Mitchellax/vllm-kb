@@ -1,14 +1,14 @@
 # vllm-kb 使用指南
 
 本指南覆盖：环境准备、数据采集与更新、全部查询命令、故障处理推荐流程、远程部署（存算分离）。
+数据如何入库、查询时请求打到哪个接口/查哪些存储，见 [数据流说明](DATAFLOW.md)。
 
 ## 1. 环境准备
 
 ### 1.1 依赖
 
 ```bash
-pip install -r requirements.txt        # 核心：requests / pydantic / lancedb
-pip install fastapi uvicorn            # 检索 API（可选，离线查询可不用）
+pip install -r requirements.txt        # 核心：requests / pydantic / lancedb / kuzu / fastapi / uvicorn
 ```
 
 ### 1.2 配置（密钥走环境变量）
@@ -77,6 +77,29 @@ python scripts/build_kb.py --limit 100
 > 执行前强制确认——TTY 交互输入 `y/yes`；**非交互环境（agent/CI）必须加 `--yes`**，否则拒绝执行。
 > canonical/raw/图/审核库不受影响；中断后重跑仍会先清空再重建。
 
+> **日常维护流程（推荐节奏）**——知识库是"离线数据 + 定期刷新"，不需要实时：
+>
+> ```bash
+> # 1. 拉取社区增量 + 增量入库（新增 issue/PR；时间窗口见上；中断后重跑同一命令续传）
+> python scripts/build_kb.py --incremental
+>
+> # 2. （可选）业务来源有新增文件（data/imports/）时再跑一次不带参数的 build_kb.py
+> #    （本地来源 pull 资产 + 入库；GitHub 源已 done 会打印跳过）
+>
+> # 3. 重建图（增量入库后图不含新文档——graph 查询要覆盖新增条目必须重建）：
+> #    停 serve_api（Kùzu 单写者）→ 重建 → 重启
+> python scripts/build_graph.py
+>
+> # 4. 抽查：python skills/vllm-kb/client.py stats   /  graph stats
+> ```
+>
+> 注意：
+> - **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图；
+> - **`--incremental` 补不到历史单条**（窗口从上次 `max createdAt` 起、PR 按更新时间排序、
+>   连续 3 页无新增即停）——缺旧条目时用 §7 的 `backfill_canonical.py`（canonical 层、无需网络）
+>   或全量重拉（raw 层也要补时）；
+> - 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
+
 ### 2.2 辅助数据构建
 
 ```bash
@@ -100,6 +123,8 @@ python scripts/build_fts.py                     # 读现有 chunk 原文重新�
 python scripts/build_fts.py --limit 1000        # 试跑前 N 个 chunk
 
 # 正文 TF-IDF 标签候选导出（jieba——输出文件，人工审阅后手动写入 config.tags.registry）
+# 注意：与审核队列的 tag_candidate 是两条独立路径——本脚本只产文件、不自动打标；
+# 审核队列候选来自文件名/标题提取（自动、可一键采纳打标），见 §3.5。
 python scripts/build_tag_candidates.py          # 业务文档（doc_*）正文候选 → data/tag_candidates_manual.json
 python scripts/build_tag_candidates.py --include-github   # 也处理 github issue/PR（默认仅业务文档）
 ```
@@ -343,8 +368,9 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
   - **🗑 标记删除**：只删除 `kb.sqlite3` 数据库记录，**原始资产文件保留**——进入队列底部
     "**待实际删除**"列表（含资产路径），由人员**手动本地删除**原始文件；
   - **↩ 撤回**：在待删除列表恢复数据库记录（用删除前的备份），重新进入队列；
-  - **tag_candidate 采纳**：未收录的自动标签候选 → "✓ 采纳为标签"（入词典 + 即时打标），
-    忽略不记录（候选可再次出现）。
+  - **tag_candidate 采纳**：未收录的自动标签候选 → "✓ 采纳为标签"（入词典 + 对该候选**全部提及文档**打标，
+    检索侧立即生效）；不采纳则 **✓ 认证** 即忽略（不改任何数据，候选不再自动出现）。
+    候选标签的来源、聚合与生效边界见下方"候选标签（tag_candidate）说明"。
   审核记录存 `data/review.sqlite3`（独立于只读检索库），带审核人/时间戳可审计；
 - **文档管理（含两层标签编辑）**：列出外源文档（导入的 PDF/Markdown 等，GitHub 不在此列），
   每条显示**自动标签**（领域/作用分区，点 ✕ 排除）、**已排除**（点 ↺ 恢复）、**人工标签**
@@ -361,6 +387,40 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
   （遵守"密钥不入 config.json"，任何入口 `AppConfig.load` 自动加载进环境变量）；
   key 在页面上一律脱敏（只显示已/未配置），**embedding 与 OCR 均支持连通性测试**
   （OCR 用内置测试图走真实识别链路，验证 HTTP/鉴权/模型）；修改对已运行的服务需**重启生效**。
+
+**候选标签（tag_candidate）说明** —— 文档打标时的候选与审核队列的候选是同一机制的"产生端/审核端"：
+
+1. **来源（文档打 tag 时）**：入库自动打标（`vllm_kb/tagging.py` 的 `extract_tags`）从**文件名 stem +
+   内部标题**确定性提取"未收录强候选"（拉丁词 token + 短标题，tier 启发式），随文档写入
+   `kb.sqlite3` 的 `docs.extra.tag_candidates`（PDF/Markdown 来源）。**候选不会打到文档上**——
+   文档自动标签只含词典命中项，候选只进审核队列待人工裁决；
+2. **审核队列（按词聚合）**：审核工作台自动补单时 `seed_tag_candidates` 扫描全部文档的
+   `extra.tag_candidates`，**按候选词聚合**成一条审核项（`item_ref = tag:{name}`，payload 含
+   提及文档数 + 文档列表 + 建议 tier；词典已收录的词不生成）——同词多文档只审一次，
+   **审一次 = 全部提及文档生效**；
+3. **采纳（adopt）**：① 候选词写入 `config.json` 的 `tags.registry`（tier 取审核下拉选择或启发式，
+   全库词典生效）；② 对聚合记录的全部提及文档写人工标签（`doc_tags.manual`），并按
+   `final = (自动 − 排除) ∪ 人工` 同步 `docs.tags`——**检索侧立即生效**；③ 审核项标记 approved，
+   重跑补单不再出现；
+4. **忽略**：**✓ 认证**即忽略（不采纳、不改任何数据）；因 `item_ref` 已存在（任意状态），
+   之后自动补单不再打扰。**🗑 标记删除按钮对 tag_candidate 不适用**（其 `item_ref` 是候选词
+   `tag:{name}` 而非文档 source_id，点删除会报"文档不存在"）。
+
+**生效边界**（"刷新到所有文档"需分清）：
+
+| 目标 | 采纳后何时可见 | 需要做什么 |
+|---|---|---|
+| 检索 API：`tags` 目录 / `tags docs` / `context` / search 的 **FTS 命中**过滤 | **立即**（读 `docs.tags`，采纳时已同步） | 无 |
+| search 的**向量命中**过滤（chunk 向量 meta.tags 是入库时快照） | 下次入库 | 重跑 `build_kb.py --skip-pull` |
+| Kùzu 图（TAGGED_WITH 边 / `graph tags`） | 重建图后 | `build_graph.py`（先停检索服务） |
+| 词典对新文档生效（文件名/标题含该词自动打标） | 下次入库 | 无（词典已写入 config.json） |
+| 未提及该候选的其他文档 | 仅词典更新，**不自动打标** | 文档管理页人工添加，或走下方正文候选独立路径 |
+
+**与 `build_tag_candidates.py`（正文 TF-IDF）的区别**（易混淆点）：审核队列候选来自**文件名/标题**
+提取（自动、可一键采纳打标）；`build_tag_candidates.py` 用 jieba TF-IDF 从**正文**提取候选，
+输出 `data/tag_candidates_manual.json` 文件，**人工审阅后手动写入** `config.json` 的 `tags.registry`——
+不经过审核队列、**不自动打标**（写入后下次入库/建图对新文档生效）。两条路径独立，勿混淆
+（Excel 来源明确走正文路径：不做文件名/标题标签）。
 
 自动补单规则：`verification=unverified` 的文档 → verification_pending；标题含"待审核/待修改"→
 case_title_flag；`extra.tag_candidates`（未收录强候选）→ tag_candidate。
@@ -636,6 +696,31 @@ A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳�
 
 **Q: 离线能用吗？**
 A: 能。采集完成后全部检索离线；嵌入可用 `echo` provider 离线自测（效果粗糙）。
+
+**Q: kb 检索能命中（title/search），但 graph chain/fixes 查不到？**
+A: 典型的 **kb↔canonical 不同步**：`canonical.jsonl` 是 `build_graph` 与 `--rebuild` 的
+**唯一事实源**——kb 有、canonical 无的文档，图里没有（图从 canonical 建）、全量重建也会丢
+（rebuild 从 canonical 重嵌）。常规增量入库不会漂移（pipeline 先 upsert canonical 再 ingest）；
+历史旧版流程 / `--recanonicalize`（raw 快照不全）可能造成。
+修复（`scripts/backfill_canonical.py`，从 kb.sqlite3 重建缺失的 canonical 行，无需网络）：
+
+```bash
+python scripts/backfill_canonical.py                                    # dry-run：打印缺失清单
+python scripts/backfill_canonical.py --write                            # 回填全部缺失（幂等）
+python scripts/backfill_canonical.py --doc github:vllm-project-vllm-ascend:pr:9749 --write  # 只补单条
+# 然后：
+python scripts/build_kb.py --skip-pull     # 回填文档重入库（body 为 chunks 拼回，会触发重嵌，幂等）
+# 停 serve_api → python scripts/build_graph.py → 重启 serve_api
+```
+
+回填行 `body` 由 chunks 按序拼回（与 `/doc` 端点同法，chunk 重叠有少量重复，不影响建图关系提取）；
+`extra` 原样带出（图构建依赖 `repo/github_number/merged_at` 建 FIXES/MERGED_IN 边）；
+`tags` 取 `doc_tags.auto_snapshot`（canonical 语义 = 自动标签）。
+
+若 **kb 中也不存在**该文档（从未采集过，如内网历史缺失的单条 PR），backfill 无法补——
+需重新拉取：`--incremental`（补不到历史单条，见 §2.1）或全量重拉（删 raw + checkpoint 重跑）
+或手补该条的 raw 快照（`data/raw/{source_id}/{prs,comments}/{number}.json`，格式同 REST 响应）
+后再 `build_kb.py --skip-pull`。
 
 **Q: 图打不开 / build_graph 失败，数据根路径含中文？**
 A: Kùzu 图库路径**不能含非 ASCII 字符**（中文、emoji 等）——`data/graph` 或存算分离的
