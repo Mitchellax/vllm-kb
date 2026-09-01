@@ -64,13 +64,20 @@ def _request(url: str, timeout: int, payload: dict | None = None) -> dict:
     - HTTP 4xx/5xx：抛 ClientError，含状态码 + 服务端 detail（如"版本未预存/图未构建"）；
     - 连接失败/超时：抛 ClientError，说明服务地址与启动方式；
     - 200 但非 JSON 响应：抛 ClientError。
+
+    会话归属：透传 VLLM_KB_SESSION 环境变量到 X-Session-Id header，
+    供服务端行为遥测关联同一 agent 会话内的多轮查询（缺失时服务端回退 ip+时间窗）。
     """
+    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    session_id = os.environ.get("VLLM_KB_SESSION", "")
+    if session_id:
+        headers["X-Session-Id"] = session_id
     if payload is not None:
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers=headers, method="POST")
     else:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))

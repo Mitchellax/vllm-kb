@@ -129,4 +129,11 @@ def create_app(config_path: Optional[str] = None):
 
         api_code_graph.register(app, ctx)
 
+    # 行为遥测中间件：feedback_enabled 时挂载，全量记查询行为到独立 telemetry 库
+    # （不碰只读 kb.sqlite3；中间件只记原始行为，推断在离线脚本）
+    if cfg.confidence.feedback_enabled:
+        from .telemetry import make_middleware
+
+        make_middleware(app, cfg)
+
     return app
