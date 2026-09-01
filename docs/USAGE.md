@@ -667,6 +667,61 @@ client.py code-graph health
 - 谁调用了某函数、变更会影响什么、架构怎么分层、跨仓调用关系 → `code-graph`
 - gh-puller 不可达时降级思路：`code-graph` 503 → 改用 `code` 查本地索引（手动）
 
+### 4.10 行为遥测与置信度反馈（feedback_enabled）
+
+行为遥测自动采集查询行为（不依赖用户主动反馈），离线推断三态反馈（hit/miss/unknown），
+用时间维度指数遗忘更新每个 doc 的后验 Beta 分布，查询期新增 **w_hist 历史可靠度**因子
+（后验下界 lb = mean - z·sd）并入 final 排序。**与 w_rel 正交，不乘进 w_rel**——
+保护审计链（同一文档元数据不变时 conf 部分确定性可审计，w_hist 独立可解释）。
+
+**启用**：config `confidence.feedback_enabled = true`。中间件全量记查询行为到独立
+`data/telemetry.sqlite3`（不碰只读 `kb.sqlite3`）。会话归属经 `VLLM_KB_SESSION` 环境变量
+→ `X-Session-Id` header 透传（agent 侧管），缺失回退 ip+时间窗。
+
+**数据流（三段分离，审计可逆）**：
+```
+serve_api (只读)                    离线周期
+┌─────────────────────────┐       ┌───────────────────────────┐
+│ middleware 记原始行为    │       │ scripts/build_feedback.py │
+│ → telemetry.sqlite3     │ ────▶ │ 会话重建+行为推断三态      │
+│ (独立库,不碰 kb.sqlite3) │       │ → confidence_feedback.json │
+│                         │       │ → knowledge_gaps 表        │
+│ compute_confidence      │       └───────────────────────────┘
+│ + w_hist(读 feedback.json)│ ◀──────── 重启 serve_api 生效
+│ final=sim^γ·conf^(1-γ)·lb^σ │
+└─────────────────────────┘
+```
+
+**离线推断**：`python scripts/build_feedback.py` —— 扫遥测库重建会话序列，
+按行为模式推断三态（权重≤0.5，自证循环阻尼）：
+- search/signature 命中后拉 doc 不重查 → 弱正 hit（0.3）
+- signature 命中后会话直接结束 → 弱正 hit（0.3）
+- 有 doc 命中后调 code/diff → 中正 hit（0.5）
+- 60s 内改述重查 → 弱负 miss（0.3）
+- 命中后零后续 → unknown（不进 n_eff，单独计数）
+- 无命中的查询进缺口检测，不进后验
+
+**后验更新（时间维度指数遗忘）**：`a <- a×2^(-Δt/HL) + w×hit`，HL 复用 config
+`half_life_days`（非事件次数衰减——克服版本漂移且冷门案例不异常）。seed=1+1 随遗忘
+衰减，HL 决定失效。**seed 强度 1+1=2，数据部分需≥3 超先验 1.5 倍才主导后验**
+（隐含前提：平均确认频率约每季度 1 条；冷门 domain 检索频率过低时 supported 状态
+不会出现——符合设计，冷门且无反馈证据的文档保持中性不被误杀）。
+
+**w_hist 三段式**（当期值不缓存，每次查询重算）：
+- `n_eff=0` → w_hist=1.0（中性，不用 seed 套 lb——避免误杀新文档），flag=new
+- `0<n_eff<n_min` → w_hist=lb（正常算），flag=accumulating/evidence_thin
+- `n_eff≥n_min` → w_hist=lb，flag=supported/used_but_unconfirmed/failing
+
+**关键约束**：
+- **z（检索侧排序）vs p_min（消费侧决策）分工**：vllm-kb 只输出 lb，不参与消费侧决断
+- **只标注不拦截**：history_flag 供消费侧决策，vllm-kb 永不过滤候选
+- **n_eff 是加权观察非次数**：w=0.4 的推断只贡献 0.4
+- **unknown 不进 n_eff**：统计正确，单独计数
+
+**知识缺口**：审核工作台 → "知识缺口" tab，展示同签名跨≥3会话反复查无果的缺口
+（hard_gap 强签名零命中 / soft_gap 命中无结论 / quality_gap 弱签名零命中）。
+serve_api 不暴露缺口端点（缺口不进检索）。
+
 ## 5. 故障处理推荐流程
 
 ```

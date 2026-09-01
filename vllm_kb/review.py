@@ -1074,7 +1074,8 @@ def api_configs(cfg: "AppConfig") -> list[dict]:
         "path": cg.path,
         "enabled": cg.enabled,
         "key_configured": True,  # 内网无鉴权（暂定）
-        "status": ("enabled" if cg.enabled else "disabled") if cg.base_url else "missing",
+        "status": "configured" if (cg.enabled and cg.base_url) else
+                  ("disabled" if cg.base_url else "missing"),
         "note": "代码图谱检索（调用链/影响面/架构）；enabled=False 时 /code-graph/* 端点不注册",
     })
     return out

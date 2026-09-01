@@ -60,17 +60,20 @@ pre{background:#111827;color:#e5e7eb;padding:10px;border-radius:6px;overflow:aut
 <a id="nav-queue" onclick="tab('queue')">审核队列</a>
 <a id="nav-docs" onclick="tab('docs')">文档管理</a>
 <a id="nav-tags" onclick="tab('tags')">标签管理</a>
-<a id="nav-configs" onclick="tab('configs')">API 配置</a></header>
+<a id="nav-configs" onclick="tab('configs')">API 配置</a><a id="nav-gaps" onclick="tab('gaps')">知识缺口</a></header>
 <div id="toast" style="position:fixed;top:12px;right:20px;background:#111827;color:#fff;padding:8px 14px;border-radius:6px;display:none;z-index:99;font-size:13px"></div>
 <main>
-<div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-tags" style="display:none"></div><div id="view-configs" style="display:none"></div>
+<div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-tags" style="display:none"></div><div id="view-configs" style="display:none"></div><div id="view-gaps" style="display:none"></div>
 </main>
 <script>
 const $=s=>document.querySelector(s);
 async function j(url,opt){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);return d}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function badge(s){return `<span class="badge ${s}">${s}</span>`}
-function tab(name){['stats','queue','docs','tags','configs'].forEach(t=>{document.getElementById('view-'+t).style.display=t===name?'':'none';document.getElementById('nav-'+t).className=t===name?'active':''});if(name==='stats')loadStats();if(name==='queue')loadQueue();if(name==='docs')loadDocs();if(name==='tags')loadTagDict();if(name==='configs')loadConfigs()}
+function tab(name){['stats','queue','docs','tags','configs','gaps'].forEach(t=>{document.getElementById('view-'+t).style.display=t===name?'':'none';document.getElementById('nav-'+t).className=t===name?'active':''});if(name==='stats')loadStats();if(name==='queue')loadQueue();if(name==='docs')loadDocs();if(name==='tags')loadTagDict();if(name==='configs')loadConfigs();if(name==='gaps')loadGaps()}
+async function loadGaps(){let gs=[];try{gs=await j('/api/gaps')}catch(e){$('#view-gaps').innerHTML=`<h3>知识缺口</h3><div class="card muted">未启用行为遥测（config.confidence.feedback_enabled）或无缺口数据。启用后跑 scripts/build_feedback.py 生成。</div>`;return}
+const byType={hard_gap:'强签名零命中',soft_gap:'命中无结论',quality_gap:'弱签名零命中'};
+$('#view-gaps').innerHTML=`<h3>知识缺口（${gs.length} 个，行为遥测推断——同签名跨会话反复查无果）</h3>`+gs.map(g=>`<div class="card"><b>${esc(byType[g.gap_type]||g.gap_type)}</b> <span class="badge pending">sessions=${g.session_count}</span> <span class="muted">${esc(g.component||'')}</span><table><tr><th>签名</th><td class="mono">${esc((g.signature_text||'').slice(0,120))}</td></tr><tr><th>样例查询</th><td class="mono">${esc((g.sample_queries||[]).join(' | ').slice(0,200))}</td></tr><tr><th>平均命中</th><td>${g.avg_result_count}</td></tr><tr><th>首现/末现</th><td class="muted">${esc((g.first_seen||'').slice(0,16))} ~ ${esc((g.last_seen||'').slice(0,16))}</td></tr></table></div>`).join('')||'<div class="card muted">暂无缺口</div>'}
 async function loadStats(){const s=await j('/api/stats');const cats=Object.entries(s).sort((a,b)=>b[1].pending-a[1].pending);
 let tagCard='';try{const td=await j('/api/tag-dict');tagCard=`<div class="card"><b>标签词典</b> 领域类 ${td.stats.domain} 个 · 作用类 ${td.stats.purpose} 个 · 已打标文档 ${td.stats.tagged_docs} 篇</div>`}catch(e){}
 $('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pending,0)} 待办 / ${cats.reduce((a,[k,v])=>a+v.suspected,0)} 存疑）</h3>`+tagCard+cats.map(([k,v])=>`<div class="card"><b>${esc(k)}</b> <span class="badge pending">待办 ${v.pending}</span>${v.suspected?`<span class="badge suspected">存疑 ${v.suspected}</span>`:''} <span class="muted">共 ${v.total}</span></div>`).join('')||'<div class="card">暂无审核项（导入文档后自动补单）</div>'}
@@ -409,6 +412,33 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     @app.get("/api/configs")
     def configs():
         return api_configs(cfg)
+
+    @app.get("/api/gaps")
+    def gaps():
+        """知识缺口列表（行为遥测推断：同签名跨会话反复查无果）。
+
+        读 telemetry 库的 knowledge_gaps 表（build_feedback.py 产出）。
+        feedback 未启用或表不存在时返回空列表。
+        """
+        import sqlite3
+
+        from pathlib import Path
+
+        db = cfg.resolve(cfg.confidence.telemetry_path)
+        if not Path(str(db)).exists():
+            return []
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM knowledge_gaps ORDER BY session_count DESC"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []  # 表不存在
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     @app.post("/api/configs/save")
     def save_config(body: dict):

@@ -304,11 +304,11 @@ class TestApiConfigs(unittest.TestCase):
         self.assertIn("code_graph", cs)
         self.assertEqual(cs["code_graph"]["status"], "missing")
         self.assertEqual(cs["code_graph"]["provider"], "gh-puller")
-        # enabled=True + base_url 有 → enabled
+        # enabled=True + base_url 有 → configured
         cfg.code_graph.enabled = True
         cfg.code_graph.base_url = "http://localhost:8787"
         cs = {c["name"]: c for c in api_configs(cfg)}
-        self.assertEqual(cs["code_graph"]["status"], "enabled")
+        self.assertEqual(cs["code_graph"]["status"], "configured")
         self.assertEqual(cs["code_graph"]["path"], "/gh-puller/graph")
         # enabled=False + base_url 有 → disabled
         cfg.code_graph.enabled = False
