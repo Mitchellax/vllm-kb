@@ -129,7 +129,7 @@ def register(app, ctx) -> None:
         return _call(client.query_graph,
                      project=_project(req.repo), query=req.query, max_rows=req.max_rows)
 
-    @app.get("/code-graph/architecture")
+    @app.post("/code-graph/architecture")
     def code_graph_architecture(req: ArchitectureRequest):
         """get_architecture：架构总览（聚类/边界/热点/层次/依赖/路由）。"""
         return _call(client.get_architecture,

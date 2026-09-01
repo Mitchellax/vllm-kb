@@ -18,6 +18,9 @@ import urllib.parse
 
 
 DEFAULT_BASE = os.environ.get("VLLM_KB_BASE", "http://127.0.0.1:8000")
+# 代码图谱服务（gh-puller 接入）独立 base——缺省沿用主 API（同进程注册路由时），
+# 远程部署可分离：VLLM_KB_CODE_GRAPH_BASE 指向 gh-puller HTTP 端点。
+DEFAULT_GRAPH_BASE = os.environ.get("VLLM_KB_CODE_GRAPH_BASE", DEFAULT_BASE)
 
 
 def _force_utf8_stdio() -> None:
@@ -383,6 +386,132 @@ def fmt_tags_match(data: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------- 代码图谱检索（gh-puller 接入）格式化 ----------------
+
+def _fmt_graph_tree(rows: list[dict], indent: str = "") -> list[str]:
+    """图谱工具普遍返回 prefix-grouped tree rows（name label lines in out）。
+    递归打印分组头 + 成员行；无分组结构时按字典列表平铺。"""
+    out = []
+    for r in (rows or [])[:50]:
+        if not isinstance(r, dict):
+            continue
+        if "group" in r and "members" in r:
+            out.append(f"{indent}{r.get('group', '')}  ({len(r['members'])} 项)")
+            out.extend(_fmt_graph_tree(r["members"], indent + "  "))
+        else:
+            name = r.get("name") or r.get("qn") or r.get("function") or ""
+            label = r.get("label", "")
+            lines = r.get("lines") or r.get("line")
+            f = r.get("file") or r.get("out") or ""
+            extra = f"  [{label}]" if label else ""
+            loc = f"  {f}:{lines}" if (f and lines) else (f"  {f}" if f else "")
+            out.append(f"{indent}{name}{extra}{loc}")
+    return out
+
+
+def fmt_graph_search(data):
+    """search_graph/search_code 结果：函数/类/路由命中（tree rows 或 hits 列表）。"""
+    lines = ["代码图谱命中:"]
+    if isinstance(data, dict):
+        rows = data.get("results") or data.get("hits") or data.get("rows")
+        total = data.get("total") or data.get("total_results")
+        if total is not None:
+            lines.append(f"(共 {total} 项)")
+        if isinstance(rows, list):
+            lines.extend(_fmt_graph_tree(rows))
+        elif not rows:
+            lines.append("(无命中)")
+    if len(lines) == 1:
+        lines.append("(无命中或上游返回非预期结构)")
+    return "\n".join(lines)
+
+
+def fmt_graph_trace(data):
+    """trace_path 结果：调用链/数据流树（callees/callers 分组）。"""
+    lines = ["调用链追踪:"]
+    if not isinstance(data, dict):
+        return "调用链追踪: (无数据)"
+    for key, label in (("callees", "调用方→"), ("callers", "←被调用")):
+        rows = data.get(key)
+        if rows:
+            lines.append(f"[{label}] ({data.get(key + '_total', len(rows))} 总数)")
+            lines.extend(_fmt_graph_tree(rows))
+    impacted = data.get("impacted") or data.get("impacted_modules")
+    if impacted:
+        lines.append("[影响面]")
+        lines.extend(_fmt_graph_tree(impacted if isinstance(impacted, list) else [impacted]))
+    if len(lines) == 1:
+        lines.append("(无追踪结果)")
+    return "\n".join(lines)
+
+
+def fmt_graph_query(data):
+    """query_graph 结果：Cypher 行（任意结构，按行 JSON 平铺）。"""
+    rows = data.get("rows") or data.get("result") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return f"Cypher 结果: {json.dumps(data, ensure_ascii=False)[:500]}"
+    lines = [f"Cypher 结果（{len(rows)} 行）:"]
+    for r in rows[:30]:
+        lines.append("  " + json.dumps(r, ensure_ascii=False)[:200])
+    return "\n".join(lines)
+
+
+def fmt_graph_architecture(data):
+    """get_architecture 结果：架构总览（overview/结构/聚类/边界）。"""
+    lines = ["架构总览:"]
+    if not isinstance(data, dict):
+        return "架构总览: (无数据)"
+    for k in ("overview", "summary", "title", "languages", "packages",
+              "entry_points", "routes", "hotspots", "boundaries", "layers"):
+        v = data.get(k)
+        if v:
+            if isinstance(v, list):
+                lines.append(f"[{k}] " + ", ".join(str(x) for x in v[:20]))
+            elif isinstance(v, dict):
+                lines.append(f"[{k}]")
+                for kk, vv in list(v.items())[:15]:
+                    lines.append(f"  {kk}: {vv}")
+            else:
+                lines.append(f"[{k}] {v}")
+    clusters = data.get("clusters")
+    if isinstance(clusters, list):
+        lines.append(f"[聚类] {len(clusters)} 个:")
+        for c in clusters[:10]:
+            if isinstance(c, dict):
+                lines.append(f"  {c.get('label', '?')} ({c.get('member_count', '?')} 成员) cohesion={c.get('cohesion', '?')}")
+    if len(lines) == 1:
+        lines.append("(无 aspect 数据，可能 aspects 未传或项目未索引)")
+    return "\n".join(lines)
+
+
+def fmt_graph_changes(data):
+    """detect_changes 结果：变更影响面（blast radius）。"""
+    lines = ["变更影响面:"]
+    if not isinstance(data, dict):
+        return "变更影响面: (无数据)"
+    cf = data.get("changed_files")
+    if cf:
+        lines.append(f"[变更文件] {len(cf)} 个:")
+        for f in cf[:15]:
+            lines.append(f"  {f if isinstance(f, str) else f.get('file', f)}")
+    imp = data.get("impacted")
+    total = data.get("impacted_total")
+    if imp is not None:
+        lines.append(f"[影响面] ({total if total is not None else '未知'} 总数):")
+        if isinstance(imp, list):
+            lines.extend(_fmt_graph_tree(imp))
+    mods = data.get("impacted_modules")
+    if isinstance(mods, list):
+        lines.append(f"[受影响模块] {len(mods)} 个: " + ", ".join(str(m) for m in mods[:20]))
+    if len(lines) == 1:
+        lines.append("(无影响结果，可能 scope=files 或 diff 无符号变更)")
+    return "\n".join(lines)
+
+
+def fmt_graph_health(data):
+    return "代码图谱服务: " + json.dumps(data, ensure_ascii=False)
+
+
 def main() -> None:
     _force_utf8_stdio()
     ap = argparse.ArgumentParser(description="vllm-kb 只读检索客户端")
@@ -483,6 +612,53 @@ def main() -> None:
 
     p = sub.add_parser("context", help="问题→标签匹配（文档能力发现：知识库有哪些文档能帮上这个问题）")
     p.add_argument("text", help="问题描述（如 vllm-ascend HCCL 超时）")
+
+    # 代码图谱检索（gh-puller 接入）——与本地 code 命令并列，能力互补不重叠
+    p = sub.add_parser("code-graph", help="代码图谱检索（gh-puller：调用链/影响面/架构，与本地 code 互补）")
+    p.add_argument("--graph-base", default=DEFAULT_GRAPH_BASE,
+                   help=f"图谱服务地址（默认 {DEFAULT_GRAPH_BASE}；远程部署设 VLLM_KB_CODE_GRAPH_BASE）")
+    cgsub = p.add_subparsers(dest="code_graph_cmd", required=True)
+    g = cgsub.add_parser("search", help="搜函数/类/路由（BM25/正则/语义，优先于 grep 找定义）")
+    g.add_argument("query", help="自然语言或关键词（如 'update settings'）")
+    g.add_argument("--repo", default=None, help="仓库：vllm-ascend（默认）| vllm")
+    g.add_argument("--label", default=None, help="节点标签过滤（Function/Class/Route）")
+    g.add_argument("--limit", type=int, default=10)
+    g = cgsub.add_parser("code-search", help="grep + 图增强（去重到函数、按结构重要性排序）")
+    g.add_argument("pattern", help="grep 文本")
+    g.add_argument("--repo", default=None)
+    g.add_argument("--mode", default="compact", choices=["compact", "full", "files"],
+                   help="compact=签名+元数据(默认) full=带源码 files=仅文件列表")
+    g.add_argument("--path-filter", default=None, help="结果文件路径正则（如 ^src/）")
+    g.add_argument("--limit", type=int, default=10)
+    g = cgsub.add_parser("trace", help="调用链/数据流/跨服务路径追踪（替代手写 grep 找调用关系）")
+    g.add_argument("function", help="函数名（qualified_name 或短名）")
+    g.add_argument("--repo", default=None)
+    g.add_argument("--direction", default="both", choices=["inbound", "outbound", "both"],
+                   help="inbound=谁调用我 outbound=我调用谁 both=双向")
+    g.add_argument("--depth", type=int, default=3, help="最大跳数")
+    g.add_argument("--mode", default="calls", choices=["calls", "data_flow", "cross_service"],
+                   help="calls=调用链(默认) data_flow=值传播 cross_service=跨服务")
+    g.add_argument("--limit", type=int, default=100)
+    g = cgsub.add_parser("query", help="执行 Cypher 查知识图谱（多跳/聚合/跨服务分析）")
+    g.add_argument("cypher", help="Cypher 查询（如 'MATCH (n:Function) RETURN n.name LIMIT 10'）")
+    g.add_argument("--repo", default=None)
+    g.add_argument("--max-rows", type=int, default=None)
+    g = cgsub.add_parser("architecture", help="架构总览（聚类/边界/热点/层次/依赖）")
+    g.add_argument("--repo", default=None)
+    g.add_argument("--aspects", nargs="+", default=None,
+                   help="aspect 列表：all/overview/structure/dependencies/routes/languages/"
+                        "packages/entry_points/hotspots/boundaries/layers/clusters")
+    g.add_argument("--path", default=None, help="目录前缀限定（如 apps/）")
+    g = cgsub.add_parser("changes", help="git diff → 变更影响面（blast radius：波及的调用方）")
+    g.add_argument("diff", help="git diff 文本，或 '-' 从 stdin 读")
+    g.add_argument("--repo", default=None)
+    g.add_argument("--scope", default="impact", choices=["files", "impact"],
+                   help="files=仅变更文件 impact=含影响面(默认)")
+    g.add_argument("--direction", default="inbound", choices=["inbound", "outbound", "both"],
+                   help="inbound=谁被变更波及(默认) outbound=变更依赖谁")
+    g.add_argument("--depth", type=int, default=2)
+    g.add_argument("--limit", type=int, default=20)
+    g = cgsub.add_parser("health", help="探测 gh-puller 代码图谱服务可达性")
 
     args = ap.parse_args()
     base = args.base
@@ -585,6 +761,43 @@ def main() -> None:
     elif args.cmd == "context":
         data = _post(base, "/tags/match", {"text": args.text})
         print(fmt_tags_match(data))
+    elif args.cmd == "code-graph":
+        gbase = args.graph_base
+        if args.code_graph_cmd == "health":
+            print(fmt_graph_health(_get(gbase, "/code-graph/health")))
+        elif args.code_graph_cmd == "search":
+            payload = {"query": args.query, "repo": args.repo, "limit": args.limit}
+            if args.label:
+                payload["label"] = args.label
+            print(fmt_graph_search(_post(gbase, "/code-graph/search", payload)))
+        elif args.code_graph_cmd == "code-search":
+            payload = {"pattern": args.pattern, "repo": args.repo, "mode": args.mode,
+                       "limit": args.limit}
+            if args.path_filter:
+                payload["path_filter"] = args.path_filter
+            print(fmt_graph_search(_post(gbase, "/code-graph/code-search", payload)))
+        elif args.code_graph_cmd == "trace":
+            payload = {"function_name": args.function, "repo": args.repo,
+                       "direction": args.direction, "depth": args.depth,
+                       "limit": args.limit, "mode": args.mode}
+            print(fmt_graph_trace(_post(gbase, "/code-graph/trace", payload)))
+        elif args.code_graph_cmd == "query":
+            payload = {"query": args.cypher, "repo": args.repo}
+            if args.max_rows:
+                payload["max_rows"] = args.max_rows
+            print(fmt_graph_query(_post(gbase, "/code-graph/query", payload)))
+        elif args.code_graph_cmd == "architecture":
+            payload = {"repo": args.repo}
+            if args.aspects:
+                payload["aspects"] = args.aspects
+            if args.path:
+                payload["path"] = args.path
+            print(fmt_graph_architecture(_post(gbase, "/code-graph/architecture", payload)))
+        elif args.code_graph_cmd == "changes":
+            diff_text = sys.stdin.read() if args.diff == "-" else args.diff
+            payload = {"diff": diff_text, "repo": args.repo, "scope": args.scope,
+                       "direction": args.direction, "depth": args.depth, "limit": args.limit}
+            print(fmt_graph_changes(_post(gbase, "/code-graph/changes", payload)))
 
 
 if __name__ == "__main__":

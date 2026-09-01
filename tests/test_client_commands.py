@@ -413,5 +413,127 @@ class TestCliDispatch(unittest.TestCase):
         self.assertNotIn("filters", calls["payload"])
 
 
+class TestCodeGraphCommands(unittest.TestCase):
+    """code-graph 命令组：分发 + payload 透传 + 格式化（mock HTTP）。"""
+
+    def test_search_dispatch_and_payload(self):
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["base"] = base
+            calls["path"] = path
+            calls["payload"] = payload
+            return {"results": [{"name": "foo", "label": "Function", "file": "a.py", "lines": "1-10"}]}
+
+        txt = run_main(["code-graph", "search", "auth flow", "--repo", "vllm", "--limit", "5"],
+                       post_data=fake_post)
+        self.assertEqual(calls["path"], "/code-graph/search")
+        self.assertEqual(calls["payload"]["query"], "auth flow")
+        self.assertEqual(calls["payload"]["repo"], "vllm")
+        self.assertEqual(calls["payload"]["limit"], 5)
+        self.assertIn("foo", txt)
+        self.assertIn("Function", txt)
+
+    def test_trace_dispatch(self):
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["payload"] = payload
+            return {"callees": [{"name": "bar"}], "callees_total": 1}
+
+        txt = run_main(["code-graph", "trace", "do_auth", "--direction", "outbound",
+                        "--depth", "5", "--mode", "data_flow"], post_data=fake_post)
+        self.assertEqual(calls["payload"]["function_name"], "do_auth")
+        self.assertEqual(calls["payload"]["direction"], "outbound")
+        self.assertEqual(calls["payload"]["depth"], 5)
+        self.assertEqual(calls["payload"]["mode"], "data_flow")
+        self.assertIn("bar", txt)
+
+    def test_query_dispatch(self):
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["payload"] = payload
+            return {"rows": [{"n": {"name": "foo"}}]}
+
+        txt = run_main(["code-graph", "query", "MATCH (n) RETURN n", "--max-rows", "100"],
+                       post_data=fake_post)
+        self.assertIn("MATCH", calls["payload"]["query"])
+        self.assertEqual(calls["payload"]["max_rows"], 100)
+        self.assertIn("foo", txt)
+
+    def test_architecture_dispatch_post(self):
+        """architecture 是 POST（body model），非 GET。"""
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["path"] = path
+            calls["payload"] = payload
+            return {"title": "demo", "languages": ["py", "cpp"], "clusters": []}
+
+        def fake_get(*a, **k):
+            self.fail("architecture should POST not GET")
+
+        txt = run_main(["code-graph", "architecture", "--aspects", "structure", "routes",
+                        "--path", "apps/"], post_data=fake_post, get_data=fake_get)
+        self.assertEqual(calls["path"], "/code-graph/architecture")
+        self.assertEqual(calls["payload"]["aspects"], ["structure", "routes"])
+        self.assertEqual(calls["payload"]["path"], "apps/")
+        self.assertIn("py", txt)
+
+    def test_changes_dispatch_with_stdin(self):
+        """changes - 从 stdin 读 diff。"""
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["payload"] = payload
+            return {"changed_files": ["a/x.py"], "impacted": [{"name": "bar"}], "impacted_total": 1}
+
+        import io as _io
+        old_stdin = sys.stdin
+        sys.stdin = _io.StringIO("diff --git a/x b/x\n+new")
+        try:
+            txt = run_main(["code-graph", "changes", "-", "--scope", "impact"],
+                           post_data=fake_post)
+        finally:
+            sys.stdin = old_stdin
+        self.assertEqual(calls["payload"]["diff"], "diff --git a/x b/x\n+new")
+        self.assertEqual(calls["payload"]["scope"], "impact")
+        self.assertIn("bar", txt)
+
+    def test_health_dispatch(self):
+        txt = run_main(["code-graph", "health"],
+                       get_data=lambda *a, **k: {"status": "ok"})
+        self.assertIn("ok", txt)
+
+    def test_graph_base_flag_separate_from_base(self):
+        """--graph-base 独立于 --base，code-graph 用前者。"""
+        calls = {}
+
+        def fake_post(base, path, payload=None):
+            calls["base"] = base
+            return {}
+
+        def fake_get(base, path, params=None):
+            calls["base"] = base
+            return {}
+
+        run_main(["--base", "http://main:8000", "code-graph", "--graph-base",
+                  "http://graph:8787", "health"], get_data=fake_get)
+        self.assertEqual(calls["base"], "http://graph:8787")
+
+    def test_fmt_empty_results(self):
+        """空结果不崩。"""
+        txt = run_main(["code-graph", "search", "x"], post_data=lambda *a, **k: {})
+        self.assertIn("无命中", txt)
+
+    def test_fmt_tree_groups(self):
+        """tree rows 带分组结构。"""
+        data = {"results": [{"group": "com.auth", "members": [{"name": "login", "label": "Function"}]}]}
+        txt = run_main(["code-graph", "search", "x"], post_data=lambda *a, **k: data)
+        self.assertIn("com.auth", txt)
+        self.assertIn("login", txt)
+
+
 if __name__ == "__main__":
     unittest.main()
