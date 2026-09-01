@@ -131,7 +131,8 @@ class CodeGraphCfg(BaseModel):
     """
 
     enabled: bool = False  # 未配置即不注册端点
-    base_url: str = ""  # gh-puller HTTP REST 地址（剥离 MCP 后的入口）
+    base_url: str = ""  # gh-puller Streamable HTTP 地址（如 http://localhost:8787）
+    path: str = "/gh-puller/graph"  # MCP 单端点路径（stateless，免 initialize 握手）
     timeout_seconds: int = 30
     max_retries: int = 1
     # vllm-kb 内部简名 → gh-puller project 标识（index_repository 时的 repo_url）
