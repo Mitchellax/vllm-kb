@@ -161,6 +161,20 @@ class ConfidenceCfg(BaseModel):
     verification_weights: dict[str, float] = Field(default_factory=lambda: {
         "unverified": 0.5, "tested": 0.85, "expert": 0.95,
     })
+    # 行为遥测反馈（后验历史可靠度 w_hist）：见 feedback_model.py / scripts/build_feedback.py。
+    # 反馈数据独立链（telemetry 库 → 离线推断 → confidence_feedback.json → 查询期 w_hist），
+    # 不碰只读 kb.sqlite3，不改 compute_confidence 的确定性部分（审计可逆）。
+    feedback_enabled: bool = False  # 总开关：False 时 w_hist=1.0（中性），不影响打分
+    feedback_half_life_days: float = 365.0  # 后验指数遗忘半衰期（复用 half_life_days 语义，可独立调）
+    feedback_z: float = 1.0  # 后验下界 z（单侧置信分位数；冷启动保护强度，n_eff 大时 sd→0 无意义）
+    feedback_n_min: float = 5.0  # n_eff 充分阈值（加权观察非次数；seed=1+1=2，数据部分≥3 超先验 1.5 倍才主导）
+    history_sigma: float = 0.5  # final 中 lb 的指数权重（final = sim^γ × conf^(1-γ) × lb^σ）
+    feedback_seed_success: float = 1.0  # 先验 seed a（弱先验，随遗忘衰减，HL 决定失效）
+    feedback_seed_fail: float = 1.0  # 先验 seed b
+    telemetry_path: str = "data/telemetry.sqlite3"  # 行为遥测库（mode=rw，独立于只读 kb.sqlite3）
+    feedback_path: str = "data/confidence_feedback.json"  # 离线产出的后验表（serve_api 启动加载）
+    # 强签名判定：kind 白名单（可配）+ weight 阈值（后继从反馈数据学，先搁置）+ 结构性排除
+    strong_sig_kinds: list[str] = Field(default_factory=lambda: ["kernel", "op", "errcode", "acl_code"])
 
 
 class RetrievalCfg(BaseModel):
