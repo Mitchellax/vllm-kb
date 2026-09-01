@@ -266,6 +266,8 @@ class SearchEngine:
                 kind=meta.get("kind"),
                 # 验证状态（维度 B）：expert/tested/unverified 作为可靠度下限提升
                 verification=meta.get("verification"),
+                # 行为遥测反馈（历史可靠度 w_hist）：按 doc_id 查反馈表
+                doc_id=meta.get("doc_id"),
             )
             resolved = meta.get("status") in ("closed", "merged") and bool(meta.get("resolved_at"))
             results.append(
@@ -277,7 +279,8 @@ class SearchEngine:
                     url=meta.get("url", ""),
                     similarity=round(m["sim"], 4),
                     confidence=conf,
-                    final=round(final_score(m["sim"], conf.score, c_cfg.gamma), 4),
+                    final=round(final_score(m["sim"], conf.score, c_cfg.gamma,
+                                            w_hist=conf.w_hist, sigma=c_cfg.history_sigma), 4),
                     source=m["src"],
                     component=doc_comp,
                     resolved=resolved,

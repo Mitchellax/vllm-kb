@@ -83,6 +83,9 @@ def register(app, ctx) -> None:
                         "w_rel": r.confidence.reliability,
                         "target_version": r.confidence.target_version,
                         "verification": r.confidence.extras.get("verification", ""),
+                        "w_hist": r.confidence.w_hist,
+                        "n_eff": r.confidence.n_eff,
+                        "history_flag": r.confidence.history_flag,
                     },
                     "snippet": _out(r.text[:500]),
                 }

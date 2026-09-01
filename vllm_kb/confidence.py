@@ -254,6 +254,33 @@ class ConfidenceBreakdown:
     target_version: str
     now: str
     extras: dict = field(default_factory=dict)
+    # 行为遥测反馈（历史可靠度）：与 w_time/w_ver/w_rel 正交，不乘进 w_rel
+    w_hist: float = 1.0  # 后验下界 lb（n_eff=0 时 1.0 中性）
+    n_eff: float = 0.0  # 加权有效证据量（unknown 不计）
+    history_flag: str = "new"  # new/accumulating/supported/used_but_unconfirmed/evidence_thin/failing
+
+
+# 反馈表单例缓存（serve_api 启动时加载一次，改规则重跑 build_feedback + 重启生效）
+_feedback_table_cache: dict = {}
+
+
+def _load_feedback_for_doc(cfg: "ConfidenceCfg", doc_id: str):
+    """加载 doc 的后验反馈（从 confidence_feedback.json，缓存）。
+
+    feedback_enabled=False 或文件缺失 → None（w_hist=1.0 中性）。
+    """
+    if not cfg.feedback_enabled:
+        return None
+    global _feedback_table_cache
+    table = _feedback_table_cache.get("table")
+    if table is None:
+        from .feedback_model import load_feedback_table
+        from pathlib import Path
+
+        p = Path(cfg.feedback_path)
+        table = load_feedback_table(p)
+        _feedback_table_cache["table"] = table
+    return table.get(doc_id)
 
 
 def compute_confidence(
@@ -269,6 +296,7 @@ def compute_confidence(
     explicit_reliability: Optional[float] = None,
     kind: Optional[str] = None,
     verification: Optional[str] = None,
+    doc_id: Optional[str] = None,
 ) -> ConfidenceBreakdown:
     c = cfg or ConfidenceCfg()
     w_t = time_weight(created_at, resolved_at, now, c.half_life_days, c.time_floor)
@@ -280,6 +308,10 @@ def compute_confidence(
     extras = {}
     if verification:
         extras["verification"] = verification
+    # 历史可靠度 w_hist（与 w_rel 正交，不乘进 w_rel——保护审计链）
+    from .feedback_model import compute_posterior
+    fb = _load_feedback_for_doc(c, doc_id) if doc_id else None
+    ps = compute_posterior(fb, c)
     return ConfidenceBreakdown(
         score=score,
         time_weight=round(w_t, 4),
@@ -288,13 +320,22 @@ def compute_confidence(
         target_version=target_version or "(未指定)",
         now=now_str,
         extras=extras,
+        w_hist=round(ps.w_hist, 4),
+        n_eff=round(ps.n_eff, 4),
+        history_flag=ps.history_flag,
     )
 
 
-def final_score(similarity: float, confidence: float, gamma: float = 0.6) -> float:
-    """检索排序分 = sim^gamma * confidence^(1-gamma)。"""
+def final_score(similarity: float, confidence: float, gamma: float = 0.6,
+                w_hist: float = 1.0, sigma: float = 0.5) -> float:
+    """检索排序分 = sim^gamma * confidence^(1-gamma) * w_hist^sigma。
+
+    乘性保证：sim=0 时 final=0（无匹配不被历史翻盘）；w_hist=0 时 final=0（历史全负不被相似度翻盘）。
+    w_hist=1.0（中性，新文档）时 1.0^sigma=1.0，final 不变。
+    """
     sim = max(0.0, min(1.0, similarity))
     conf = max(0.0, min(1.0, confidence))
+    wh = max(0.0, min(1.0, w_hist))
     if sim == 0 and conf == 0:
         return 0.0
-    return (sim ** gamma) * (conf ** (1.0 - gamma))
+    return (sim ** gamma) * (conf ** (1.0 - gamma)) * (wh ** sigma)
