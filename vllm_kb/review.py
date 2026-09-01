@@ -1065,6 +1065,18 @@ def api_configs(cfg: "AppConfig") -> list[dict]:
         "status": "configured" if (gh_token or gh_in_cfg) else "missing",
         "note": "采集需要；检索不需要（离线）",
     })
+    # 代码图谱检索（gh-puller 接入）——与 embedding/OCR 同级管理（连通性测试）
+    cg = cfg.code_graph
+    out.append({
+        "name": "code_graph",
+        "provider": "gh-puller",
+        "base_url": cg.base_url or "",
+        "path": cg.path,
+        "enabled": cg.enabled,
+        "key_configured": True,  # 内网无鉴权（暂定）
+        "status": ("enabled" if cg.enabled else "disabled") if cg.base_url else "missing",
+        "note": "代码图谱检索（调用链/影响面/架构）；enabled=False 时 /code-graph/* 端点不注册",
+    })
     return out
 
 

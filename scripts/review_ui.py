@@ -153,12 +153,13 @@ try{await j('/api/tag-dict/delete',{method:'POST',headers:{'Content-Type':'appli
 async function loadConfigs(){const cs=await j('/api/configs');fillCache(cs);
 $('#view-configs').innerHTML=`<h3>API 配置中心（key 脱敏；可编辑）</h3>`+cs.map(c=>`<div class="card" id="cfg-${esc(c.name)}"><b>${esc(c.name)}</b> <span class="badge ${c.status==='configured'?'confirmed':'pending'}">${c.status}</span>
 <table><tr><th>provider</th><td>${esc(c.provider)}</td></tr>${c.mode&&c.mode!=='custom'?`<tr><th>mode</th><td>${esc(c.mode)}</td></tr>`:''}${c.model?`<tr><th>model</th><td class="mono">${esc(c.model)}</td></tr>`:''}<tr><th>base_url</th><td class="mono">${esc(c.base_url)}</td></tr><tr><th>key</th><td>${c.key_configured?'已配置':'未配置'}</td></tr><tr><th>说明</th><td class="muted">${esc(c.note||'')}</td></tr></table>
-<div><button onclick="editConfig('${esc(c.name)}')">编辑配置</button> ${c.name==='embedding'?`<button onclick="testApi('embedding','etest')">测试连通</button><span id="etest" class="muted"></span>`:''}${c.name==='ocr'?`<button onclick="testApi('ocr','otest')">测试连通</button><span id="otest" class="muted"></span>`:''}</div></div>`).join('')}
+<div><button onclick="editConfig('${esc(c.name)}')">编辑配置</button> ${c.name==='embedding'?`<button onclick="testApi('embedding','etest')">测试连通</button><span id="etest" class="muted"></span>`:''}${c.name==='ocr'?`<button onclick="testApi('ocr','otest')">测试连通</button><span id="otest" class="muted"></span>`:''}${c.name==='code_graph'?`<button onclick="testApi('code_graph','gtest')">测试连通</button><span id="gtest" class="muted"></span>`:''}</div></div>`).join('')}
 const CFG_FIELDS={
  embedding:[['provider','select',['openai_compatible','echo']],['base_url','text'],['model','text'],['api_key','password']],
  ocr:[['ocr_provider','select',['ask','api','paddle','none']],['ocr_api_mode','select',['custom','openai']],['ocr_api_base','text'],['ocr_api_model','text'],['ocr_api_key','password']],
- github:[['token','password']]};
-function fillCache(cs){window._cfgCache={};cs.forEach(c=>window._cfgCache[c.name]={provider:c.provider,base_url:c.base_url,model:c.model||'',mode:c.mode||'custom',ocr_provider:c.provider,ocr_api_base:c.base_url,ocr_api_model:c.model||'',ocr_api_mode:c.mode||'custom'})}
+ github:[['token','password']],
+ code_graph:[['enabled','select',['true','false']],['base_url','text'],['path','text']]};
+function fillCache(cs){window._cfgCache={};cs.forEach(c=>window._cfgCache[c.name]={provider:c.provider,base_url:c.base_url,model:c.model||'',mode:c.mode||'custom',ocr_provider:c.provider,ocr_api_base:c.base_url,ocr_api_model:c.model||'',ocr_api_mode:c.mode||'custom',enabled:c.enabled===true?'true':'false',path:c.path||'/gh-puller/graph'})}
 async function editConfig(name){const old=document.getElementById('form-'+name);if(old)old.remove();
 try{fillCache(await j('/api/configs'))}catch(e){} // 打开时拉最新配置，避免缓存/时序回填旧值
 const c=CFG_FIELDS[name];const cur=window._cfgCache[name]||{};const html=c.map(([k,t,opts])=>`<div style="margin:4px 0"><label>${esc(k)}: </label>${t==='select'?`<select id="f-${k}">${opts.map(o=>`<option ${(cur[k]||'')===o?'selected':''}>${esc(o)}</option>`).join('')}</select>`:`<input id="f-${k}" type="${t}" placeholder="${t==='password'?'(留空不改)':'...'}" style="width:340px" ${cur[k]&&t!=='password'?`value="${esc(cur[k])}"`:''}>`}</div>`).join('');
@@ -440,6 +441,12 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         elif name == "github":
             if "token" in fields:
                 save_secret(cfg, "GITHUB_TOKEN", fields.get("token") or "")
+        elif name == "code_graph":
+            upd = {k: fields[k] for k in ("enabled", "base_url", "path") if k in fields}
+            # enabled 是 bool，前端传 "true"/"false" 字符串
+            if "enabled" in upd:
+                upd["enabled"] = upd["enabled"] in ("true", "True", "1", True)
+            update_config_json(cfg, "code_graph", upd, config_path=_config_path)
         else:
             raise HTTPException(400, f"未知配置: {name}")
         # 重载内存 cfg（读 config.json + secrets），/api/configs 立即反映
@@ -475,7 +482,19 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             if not r["ok"]:
                 raise HTTPException(502, r["detail"])
             return r
-        raise HTTPException(400, "仅支持 embedding / ocr 连通性测试")
+        if name == "code_graph":
+            try:
+                from vllm_kb.code_graph import CodeGraphClient
+
+                r = CodeGraphClient(cfg.code_graph).health()
+                if r["status"] == "ok":
+                    return {"ok": True, "detail": "连通（gh-puller 可达）"}
+                raise HTTPException(502, f"不可达: {r.get('status')} {r.get('error', '')}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(502, f"代码图谱服务不可用: {e}")
+        raise HTTPException(400, "仅支持 embedding / ocr / code_graph 连通性测试")
 
     return app
 

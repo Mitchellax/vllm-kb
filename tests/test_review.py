@@ -295,6 +295,27 @@ class TestApiConfigs(unittest.TestCase):
         self.assertEqual(cs["ocr"]["model"], "table-ocr")
         tmp.cleanup()
 
+    def test_code_graph_config_item(self):
+        """api_configs 包含 code_graph 项：disabled/enabled/missing 三态。"""
+        tmp = tempfile.TemporaryDirectory()
+        # 默认 enabled=False, base_url 空 → missing
+        cfg = make_cfg(Path(tmp.name))
+        cs = {c["name"]: c for c in api_configs(cfg)}
+        self.assertIn("code_graph", cs)
+        self.assertEqual(cs["code_graph"]["status"], "missing")
+        self.assertEqual(cs["code_graph"]["provider"], "gh-puller")
+        # enabled=True + base_url 有 → enabled
+        cfg.code_graph.enabled = True
+        cfg.code_graph.base_url = "http://localhost:8787"
+        cs = {c["name"]: c for c in api_configs(cfg)}
+        self.assertEqual(cs["code_graph"]["status"], "enabled")
+        self.assertEqual(cs["code_graph"]["path"], "/gh-puller/graph")
+        # enabled=False + base_url 有 → disabled
+        cfg.code_graph.enabled = False
+        cs = {c["name"]: c for c in api_configs(cfg)}
+        self.assertEqual(cs["code_graph"]["status"], "disabled")
+        tmp.cleanup()
+
 
 class TestSecrets(unittest.TestCase):
     def setUp(self):
