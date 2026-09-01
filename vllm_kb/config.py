@@ -121,6 +121,26 @@ class CodeCfg(BaseModel):
     download_workers: int = 2
 
 
+class CodeGraphCfg(BaseModel):
+    """代码图谱检索配置（接入 gh-puller 的代码知识图谱：调用链/数据流/影响面/架构）。
+
+    与 code（本地版本化符号快照）互补不重叠：本地强在版本化定位与报错字面量索引、
+    离线；图谱强在跨函数/跨仓关系推理。enabled=False（默认）时 api 不注册 /code-graph/*，
+    端点不存在（比 503 更干净）；gh-puller 不可达时该组端点直接 503 + 引导用 code 命令，
+    不回退本地（本地无等价图谱能力，回退无意义）。
+    """
+
+    enabled: bool = False  # 未配置即不注册端点
+    base_url: str = ""  # gh-puller HTTP REST 地址（剥离 MCP 后的入口）
+    timeout_seconds: int = 30
+    max_retries: int = 1
+    # vllm-kb 内部简名 → gh-puller project 标识（index_repository 时的 repo_url）
+    repo_project_map: dict[str, str] = Field(default_factory=lambda: {
+        "vllm-ascend": "vllm-project/vllm-ascend",
+        "vllm": "vllm-project/vllm",
+    })
+
+
 class ConfidenceCfg(BaseModel):
     alpha: float = 0.6
     beta: float = 0.4
@@ -220,6 +240,7 @@ class AppConfig(BaseModel):
     api: ApiCfg = Field(default_factory=ApiCfg)
     verify: VerifyCfg = Field(default_factory=VerifyCfg)
     code: CodeCfg = Field(default_factory=CodeCfg)
+    code_graph: CodeGraphCfg = Field(default_factory=CodeGraphCfg)
     logging: LoggingCfg = Field(default_factory=LoggingCfg)
     tags: TagCfg = Field(default_factory=TagCfg)
     sanitize: SanitizeCfg = Field(default_factory=SanitizeCfg)
