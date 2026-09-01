@@ -369,11 +369,12 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH，含手册表格→错误码、命令格式→Interface、文档互证）+ 链路查询（tags/evidence/sig 大小写不敏感） |
 | `sanitize.py` | 内部数据脱敏（后置）：出口统一脱敏（IP/路径白名单 keep_paths/keep_ips）+ 入库命中收集（sources）→ `data/sanitize_log.json` |
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布 |
+| `code_graph.py` | 代码图谱检索（gh-puller 接入）：MCP Streamable HTTP 客户端 + 熔断器，调用链/数据流/影响面/架构聚类/语义搜索——与 `code_index` 互补不重叠，不可达 503+引导不回退 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔 |
 | `net.py` | 网络统一入口：内网模式（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
-| `api.py` | 只读 FastAPI 检索服务（SQLite `mode=ro`、向量库只读包装、无写端点、/graph/* 与 /tags/* 端点、/health 含 embedding 状态） |
+| `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册） |
 
 ## 🗺️ 版本计划
 

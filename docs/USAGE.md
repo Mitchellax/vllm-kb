@@ -623,6 +623,50 @@ python skills/vllm-kb/client.py graph evidence pdf:Atlas A3 中心推理和训�
 图与检索 API 的关系：图由 `scripts/build_graph.py` 构建，`serve_api.py` 的 `/graph/*` 端点只读查询；
 **更新图前请停止检索 API**（Kùzu 单写者，构建期间不可并发查询）。
 
+### 4.9 code-graph —— 代码图谱检索（gh-puller 接入）
+
+代码知识图谱检索，与 `code`（本地版本化符号索引）**并列、能力互补不重叠**：
+
+| 维度 | `code`（本地） | `code-graph`（gh-puller） |
+|---|---|---|
+| 强项 | 版本化定位、报错字面量索引、离线、跨版本 diff | 调用链/数据流、变更影响面、架构聚类、跨仓边、语义搜索 |
+| 速度 | 毫秒级（本地 SQLite） | 秒级（gh-puller + 图谱查询） |
+| 依赖 | 离线 | gh-puller HTTP 服务在线 |
+
+**启用**：config `code_graph.enabled = true` + `base_url`（gh-puller Streamable HTTP 地址，
+默认端口 8787，路径 `/gh-puller/graph`）。未启用时 `serve_api` 不注册 `/code-graph/*`
+端点（404 比 503 干净）。**不可达时端点直接 503 + 引导用 `code` 命令查本地索引**——
+本地无等价图谱能力，不走回退（回退无意义）。
+
+**命令**（skill，`--graph-base` / `VLLM_KB_CODE_GRAPH_BASE` 独立寻址，缺省沿用 `--base`）：
+
+```bash
+# 搜函数/类/路由（BM25/正则/语义三模，优先于 grep 找定义）
+client.py code-graph search "update settings" --repo vllm
+client.py code-graph code-search "DispatchFFNCombine" --mode full --path-filter "^vllm_ascend"
+
+# 调用链追踪（替代手写 grep 找调用关系）
+client.py code-graph trace do_auth --direction outbound --depth 5 --mode data_flow
+
+# Cypher 查知识图谱（多跳/聚合/跨服务分析）
+client.py code-graph query "MATCH (n:Function)-[:CALLS]->(m) RETURN n.name, count(m)"
+
+# 架构总览（聚类/边界/热点/层次/依赖）
+client.py code-graph architecture --aspects all --path apps/
+client.py code-graph architecture --aspects clusters boundaries hotspots
+
+# git diff → 变更影响面（blast radius：变更波及的调用方）
+git diff | client.py code-graph changes - --scope impact --direction inbound
+
+# 探测 gh-puller 可达性
+client.py code-graph health
+```
+
+**何时用 code-graph vs code**：
+- 定位某版本某符号在哪定义、报错文本来自哪段代码 → `code`（本地快、版本化）
+- 谁调用了某函数、变更会影响什么、架构怎么分层、跨仓调用关系 → `code-graph`
+- gh-puller 不可达时降级思路：`code-graph` 503 → 改用 `code` 查本地索引（手动）
+
 ## 5. 故障处理推荐流程
 
 ```
