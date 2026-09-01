@@ -1,0 +1,213 @@
+"""build_feedback.py 离线推断单测：会话重建+行为推断三态+缺口判决+后验更新。
+
+用造的遥测事件（不依赖真实 serve_api）验证推断规则正确性。
+"""
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+
+import build_feedback as bf
+from vllm_kb.config import AppConfig
+from vllm_kb.feedback_model import DocFeedback, apply_feedback_event, load_feedback_table
+
+
+def _cfg(tmpdir):
+    cfg = AppConfig.load("config.json", require_keys=False)
+    cfg.confidence.feedback_enabled = True
+    cfg.confidence.telemetry_path = str(Path(tmpdir) / "telemetry.sqlite3")
+    cfg.confidence.feedback_path = str(Path(tmpdir) / "confidence_feedback.json")
+    return cfg
+
+
+def _event(session, ts, endpoint, doc_ids=None, count=0, sig_hash="", sig_entities="",
+           query_norm="q", component="vllm-ascend"):
+    return {
+        "session_id": session, "ts": ts, "endpoint": endpoint, "method": "POST",
+        "result_doc_ids": json.dumps(doc_ids or []), "result_count": count,
+        "signature_hash": sig_hash, "signature_entities": sig_entities,
+        "signature_text": "", "query_normalized": query_norm, "component": component,
+    }
+
+
+def _ts(minute):
+    """生成 UTC iso 时间戳，minute 为相对偏移。"""
+    return (datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=minute)).isoformat()
+
+
+class TestInferFeedback(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cfg = _cfg(self.tmpdir)
+
+    def test_signature_hit_then_end_weak_positive(self):
+        """signature 命中后会话直接结束 → 弱正 hit。"""
+        events = [
+            _event("s1", _ts(0), "/signature-search", doc_ids=["doc:a"], count=1,
+                   sig_hash="h1", sig_entities='[{"kind":"kernel","text":"foo"}]'),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        hits = [e for e in ev if e["state"] == "hit"]
+        self.assertTrue(any(h["doc_id"] == "doc:a" for h in hits))
+
+    def test_search_then_pull_doc_no_research_weak_positive(self):
+        """search 命中后拉 doc 且不重查 → 弱正 hit。"""
+        events = [
+            _event("s1", _ts(0), "/search", doc_ids=["doc:a"], count=1, query_norm="q1"),
+            _event("s1", _ts(1), "/doc/doc:a"),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        hits = [e for e in ev if e["state"] == "hit" and e["doc_id"] == "doc:a"]
+        self.assertTrue(hits)
+
+    def test_rephrase_within_60s_weak_negative(self):
+        """60s 内改述重查 → 弱负 miss。"""
+        events = [
+            _event("s1", _ts(0), "/search", doc_ids=["doc:a"], count=1, query_norm="q1"),
+            _event("s1", _ts(1), "/search", doc_ids=["doc:b"], count=1, query_norm="q2"),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        misses = [e for e in ev if e["state"] == "miss" and e["doc_id"] == "doc:a"]
+        self.assertTrue(misses)
+
+    def test_code_after_doc_hit_medium_positive(self):
+        """有 doc 命中后调 code → 中正 hit。"""
+        events = [
+            _event("s1", _ts(0), "/search", doc_ids=["doc:a"], count=1, query_norm="q1"),
+            _event("s1", _ts(2), "/code/search", query_norm="keyword"),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        hits = [e for e in ev if e["state"] == "hit" and e["doc_id"] == "doc:a"]
+        self.assertTrue(hits)
+        self.assertTrue(any(h["weight"] == 0.5 for h in hits))
+
+    def test_code_without_doc_hit_no_evidence(self):
+        """无 doc 命中后调 code → 无 doc 级证据（进缺口检测，不进后验）。"""
+        events = [
+            _event("s1", _ts(0), "/search", doc_ids=[], count=0, query_norm="q1"),
+            _event("s1", _ts(2), "/code/search", query_norm="keyword"),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        # 无命中时不产生 doc 级证据（没有目标 doc 可标）
+        self.assertEqual(len(ev), 0)
+
+    def test_zero_action_unknown(self):
+        """search 命中后零后续 → unknown（不进 n_eff）。"""
+        events = [
+            _event("s1", _ts(0), "/search", doc_ids=["doc:a"], count=1, query_norm="q1"),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        unknowns = [e for e in ev if e["state"] == "unknown" and e["doc_id"] == "doc:a"]
+        self.assertTrue(unknowns)
+
+    def test_unknown_does_not_increate_neff(self):
+        """unknown 证据不进 a/b/n_eff（feedback_model 处理）。"""
+        events = [
+            _event("s1", _ts(0), "/search", doc_ids=["doc:a"], count=1, query_norm="q1"),
+        ]
+        ev = bf.infer_feedback(events, self.cfg)
+        table = bf.update_posteriors(ev, {}, self.cfg)
+        fb = table["doc:a"]
+        # unknown 只增 n_unknown，a/b 保持 seed（1.0）
+        self.assertEqual(fb.n_unknown, 1.0)
+        self.assertAlmostEqual(fb.a, 1.0, places=2)  # seed 衰减后≈1（Δt 小）
+        self.assertAlmostEqual(fb.b, 1.0, places=2)
+
+
+class TestGapDetection(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cfg = _cfg(self.tmpdir)
+
+    def test_strong_sig_zero_hits_hard_gap(self):
+        """强签名零命中跨≥3会话 → hard_gap。"""
+        sig_entities = json.dumps([{"kind": "kernel", "text": "DispatchFFN"}])
+        events = [
+            _event("s1", _ts(0), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities),
+            _event("s2", _ts(100), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities),
+            _event("s3", _ts(200), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities),
+        ]
+        gaps = bf.detect_gaps(events, self.cfg)
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["gap_type"], "hard_gap")
+
+    def test_weak_sig_not_hard_gap(self):
+        """弱签名（无 kernel/op/errcode）零命中 → quality_gap 非 hard_gap。"""
+        sig_entities = json.dumps([{"kind": "phrase", "text": "timeout"}])
+        events = [
+            _event(f"s{i}", _ts(i * 100), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities) for i in range(4)
+        ]
+        gaps = bf.detect_gaps(events, self.cfg)
+        self.assertTrue(gaps)
+        self.assertEqual(gaps[0]["gap_type"], "quality_gap")
+
+    def test_low_results_soft_gap(self):
+        """命中但少（1-2）→ soft_gap。"""
+        sig_entities = json.dumps([{"kind": "errcode", "text": "561000"}])
+        events = [
+            _event(f"s{i}", _ts(i * 100), "/signature-search", count=1, sig_hash="h1",
+                   sig_entities=sig_entities) for i in range(4)
+        ]
+        gaps = bf.detect_gaps(events, self.cfg)
+        self.assertTrue(gaps)
+        self.assertEqual(gaps[0]["gap_type"], "soft_gap")
+
+    def test_less_than_3_sessions_no_gap(self):
+        """<3 会话不记缺口。"""
+        sig_entities = json.dumps([{"kind": "kernel", "text": "foo"}])
+        events = [
+            _event("s1", _ts(0), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities),
+            _event("s2", _ts(100), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities),
+        ]
+        gaps = bf.detect_gaps(events, self.cfg)
+        self.assertEqual(len(gaps), 0)
+
+
+class TestPosteriorUpdate(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cfg = _cfg(self.tmpdir)
+
+    def test_hit_increases_a(self):
+        ev = [{"doc_id": "doc:a", "state": "hit", "weight": 0.3, "ts": _ts(0)}]
+        table = bf.update_posteriors(ev, {}, self.cfg)
+        self.assertGreater(table["doc:a"].a, 1.0)  # seed + 0.3
+
+    def test_miss_increases_b(self):
+        ev = [{"doc_id": "doc:a", "state": "miss", "weight": 0.5, "ts": _ts(0)}]
+        table = bf.update_posteriors(ev, {}, self.cfg)
+        self.assertGreater(table["doc:a"].b, 1.0)
+
+    def test_existing_table_updated(self):
+        """已有后验表追加新证据。"""
+        existing = {"doc:a": DocFeedback(a=2.0, b=1.0, n_unknown=0.0, last_update_ts=_ts(0))}
+        ev = [{"doc_id": "doc:a", "state": "hit", "weight": 0.5, "ts": _ts(1)}]
+        table = bf.update_posteriors(ev, existing, self.cfg)
+        self.assertGreater(table["doc:a"].a, 2.0)  # 衰减后 + 0.5
+
+    def test_save_and_reload(self):
+        ev = [{"doc_id": "doc:a", "state": "hit", "weight": 0.5, "ts": _ts(0)}]
+        table = bf.update_posteriors(ev, {}, self.cfg)
+        save_path = Path(self.tmpdir) / "fb.json"
+        bf.save_feedback_table(save_path, table)
+        loaded = load_feedback_table(save_path)
+        self.assertIn("doc:a", loaded)
+        self.assertGreater(loaded["doc:a"].a, 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
