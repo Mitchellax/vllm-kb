@@ -1089,7 +1089,7 @@ _TINY_PNG_B64 = (
 )
 
 
-def ocr_connectivity_test(cfg: "AppConfig") -> dict:
+def probe_ocr_connectivity(cfg: "AppConfig") -> dict:
     """OCR 连通性测试：用内置测试图走**真实 OCR 链路**（HTTP/鉴权/模型一次验证）。
 
     返回 {"ok": bool, "detail": str}。配置缺失（无 image source / provider=none /

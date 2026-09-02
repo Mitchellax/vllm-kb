@@ -43,13 +43,16 @@ def resolve_script(cmd: str) -> str | None:
 class TestDocCommands(unittest.TestCase):
     maxDiff = None
 
+    # 参数定义最复杂的子命令，保留深层 --help 校验参数（其余只校验脚本存在 + 顶层 --help）
+    _DEEP_CHECK_SUBCOMMANDS = {"search", "signature", "code", "diff", "code-graph"}
+
     def test_all_doc_commands_resolve_and_parse(self):
         cmds = extract_commands()
         self.assertGreater(len(cmds), 50, "文档命令过少，可能解析异常")
         failures: list[str] = []
-        # client.py 的 --help 一次列全部子命令，跳过逐条子命令 --help（argparse 对 unknown
-        # 子命令报 exit 2 而非 crash；子命令覆盖由 test_skill_covers_all_client_subcommands 反向核验）
-        client_help_done = False
+        # client.py 的顶层 --help 只列子命令名，不校验参数定义；
+        # 对代表性子命令保留深层 --help（校验参数定义），其余 client.py 子命令跳过逐条 --help
+        client_top_done = False
         for cmd in cmds:
             if "-m unittest" in cmd:
                 continue  # 模块调用，另行验证
@@ -59,10 +62,15 @@ class TestDocCommands(unittest.TestCase):
                 continue
             parts = cmd.split()
             if "client.py" in script:
-                if client_help_done:
-                    continue  # 只跑一次 client.py --help（列全部子命令），跳过逐条
-                args = [sys.executable, str(ROOT / script), "--help"]
-                client_help_done = True
+                sub_cmd = next((p for p in parts[2:] if not p.startswith("-")), None)
+                if sub_cmd in self._DEEP_CHECK_SUBCOMMANDS:
+                    # 代表性子命令：深层 --help 校验参数定义
+                    args = [sys.executable, str(ROOT / script), sub_cmd, "--help"]
+                elif client_top_done:
+                    continue  # 其余 client.py 子命令只跑一次顶层 --help，跳过逐条
+                else:
+                    args = [sys.executable, str(ROOT / script), "--help"]
+                    client_top_done = True
             else:
                 args = [sys.executable, str(ROOT / script), "--help"]
             try:

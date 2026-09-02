@@ -60,24 +60,35 @@ class TestSources(unittest.TestCase):
             tmp.cleanup()
 
     def test_github_source_defaults_raw_dir_per_source(self):
-        src = create_source(SourceCfg(id="vllm-ascend", type="github"), PROJECT_ROOT)
-        self.assertEqual(src.raw_dir.name, "vllm-ascend")
-        self.assertEqual(src.raw_dir.parent.name, "raw")
-        self.assertEqual(src.puller.repo, "vllm-project/vllm")
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            root = Path(tmp.name)
+            src = create_source(SourceCfg(id="vllm-ascend", type="github"), root)
+            self.assertEqual(src.raw_dir.name, "vllm-ascend")
+            self.assertEqual(src.raw_dir.parent.name, "raw")
+            self.assertEqual(src.puller.repo, "vllm-project/vllm")
+        finally:
+            tmp.cleanup()
 
     def test_build_sources_skips_disabled_and_unknown(self):
-        cfg = AppConfig.model_validate(
-            {
-                "sources": [
-                    {"id": "a", "type": "github", "enabled": False},
-                    {"id": "b", "type": "markdown"},
-                    {"id": "c", "type": "ghost-type"},
-                ],
-                "embedding": {"provider": "echo"},
-            }
-        )
-        sources = build_sources(cfg, PROJECT_ROOT)
-        self.assertEqual([s.id for s in sources], ["b"])
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            cfg = AppConfig.model_validate(
+                {
+                    "sources": [
+                        {"id": "a", "type": "github", "enabled": False},
+                        {"id": "b", "type": "markdown"},
+                        {"id": "c", "type": "ghost-type"},
+                    ],
+                    "embedding": {"provider": "echo"},
+                }
+            )
+            sources = build_sources(cfg, Path(tmp.name))
+            self.assertEqual([s.id for s in sources], ["b"])
+        finally:
+            tmp.cleanup()
 
     def test_legacy_github_folding(self):
         """旧版顶层 github 段自动折叠为等效 source（向后兼容）。"""
@@ -108,16 +119,28 @@ class TestSources(unittest.TestCase):
 
     def test_collect_docs_empty_when_import_dir_missing(self):
         """流水线 collect_docs：导入目录不存在（markdown/pdf）应返回空而不中断。"""
+        import os
+        import tempfile
         from vllm_kb.pipeline import collect_docs
 
-        cfg = AppConfig.model_validate(
-            {
-                "sources": [{"id": "md", "type": "markdown", "path": "x"}],
-                "embedding": {"provider": "echo"},
-            }
-        )
-        docs = collect_docs(cfg, pull=False, limit=None)
-        self.assertEqual(docs, [])
+        tmp = tempfile.TemporaryDirectory()
+        old_root = os.environ.get("VLLM_KB_DATA_ROOT")
+        os.environ["VLLM_KB_DATA_ROOT"] = tmp.name
+        try:
+            cfg = AppConfig.model_validate(
+                {
+                    "sources": [{"id": "md", "type": "markdown", "path": "x"}],
+                    "embedding": {"provider": "echo"},
+                }
+            )
+            docs = collect_docs(cfg, pull=False, limit=None)
+            self.assertEqual(docs, [])
+        finally:
+            if old_root is None:
+                os.environ.pop("VLLM_KB_DATA_ROOT", None)
+            else:
+                os.environ["VLLM_KB_DATA_ROOT"] = old_root
+            tmp.cleanup()
 
 
 if __name__ == "__main__":
