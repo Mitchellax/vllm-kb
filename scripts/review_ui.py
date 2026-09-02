@@ -487,7 +487,7 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     @app.post("/api/configs/test")
     def test_config(body: dict):
         """连通性测试：embedding 发真实嵌入请求；OCR 用内置测试图走真实识别链路。"""
-        from vllm_kb.review import test_ocr_connectivity
+        from vllm_kb.review import ocr_connectivity_test
 
         name = body.get("name", "")
         if name == "embedding":
@@ -506,7 +506,7 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
                 raise HTTPException(502, f"embedding API 不可用: {e}")
         if name == "ocr":
             try:
-                r = test_ocr_connectivity(cfg)
+                r = ocr_connectivity_test(cfg)
             except ValueError as e:
                 raise HTTPException(400, str(e))
             if not r["ok"]:

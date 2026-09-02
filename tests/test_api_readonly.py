@@ -111,10 +111,14 @@ class TestReadOnlySearchEngine(unittest.TestCase):
             with self.assertRaises(ReadOnlyError):
                 engine.vector_store.add_items([])
             # SQLite 写操作抛错
-            with self.assertRaises(sqlite3.OperationalError):
-                engine._ro_conn().execute(
-                    "INSERT INTO docs (source_id, source_type) VALUES ('z','z')"
-                )
+            ro_conn = engine._ro_conn()
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro_conn.execute(
+                        "INSERT INTO docs (source_id, source_type) VALUES ('z','z')"
+                    )
+            finally:
+                ro_conn.close()
         finally:
             engine.close()
 

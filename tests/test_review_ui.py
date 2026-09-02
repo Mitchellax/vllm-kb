@@ -317,7 +317,7 @@ class ReviewUiApiTest(unittest.TestCase):
         cs = {c["name"]: c for c in self.client.get("/api/configs").json()}
         self.assertEqual(cs["ocr"]["model"], "table-ocr")
 
-    def test_configs_test_ocr_connectivity(self):
+    def test_configs_ocr_connectivity(self):
         """OCR 连通性测试端点：mock 引擎成功 → 200；未配置 → 400；失败 → 502。"""
         from unittest import mock as _mock
 

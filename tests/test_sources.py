@@ -44,14 +44,20 @@ class TestSources(unittest.TestCase):
             _s._REGISTRY.pop("custom")
 
     def test_unimplemented_source_raises_not_implemented(self):
-        # markdown/pdf/excel 已实现；excel 导入目录不存在时返回 0/空（schema-free，不抛错）
-        src = create_source(SourceCfg(id="xlsx", type="excel", path="data/imports/nonexist"))
-        self.assertEqual(src.pull(), 0)
-        self.assertEqual(src.canonicalize(), [])
-        # markdown 现在可用（导入目录不存在时返回 0/空，不抛错）
-        md = create_source(SourceCfg(id="md", type="markdown", path="data/imports/nonexist"))
-        self.assertEqual(md.pull(), 0)
-        self.assertEqual(md.canonicalize(), [])
+        # markdown/pdf/excel 已实现；导入目录不存在时返回 0/空（schema-free，不抛错）
+        # 用临时目录避免扫描真实仓库资产
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            nonexistent = str(Path(tmp.name) / "nonexist")
+            src = create_source(SourceCfg(id="xlsx", type="excel", path=nonexistent))
+            self.assertEqual(src.pull(), 0)
+            self.assertEqual(src.canonicalize(), [])
+            md = create_source(SourceCfg(id="md", type="markdown", path=nonexistent))
+            self.assertEqual(md.pull(), 0)
+            self.assertEqual(md.canonicalize(), [])
+        finally:
+            tmp.cleanup()
 
     def test_github_source_defaults_raw_dir_per_source(self):
         src = create_source(SourceCfg(id="vllm-ascend", type="github"), PROJECT_ROOT)

@@ -14,7 +14,7 @@ from vllm_kb.review import (
     api_configs,
     seed_case_title_flags,
     seed_verification_pending,
-    test_ocr_connectivity,
+    ocr_connectivity_test,
     update_config_json,
 )
 from vllm_kb.secrets import load_secrets, save_secret, secrets_path
@@ -428,7 +428,7 @@ class TestOcrConnectivity(unittest.TestCase):
 
     @mock.patch("vllm_kb.ocr.ocr_image", return_value=("vllm-kb OCR 123", 0.95))
     def test_api_ok(self, _m):
-        r = test_ocr_connectivity(self._cfg_with_image(
+        r = ocr_connectivity_test(self._cfg_with_image(
             ocr_provider="api", ocr_api_base="http://ocr:8000", ocr_api_model="table"))
         self.assertTrue(r["ok"])
         self.assertIn("vllm-kb OCR 123", r["detail"])
@@ -437,25 +437,25 @@ class TestOcrConnectivity(unittest.TestCase):
 
     @mock.patch("vllm_kb.ocr.ocr_image", side_effect=OcrApiError("conn refused"))
     def test_api_failure(self, _m):
-        r = test_ocr_connectivity(self._cfg_with_image(ocr_provider="api", ocr_api_base="http://x:1"))
+        r = ocr_connectivity_test(self._cfg_with_image(ocr_provider="api", ocr_api_base="http://x:1"))
         self.assertFalse(r["ok"])
         self.assertIn("conn refused", r["detail"])
 
     def test_no_image_source(self):
         with self.assertRaises(ValueError):
-            test_ocr_connectivity(make_cfg(self.root))
+            ocr_connectivity_test(make_cfg(self.root))
 
     def test_provider_none(self):
         with self.assertRaises(ValueError):
-            test_ocr_connectivity(self._cfg_with_image(ocr_provider="none"))
+            ocr_connectivity_test(self._cfg_with_image(ocr_provider="none"))
 
     def test_ask_without_api(self):
         with self.assertRaises(ValueError):
-            test_ocr_connectivity(self._cfg_with_image(ocr_provider="ask"))
+            ocr_connectivity_test(self._cfg_with_image(ocr_provider="ask"))
 
     @mock.patch("vllm_kb.ocr.ocr_image", return_value=("", 0.0))
     def test_paddle_local(self, _m):
-        r = test_ocr_connectivity(self._cfg_with_image(ocr_provider="paddle"))
+        r = ocr_connectivity_test(self._cfg_with_image(ocr_provider="paddle"))
         self.assertTrue(r["ok"])
 
 

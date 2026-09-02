@@ -99,7 +99,11 @@ class DocTagsTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(self._tags_of("pdf:a"), ["HCCL", "超时排查"])
-        g = get_doc_tags_conn(sqlite3.connect(self.kb), "pdf:a")
+        conn2 = sqlite3.connect(self.kb)
+        try:
+            g = get_doc_tags_conn(conn2, "pdf:a")
+        finally:
+            conn2.close()
         self.assertEqual(g["excluded"], [])
         self.assertEqual(g["reviewer"], "tester")
 
@@ -114,7 +118,11 @@ class DocTagsTest(unittest.TestCase):
             conn.close()
         # 自动标签变化（如提取规则更新）→ 重入库
         ingest_docs(self.cfg, [self.doc("pdf:a", ["HCCL", "超时排查", "网络"])], self.embed, self.store)
-        g = get_doc_tags_conn(sqlite3.connect(self.kb), "pdf:a")
+        conn3 = sqlite3.connect(self.kb)
+        try:
+            g = get_doc_tags_conn(conn3, "pdf:a")
+        finally:
+            conn3.close()
         self.assertEqual(g["auto_snapshot"], ["HCCL", "超时排查", "网络"])
         self.assertEqual(g["excluded"], ["超时排查"])  # 覆盖层保留
         # 最终标签 = (新自动 − 排除) ∪ 人工
