@@ -114,7 +114,19 @@
     ],
     "download_workers": 2
   },
-  "_comment_confidence": "置信度 = w_time * (alpha*w_ver + beta*w_rel)，最终分 = sim^gamma * conf^(1-gamma)。",
+  "_comment_code_graph": "代码图谱检索（gh-puller MCP Streamable HTTP 接入）：调用链/数据流/影响面/架构。与 code（本地版本化符号索引）互补不重叠。enabled=false 时 /code-graph/* 端点不注册。base_url+path 是 gh-puller HTTP 端点（默认端口 8787）。不可达时端点 503+引导用 code 命令（不回退本地）。",
+  "code_graph": {
+    "enabled": false,
+    "base_url": "",
+    "path": "/gh-puller/graph",
+    "timeout_seconds": 30,
+    "max_retries": 1,
+    "repo_project_map": {
+      "vllm-ascend": "vllm-project/vllm-ascend",
+      "vllm": "vllm-project/vllm"
+    }
+  },
+  "_comment_confidence": "置信度 = w_time * (alpha*w_ver + beta*w_rel)，最终分 = sim^gamma * conf^(1-gamma) * w_hist^sigma（w_hist 历史可靠度，行为遥测反馈，与 w_rel 正交）。feedback_enabled=False 时 w_hist=1.0 中性。feedback_* 参数见 vllm_kb/feedback_model.py。",
   "confidence": {
     "alpha": 0.6,
     "beta": 0.4,
@@ -130,7 +142,24 @@
       "official_doc": 0.85,
       "wiki": 0.7,
       "discussion": 0.5
-    }
+    },
+    "verification_weights": {
+      "unverified": 0.5,
+      "tested": 0.85,
+      "expert": 0.95
+    },
+    "feedback_enabled": false,
+    "feedback_half_life_days": 365.0,
+    "feedback_z": 1.0,
+    "feedback_n_min": 5.0,
+    "history_sigma": 0.5,
+    "history_sigma_min": 0.2,
+    "feedback_seed_success": 1.0,
+    "feedback_seed_fail": 1.0,
+    "telemetry_path": "data/telemetry.sqlite3",
+    "feedback_path": "data/confidence_feedback.json",
+    "strong_sig_kinds": ["kernel", "op", "errcode", "acl_code"],
+    "strong_sig_weight_min": 2.5
   },
   "_comment_retrieval": "default_target_version 兜底；查询时应显式传实际部署的 vLLM 版本或使用 'vllm-ascend:0.18.0 问题' 组件查询。prefer_unresolved_without_resolved: 无强匹配已解决问题时优先列未解决（含规避方案），resolved_min_similarity 为触发阈值。dedupe_by_doc 让同一 issue 只保留最高分 chunk。",
   "retrieval": {

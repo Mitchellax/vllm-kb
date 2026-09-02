@@ -111,6 +111,25 @@ python client.py graph evidence pdf:xxx             # 文档互证（Evidence）
 `graph evidence` 返回与目标文档**共享 ≥2 个实体**（算子/错误码/模型/版本/接口/标签）的其他文档——
 多来源互证信号（同一结论被多本手册佐证，可提高采信度）。
 
+### 9b) 代码图谱检索 `code-graph` —— 调用链/影响面/架构（gh-puller 接入）
+
+与 `code`（本地版本化符号索引）**并列、能力互补不重叠**：
+
+```bash
+python client.py code-graph search "update settings" --repo vllm        # 搜函数/类/路由（BM25/正则/语义）
+python client.py code-graph code-search "DispatchFFNCombine" --mode full  # grep + 图增强（去重到函数）
+python client.py code-graph trace do_auth --direction outbound --depth 5 # 调用链追踪（谁调用我/我调用谁）
+python client.py code-graph query "MATCH (n:Function)-[:CALLS]->(m) RETURN n.name"  # Cypher 查知识图谱
+python client.py code-graph architecture --aspects all                   # 架构总览（聚类/边界/热点）
+git diff | python client.py code-graph changes -                          # git diff → 变更影响面（blast radius）
+python client.py code-graph health                                        # 探测 gh-puller 可达性
+```
+
+- `code`（本地）强在：版本化定位、报错字面量索引、离线、跨版本 diff
+- `code-graph`（gh-puller）强在：跨函数调用链/数据流、变更影响面、架构聚类、跨仓边、语义搜索
+- gh-puller 不可达时 `code-graph` 返回 503 → 改用 `code` 查本地索引（手动）
+- `--graph-base` / `VLLM_KB_CODE_GRAPH_BASE` 独立寻址（缺省沿用 `--base`）
+
 ### 10) 文档标签（能力发现）`tags` / `context` —— "知识库有哪些文档能帮上这个问题"
 
 ```bash
