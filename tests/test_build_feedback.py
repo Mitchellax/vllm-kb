@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -128,8 +129,8 @@ class TestGapDetection(unittest.TestCase):
         self.cfg = _cfg(self.tmpdir)
 
     def test_strong_sig_zero_hits_hard_gap(self):
-        """强签名零命中跨≥3会话 → hard_gap。"""
-        sig_entities = json.dumps([{"kind": "kernel", "text": "DispatchFFN"}])
+        """强签名（kind 白名单 + weight≥2.5）零命中跨≥3会话 → hard_gap。"""
+        sig_entities = json.dumps([{"kind": "kernel", "text": "DispatchFFN", "weight": 3.5}])
         events = [
             _event("s1", _ts(0), "/signature-search", count=0, sig_hash="h1",
                    sig_entities=sig_entities),
@@ -142,6 +143,17 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["gap_type"], "hard_gap")
 
+    def test_short_errcode_weight_low_not_hard_gap(self):
+        """短码（weight<2.5 如 drvRetCode=6 weight=1.0）不判 hard_gap → quality_gap。"""
+        sig_entities = json.dumps([{"kind": "errcode", "text": "6", "weight": 1.0}])
+        events = [
+            _event(f"s{i}", _ts(i * 100), "/signature-search", count=0, sig_hash="h1",
+                   sig_entities=sig_entities) for i in range(4)
+        ]
+        gaps = bf.detect_gaps(events, self.cfg)
+        self.assertTrue(gaps)
+        self.assertEqual(gaps[0]["gap_type"], "quality_gap")
+
     def test_weak_sig_not_hard_gap(self):
         """弱签名（无 kernel/op/errcode）零命中 → quality_gap 非 hard_gap。"""
         sig_entities = json.dumps([{"kind": "phrase", "text": "timeout"}])
@@ -153,16 +165,28 @@ class TestGapDetection(unittest.TestCase):
         self.assertTrue(gaps)
         self.assertEqual(gaps[0]["gap_type"], "quality_gap")
 
-    def test_low_results_soft_gap(self):
-        """命中但少（1-2）→ soft_gap。"""
-        sig_entities = json.dumps([{"kind": "errcode", "text": "561000"}])
+    def test_hits_no_resolved_soft_gap(self):
+        """命中但全无 resolved 结论 → soft_gap（mock _count_resolved_docs 返回 0）。"""
+        sig_entities = json.dumps([{"kind": "errcode", "text": "561000", "weight": 3.0}])
         events = [
-            _event(f"s{i}", _ts(i * 100), "/signature-search", count=1, sig_hash="h1",
-                   sig_entities=sig_entities) for i in range(4)
+            _event(f"s{i}", _ts(i * 100), "/signature-search", doc_ids=["doc:x"],
+                   count=1, sig_hash="h1", sig_entities=sig_entities) for i in range(4)
         ]
-        gaps = bf.detect_gaps(events, self.cfg)
+        with mock.patch("build_feedback._count_resolved_docs", return_value=0):
+            gaps = bf.detect_gaps(events, self.cfg)
         self.assertTrue(gaps)
         self.assertEqual(gaps[0]["gap_type"], "soft_gap")
+
+    def test_hits_with_resolved_no_gap(self):
+        """命中且有 resolved → 不算缺口（有结论不缺知识）。"""
+        sig_entities = json.dumps([{"kind": "errcode", "text": "561000", "weight": 3.0}])
+        events = [
+            _event(f"s{i}", _ts(i * 100), "/signature-search", doc_ids=["doc:x"],
+                   count=1, sig_hash="h1", sig_entities=sig_entities) for i in range(4)
+        ]
+        with mock.patch("build_feedback._count_resolved_docs", return_value=1):
+            gaps = bf.detect_gaps(events, self.cfg)
+        self.assertEqual(len(gaps), 0)
 
     def test_less_than_3_sessions_no_gap(self):
         """<3 会话不记缺口。"""

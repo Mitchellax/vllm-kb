@@ -91,10 +91,37 @@ def _result_doc_ids(e: dict) -> set[str]:
         return set()
 
 
-def _is_strong_signature(entities_json: str, cfg: AppConfig) -> bool:
-    """强签名判定：kind 白名单（kernel/op/errcode）+ 排除结构性（signature.kind 已无结构性 kind）。
+def _count_resolved_docs(doc_ids: set[str], cfg: AppConfig) -> int:
+    """查 kb.sqlite3（只读）：命中 doc 中有多少已 resolved（status IN closed/merged AND resolved_at）。
 
-    weight 阈值后继从反馈数据学，先搁置（任何白名单 kind 即强签名）。
+    用于 soft_gap 判定——命中但全无 resolved 结论才算缺口。
+    """
+    if not doc_ids:
+        return 0
+    kb_path = cfg.resolve(cfg.storage.sqlite_path)
+    if not kb_path.exists():
+        return 0  # 库不存在，保守返回 0（视为无结论）
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(f"file:{kb_path}?mode=ro", uri=True)
+        try:
+            placeholders = ",".join("?" * len(doc_ids))
+            row = conn.execute(
+                f"SELECT count(*) FROM docs WHERE source_id IN ({placeholders}) "
+                f"AND status IN ('closed', 'merged') AND resolved_at IS NOT NULL",
+                list(doc_ids),
+            ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+    except Exception:
+        return 0  # 查询失败保守返回 0
+
+
+def _is_strong_signature(entities_json: str, cfg: AppConfig) -> bool:
+    """强签名判定：kind 白名单 + weight≥阈值（过滤短码如 drvRetCode=6 weight=1.0 根因太泛）。
+
+    weight 阈值 strong_sig_weight_min（默认 2.5，后继从反馈数据学）。
     """
     if not entities_json:
         return False
@@ -102,8 +129,12 @@ def _is_strong_signature(entities_json: str, cfg: AppConfig) -> bool:
         entities = json.loads(entities_json)
     except (json.JSONDecodeError, TypeError):
         return False
-    kinds = {e.get("kind", "") for e in entities if isinstance(e, dict)}
-    return bool(kinds & set(cfg.confidence.strong_sig_kinds))
+    wmin = cfg.confidence.strong_sig_weight_min
+    kinds = set(cfg.confidence.strong_sig_kinds)
+    return any(
+        e.get("kind") in kinds and e.get("weight", 0) >= wmin
+        for e in entities if isinstance(e, dict)
+    )
 
 
 def infer_feedback(events: list[dict], cfg: AppConfig) -> list[dict]:
@@ -243,14 +274,20 @@ def detect_gaps(events: list[dict], cfg: AppConfig) -> list[dict]:
 
         # 统计
         zero_hits = [e for e in evts if e.get("result_count", 0) == 0]
-        low_results = [e for e in evts if 0 < e.get("result_count", 0) <= 2]
+        has_hits = [e for e in evts if e.get("result_count", 0) > 0]
         component = evts[0].get("component", "")
 
         gap_type = None
         if is_strong and zero_hits:
             gap_type = "hard_gap"  # 强签名零命中
-        elif low_results and not zero_hits:
-            gap_type = "soft_gap"  # 命中但少（可能有内容无结论）
+        elif has_hits:
+            # 命中但无结论：查命中 doc 是否有 resolved（status IN closed/merged AND resolved_at）
+            all_doc_ids = set()
+            for e in has_hits:
+                all_doc_ids.update(_result_doc_ids(e))
+            resolved_count = _count_resolved_docs(all_doc_ids, cfg)
+            if resolved_count == 0:
+                gap_type = "soft_gap"  # 命中但全无 resolved 结论
         elif zero_hits:
             gap_type = "quality_gap"  # 零命中但弱签名
 

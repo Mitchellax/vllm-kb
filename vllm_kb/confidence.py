@@ -258,6 +258,7 @@ class ConfidenceBreakdown:
     w_hist: float = 1.0  # 后验下界 lb（n_eff=0 时 1.0 中性）
     n_eff: float = 0.0  # 加权有效证据量（unknown 不计）
     history_flag: str = "new"  # new/accumulating/supported/used_but_unconfirmed/evidence_thin/failing
+    sigma: float = 0.5  # lb 在 final 中的指数权重（n_eff 线性插值，避免 n_min 边界跳变）
 
 
 # 反馈表单例缓存（serve_api 启动时加载一次，改规则重跑 build_feedback + 重启生效）
@@ -323,6 +324,7 @@ def compute_confidence(
         w_hist=round(ps.w_hist, 4),
         n_eff=round(ps.n_eff, 4),
         history_flag=ps.history_flag,
+        sigma=round(ps.sigma, 4),
     )
 
 

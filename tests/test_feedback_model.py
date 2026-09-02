@@ -106,6 +106,35 @@ class TestPosteriorStats(unittest.TestCase):
         self.assertLess(ps.sd, 0.01)  # sd 很小但不精确为 0
         self.assertAlmostEqual(ps.lb, ps.mean, places=1)  # z 大时 lb 仍接近 mean
 
+    def test_sigma_linear_interpolation(self):
+        """sigma 在 n_eff 0→n_min 间线性插值 sigma_min→history_sigma。"""
+        cfg = _cfg(history_sigma=0.5, history_sigma_min=0.2, feedback_n_min=5.0)
+        # n_eff 接近 0 → sigma 接近 0.2
+        fb_low = DocFeedback(a=0.1, b=0.1, n_unknown=0.0, last_update_ts=_NOW.isoformat())
+        ps_low = compute_posterior(fb_low, cfg)
+        self.assertLess(ps_low.sigma, 0.3)  # 接近 0.2
+
+        # n_eff = n_min/2 → sigma 在 0.2 和 0.5 中间
+        fb_mid = DocFeedback(a=1.25, b=1.25, n_unknown=0.0, last_update_ts=_NOW.isoformat())
+        ps_mid = compute_posterior(fb_mid, cfg)
+        self.assertAlmostEqual(ps_mid.sigma, 0.35, places=2)  # (0.2+0.5)/2
+
+        # n_eff >= n_min → sigma = 0.5
+        fb_high = DocFeedback(a=5.0, b=0.0, n_unknown=0.0, last_update_ts=_NOW.isoformat())
+        ps_high = compute_posterior(fb_high, cfg)
+        self.assertEqual(ps_high.sigma, 0.5)
+
+    def test_sigma_no_jump_at_n_min(self):
+        """n_eff 跨过 n_min 时 sigma 无跳变（插值到 n_min 时≈history_sigma）。"""
+        cfg = _cfg(history_sigma=0.5, history_sigma_min=0.2, feedback_n_min=5.0)
+        # n_eff 略低于 n_min
+        fb_below = DocFeedback(a=2.5, b=2.49, n_unknown=0.0, last_update_ts=_NOW.isoformat())
+        ps_below = compute_posterior(fb_below, cfg)
+        # n_eff 略高于 n_min
+        fb_above = DocFeedback(a=2.5, b=2.51, n_unknown=0.0, last_update_ts=_NOW.isoformat())
+        ps_above = compute_posterior(fb_above, cfg)
+        self.assertAlmostEqual(ps_below.sigma, ps_above.sigma, places=2)
+
 
 class TestExponentialForgetting(unittest.TestCase):
     def test_hit_increases_a(self):

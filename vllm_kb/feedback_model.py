@@ -66,7 +66,7 @@ class DocFeedback:
 
 @dataclass
 class PosteriorStats:
-    """后验统计量 + w_hist + flag（当期值，每次查询重算，不缓存）。"""
+    """后验统计量 + w_hist + flag + sigma（当期值，每次查询重算，不缓存）。"""
     n_eff: float
     mean: Optional[float]  # n_eff=0 时 None
     sd: Optional[float]
@@ -74,17 +74,21 @@ class PosteriorStats:
     w_hist: float  # 历史可靠度（= lb，n_eff=0 时 1.0）
     n_unknown: float
     history_flag: str  # new/accumulating/supported/used_but_unconfirmed/evidence_thin/failing
+    sigma: float  # lb 在 final 中的指数权重（n_eff 线性插值 sigma_min→history_sigma，避免 n_min 边界跳变）
 
 
 def compute_posterior(fb: Optional[DocFeedback], cfg: ConfidenceCfg) -> PosteriorStats:
-    """从 DocFeedback 算后验统计量 + w_hist + flag（当期值不缓存）。
+    """从 DocFeedback 算后验统计量 + w_hist + flag + sigma（当期值不缓存）。
 
-    fb=None（无反馈记录的新文档）→ n_eff=0, w_hist=1.0, flag=new。
+    fb=None（无反馈记录的新文档）→ n_eff=0, w_hist=1.0, flag=new, sigma 不参与。
+    sigma 线性插值：n_eff 从 0→n_min 时 sigma 从 sigma_min→history_sigma，
+    n_eff≥n_min 后固定 history_sigma。避免 n_min 边界 lb^σ 跳变。
     """
     if fb is None or (fb.a + fb.b) <= 0:
         return PosteriorStats(
             n_eff=0.0, mean=None, sd=None, lb=1.0, w_hist=1.0,
             n_unknown=fb.n_unknown if fb else 0.0, history_flag="new",
+            sigma=cfg.history_sigma,  # n_eff=0 不参与（w_hist=1.0），值不影响
         )
 
     hit_w = fb.a
@@ -100,12 +104,22 @@ def compute_posterior(fb: Optional[DocFeedback], cfg: ConfidenceCfg) -> Posterio
     lb = (mean - z * sd) if (mean is not None and sd is not None) else 1.0
     lb = max(0.0, min(1.0, lb))  # 裁剪到 [0,1]
 
+    # sigma 线性插值（n_eff 0→n_min: sigma_min→history_sigma；≥n_min: history_sigma）
+    n_min = cfg.feedback_n_min
+    if n_eff >= n_min:
+        sigma = cfg.history_sigma
+    elif n_min > 0:
+        t = n_eff / n_min  # 0→1
+        sigma = cfg.history_sigma_min + t * (cfg.history_sigma - cfg.history_sigma_min)
+    else:
+        sigma = cfg.history_sigma
+
     # flag 判定（当期值，按 n_eff/mean/n_unknown 综合）
     flag = _determine_flag(n_eff, mean, fb.n_unknown, cfg)
 
     return PosteriorStats(
         n_eff=n_eff, mean=mean, sd=sd, lb=lb, w_hist=lb,
-        n_unknown=fb.n_unknown, history_flag=flag,
+        n_unknown=fb.n_unknown, history_flag=flag, sigma=sigma,
     )
 
 

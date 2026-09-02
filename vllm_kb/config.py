@@ -168,13 +168,15 @@ class ConfidenceCfg(BaseModel):
     feedback_half_life_days: float = 365.0  # 后验指数遗忘半衰期（复用 half_life_days 语义，可独立调）
     feedback_z: float = 1.0  # 后验下界 z（单侧置信分位数；冷启动保护强度，n_eff 大时 sd→0 无意义）
     feedback_n_min: float = 5.0  # n_eff 充分阈值（加权观察非次数；seed=1+1=2，数据部分≥3 超先验 1.5 倍才主导）
-    history_sigma: float = 0.5  # final 中 lb 的指数权重（final = sim^γ × conf^(1-γ) × lb^σ）
+    history_sigma: float = 0.5  # final 中 lb 的指数权重（n_eff≥n_min 时的稳态值；n_eff< n_min 时线性插值 sigma_min→history_sigma）
+    history_sigma_min: float = 0.2  # 冷启动期 lb 的最小指数权重（n_eff→0 时；弱干预避免少量反馈文档被压过低）
     feedback_seed_success: float = 1.0  # 先验 seed a（弱先验，随遗忘衰减，HL 决定失效）
     feedback_seed_fail: float = 1.0  # 先验 seed b
     telemetry_path: str = "data/telemetry.sqlite3"  # 行为遥测库（mode=rw，独立于只读 kb.sqlite3）
     feedback_path: str = "data/confidence_feedback.json"  # 离线产出的后验表（serve_api 启动加载）
     # 强签名判定：kind 白名单（可配）+ weight 阈值（后继从反馈数据学，先搁置）+ 结构性排除
     strong_sig_kinds: list[str] = Field(default_factory=lambda: ["kernel", "op", "errcode", "acl_code"])
+    strong_sig_weight_min: float = 2.5  # 强签名 weight 阈值（过滤短码如 drvRetCode=6 weight=1.0 根因太泛）
 
 
 class RetrievalCfg(BaseModel):

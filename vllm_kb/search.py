@@ -280,7 +280,7 @@ class SearchEngine:
                     similarity=round(m["sim"], 4),
                     confidence=conf,
                     final=round(final_score(m["sim"], conf.score, c_cfg.gamma,
-                                            w_hist=conf.w_hist, sigma=c_cfg.history_sigma), 4),
+                                            w_hist=conf.w_hist, sigma=conf.sigma), 4),
                     source=m["src"],
                     component=doc_comp,
                     resolved=resolved,

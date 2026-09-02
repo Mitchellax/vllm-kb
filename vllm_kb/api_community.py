@@ -86,6 +86,7 @@ def register(app, ctx) -> None:
                         "w_hist": r.confidence.w_hist,
                         "n_eff": r.confidence.n_eff,
                         "history_flag": r.confidence.history_flag,
+                        "sigma": r.confidence.sigma,
                     },
                     "snippet": _out(r.text[:500]),
                 }
