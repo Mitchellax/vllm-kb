@@ -11,6 +11,8 @@
 pip install -r requirements.txt        # 核心：requests / pydantic / lancedb / kuzu / fastapi / uvicorn
 ```
 
+> **Windows PowerShell**：设 `PYTHONUTF8=1`（`[Environment]::SetEnvironmentVariable("PYTHONUTF8","1","User")` 或会话内 `$env:PYTHONUTF8=1`）避免 GBK 输出乱码。client.py 已在进程内 reconfigure stdout 为 UTF-8，但子进程（如 test_doc_commands 的 `--help` 子进程）和管道场景仍需此变量。
+
 ### 1.2 配置（密钥走环境变量）
 
 ```bash

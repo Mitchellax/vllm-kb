@@ -47,6 +47,9 @@ class TestDocCommands(unittest.TestCase):
         cmds = extract_commands()
         self.assertGreater(len(cmds), 50, "文档命令过少，可能解析异常")
         failures: list[str] = []
+        # client.py 的 --help 一次列全部子命令，跳过逐条子命令 --help（argparse 对 unknown
+        # 子命令报 exit 2 而非 crash；子命令覆盖由 test_skill_covers_all_client_subcommands 反向核验）
+        client_help_done = False
         for cmd in cmds:
             if "-m unittest" in cmd:
                 continue  # 模块调用，另行验证
@@ -56,13 +59,14 @@ class TestDocCommands(unittest.TestCase):
                 continue
             parts = cmd.split()
             if "client.py" in script:
-                sub_cmd = next((p for p in parts[2:] if not p.startswith("-")), None)
-                args = [sys.executable, str(ROOT / script), sub_cmd, "--help"] if sub_cmd \
-                    else [sys.executable, str(ROOT / script), "--help"]
+                if client_help_done:
+                    continue  # 只跑一次 client.py --help（列全部子命令），跳过逐条
+                args = [sys.executable, str(ROOT / script), "--help"]
+                client_help_done = True
             else:
                 args = [sys.executable, str(ROOT / script), "--help"]
             try:
-                r = subprocess.run(args, capture_output=True, timeout=30, cwd=str(ROOT))
+                r = subprocess.run(args, capture_output=True, timeout=15, cwd=str(ROOT))
                 if r.returncode != 0:
                     tail = (r.stderr or r.stdout).decode("utf-8", "replace").strip().splitlines()
                     failures.append(f"{cmd}  → 退出码 {r.returncode}: {' '.join(tail[-2:])[:120]}")

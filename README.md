@@ -65,6 +65,7 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 ### 环境要求
 
 - Python 3.10+
+- **Windows PowerShell**：设 `PYTHONUTF8=1`（环境变量）避免 GBK 输出乱码（中文标题/URL 在默认 cp936 代码页下乱码或抛 UnicodeEncodeError；client.py 已在进程内 reconfigure stdout，但子进程/管道场景仍需此变量）
 - 磁盘：全量构建（vllm + vllm-ascend 双仓社区数据 + 代码快照 + 图）约 4~6GB；
   本仓库 `data/` 为已构建样例（~1GB：16k+ 文档 / 31k+ chunks）。若曾用旧版库反复增量入库，
   LanceDB 会累积历史版本致体积膨胀数十 GB，可用 `cleanup_old_versions()` 清理，见 [使用指南 §7](docs/USAGE.md#7-常见问题)
