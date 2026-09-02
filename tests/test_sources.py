@@ -16,14 +16,22 @@ from vllm_kb.models import KbDocument
 
 
 class TestSources(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)  # 所有构造统一临时 root，路径解析不落真实仓库
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
     def test_registry_types(self):
-        self.assertIsInstance(create_source(SourceCfg(id="a", type="github")), GithubSource)
-        self.assertIsInstance(create_source(SourceCfg(id="a", type="markdown")), MarkdownSource)
-        self.assertIsInstance(create_source(SourceCfg(id="a", type="excel")), ExcelSource)
+        self.assertIsInstance(create_source(SourceCfg(id="a", type="github"), self.root), GithubSource)
+        self.assertIsInstance(create_source(SourceCfg(id="a", type="markdown"), self.root), MarkdownSource)
+        self.assertIsInstance(create_source(SourceCfg(id="a", type="excel"), self.root), ExcelSource)
 
     def test_unknown_type_raises(self):
         with self.assertRaises(ValueError):
-            create_source(SourceCfg(id="a", type="nope"))
+            create_source(SourceCfg(id="a", type="nope"), self.root)
 
     def test_custom_registration(self):
         class MySource(BaseSource):
@@ -37,7 +45,7 @@ class TestSources(unittest.TestCase):
 
         register_source("custom", MySource)
         try:
-            self.assertIsInstance(create_source(SourceCfg(id="c", type="custom")), MySource)
+            self.assertIsInstance(create_source(SourceCfg(id="c", type="custom"), self.root), MySource)
         finally:
             from vllm_kb import sources as _s
 
