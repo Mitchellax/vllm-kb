@@ -45,15 +45,16 @@ class TestSources(unittest.TestCase):
 
     def test_unimplemented_source_raises_not_implemented(self):
         # markdown/pdf/excel 已实现；导入目录不存在时返回 0/空（schema-free，不抛错）
-        # 用临时目录避免扫描真实仓库资产
+        # 临时目录作 project_root：导入路径与资产层（data/assets/*）都不落真实仓库
         import tempfile
         tmp = tempfile.TemporaryDirectory()
         try:
-            nonexistent = str(Path(tmp.name) / "nonexist")
-            src = create_source(SourceCfg(id="xlsx", type="excel", path=nonexistent))
+            root = Path(tmp.name)
+            nonexistent = str(root / "nonexist")
+            src = create_source(SourceCfg(id="xlsx", type="excel", path=nonexistent), root)
             self.assertEqual(src.pull(), 0)
             self.assertEqual(src.canonicalize(), [])
-            md = create_source(SourceCfg(id="md", type="markdown", path=nonexistent))
+            md = create_source(SourceCfg(id="md", type="markdown", path=nonexistent), root)
             self.assertEqual(md.pull(), 0)
             self.assertEqual(md.canonicalize(), [])
         finally:
