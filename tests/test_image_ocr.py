@@ -149,13 +149,15 @@ class TestImageSource(unittest.TestCase):
 
     @mock.patch("vllm_kb.ocr.ocr_image", return_value=("", 0.0))
     @mock.patch("builtins.input", return_value="y")
-    def test_ask_no_api_yes_local(self, _in, _ocr):
-        """ask + 无 api_base：询问 → y → 本地 paddle 运行。"""
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    def test_ask_no_api_yes_local(self, _tty, _in, _ocr):
+        """ask + 无 api_base：询问 → y → 本地 paddle 运行（mock isatty 确保 input 链路被演练）。"""
         self.make_src(ocr_provider="ask").canonicalize()
         self.assertTrue(self.ocr_path().exists())
 
     @mock.patch("builtins.input", return_value="n")
-    def test_ask_no_api_no_skip(self, _in):
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    def test_ask_no_api_no_skip(self, _tty, _in):
         """ask + 无 api_base：询问 → n → 跳过 OCR（无产物）。"""
         self.make_src(ocr_provider="ask").canonicalize()
         self.assertFalse(self.ocr_path().exists())
@@ -169,7 +171,8 @@ class TestImageSource(unittest.TestCase):
     @mock.patch("vllm_kb.ocr.ocr_image",
                 side_effect=OcrApiError("connection refused"))
     @mock.patch("builtins.input", return_value="n")
-    def test_api_failure_ask_no_skip(self, _in, _ocr):
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    def test_api_failure_ask_no_skip(self, _tty, _in, _ocr):
         """provider=api 调用失败 → 询问 → n → 跳过。"""
         self.make_src(ocr_provider="api", ocr_api_base="http://127.0.0.1:9999").canonicalize()
         self.assertFalse(self.ocr_path().exists())
@@ -177,8 +180,9 @@ class TestImageSource(unittest.TestCase):
     @mock.patch("vllm_kb.ocr.ocr_image",
                 side_effect=[OcrApiError("down"), ("halMemCreate failed", 0.8)])
     @mock.patch("builtins.input", return_value="y")
-    def test_api_failure_ask_yes_local_retry(self, _in, _ocr):
-        """provider=api 失败 → 询问 → y → 本地重试成功。"""
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    def test_api_failure_ask_yes_local_retry(self, _tty, _in, _ocr):
+        """provider=api 失败 → 询问 → y → 本地重试成功（切换 paddle + 写产物）。"""
         self.make_src(ocr_provider="api", ocr_api_base="http://127.0.0.1:9999").canonicalize()
         self.assertTrue(self.ocr_path().exists())
         meta = json.loads(self.ocr_path().read_text(encoding="utf-8"))
