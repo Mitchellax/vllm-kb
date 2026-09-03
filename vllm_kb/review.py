@@ -1146,7 +1146,8 @@ def update_config_json(cfg: "AppConfig", section: str, fields: dict,
     """更新 config.json 的**非密钥**字段。
 
     section: embedding（顶层 embedding 段）| ocr（sources 中 type=image 条目）|
-             github（sources 中 github 条目的非密钥字段）。
+             github（sources 中 github 条目的非密钥字段）|
+             code_graph（顶层 code_graph 段：enabled/base_url/path）。
     密钥一律不写 config.json（走 secrets 文件，见 vllm_kb/secrets.py）。
     修改对已运行服务生效需重启。
     """
@@ -1171,6 +1172,10 @@ def update_config_json(cfg: "AppConfig", section: str, fields: dict,
             if sc.get("type") == "github":
                 sc.update(fields)
                 break
+    elif section == "code_graph":
+        # 顶层 code_graph 段（gh-puller 接入）：UI 只编辑 enabled/base_url/path
+        # （repo_project_map 等高级字段手工编辑 config.json）
+        data.setdefault("code_graph", {}).update(fields)
     else:
-        raise ValueError(f"未知配置段: {section}（支持 embedding | ocr | github）")
+        raise ValueError(f"未知配置段: {section}（支持 embedding | ocr | github | code_graph）")
     cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

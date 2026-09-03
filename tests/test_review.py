@@ -405,6 +405,37 @@ class TestSecrets(unittest.TestCase):
         with self.assertRaises(ValueError):
             update_config_json(self.cfg, "ocr", {"ocr_provider": "paddle"}, config_path=cfg_path)
 
+    def test_update_config_json_code_graph(self):
+        """code_graph 段可写（回归：review UI 编辑保存曾因不支持该段抛 ValueError
+        → 500 纯文本 → 前端 r.json() 报 unexpected token）。"""
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"code_graph": {"enabled": False,
+                                                       "base_url": "", "path": "/old"},
+                                        "sources": []}), encoding="utf-8")
+        update_config_json(self.cfg, "code_graph",
+                           {"enabled": True, "base_url": "http://gh-puller:8080",
+                            "path": "/api/graph"},
+                           config_path=cfg_path)
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["code_graph"]["enabled"], True)
+        self.assertEqual(data["code_graph"]["base_url"], "http://gh-puller:8080")
+        self.assertEqual(data["code_graph"]["path"], "/api/graph")
+
+    def test_update_config_json_code_graph_creates_section(self):
+        # config.json 原本无 code_graph 段：setdefault 创建
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"sources": []}), encoding="utf-8")
+        update_config_json(self.cfg, "code_graph", {"enabled": True}, config_path=cfg_path)
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["code_graph"], {"enabled": True})
+
+    def test_update_config_json_unknown_section(self):
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"sources": []}), encoding="utf-8")
+        with self.assertRaises(ValueError) as cm:
+            update_config_json(self.cfg, "nope", {}, config_path=cfg_path)
+        self.assertIn("code_graph", str(cm.exception))  # 错误信息列出全部支持段
+
 
 class TestOcrConnectivity(unittest.TestCase):
     def setUp(self):

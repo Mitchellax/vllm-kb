@@ -284,6 +284,39 @@ class ReviewUiApiTest(unittest.TestCase):
         r = self.client.post("/api/configs/save", json={"name": "nope", "fields": {}})
         self.assertEqual(r.status_code, 400)
 
+    def test_configs_save_code_graph(self):
+        """code_graph 编辑保存（回归：update_config_json 曾不支持该段 → 未接的
+        ValueError 变纯文本 500 → 前端 r.json() 报 unexpected token 无法保存）。"""
+        r = self.client.post("/api/configs/save",
+                             json={"name": "code_graph",
+                                   "fields": {"enabled": "true",
+                                              "base_url": "http://gh-puller:8080",
+                                              "path": "/api/graph"}})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        # config.json 段被创建/更新（enabled 字符串转 bool）
+        self.assertEqual(data["code_graph"]["enabled"], True)
+        self.assertEqual(data["code_graph"]["base_url"], "http://gh-puller:8080")
+        self.assertEqual(data["code_graph"]["path"], "/api/graph")
+        # /api/configs 立即反映（enabled+base_url → configured）
+        cs = {c["name"]: c for c in self.client.get("/api/configs").json()}
+        self.assertEqual(cs["code_graph"]["status"], "configured")
+        self.assertEqual(cs["code_graph"]["base_url"], "http://gh-puller:8080")
+
+    def test_configs_save_backend_valueerror_returns_json_400(self):
+        """后端 ValueError（如 ocr 无 image 来源）必须返回 JSON 400 而非纯文本 500
+        ——前端 j() 对非 JSON 响应报 unexpected token。"""
+        # 临时把 config.json 的 sources 换成无 image 条目
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        data["sources"] = [{"id": "github", "type": "github", "enabled": False}]
+        self.cfg_path.write_text(json.dumps(data), encoding="utf-8")
+        r = self.client.post("/api/configs/save",
+                             json={"name": "ocr", "fields": {"ocr_provider": "paddle"}})
+        self.assertEqual(r.status_code, 400)
+        # 响应是 JSON（前端可读 detail），不是纯文本
+        body = r.json()
+        self.assertIn("image", body["detail"])
+
     def test_configs_save_refreshes_status(self):
         """保存后 /api/configs 立即反映新状态（内存 cfg 重载，无需重启页面/服务）。"""
         cs = {c["name"]: c for c in self.client.get("/api/configs").json()}

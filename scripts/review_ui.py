@@ -454,31 +454,36 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
 
         name = body.get("name", "")
         fields = body.get("fields") or {}
-        if name == "embedding":
-            update_config_json(cfg, "embedding",
-                               {k: fields[k] for k in ("provider", "base_url", "model")
-                                if k in fields}, config_path=_config_path)
-            if "api_key" in fields:
-                save_secret(cfg, "EMBEDDING_API_KEY", fields.get("api_key") or "")
-        elif name == "ocr":
-            update_config_json(cfg, "ocr",
-                               {k: fields[k] for k in ("ocr_provider", "ocr_api_base",
-                                                       "ocr_api_model", "ocr_api_mode")
-                                if k in fields},
-                               config_path=_config_path)
-            if "ocr_api_key" in fields:
-                save_secret(cfg, "OCR_API_KEY", fields.get("ocr_api_key") or "")
-        elif name == "github":
-            if "token" in fields:
-                save_secret(cfg, "GITHUB_TOKEN", fields.get("token") or "")
-        elif name == "code_graph":
-            upd = {k: fields[k] for k in ("enabled", "base_url", "path") if k in fields}
-            # enabled 是 bool，前端传 "true"/"false" 字符串
-            if "enabled" in upd:
-                upd["enabled"] = upd["enabled"] in ("true", "True", "1", True)
-            update_config_json(cfg, "code_graph", upd, config_path=_config_path)
-        else:
-            raise HTTPException(400, f"未知配置: {name}")
+        # ValueError（未知配置段/缺来源等）转 400 JSON——不接会变纯文本 500，
+        # 前端 j() 的 r.json() 解析失败报 "Unexpected token"（code_graph 曾中招）
+        try:
+            if name == "embedding":
+                update_config_json(cfg, "embedding",
+                                   {k: fields[k] for k in ("provider", "base_url", "model")
+                                    if k in fields}, config_path=_config_path)
+                if "api_key" in fields:
+                    save_secret(cfg, "EMBEDDING_API_KEY", fields.get("api_key") or "")
+            elif name == "ocr":
+                update_config_json(cfg, "ocr",
+                                   {k: fields[k] for k in ("ocr_provider", "ocr_api_base",
+                                                           "ocr_api_model", "ocr_api_mode")
+                                    if k in fields},
+                                   config_path=_config_path)
+                if "ocr_api_key" in fields:
+                    save_secret(cfg, "OCR_API_KEY", fields.get("ocr_api_key") or "")
+            elif name == "github":
+                if "token" in fields:
+                    save_secret(cfg, "GITHUB_TOKEN", fields.get("token") or "")
+            elif name == "code_graph":
+                upd = {k: fields[k] for k in ("enabled", "base_url", "path") if k in fields}
+                # enabled 是 bool，前端传 "true"/"false" 字符串
+                if "enabled" in upd:
+                    upd["enabled"] = upd["enabled"] in ("true", "True", "1", True)
+                update_config_json(cfg, "code_graph", upd, config_path=_config_path)
+            else:
+                raise HTTPException(400, f"未知配置: {name}")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         # 重载内存 cfg（读 config.json + secrets），/api/configs 立即反映
         cfg = AppConfig.load(_config_path, require_keys=False) if _config_path \
             else AppConfig.load(None, require_keys=False)
