@@ -287,6 +287,44 @@ class TestGithubConvert(unittest.TestCase):
         doc = GithubPuller(make_source(), PROJECT_ROOT)._to_doc(item, [])
         self.assertEqual(doc.status, "merged")
         self.assertEqual(doc.extra.get("merge_commit_sha"), "abc123def")
+        # 旧 raw（无 head 字段）：extra 不含 head 键
+        self.assertNotIn("head_repo", doc.extra)
+
+    def test_item_from_graphql_pr_node_head_metadata(self):
+        """PR head 三元组：fork 仓/分支/锁定 commit（commits.last=合并时 head，不随分支漂移）。"""
+        node = {
+            "number": 9, "title": "[Fix]: fork work", "body": "x",
+            "state": "MERGED", "createdAt": "2026-02-01T00:00:00Z",
+            "closedAt": "2026-02-03T00:00:00Z", "url": "https://github.com/x/pull/9",
+            "author": {"login": "carol"}, "labels": {"nodes": []},
+            "merged": True, "mergedAt": "2026-02-03T00:00:00Z",
+            "mergeCommit": {"oid": "m" * 40},
+            "headRefName": "dev_hy4",
+            "headRepository": {"nameWithOwner": "voidvelocity/vllm"},
+            "commits": {"nodes": [{"commit": {"oid": "h" * 40}}]},
+        }
+        item = GithubPuller._item_from_node(node, is_pr=True)
+        pr = item["pull_request"]
+        self.assertEqual(pr["head_repo"], "voidvelocity/vllm")
+        self.assertEqual(pr["head_branch"], "dev_hy4")
+        self.assertEqual(pr["head_sha"], "h" * 40)
+        doc = GithubPuller(make_source(), PROJECT_ROOT)._to_doc(item, [])
+        self.assertEqual(doc.extra.get("head_repo"), "voidvelocity/vllm")
+        self.assertEqual(doc.extra.get("head_branch"), "dev_hy4")
+        self.assertEqual(doc.extra.get("head_sha"), "h" * 40)
+
+    def test_item_from_graphql_pr_node_no_commits(self):
+        # commits 节点缺失（查询裁剪/异常形态）：head_sha 为 None，不抛异常
+        node = {
+            "number": 11, "title": "t", "body": "b", "state": "OPEN",
+            "createdAt": "2026-03-01T00:00:00Z", "closedAt": None,
+            "url": "https://github.com/x/pull/11", "author": {"login": "d"},
+            "labels": {"nodes": []}, "merged": False, "mergedAt": None,
+            "headRefName": "feature",
+        }
+        item = GithubPuller._item_from_node(node, is_pr=True)
+        self.assertIsNone(item["pull_request"]["head_sha"])
+        self.assertEqual(item["pull_request"]["head_branch"], "feature")
 
     def test_graphql_states_mapping(self):
         from vllm_kb.github_pull import GithubPuller as GP
@@ -841,6 +879,9 @@ class TestPullMissing(unittest.TestCase):
             "labels": [{"name": "bug"}], "user": {"login": "alice"},
             "merged": True, "merged_at": "2026-06-01T00:00:00Z",
             "merge_commit_sha": "abc123",
+            # REST /pulls/{n} 原生 head 三元组
+            "head": {"ref": "dev_hy4", "sha": "9" * 40,
+                     "repo": {"full_name": "voidvelocity/vllm"}},
         }
 
     @staticmethod
@@ -872,6 +913,10 @@ class TestPullMissing(unittest.TestCase):
             self.assertTrue(item["pull_request"]["merged"])
             self.assertEqual(item["pull_request"]["merged_at"], "2026-06-01T00:00:00Z")
             self.assertEqual(item["user"]["login"], "alice")
+            # REST head 三元组透传到 raw item
+            self.assertEqual(item["pull_request"]["head_repo"], "voidvelocity/vllm")
+            self.assertEqual(item["pull_request"]["head_branch"], "dev_hy4")
+            self.assertEqual(item["pull_request"]["head_sha"], "9" * 40)
             cp = puller._load_checkpoint()
             self.assertIn("42", cp["issues"])
             self.assertEqual(len(calls), 1)  # 只发 pulls 一次（fetch_comments=False 不拉评论）

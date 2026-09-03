@@ -174,6 +174,9 @@ class GithubPuller:
           nodes {
             number title body state createdAt updatedAt closedAt url merged mergedAt
             mergeCommit { oid }
+            headRefName
+            headRepository { nameWithOwner }
+            commits(last: 1) { nodes { commit { oid } } }
             author { login }
             labels(first: 20) { nodes { name } }
             comments(first: 100) @include(if: $withComments) {
@@ -283,10 +286,18 @@ class GithubPuller:
             "user": {"login": (node.get("author") or {}).get("login") or "unknown"},
         }
         if is_pr:
+            # head 三元组（PR 来自哪个 fork 仓/分支/锁在哪个 commit）：
+            # commits(last:1) 即合并时的 head commit（merged 后分支推进也不漂移；
+            # headRefOid 会随分支移动，不用）
+            head_commits = (node.get("commits") or {}).get("nodes") or []
+            head_sha = (head_commits[0].get("commit") or {}).get("oid") if head_commits else None
             item["pull_request"] = {
                 "merged": bool(node.get("merged")),
                 "merged_at": node.get("mergedAt"),
                 "merge_commit_sha": (node.get("mergeCommit") or {}).get("oid"),
+                "head_repo": (node.get("headRepository") or {}).get("nameWithOwner"),
+                "head_branch": node.get("headRefName"),
+                "head_sha": head_sha,
             }
         return item
 
@@ -625,6 +636,11 @@ class GithubPuller:
                 "merged_at": pr_info.get("merged_at"),
                 "merge_commit_sha": pr_info.get("merge_commit_sha"),
             }
+            # PR head 三元组：来自哪个 fork 仓/分支/锁在哪个 commit（fork 快照交叉定位）
+            if pr_info.get("head_repo") or pr_info.get("head_branch") or pr_info.get("head_sha"):
+                extra["head_repo"] = pr_info.get("head_repo")
+                extra["head_branch"] = pr_info.get("head_branch")
+                extra["head_sha"] = pr_info.get("head_sha")
             # PR 正文提到版本不可靠（常见于兼容性/变更说明），版本信号只信标签
             span_min = self._version_from_labels(labels)
             component_versions: dict[str, str] = {}
@@ -727,10 +743,15 @@ class GithubPuller:
             "user": {"login": (data.get("user") or {}).get("login") or "unknown"},
         }
         if is_pr:
+            head = data.get("head") or {}
             item["pull_request"] = {
                 "merged": bool(data.get("merged")),
                 "merged_at": data.get("merged_at"),
                 "merge_commit_sha": data.get("merge_commit_sha"),
+                # REST /pulls/{n} 原生 head：{ref, sha, repo.full_name}
+                "head_repo": ((head.get("repo") or {}).get("full_name")),
+                "head_branch": head.get("ref"),
+                "head_sha": head.get("sha"),
             }
         return item
 
