@@ -368,16 +368,30 @@ def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
                             timeout: int = 300) -> str:
     """下载 clone 层 blob（~75MB）并扫描 .git，返回锁定 commit（失败 ''）。
 
-    先按 gzip 流解（docker 层标准存储格式），失败再按未压缩 tar 兜底。
+    流式下载 + 每 10MB 进度行（75MB 层在内网慢链路上要跑数分钟，静默会被
+    误判为卡死）。先按 gzip 流解（docker 层标准存储格式），失败再按未压缩
+    tar 兜底。
     """
     import gzip
     import io
     import tarfile
 
     r = session.get(f"{v2}/blobs/{layer_digest}",
-                    headers={"Authorization": "Bearer " + token}, timeout=timeout)
+                    headers={"Authorization": "Bearer " + token},
+                    timeout=timeout, stream=True)
     r.raise_for_status()
-    data = r.content
+    buf = io.BytesIO()
+    got = 0
+    next_mark = 10 << 20
+    for chunk in r.iter_content(1 << 20):
+        if not chunk:
+            continue
+        buf.write(chunk)
+        got += len(chunk)
+        if got >= next_mark:
+            print(f"[matrix]    clone 层下载中 {got >> 20} MB ...", flush=True)
+            next_mark += 10 << 20
+    data = buf.getvalue()
     for open_ in (lambda: gzip.GzipFile(fileobj=io.BytesIO(data)),
                   lambda: io.BytesIO(data)):
         try:
@@ -395,6 +409,9 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries:
 
     返回 {"sha": 40-hex 或 "", "layer": 层 digest, "error": 失败原因}。
     层内的 .git 是构建时 git clone 留下的（depth 1），不随 fork 分支推进漂移。
+
+    层 SHA 缓存（data/cache/fork_sha.json）：层 digest 不可变 → 扫描结果永久
+    有效，跨运行复用（首次扫描后，即使矩阵未写盘/删掉，也不重下 75MB 层）。
     """
     from vllm_kb.net import get_session
 
@@ -408,6 +425,11 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries:
         return out
     layer_digest = layers[j]
     out["layer"] = layer_digest
+    cache = _cache_load(_FORK_SHA_CACHE)
+    hit = cache.get(layer_digest) or {}
+    if hit.get("sha"):
+        out["sha"] = hit["sha"]
+        return out
     session = get_session(insecure)
     v2 = _quay_v2(qbase)
     for attempt in range(2):
@@ -415,6 +437,8 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries:
             sha = _scan_layer_for_git_sha(session, v2, layer_digest, token, timeout=max(timeout, 300))
             if sha:
                 out["sha"] = sha
+                cache[layer_digest] = {"sha": sha, "scanned_at": time.time()}
+                _cache_save(_FORK_SHA_CACHE, cache)
             else:
                 out["error"] = "clone 层内未找到 .git commit（浅克隆元数据被清理？）"
             return out
@@ -550,6 +574,42 @@ def default_code_root() -> str:
         return cfg.get("storage", {}).get("code_root", "data/code")
     except Exception:
         return "data/code"
+
+
+# ---------------- 跨运行缓存（data/cache/，不可变对象的扫描/拉取结果复用） ----------------
+# fork clone 层 SHA：层 digest 不可变 → 扫描结果永久有效；
+# GitHub release 说明：历史 release body 不可变（TTL 兜底新 release 更新）；
+# requirements 兜底结果：tag 内容不可变（含 404）。
+# 网络失败/部分数据一律不写缓存（下次重试），--refresh-cache 强制重拉。
+
+_FORK_SHA_CACHE = "fork_sha.json"
+_RELEASES_CACHE = "github_releases.json"
+_REQ_CACHE = "github_requirements.json"
+
+
+def default_cache_dir() -> Path:
+    """矩阵缓存根（默认 data/cache；config.json storage.cache_root 可覆盖）。"""
+    try:
+        cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+        return Path(cfg.get("storage", {}).get("cache_root", "data/cache"))
+    except Exception:
+        return Path("data/cache")
+
+
+def _cache_load(name: str) -> dict:
+    try:
+        return json.loads((default_cache_dir() / name).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _cache_save(name: str, data: dict) -> None:
+    try:
+        p = default_cache_dir() / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        print(f"[matrix] 缓存写入失败（{name}）: {e}", flush=True)
 
 
 def _requirements_from_snapshot(tag: str) -> str:

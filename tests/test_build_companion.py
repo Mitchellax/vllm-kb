@@ -407,6 +407,15 @@ class TestForkShaExtraction(unittest.TestCase):
     ]
     LAYERS = ["sha256:apt", "sha256:clone"]
 
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self._urls = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
     def _run_extract(self, layer_members, gz=True):
         from unittest import mock
 
@@ -416,6 +425,7 @@ class TestForkShaExtraction(unittest.TestCase):
             {"digest": d} for d in self.LAYERS]}
         config_blob = {"config": {"Env": []}, "history": self.HISTORY}
         layer_bytes = self._layer_bytes(layer_members, gz=gz)
+        self._urls = []
 
         class _Resp:
             def __init__(self, json_data=None, content=b""):
@@ -427,7 +437,12 @@ class TestForkShaExtraction(unittest.TestCase):
             def json(self):
                 return self._json
 
+            def iter_content(self, chunk_size=1 << 20):
+                for i in range(0, len(self.content), chunk_size):
+                    yield self.content[i:i + chunk_size]
+
         def fake_get(url, **kw):
+            self._urls.append(url)
             if url.endswith("/manifest/sha256:list"):
                 return _Resp({"manifest_data": json.dumps(manifest_list)})
             if url.endswith("/manifest/sha256:sub"):
@@ -438,10 +453,33 @@ class TestForkShaExtraction(unittest.TestCase):
                 return _Resp(content=layer_bytes)
             raise AssertionError(f"意外 URL: {url}")
 
-        with mock.patch("vllm_kb.net.get_session") as ms:
+        # 临时缓存目录（层 SHA 缓存落盘，防污染真实 data/cache；同一测试内
+        # 多次调用共享目录——缓存命中断言的前提）
+        with mock.patch("vllm_kb.net.get_session") as ms, \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=Path(self._tmp.name)):
             ms.return_value.get.side_effect = fake_get
             return bm.extract_fork_sha(
                 {"name": "glm5.2-a3", "manifest_digest": "sha256:list"}, "T")
+
+    def test_layer_sha_cached_across_runs(self):
+        """层 SHA 缓存：首次扫描落盘，二次运行不再下载 75MB 层 blob。
+
+        回归：缓存按层 digest（不可变）键控，即使矩阵未写盘/行内无
+        vllm_sha（digest 锚不适用）也命中——内网慢链路每次重下 75MB 的痛点。"""
+        members = [("vllm-workspace/vllm/.git/shallow", self.SHA.encode() + b"\n")]
+        out1 = self._run_extract(members)
+        self.assertEqual(out1["sha"], self.SHA)
+        self.assertTrue(any(u.endswith("/blobs/sha256:clone") for u in self._urls))
+        # 缓存文件已写
+        cache = json.loads((Path(self._tmp.name) / "fork_sha.json").read_text(encoding="utf-8"))
+        self.assertEqual(cache["sha256:clone"]["sha"], self.SHA)
+        # 第二次：manifest+config 仍拉（小请求），clone 层 blob 不再下载
+        out2 = self._run_extract(members)
+        self.assertEqual(out2["sha"], self.SHA)  # 结果来自缓存
+        self.assertEqual(out2["error"], "")
+        self.assertFalse(any(u.endswith("/blobs/sha256:clone") for u in self._urls),
+                         f"缓存命中后不应再下载层 blob: {self._urls}")
 
     def test_shallow_sha(self):
         members = [
