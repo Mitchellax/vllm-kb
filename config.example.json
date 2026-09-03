@@ -92,7 +92,7 @@
     "max_chunk_chars": 4000,
     "overlap_chars": 200
   },
-  "_comment_storage": "vector_backend: lancedb（推荐）| python（纯标准库兜底）。canonical_file: 多来源统一单文件（不按来源拆分）。companion_file: vllm-ascend 组件配套矩阵（scripts/fetch_quay_tags.py 辅助生成+人工核对）。release_calendar: Phase 1 由 Releases API 生成 tag->日期 映射。code_root: 版本化代码仓根目录（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json），由 scripts/build_code_snapshots.py / build_vllm_snapshots.py 生成。",
+  "_comment_storage": "vector_backend: lancedb（推荐）| python（纯标准库兜底）。canonical_file: 多来源统一单文件（不按来源拆分）。companion_file: vllm-ascend 组件配套矩阵（scripts/fetch_quay_tags.py 辅助生成+人工核对）。release_calendar: Phase 1 由 Releases API 生成 tag->日期 映射。code_root: 版本化代码仓根目录（zips/{version}.zip + snapshots/{version}/ + forks/{model}/ + index.sqlite3 + symbols.json），由 scripts/build_code_snapshots.py / build_vllm_snapshots.py / build_fork_snapshots.py 生成。cache_root: 跨运行缓存目录（fork 层 SHA / GitHub releases / requirements 兜底；不可变对象复用，防限流与重复下载，可整个删掉重建）。",
   "storage": {
     "vector_backend": "lancedb",
     "lancedb_path": "data/lancedb",
@@ -101,6 +101,7 @@
     "companion_file": "data/compatibility/vllm-ascend.json",
     "release_calendar": "data/compatibility/release_calendar.json",
     "code_root": "data/code",
+    "cache_root": "data/cache",
     "graph_path": "data/graph",
     "review_path": "data/review.sqlite3"
   },

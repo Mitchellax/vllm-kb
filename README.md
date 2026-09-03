@@ -20,13 +20,19 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   FIXES/MERGED_IN/MENTIONS/DOCUMENTS 边——**修复链路追溯**（`graph chain`：issue→修复 PR→落地 release，
   "这个修复是否已进入我的部署版本"）、**手册定义查询**（错误码/命令在哪个手册定义）
 - **版本化代码仓**：预存 vllm-ascend 各版本 + 对应 vllm 主仓源码快照，按部署版本定位 `file:line`；
+  **0day fork 仓**（hy4/glm5.2 等模型开发分支）按镜像锁定 commit 拉取快照，独立 `fork:{model}`
+  命名空间检索（与官方版本物理隔离，默认检索不混入）；PR 采集带 head 三元组
+  （fork 仓/分支/锁定 commit），与 fork 快照对齐；
   `--in-file` 限定文件检索、`--per-version` 版本差异对比、`diff` 命令跨版本精确 diff 定位修复引入版本
   （`--keyword` 过滤相关差异行）；`--file --max-chars` 读取完整源码（截断带明确标记）、
   `--list` 对比可用/已存/缺失版本
 - **版本日历**：正式 release / rc 形态判断（`version 0.18.0` → release），置信度版本上界映射
 - **组件配套矩阵**：vllm-ascend → vllm/cann/pytorch-ascend 自动匹配——vllm 取镜像 `VLLM_TAG`
-  （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、PTA 从对应 tag 的 `requirements.txt`
-  提取（0day 模型经 vllm 版本关联）；写回前版本号正则校验，非法值置空
+  （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、torch/PTA 从对应 tag 的
+  `requirements.txt` 提取（**本地快照优先**，0day 模型同 minor 系列回退）；
+  **fork 行**（0day 模型镜像）自动扫描 git clone 层固化锁定 commit（digest 锚定 + 层 digest
+  磁盘缓存，跨运行零重复下载）；GitHub releases/requirements 跨运行缓存——全命中时
+  API 请求为 0，不受未认证限流约束；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
   Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）；
@@ -146,6 +152,7 @@ python skills/vllm-kb/client.py version 0.18.0          # → release（正式�
 # 对应版本源码定位
 python skills/vllm-kb/client.py code DispatchFFNCombine --version v0.23.0rc1
 python skills/vllm-kb/client.py code make_zmq_socket --repo vllm --version 0.22.1
+python skills/vllm-kb/client.py code mega_moe --repo fork:glm5.2 --version 418bd6273c03  # 0day fork 仓（锁定 commit）
 python skills/vllm-kb/client.py code "fill_(-1)" --in-file worker/model_runner_v1.py --per-version  # 定位修复引入版本
 python skills/vllm-kb/client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"  # 跨版本精确 diff（新增行=修复引入点）
 
@@ -188,11 +195,13 @@ python scripts/build_release_calendar.py --all-repos
 # 6. 版本化代码仓快照（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json）
 python scripts/build_code_snapshots.py          # vllm-ascend 版本
 python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本（配套矩阵映射，自动跟随）
+python scripts/build_fork_snapshots.py          # 0day fork 仓（--model 指定模型；独立 forks 命名空间，按镜像锁定 SHA 拉取）
 #    符号索引（index.sqlite3）是派生数据：提取规则/schema 升级后重建
 #    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
 
 # 7. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
 python scripts/build_companion_matrix.py        # 生成/更新 data/compatibility/vllm-ascend.json
+python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（fork 层 SHA/GitHub 数据）
 python scripts/fetch_quay_tags.py               # 拉 quay.io 镜像 tag（看护策略过滤日构建/分支/主干）
 
 # 8. 图存储重建（修复链路/手册定义；需先停检索服务，Kùzu 单写者）
@@ -239,6 +248,7 @@ data/
 ├── code/                   # 版本化代码仓
 │   ├── zips/               # vllm-ascend 各版本源码 zip
 │   ├── snapshots/          # 解压后的源码快照（按需读取 / diff，版本子目录）
+│   ├── forks/              # 0day fork 仓快照（{model}/ 子目录，按镜像锁定 commit；与官方版本物理隔离）
 │   ├── index.sqlite3       # 符号索引（算子名→文件:行号 + 报错字面量索引）
 │   ├── symbols.json        # 三层签名提取的符号表
 │   └── signal_words.json   # 社区高频信号词（build_signal_words.py 生成，供 agent 判断）
@@ -246,6 +256,7 @@ data/
 ├── assets/                 # 业务来源原始资产（pdf/md/images，不可变，sha256）
 ├── parsed/                 # 解析产物（PDF 表格 JSON、OCR 结果，可重跑；建图时提取表格→错误码）
 ├── imports/                # 业务数据放置目录（pdf/md/xlsx）
+├── cache/                  # 跨运行缓存（fork 层 SHA / GitHub releases / requirements 兜底；不可变对象复用，防限流与重复下载）
 ├── review.sqlite3          # 审核工作台队列（认证/存疑/删除）
 ├── tag_candidates_manual.json  # 标签候选人工审阅输出（可手动同步进 config.tags.registry）
 ├── checkpoints/            # 采集断点（续传）

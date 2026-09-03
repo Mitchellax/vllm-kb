@@ -46,7 +46,7 @@
 
 | 阶段 | 处理 | 产物 |
 |---|---|---|
-| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR）+ 评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/`）原始 JSON 快照（**事实源**，可重放） |
+| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR，PR 带 head 三元组 `head_repo/head_branch/head_sha`——fork PR 的来源仓/分支/锁定 commit，与 fork 快照对齐）+ 评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/`）原始 JSON 快照（**事实源**，可重放） |
 | 2. 规范化 | `src.canonicalize()`：原始 JSON → 统一 `KbDocument`（source_id / title / body / 组件 / 版本区间 / status / extra） | 追加/upsert 到统一 `data/raw/canonical.jsonl`（按 source_id 幂等） |
 | 3. 入库 | `ingest_docs()`（见 2.6） | LanceDB 向量 + kb.sqlite3 |
 
@@ -72,6 +72,7 @@
 |---|---|
 | `python scripts/build_code_snapshots.py` | vllm-ascend 各版本：`data/code/zips/{version}.zip` + 解压 `data/code/snapshots/{version}/` |
 | `python scripts/build_vllm_snapshots.py` | 对应 vllm 主仓快照（版本由配套矩阵映射，自动跟随） |
+| `python scripts/build_fork_snapshots.py` | 0day fork 仓快照（hy4/glm5.2 等模型开发分支）：`data/code/forks/{model}/`，版本=镜像锁定 commit（SHA 前 12 位）——检索走 `repo=fork:{model}` 命名空间，与官方版本物理隔离 |
 | `python scripts/build_code_snapshots.py --index-only` | 派生数据重建：`data/code/index.sqlite3`（符号索引 + 报错字面量索引）、`symbols.json`（三层签名符号表）、`signal_words.json`（社区高频信号词） |
 
 ### 2.4 辅助数据
@@ -79,7 +80,7 @@
 | 命令 | 产物 | 用途 |
 |---|---|---|
 | `python scripts/build_release_calendar.py --all-repos` | `data/compatibility/release_calendar.{repo}.json`（分仓） | 版本形态判断（release/rc/pre）+ 置信度版本上界（查询期现算） |
-| `python scripts/build_companion_matrix.py`（`fetch_quay_tags.py` 辅助） | `data/compatibility/vllm-ascend.json` | 组件配套反向展开（vllm-ascend:0.18.0 → vllm/cann/pytorch-ascend） |
+| `python scripts/build_companion_matrix.py`（`fetch_quay_tags.py` 辅助） | `data/compatibility/vllm-ascend.json`（fork 行含 `vllm_repo/ref/base/sha/image_digest`）+ 跨运行缓存 `data/cache/`（fork 层 SHA 永久 / GitHub releases TTL 7 天 / requirements 永久，`--refresh-cache` 强制刷新） | 组件配套反向展开（vllm-ascend:0.18.0 → vllm/cann/pytorch-ascend）；fork 行锁定 commit 供 `build_fork_snapshots.py` 按 SHA 拉快照 |
 
 ### 2.5 图存储（Kùzu）
 
@@ -132,6 +133,7 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | `title "关键词"` | `GET /title` | `kb.sqlite3` `docs` 表（title / source_id SQL LIKE） | 已知现象找 issue 最快路径 |
 | `version 0.18.0` | `GET /version` | `data/compatibility/release_calendar.{repo}.json` | 版本形态判断 |
 | `code <关键词>` | `POST /code/search` | `data/code/index.sqlite3` 符号索引命中；未命中退 grep 版本快照（`snapshots/`，按需解压 zip）| `--in-file` 限文件、`--per-version` 分版本；`--kind msg` 走报错字面量索引 |
+| `code --repo vllm` / `--repo fork:{model}` | 同上（repo 参数路由） | vllm 主仓快照（`build_vllm_snapshots.py`）/ 0day fork 仓快照（`data/code/forks/{model}/`，版本=锁定 commit）| fork 命名空间与官方版本物理隔离，必须显式传 `repo=fork:` 才命中 |
 | `code --file <路径>` | `GET /code/file` | `data/code` 指定版本快照文件（截断带标记） | |
 | `diff <v1> <v2> <路径>` | `GET /code/diff` | 两个版本快照同一文件的 unified diff（difflib） | `--keyword` 只留相关差异行 |
 | `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单 | 管理员调试 |

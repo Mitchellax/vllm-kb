@@ -130,8 +130,14 @@ python scripts/build_code_snapshots.py --all       # 全量预存（所有 tag�
 python scripts/build_vllm_snapshots.py --list      # 先看要拉哪些（已预存/缺失分组）
 python scripts/build_vllm_snapshots.py             # 全部下载 + 建索引
 
+# 版本化代码仓：0day fork 仓（hy4/glm5.2 等模型开发分支，独立 forks 命名空间）
+python scripts/build_fork_snapshots.py --list      # fork 行状态（模型/锁定 SHA/已预存）
+python scripts/build_fork_snapshots.py             # 全部模型快照 + 建索引
+python scripts/build_fork_snapshots.py --model hy4 # 只拉指定模型
+
 # 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配）
 python scripts/build_companion_matrix.py
+python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（默认按 TTL/不可变语义命中）
 
 # FTS5 全文索引重建（jieba 中文分词——可选，不重嵌向量；装 jieba 或升级分词规则后重跑）
 python scripts/build_fts.py                     # 读现有 chunk 原文重新分词重建 chunks_fts
@@ -163,12 +169,31 @@ python scripts/build_companion_matrix.py         # 全部脚本自动走内网�
 
 **配套矩阵自动匹配规则**（`build_companion_matrix.py`）：
 
-- `vllm`：镜像 Env 的 `VLLM_TAG`（构建时锁定，最可靠）> GitHub release 说明 > 版本号启发式；
+- `vllm`：镜像 Env 的 `VLLM_TAG`（构建时锁定，最可靠）> 镜像 buildkit history（fork 仓
+  `VLLM_REPO/VLLM_REF/VLLM_BASE`）> GitHub release 说明 > 版本号启发式；
+- **fork 行**（0day 模型镜像，如 `hy4`/`glm5.2`）：除上表字段外自动带 `vllm_repo`（fork 仓）、
+  `vllm_ref`（分支）、`vllm_base`（基线版本）、`vllm_sha`（**clone 层扫描固化的锁定 commit**）、
+  `image_digest`（digest 锚定：镜像未重推则跳过重扫）。配套代码快照用
+  `build_fork_snapshots.py` 按锁定 SHA 拉取（见上）；
 - `cann`：镜像 Env 的 `cann-X.Y.Z` 路径；缺失时按**基础版本号**回退同系列其他形态
   （如 `v0.13.0rc1` 用 `0.13.0` 系列的 cann），同系列也没有则留空人工看护；
-- `pytorch-ascend`（PTA）：对应 tag 的 `requirements.txt` 中 `torch-npu==X.Y.Z.postN`；
-  0day 模型（非版本 tag）参考其 vllm 版本对应 tag 的 PTA，无命中留空；`pytorch`（torch）不必须留空；
+- `pytorch-ascend`（PTA）与 `pytorch`（torch）：对应 tag 的 `requirements.txt`
+  （`torch-npu==X.Y.Z.postN` / `torch==X.Y.Z`）——**本地快照 zip 优先**（零网络），
+  快照未预存的 tag 走 GitHub API 兜底；0day 模型（非版本 tag）无 requirements 时回退
+  **同 minor 系列已发布 tag**（bailing 0.19.0 → 0.19.x 系列），系列内无 release 或
+  未发布版本留空人工；
 - 写回前**版本号正则校验**：非法值（`latest`、带前缀等）置空 + 告警，不污染矩阵。
+
+**跨运行缓存**（`data/cache/`，防限流与重复下载；`--refresh-cache` 强制刷新）：
+
+| 文件 | 内容 | 失效策略 |
+|---|---|---|
+| `fork_sha.json` | clone 层 digest → 锁定 SHA | 层不可变，**永久有效**（首次扫描后不再重下 ~75MB 层） |
+| `github_releases.json` | release 说明（按 API 前缀键控） | TTL 7 天（兜底新 release） |
+| `github_requirements.json` | requirements 兜底结果（含 404） | tag 内容不可变，**永久有效** |
+
+只有完整/确定性结果才落盘（翻页中途失败、网络/限流失败不缓存，下次自动重试）。
+缓存全命中时矩阵生成对 GitHub API 的请求为 **0**（未认证限流 60 次/小时不再是约束）。
 
 ### 2.3 业务来源导入（PDF 手册 / Markdown 文档）—— 完整实操
 
@@ -396,12 +421,13 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 - **标签管理**：词典（`config.json` `tags.registry`，全局唯一事实源）按领域/作用分组 + 文档数，
   支持**新增 / 改名（全库替换）/ 改 tier / 删除**——均同步 config.json；**不热插图**
   （Kùzu 单写者约束），运行 `build_graph.py` 重建后入图；
-- **API 配置中心**：集中查看并**编辑** embedding / OCR / GitHub 的配置——
+- **API 配置中心**：集中查看并**编辑** embedding / OCR / GitHub / code_graph 的配置——
   **非密钥字段**（provider/base_url/model/ocr_provider/ocr_api_mode 等）保存到 `config.json`；
   **密钥**（embedding key / OCR key / GitHub token）保存到 `data/secrets.local.json`
   （遵守"密钥不入 config.json"，任何入口 `AppConfig.load` 自动加载进环境变量）；
   key 在页面上一律脱敏（只显示已/未配置），**embedding 与 OCR 均支持连通性测试**
   （OCR 用内置测试图走真实识别链路，验证 HTTP/鉴权/模型）；修改对已运行的服务需**重启生效**。
+  校验失败（非法字段/未知配置段）返回 **400 + JSON 错误信息**（前端弹窗展示，不再 500）。
 
 **候选标签（tag_candidate）说明** —— 文档打标时的候选与审核队列的候选是同一机制的"产生端/审核端"：
 
@@ -502,6 +528,11 @@ python skills/vllm-kb/client.py code mega_moe_max_tokens --version v0.23.0rc1 --
 # vllm 主仓源码（--repo vllm）
 python skills/vllm-kb/client.py code make_zmq_socket --repo vllm --version 0.22.1
 python skills/vllm-kb/client.py code worker_busy_loop --repo vllm --version 0.22.1 --file vllm/v1/executor/multiproc_executor.py
+
+# 0day fork 仓源码（--repo fork:{model}，版本=镜像锁定 commit SHA 前 12 位；
+# 与官方 rc/release 版本物理隔离，默认检索永不混入 fork 代码）
+python skills/vllm-kb/client.py code mega_moe --repo fork:glm5.2 --version 418bd6273c03
+python skills/vllm-kb/client.py code-versions --repo fork:glm5.2   # 看该 fork 已预存哪些 SHA
 
 # 列出已预存版本
 python skills/vllm-kb/client.py code-versions --repo vllm
@@ -807,6 +838,18 @@ A: 干净向量库约 **0.8GB**（122K chunks × 1024 维）。体积膨胀是 L
 A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳过证书校验；若域名不可达
 需用内网 http 镜像（`--github-base/--quay-base/--base-url`，或环境变量 `VLLM_KB_GITHUB_BASE` 等）；
 `embedding.base_url` 可写裸 ip:port 自动补 `http://`。
+注意 `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` 环境变量会**覆盖** `--insecure`
+（requests 的 `merge_environment_settings` 会用环境 CA 串复活 SSL 校验，
+内网 MITM 场景典型症状：`CERTIFICATE_VERIFY_FAILED ... HTTPSConnectionPool`）。
+本库已内置请求级 `verify=False` hook 修正（`vllm_kb/net.py`，端到端测试固化
+`tests/test_net_tls.py`）；若用自己的脚本复用 `get_session(insecure=True)` 即可，
+不要裸设 `session.verify = False`（会被环境变量覆盖）。
+
+**Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
+A: fork 行要下载 ~75MB clone 层 blob，内网慢链路需数分钟——脚本每 10MB 打一行进度，
+静默 ≠ 卡死。扫描结果按层 digest 缓存到 `data/cache/fork_sha.json`（层不可变，
+永久有效），**第二次运行起零层下载**；GitHub releases/requirements 同样有跨运行缓存
+（全命中时 API 请求为 0）。怀疑缓存脏数据时 `--refresh-cache` 强制重拉。
 
 **Q: 离线能用吗？**
 A: 能。采集完成后全部检索离线；嵌入可用 `echo` provider 离线自测（效果粗糙）。
