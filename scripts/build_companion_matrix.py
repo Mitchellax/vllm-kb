@@ -37,7 +37,7 @@ import fetch_quay_tags as fq  # noqa: E402
 
 OFFICIAL_VLLM_REPO = "vllm-project/vllm"  # 官方 vllm 仓（非此 owner/name 即视为开发 fork）
 
-COMPANION_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend", "npu-driver"]
+COMPANION_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend", "npu-driver", "vllm_base"]
 # npu-driver(HDK) 与镜像版本不耦合（特定 HDK 有特定问题），缺失符合预期，不计入缺口告警
 REQUIRED_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend"]
 
@@ -468,6 +468,7 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
     for i, base in enumerate(sorted(groups), 1):
         print(f"[matrix] 生成行 {i}/{total}：{base}", flush=True)
         info = infos[base]
+        rep = pick_representative(groups[base])
         cann = info["cann"]
         cann_src = "镜像env"
         if not cann:
@@ -476,8 +477,13 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             if fb:
                 cann, cann_src = fb, f"同系列回退({base_version_key(base)})"
         rel_body = releases.get(base, "")
-        # vllm 配套版本优先级：镜像 VLLM_TAG（构建时锁定）> release 说明 > 版本号启发式
-        vllm_ver, vllm_src = info["vllm_tag"], "镜像env(VLLM_TAG)"
+        # vllm 配套版本优先级：官方仓 buildkit VLLM_TAG（构建锁定）> Env VLLM_TAG
+        #   > release 说明 > 版本号启发式；fork 仓（0day 开发分支）→ 基线版本 vllm_base。
+        if info.get("is_fork"):
+            vllm_ver = info.get("vllm_base", "")
+            vllm_src = f"fork基线({info['vllm_repo']}@{info['vllm_ref']})" if vllm_ver else ""
+        else:
+            vllm_ver, vllm_src = info["vllm_tag"], info["vllm_tag_src"]
         if not vllm_ver:
             vllm_ver, vllm_src = extract_vllm_from_release(
                 base, rel_body) if rel_body else extract_vllm_from_release(base, "")
@@ -502,6 +508,8 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             notes.append(f"SOC={info['soc']}")
         if info["python"]:
             notes.append(f"python={info['python']}")
+        if info.get("is_fork"):
+            notes.append(f"fork={info['vllm_repo']}@{info['vllm_ref']}")
         provenance = []
         if cann:
             provenance.append(f"cann={cann_src}")
@@ -512,18 +520,24 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         if not cann:
             # Env 无 cann 且同系列也没有：存空人工看护（缺口由 report_gaps 列出）
             provenance.append("cann=缺失(待人工)")
-        rows.append(
-            {
-                "vllm-ascend": base,
-                "vllm": vllm_ver,
-                "cann": cann,
-                "pytorch": "",          # torch 不必须，留空
-                "pytorch-ascend": pta,
-                "npu-driver": "",
-                "notes": "; ".join(notes),
-                "source": "自动(" + "+".join(provenance) + ")" if provenance else "待人工",
-            }
-        )
+        row = {
+            "vllm-ascend": base,
+            "vllm": vllm_ver,
+            "cann": cann,
+            "pytorch": "",          # torch 不必须，留空
+            "pytorch-ascend": pta,
+            "npu-driver": "",
+            "notes": "; ".join(notes),
+            "source": "自动(" + "+".join(provenance) + ")" if provenance else "待人工",
+        }
+        if info.get("is_fork"):
+            # fork 行（0day 开发分支镜像）：记录 fork 仓/分支/基线 + 镜像 digest
+            # （digest 是锁定 SHA 扫描的不可变锚：未重推即可跳过 75MB 层下载）
+            row["vllm_repo"] = info["vllm_repo"]
+            row["vllm_ref"] = info["vllm_ref"]
+            row["vllm_base"] = info["vllm_base"]
+            row["image_digest"] = rep["manifest_digest"]
+        rows.append(row)
         flag = "ok" if (cann or vllm_ver or pta) else "gap"
         print(
             f"[matrix] ({i}/{total}) {base:<28} cann={cann or '-':<8} vllm={vllm_ver or '-':<8} "
@@ -591,23 +605,37 @@ def report_gaps(rows: list[dict]) -> int:
     return len(gaps)
 
 
-# 合法版本号：x.y[.z][rcN/.postN]（vllm/cann/pytorch/pytorch-ascend 数字版本，含 rc/post 后缀）
+# 合法版本号：x.y[.z][rcN/.postN]（vllm/cann/pytorch/pytorch-ascend/vllm_base 数字版本，含 rc/post 后缀）
 _VERSION_VALID_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?(?:rc\d+|\.post\d+)*$", re.IGNORECASE)
+# fork 行附加字段格式（非版本号，单独规则）
+_SHA_VALID_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)                 # vllm_sha：git commit
+_DIGEST_VALID_RE = re.compile(r"^sha256:[0-9a-f]{64}$", re.IGNORECASE)       # image_digest：镜像 manifest
+_REPO_SLUG_VALID_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")      # vllm_repo：owner/name
 
 
 def validate_version_fields(rows: list[dict]) -> int:
-    """写回前校验所有版本字段合法性：非法值置空 + 告警，避免非法版本存入矩阵。
+    """写回前校验所有版本/格式字段合法性：非法值置空 + 告警，避免非法值存入矩阵。
 
-    返回非法字段数。合法格式示例：0.26.0 / 8.5.1 / 2.6.0 / 0.13.0rc1。
+    返回非法字段数。合法格式示例：0.26.0 / 8.5.1 / 2.6.0 / 0.13.0rc1；
+    fork 附加字段：vllm_base 同版本规则，vllm_sha 40 位 hex，
+    image_digest 形如 sha256:<64hex>，vllm_repo 形如 owner/name。
     """
     bad = 0
+
+    def _check(r: dict, field: str, valid_re) -> None:
+        nonlocal bad
+        v = r.get(field) or ""
+        if v and not valid_re.match(v):
+            print(f"[matrix] [!] {r['vllm-ascend']} 的 {field}={v!r} 非法，置空待人工", flush=True)
+            r[field] = ""
+            bad += 1
+
     for r in rows:
         for f in COMPANION_FIELDS:
-            v = r.get(f) or ""
-            if v and not _VERSION_VALID_RE.match(v):
-                print(f"[matrix] [!] {r['vllm-ascend']} 的 {f}={v!r} 非法版本，置空待人工", flush=True)
-                r[f] = ""
-                bad += 1
+            _check(r, f, _VERSION_VALID_RE)
+        _check(r, "vllm_sha", _SHA_VALID_RE)
+        _check(r, "image_digest", _DIGEST_VALID_RE)
+        _check(r, "vllm_repo", _REPO_SLUG_VALID_RE)
     return bad
 
 

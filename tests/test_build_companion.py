@@ -279,6 +279,93 @@ class TestExtractFromImage(unittest.TestCase):
         self.assertEqual(out["vllm_commit"], "abc123")
 
 
+    def test_validate_fork_fields(self):
+        """fork 附加字段：vllm_base 按版本规则，sha/digest/repo 各自格式，非法置空。"""
+        rows = [{
+            "vllm-ascend": "hy4-a3", "vllm": "0.23.0", "cann": "9.0.1",
+            "pytorch": "", "pytorch-ascend": "", "npu-driver": "",
+            "vllm_base": "0.23.0", "vllm_repo": "voidvelocity/vllm", "vllm_ref": "dev_hy4",
+            "vllm_sha": "9ab939da68de3acd6acd40365d4e1bc25ae15d79",
+            "image_digest": "sha256:4c39f1ffc0ed4b85ec9def993b59c4d53e4760b96fda7ae2b32e0374b7083bb5",
+        }]
+        self.assertEqual(bm.validate_version_fields([dict(r) for r in rows]), 0)
+        bad = [{
+            "vllm-ascend": "hy4-a3", "vllm": "0.23.0", "cann": "",
+            "pytorch": "", "pytorch-ascend": "", "npu-driver": "",
+            "vllm_base": "dev_hy4",                    # 非版本号
+            "vllm_repo": "https://github.com/a/b",     # 非 owner/name
+            "vllm_sha": "not-a-sha",
+            "image_digest": "md5:xxx",
+        }]
+        self.assertEqual(bm.validate_version_fields(bad), 4)
+        self.assertEqual(bad[0]["vllm_base"], "")
+        self.assertEqual(bad[0]["vllm_repo"], "")
+        self.assertEqual(bad[0]["vllm_sha"], "")
+        self.assertEqual(bad[0]["image_digest"], "")
+
+
+class TestBuildRowsFork(unittest.TestCase):
+    """build_rows 的 fork（0day 开发分支）行逻辑。"""
+
+    HY4_CFG = {
+        "env": ["VLLM_VERSION=0.23.0", "ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.0.1"],
+        "history": [
+            {"created_by": "ARG VLLM_REPO=https://github.com/voidvelocity/vllm.git", "empty_layer": True},
+            {"created_by": "ARG VLLM_TAG=dev_hy4", "empty_layer": True},
+        ],
+    }
+    OFFICIAL_CFG = {
+        "env": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.1.0"],
+        "history": [
+            {"created_by": "ARG VLLM_REPO=https://github.com/vllm-project/vllm.git", "empty_layer": True},
+            {"created_by": "ARG VLLM_TAG=v0.23.0", "empty_layer": True},
+        ],
+    }
+
+    def _build(self, groups, cfgs):
+        from unittest import mock
+
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        side_effect=lambda t, tk, **kw: cfgs[t["name"]]):
+            return {r["vllm-ascend"]: r for r in bm.build_rows(groups, {}, "T")}
+
+    def test_fork_row_fields(self):
+        groups = {"hy4": [{"name": "hy4-a3", "manifest_digest": "sha256:rep"}]}
+        rows = self._build(groups, {"hy4-a3": self.HY4_CFG})
+        r = rows["hy4"]
+        self.assertEqual(r["vllm"], "0.23.0")              # 基线版本
+        self.assertIn("fork基线", r["source"])
+        self.assertEqual(r["vllm_repo"], "voidvelocity/vllm")
+        self.assertEqual(r["vllm_ref"], "dev_hy4")
+        self.assertEqual(r["vllm_base"], "0.23.0")
+        self.assertEqual(r["image_digest"], "sha256:rep")  # SHA 扫描锚
+        self.assertIn("fork=voidvelocity/vllm@dev_hy4", r["notes"])
+
+    def test_official_row_no_fork_fields(self):
+        groups = {"v0.23.0": [{"name": "v0.23.0", "manifest_digest": "sha256:rep"}]}
+        rows = self._build(groups, {"v0.23.0": self.OFFICIAL_CFG})
+        r = rows["v0.23.0"]
+        self.assertEqual(r["vllm"], "0.23.0")              # buildkit 锁定
+        self.assertIn("镜像buildkit(VLLM_TAG)", r["source"])
+        self.assertNotIn("vllm_repo", r)                   # 官方行不带 fork 字段
+        self.assertNotIn("image_digest", r)
+
+    def test_fork_without_base_falls_to_heuristic(self):
+        # fork 无基线证据（glm52 形态）→ vllm 走 release/启发式回退（0day 无 release → 空）
+        cfg = {
+            "env": [],
+            "history": [{"created_by": "git clone --depth 1 --branch glm52 "
+                          "https://github.com/ZYang6263/vllm.git", "empty_layer": False}],
+        }
+        groups = {"glm5.2": [{"name": "glm5.2-a3", "manifest_digest": "sha256:rep"}]}
+        rows = self._build(groups, {"glm5.2-a3": cfg})
+        r = rows["glm5.2"]
+        self.assertEqual(r["vllm"], "")
+        self.assertEqual(r["vllm_base"], "")
+        self.assertEqual(r["vllm_repo"], "ZYang6263/vllm")  # fork 信息仍在
+        self.assertEqual(r["image_digest"], "sha256:rep")
+
+
 class TestExtractVllmFromRelease(unittest.TestCase):
     def test_upstream_statement(self):
         body = "This release aligns the plugin with upstream vLLM v0.23.0 and expands model support."
