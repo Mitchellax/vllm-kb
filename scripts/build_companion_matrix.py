@@ -3,6 +3,9 @@
 数据源与自动匹配规则：
 1. quay tag 清单（复用 fetch_quay_tags）→ 看护 tag → 按基础版本去重（去平台后缀 -a3/-310p/-openeuler）；
 2. 镜像 config Env → **cann** 版本（路径里 cann-X.Y.Z）、SOC 型号、python 版本（进 notes）；
+2.5 镜像 build history（buildkit created_by）→ **vllm** 配套版本（官方仓 VLLM_TAG，构建锁定）；
+    fork 仓（0day 开发分支镜像）→ vllm_repo/vllm_ref/vllm_base（基线版本），
+    锁定 commit 由 clone 层 .git 扫描固化（见 extract_fork_sha）；
 3. vllm-ascend GitHub release 说明 → **vllm** 配套版本
    （"aligns ... with upstream vLLM v0.23.0" / "based on vLLM v0.19.1"；
     无说明时启发式：vllm-ascend 版本号跟踪上游 vllm，剥 rc 后缀）。
@@ -32,9 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fetch_quay_tags as fq  # noqa: E402
 
-API = "https://quay.io/api/v1/repository/ascend/vllm-ascend"
-V2 = "https://quay.io/v2/ascend/vllm-ascend"
-GITHUB_RELEASES = "https://api.github.com/repos/vllm-project/vllm-ascend/releases"
+OFFICIAL_VLLM_REPO = "vllm-project/vllm"  # 官方 vllm 仓（非此 owner/name 即视为开发 fork）
 
 COMPANION_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend", "npu-driver"]
 # npu-driver(HDK) 与镜像版本不耦合（特定 HDK 有特定问题），缺失符合预期，不计入缺口告警
@@ -46,6 +47,23 @@ _SOC_RE = re.compile(r"^SOC_VERSION=(.+)$")
 _PYTHON_RE = re.compile(r"python(\d+\.\d+(?:\.\d+)?)")
 # 镜像 Env 里的 vllm tag（如 VLLM_TAG=v0.26.0）——比 release 说明更直接的配套证据
 _VLLM_TAG_RE = re.compile(r"(?:^|[\s;])VLLM_TAG\s*=\s*v?(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
+# ---- buildkit history（created_by）提取：vllm 构建参数三形态 ----
+# 形态 1/2：ARG 声明（ARG VLLM_TAG=v0.23.0）或 RUN 内联参数（RUN |5 K=V ... /bin/bash -c ...）
+# 值不跨空白：VLLM_COMMIT= 后跟空格即空值（不能吞掉后续的 /bin/bash）
+_BK_ARG_RE = re.compile(r"(?:^|[\s;])VLLM_(REPO|TAG|COMMIT)=([^\s]*)", re.IGNORECASE)
+# 形态 3：旧式 Dockerfile 把 clone 硬编码在 RUN 命令行（git clone --depth 1 --branch glm52 <url>）
+_GIT_CLONE_RE = re.compile(r"git\s+clone\s.*?(?:--branch|-b)\s+(\S+)\s+(\S+)", re.IGNORECASE)
+# github URL -> owner/name（容忍 .git 后缀与 / 路径）
+_REPO_SLUG_RE = re.compile(
+    r"github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[\s/]|$)",
+    re.IGNORECASE,
+)
+# fork 基线版本：Env VLLM_VERSION / history SETUPTOOLS_SCM_PRETEND_VERSION / 分支名内版本号
+_ENV_VLLM_VERSION_RE = re.compile(r"^VLLM_VERSION=v?(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
+_PRETEND_VER_RE = re.compile(
+    r'SETUPTOOLS_SCM_PRETEND_VERSION="?(v?\d+\.\d+(?:\.\d+)?)', re.IGNORECASE)
+# 官方仓 buildkit ref 的版本号形态（v0.23.0 / 0.23.0rc1）；分支名（dev_hy4/glm52）不匹配
+_REF_VERSION_RE = re.compile(r"^v?(\d+\.\d+(?:\.\d+)?(?:rc\d+)?)")
 _UPSTREAM_VLLM_RE = re.compile(
     r"(?i)(?:upstream\s+vllm|based\s+on\s+vllm|align(?:ing|s)?\s+the\s+plugin\s+with\s+upstream\s+vllm)"
     r"[^\d]*v?(\d+\.\d+(?:\.\d+)?)"
@@ -111,9 +129,15 @@ def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io") -> st
     return r.json()["token"]
 
 
-def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
-                    insecure: bool = False, qbase: str = "https://quay.io") -> list[str]:
-    """拉取镜像 config Env（manifest list -> amd64 子清单 -> config blob）。失败返回 []。"""
+def fetch_image_config(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
+                       insecure: bool = False, qbase: str = "https://quay.io") -> dict:
+    """拉取镜像 config（manifest list -> amd64 子清单 -> config blob）。
+
+    返回 {"env": [...], "history": [{"created_by": str, "empty_layer": bool}, ...]}；
+    失败返回 {"env": [], "history": []}。history 的 created_by 含 buildkit 构建参数
+    （ARG 值 / RUN 内联参数 / git clone 命令行），是 vllm 配套版本与 fork 仓信息
+    的最直接证据（Env 里通常没有）。
+    """
     from vllm_kb.net import get_session
 
     digest = tag_info["manifest_digest"]
@@ -140,16 +164,118 @@ def fetch_image_env(tag_info: dict, token: str, timeout: int = 30, max_retries: 
                 timeout=timeout,
             )
             blob.raise_for_status()
-            env = blob.json().get("config", {}).get("Env", []) or []
-            return [str(e) for e in env]
+            cfg = blob.json()
+            env = cfg.get("config", {}).get("Env", []) or []
+            history = [
+                {
+                    "created_by": str(h.get("created_by") or ""),
+                    "empty_layer": bool(h.get("empty_layer")),
+                }
+                for h in cfg.get("history", []) or []
+            ]
+            return {"env": [str(e) for e in env], "history": history}
         except Exception as e:
             if attempt == max_retries:
-                print(f"[matrix] 拉取 {tag_info['name']} 镜像 env 失败: {e}")
-                return []
+                print(f"[matrix] 拉取 {tag_info['name']} 镜像 config 失败: {e}")
+                return {"env": [], "history": []}
             wait = 2 ** attempt
             print(f"[matrix] {tag_info['name']} 拉取失败({e})，{wait}s 后重试", flush=True)
             time.sleep(wait)
-    return []
+    return {"env": [], "history": []}
+
+
+def _repo_slug(url: str) -> str:
+    """github 仓库 URL -> owner/name（https://github.com/a/b.git -> a/b）。非 github 域返回 ''。"""
+    m = _REPO_SLUG_RE.search(url or "")
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def extract_buildkit_info(history: list) -> dict:
+    """从镜像 build history 的 created_by 提取 vllm 构建参数（三形态）。
+
+    1. ARG 声明：ARG VLLM_REPO=... / ARG VLLM_TAG=... / ARG VLLM_COMMIT=...
+    2. RUN 内联参数：RUN |N K=V ... /bin/bash -c ...（buildkit 携带的 ARG 值，
+       同一参数会在多条 history 重复出现，取首个非空）
+    3. 旧式硬编码：git clone --depth 1 --branch <ref> <url>（ref/url 写死在命令行）
+
+    返回 {repo, ref, commit, is_fork}：repo 为 owner/name（空=未识别）；
+    is_fork = repo 非空且非官方仓（0day 开发分支镜像）。
+    """
+    repo_url = ref = commit = ""
+    clone_ref = clone_url = ""
+    for h in history:
+        cb = h.get("created_by", "") if isinstance(h, dict) else str(h or "")
+        if not cb:
+            continue
+        m = _GIT_CLONE_RE.search(cb)
+        if m and not clone_ref:
+            r, u = m.group(1), m.group(2)
+            # `-b $VLLM_TAG $VLLM_REPO` 形态是 shell 变量，非真实值（真实值由 ARG 提供）
+            if not r.startswith("$") and not u.startswith("$"):
+                clone_ref, clone_url = r, u
+        for km in _BK_ARG_RE.finditer(cb):
+            key, val = km.group(1).upper(), km.group(2)
+            if key == "REPO" and val and not repo_url:
+                repo_url = val
+            elif key == "TAG" and val and not ref:
+                ref = val
+            elif key == "COMMIT" and val and not commit:
+                commit = val
+    if not ref and clone_ref:
+        ref = clone_ref
+    if not repo_url and clone_url:
+        repo_url = clone_url
+    slug = _repo_slug(repo_url)
+    return {
+        "repo": slug,
+        "ref": ref,
+        "commit": commit,
+        "is_fork": bool(slug) and slug != OFFICIAL_VLLM_REPO,
+    }
+
+
+def _fork_base_version(env: list[str], history: list, ref: str) -> str:
+    """fork 镜像的 vllm 基线版本（fork 分支基于的官方版本），三重回退：
+
+    Env VLLM_VERSION（如 hy4 镜像）→ history SETUPTOOLS_SCM_PRETEND_VERSION（pip 安装层）
+    → 分支名内嵌版本号。均无证据时返回 ''（vllm 字段留空待人工）。
+    """
+    for e in env:
+        m = _ENV_VLLM_VERSION_RE.match(e)
+        if m:
+            return m.group(1)
+    for h in history:
+        cb = h.get("created_by", "") if isinstance(h, dict) else str(h or "")
+        m = _PRETEND_VER_RE.search(cb)
+        if m:
+            return m.group(1).lstrip("v")
+    m = _REF_VERSION_RE.match(ref or "")
+    return m.group(1) if m else ""
+
+
+def extract_from_image(env: list[str], history: list) -> dict[str, str]:
+    """从镜像 config（Env + build history）提取配套信息。
+
+    - Env：cann 版本 / SOC 型号 / python 版本 / vllm_tag（少见）
+    - history created_by（buildkit 参数）：
+      - 官方仓 + 版本号 ref → vllm_tag（构建锁定，最高优先级证据）
+      - fork 仓 → vllm_repo / vllm_ref / vllm_base（基线版本）/ vllm_commit
+    """
+    out = extract_from_env(env)
+    out["vllm_tag_src"] = "镜像env(VLLM_TAG)" if out["vllm_tag"] else ""
+    bk = extract_buildkit_info(history)
+    out["vllm_repo"] = bk["repo"]
+    out["vllm_ref"] = bk["ref"]
+    out["vllm_commit"] = bk["commit"]
+    out["is_fork"] = bk["is_fork"]
+    if not bk["is_fork"] and bk["ref"] and not bk["commit"]:
+        # 官方仓 + 版本号 ref：buildkit 锁定的配套版本（v0.23.0 -> 0.23.0）
+        m = _REF_VERSION_RE.match(bk["ref"])
+        if m and not out["vllm_tag"]:
+            out["vllm_tag"] = m.group(1)
+            out["vllm_tag_src"] = "镜像buildkit(VLLM_TAG)"
+    out["vllm_base"] = _fork_base_version(env, history, bk["ref"]) if bk["is_fork"] else ""
+    return out
 
 def extract_from_env(env: list[str]) -> dict[str, str]:
     """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本 / vllm tag。
@@ -310,12 +436,13 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
     total = len(groups)
     for i, base in enumerate(sorted(groups), 1):
         rep = pick_representative(groups[base])
-        print(f"[matrix] 镜像 env {i}/{total}：{base}（代表 tag {rep['name']}）...", flush=True)
-        env = fetch_image_env(rep, token, insecure=insecure, qbase=qbase)
-        infos[base] = extract_from_env(env)
+        print(f"[matrix] 镜像 config {i}/{total}：{base}（代表 tag {rep['name']}）...", flush=True)
+        cfg = fetch_image_config(rep, token, insecure=insecure, qbase=qbase)
+        infos[base] = extract_from_image(cfg["env"], cfg["history"])
         got = infos[base]
+        fork_mark = f" fork={got['vllm_repo']}@{got['vllm_ref']}" if got.get("is_fork") else ""
         print(f"[matrix]    cann={got['cann'] or '(空)'} vllm_tag={got['vllm_tag'] or '(空)'} "
-              f"soc={got['soc'] or '(空)'} python={got['python'] or '(空)'}", flush=True)
+              f"soc={got['soc'] or '(空)'} python={got['python'] or '(空)'}{fork_mark}", flush=True)
     # 基础版本号 -> 该系列任一非空 cann（首个遇到即用，确定性依赖排序）
     cann_by_base: dict[str, str] = {}
     for base in sorted(groups):
@@ -496,8 +623,9 @@ def suggest_from_issues(canonical_path: str | Path, min_issues: int = 1) -> None
     """从已入库的 vllm-ascend issue 数据统计"某版本上真实部署的配套组合"（众数）。
 
     仅作人工核对的参考：issue 里的版本是真实部署环境（pip freeze 段），
-    不是官方配套声明。镜像 build history 为空（buildkit 构建不留记录），
-    这是当前唯一能自动获取 torch/torch_npu 配套的途径。
+    不是官方配套声明。镜像 build history 的 buildkit 参数只含 vllm 仓/ref
+    （torch/torch_npu 版本不在其中），issue 众数仍是 torch/torch_npu 配套的
+    唯一自动获取途径。
     """
     from collections import Counter
 

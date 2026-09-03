@@ -58,12 +58,14 @@ class TestExtractFromEnv(unittest.TestCase):
         releases = {"deepseekv4-flash-0731": "aligns with upstream vLLM v0.22.1"}
         from unittest import mock
 
-        with mock.patch("build_companion_matrix.fetch_image_env", return_value=["VLLM_TAG=v0.26.0"]):
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        return_value={"env": ["VLLM_TAG=v0.26.0"], "history": []}):
             rows = bm.build_rows(groups, releases, "T")
         self.assertEqual(rows[0]["vllm"], "0.26.0")
         self.assertIn("VLLM_TAG", rows[0]["source"])
         # 无 VLLM_TAG 时回退 release 说明
-        with mock.patch("build_companion_matrix.fetch_image_env", return_value=["cann-8.5.1"]):
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        return_value={"env": ["cann-8.5.1"], "history": []}):
             rows2 = bm.build_rows(groups, releases, "T")
         self.assertEqual(rows2[0]["vllm"], "0.22.1")
 
@@ -92,7 +94,8 @@ class TestExtractFromEnv(unittest.TestCase):
         def fake_env(tag_info, token, **kw):
             return envs[tag_info["name"]]
 
-        with mock.patch("build_companion_matrix.fetch_image_env", side_effect=fake_env):
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        side_effect=lambda t, tk, **kw: {"env": envs[t["name"]], "history": []}):
             rows = bm.build_rows(groups, {}, "T")
         by_key = {r["vllm-ascend"]: r for r in rows}
         # rc1 从同系列回退得到 cann
@@ -115,7 +118,8 @@ class TestExtractFromEnv(unittest.TestCase):
         def fake_env(tag_info, token, **kw):
             return ["SOC_VERSION=ascend910b1"]  # 全部无 cann
 
-        with mock.patch("build_companion_matrix.fetch_image_env", side_effect=fake_env):
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        side_effect=lambda t, tk, **kw: {"env": ["SOC_VERSION=ascend910b1"], "history": []}):
             rows = bm.build_rows(groups, {}, "T")
         for r in rows:
             self.assertEqual(r["cann"], "")
@@ -141,6 +145,138 @@ class TestExtractFromEnv(unittest.TestCase):
         self.assertTrue(bm._VERSION_VALID_RE.match("2.6.0.post1"))
         self.assertFalse(bm._VERSION_VALID_RE.match("latest"))
         self.assertFalse(bm._VERSION_VALID_RE.match("cann-8.5.1"))
+
+
+class TestExtractBuildkitInfo(unittest.TestCase):
+    """build history created_by 的 buildkit 参数提取（三形态，样本取自真实镜像）。"""
+
+    # 官方版镜像（v0.23.0）：ARG 声明 + RUN 内联参数（buildkit 携带 ARG 值）
+    OFFICIAL_HISTORY = [
+        {"created_by": "ARG VLLM_REPO=https://github.com/vllm-project/vllm.git", "empty_layer": True},
+        {"created_by": "ARG VLLM_TAG=v0.23.0", "empty_layer": True},
+        {"created_by": "ARG VLLM_COMMIT=", "empty_layer": True},
+        {"created_by": "RUN |5 PIP_INDEX_URL=https://pypi.org/simple VLLM_REPO=https://github.com/"
+                       "vllm-project/vllm.git VLLM_TAG=v0.23.0 VLLM_COMMIT= /bin/bash -c "
+                       "git clone --depth 1 --single-branch -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm # buildkit",
+         "empty_layer": False},
+    ]
+    # 0day fork 新式（hy4-a3）：ARG 声明 fork 仓 + 分支名 ref
+    HY4_HISTORY = [
+        {"created_by": "ARG VLLM_REPO=https://github.com/voidvelocity/vllm.git", "empty_layer": True},
+        {"created_by": "ARG VLLM_TAG=dev_hy4", "empty_layer": True},
+        {"created_by": "RUN |4 VLLM_REPO=https://github.com/voidvelocity/vllm.git VLLM_TAG=dev_hy4 "
+                       "/bin/bash -c git clone --depth 1 --single-branch -b $VLLM_TAG $VLLM_REPO "
+                       "/vllm-workspace/vllm # buildkit", "empty_layer": False},
+    ]
+    # 0day fork 旧式（glm5.2-a3）：clone 硬编码在 RUN 命令行（无 ARG）
+    GLM52_HISTORY = [
+        {"created_by": "RUN |2 PIP_INDEX_URL=https://pypi.org/simple /bin/bash -c apt-get update -y && "
+                       "apt-get install -y git vim wget net-tools gcc g++ cmake # buildkit", "empty_layer": False},
+        {"created_by": "RUN |2 PIP_INDEX_URL=https://pypi.org/simple /bin/bash -c git clone --depth 1 "
+                       "--branch glm52 https://github.com/ZYang6263/vllm.git  /vllm-workspace/vllm # buildkit",
+         "empty_layer": False},
+    ]
+
+    def test_official_repo_arg_form(self):
+        out = bm.extract_buildkit_info(self.OFFICIAL_HISTORY)
+        self.assertEqual(out["repo"], "vllm-project/vllm")
+        self.assertEqual(out["ref"], "v0.23.0")
+        self.assertEqual(out["commit"], "")      # ARG VLLM_COMMIT= 空值不误报
+        self.assertFalse(out["is_fork"])
+
+    def test_fork_arg_form(self):
+        out = bm.extract_buildkit_info(self.HY4_HISTORY)
+        self.assertEqual(out["repo"], "voidvelocity/vllm")
+        self.assertEqual(out["ref"], "dev_hy4")
+        self.assertTrue(out["is_fork"])
+
+    def test_fork_hardcoded_clone_form(self):
+        out = bm.extract_buildkit_info(self.GLM52_HISTORY)
+        self.assertEqual(out["repo"], "ZYang6263/vllm")
+        self.assertEqual(out["ref"], "glm52")
+        self.assertTrue(out["is_fork"])
+
+    def test_empty_history(self):
+        self.assertEqual(bm.extract_buildkit_info([]),
+                         {"repo": "", "ref": "", "commit": "", "is_fork": False})
+
+    def test_repo_slug(self):
+        self.assertEqual(bm._repo_slug("https://github.com/a/b.git"), "a/b")
+        self.assertEqual(bm._repo_slug("https://github.com/a/b"), "a/b")
+        self.assertEqual(bm._repo_slug("git@github.com:a/b.git"), "a/b")
+        self.assertEqual(bm._repo_slug("https://gitee.com/a/b"), "")
+        self.assertEqual(bm._repo_slug(""), "")
+
+
+class TestExtractFromImage(unittest.TestCase):
+    """Env + history 组合提取：官方仓 buildkit tag / fork 基线版本。"""
+
+    def test_official_buildkit_tag(self):
+        env = ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.1.0"]
+        history = [
+            {"created_by": "ARG VLLM_TAG=v0.23.0", "empty_layer": True},
+        ]
+        out = bm.extract_from_image(env, history)
+        self.assertEqual(out["vllm_tag"], "0.23.0")           # buildkit 锁定版本
+        self.assertEqual(out["vllm_tag_src"], "镜像buildkit(VLLM_TAG)")
+        self.assertFalse(out["is_fork"])
+        self.assertEqual(out["vllm_base"], "")
+
+    def test_fork_base_from_env_version(self):
+        # hy4 形态：Env VLLM_VERSION=0.23.0（SETUPTOOLS_SCM_PRETEND_VERSION 写入的基线）
+        env = ["VLLM_VERSION=0.23.0"]
+        history = [
+            {"created_by": "ARG VLLM_REPO=https://github.com/voidvelocity/vllm.git", "empty_layer": True},
+            {"created_by": "ARG VLLM_TAG=dev_hy4", "empty_layer": True},
+        ]
+        out = bm.extract_from_image(env, history)
+        self.assertTrue(out["is_fork"])
+        self.assertEqual(out["vllm_repo"], "voidvelocity/vllm")
+        self.assertEqual(out["vllm_ref"], "dev_hy4")
+        self.assertEqual(out["vllm_base"], "0.23.0")
+        self.assertEqual(out["vllm_tag"], "")                 # fork 的 ref 非版本号，不进 vllm_tag
+
+    def test_fork_base_from_pretend_version(self):
+        # fork 无 Env VLLM_VERSION，但 pip 安装层带 SETUPTOOLS_SCM_PRETEND_VERSION
+        env = []
+        history = [
+            {"created_by": "git clone --depth 1 --branch glm52 https://github.com/ZYang6263/vllm.git",
+             "empty_layer": False},
+            {"created_by": 'RUN |2 /bin/bash -c SETUPTOOLS_SCM_PRETEND_VERSION="0.19.0" '
+                           "VLLM_TARGET_DEVICE=empty python3 -m pip install -e /vllm-workspace/vllm # buildkit",
+             "empty_layer": False},
+        ]
+        out = bm.extract_from_image(env, history)
+        self.assertEqual(out["vllm_base"], "0.19.0")
+
+    def test_fork_base_from_branch_name(self):
+        # 分支名内嵌版本号（如 release/0.23.0-dev 形态）
+        history = [{"created_by": "git clone --depth 1 --branch 0.23.0-hy4 https://github.com/a/vllm.git",
+                    "empty_layer": False}]
+        out = bm.extract_from_image([], history)
+        self.assertEqual(out["vllm_base"], "0.23.0")
+
+    def test_fork_base_unknown(self):
+        # glm52 形态：无版本号证据 → 基线留空待人工
+        history = [{"created_by": "git clone --depth 1 --branch glm52 https://github.com/ZYang6263/vllm.git",
+                    "empty_layer": False}]
+        out = bm.extract_from_image([], history)
+        self.assertEqual(out["vllm_base"], "")
+
+    def test_official_env_tag_still_works(self):
+        out = bm.extract_from_image(["VLLM_TAG=v0.26.0"], [])
+        self.assertEqual(out["vllm_tag"], "0.26.0")
+        self.assertEqual(out["vllm_tag_src"], "镜像env(VLLM_TAG)")
+
+    def test_official_commit_ref_not_version(self):
+        # 官方仓但 ref 是分支名 + 带 COMMIT（未来形态）：不误取版本，交回退链
+        history = [
+            {"created_by": "ARG VLLM_TAG=main", "empty_layer": True},
+            {"created_by": "ARG VLLM_COMMIT=abc123", "empty_layer": True},
+        ]
+        out = bm.extract_from_image([], history)
+        self.assertEqual(out["vllm_tag"], "")
+        self.assertEqual(out["vllm_commit"], "abc123")
 
 
 class TestExtractVllmFromRelease(unittest.TestCase):
@@ -308,13 +444,11 @@ class TestPtaExtraction(unittest.TestCase):
     def _build(self, groups, envs, reqs):
         from unittest import mock
 
-        def fake_env(tag_info, token, **kw):
-            return envs[tag_info["name"]]
-
         def fake_req(tag, **kw):
             return reqs.get(tag, "")
 
-        with mock.patch("build_companion_matrix.fetch_image_env", side_effect=fake_env), \
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        side_effect=lambda t, tk, **kw: {"env": envs[t["name"]], "history": []}), \
                 mock.patch("build_companion_matrix.fetch_pta_from_requirements", side_effect=fake_req):
             return {r["vllm-ascend"]: r for r in bm.build_rows(groups, {}, "T")}
 
