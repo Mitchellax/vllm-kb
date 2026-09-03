@@ -406,28 +406,37 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
     return rows
 
 
+# merge 输出列序：已知字段在前，未知透传字段按字母序追加（新增字段不影响旧文件）
+_FIELD_ORDER = [
+    "vllm-ascend", "vllm", "cann", "pytorch", "pytorch-ascend", "npu-driver",
+    "vllm_repo", "vllm_ref", "vllm_base", "vllm_sha", "image_digest",
+    "notes", "source",
+]
+
+
 def merge_with_manual(auto_rows: list[dict], manual_rows: list[dict]) -> list[dict]:
-    """合并：人工行优先（非空字段保留），自动只填空字段；quay 列表外的人工行保留。"""
+    """合并：手工行优先（非空字段**替换**自动值），自动只填空字段；quay 列表外的人工行保留。
+
+    字段取两边并集（未知字段透传，不再固定白名单），统一规则"手工非空 > 自动非空 > 空串"——
+    旧版把 pytorch/pytorch-ascend/npu-driver 写死 `m.get(...) or ""`，自动提取的
+    pytorch-ascend 会被直接丢弃，本版修正。
+    """
     manual_by_key = {r.get("vllm-ascend", ""): r for r in manual_rows}
     merged: list[dict] = []
     seen: set[str] = set()
+
+    def _merge_row(a: dict, m: dict) -> dict:
+        union = set(a) | set(m)
+        ordered = [f for f in _FIELD_ORDER if f in union]
+        ordered += sorted(union - set(_FIELD_ORDER))
+        return {k: (m.get(k) or a.get(k) or "") for k in ordered}
+
     for a in auto_rows:
         key = a["vllm-ascend"]
         seen.add(key)
         m = manual_by_key.get(key)
         if m:
-            merged.append(
-                {
-                    "vllm-ascend": key,
-                    "vllm": m.get("vllm") or a["vllm"],
-                    "cann": m.get("cann") or a["cann"],
-                    "pytorch": m.get("pytorch") or "",
-                    "pytorch-ascend": m.get("pytorch-ascend") or "",
-                    "npu-driver": m.get("npu-driver") or "",
-                    "notes": m.get("notes") or a["notes"],
-                    "source": m.get("source") or a["source"],
-                }
-            )
+            merged.append(_merge_row(a, m))
         else:
             merged.append(a)
     for key, m in manual_by_key.items():

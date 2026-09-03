@@ -189,6 +189,32 @@ class TestMergeWithManual(unittest.TestCase):
         merged = bm.merge_with_manual(auto, manual)
         self.assertEqual([r["vllm-ascend"] for r in merged], ["internal-fix", "v0.18.0"])
 
+    def test_auto_pta_survives_when_manual_empty(self):
+        """手工行未填的字段用自动值（旧版 pytorch-ascend 被写死丢弃的回归测试）。"""
+        auto = [{"vllm-ascend": "v0.23.0", "vllm": "0.23.0", "cann": "8.5.1",
+                 "pytorch": "", "pytorch-ascend": "2.10.0.post2", "npu-driver": "",
+                 "notes": "", "source": "自动(x)"}]
+        manual = [{"vllm-ascend": "v0.23.0", "vllm": "", "cann": "", "pytorch": "",
+                   "pytorch-ascend": "", "npu-driver": "", "notes": "人工", "source": ""}]
+        row = bm.merge_with_manual(auto, manual)[0]
+        self.assertEqual(row["pytorch-ascend"], "2.10.0.post2")  # 自动 PTA 不再被丢弃
+        self.assertEqual(row["cann"], "8.5.1")
+        self.assertEqual(row["notes"], "人工")
+
+    def test_field_union_passthrough(self):
+        """字段并集：自动行的新字段/手工行的独有字段都透传，不因白名单丢失。"""
+        auto = [{"vllm-ascend": "hy4-a3", "vllm": "0.23.0", "cann": "9.0.1",
+                 "pytorch": "", "pytorch-ascend": "", "npu-driver": "",
+                 "vllm_repo": "voidvelocity/vllm", "vllm_sha": "a" * 40,
+                 "notes": "", "source": "自动(x)"}]
+        manual = [{"vllm-ascend": "hy4-a3", "vllm": "", "cann": "",
+                   "custom_flag": "keep-me", "notes": "", "source": "人工"}]
+        row = bm.merge_with_manual(auto, manual)[0]
+        self.assertEqual(row["vllm_repo"], "voidvelocity/vllm")  # 自动新字段透传
+        self.assertEqual(row["vllm_sha"], "a" * 40)
+        self.assertEqual(row["custom_flag"], "keep-me")          # 手工独有字段透传
+        self.assertEqual(row["source"], "人工")
+
 
 class TestGapReport(unittest.TestCase):
     def test_gap_count(self):
