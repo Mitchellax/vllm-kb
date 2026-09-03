@@ -19,7 +19,7 @@ class CodeSearchRequest(BaseModel):
     keyword: str
     version: Optional[str] = None
     limit: Optional[int] = 20
-    repo: Optional[str] = None  # vllm-ascend | vllm
+    repo: Optional[str] = None  # vllm-ascend | vllm | fork:{model}（0day 开发分支）
     path: Optional[str] = None  # 限定文件路径子串（如 worker/model_runner_v1.py）
     per_version: Optional[bool] = False  # 每个版本各自收集命中（对比版本差异用）
     kind: Optional[str] = None  # def | op | env | msg（msg=报错字面量 LIKE 子串检索）
@@ -31,14 +31,22 @@ def register(app, ctx) -> None:
     cfg = ctx.cfg
 
     def _code_index_for(repo: Optional[str]):
-        """按 repo 取代码仓访问器：vllm-ascend（默认）| vllm。"""
-        if repo not in (None, "", "vllm-ascend", "vllm"):
-            return None
-        repo = "vllm-ascend" if repo in (None, "", "vllm-ascend") else "vllm"
-        try:
-            from .code_index import VersionedCode
+        """按 repo 取代码仓访问器：vllm-ascend（默认）| vllm | fork:{model}（0day 开发分支）。
 
-            return VersionedCode(cfg, repo=repo)
+        fork 命名空间与官方 rc/release 版本物理隔离（data/code/forks/{model}/），
+        必须显式传 repo=fork:{model} 才会命中——默认检索永不混入 fork 代码。
+        """
+        from .code_index import CodeIndexError, VersionedCode
+
+        r = repo or "vllm-ascend"
+        if r not in ("vllm-ascend", "vllm") and not r.startswith("fork:"):
+            return None
+        try:
+            return VersionedCode(cfg, repo=r)
+        except CodeIndexError as e:
+            if "非法 fork 模型名" in str(e):
+                raise HTTPException(status_code=400, detail=str(e))
+            return None
         except Exception:
             return None
 
@@ -65,8 +73,20 @@ def register(app, ctx) -> None:
         if ci is None:
             return {"repo": repo or "vllm-ascend", "versions": [],
                     "note": "code_index 未初始化（检查 config.storage.code_root）"}
-        return {"repo": repo or "vllm-ascend", "versions": ci.available_versions,
-                "note": "预存版本源码快照；未列的版本请先运行 scripts/build_code_snapshots.py 或 build_vllm_snapshots.py"}
+        payload = {"repo": repo or "vllm-ascend", "versions": ci.available_versions,
+                   "note": "预存版本源码快照；未列的版本请先运行 scripts/build_code_snapshots.py 或 build_vllm_snapshots.py"}
+        if (repo or "").startswith("fork:"):
+            import json as _json
+
+            meta_path = ci.root / "meta.json"
+            if meta_path.exists():
+                try:
+                    payload["meta"] = _json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            payload["note"] = ("fork 快照版本 = 镜像锁定 commit（SHA 前 12 位）；"
+                               "预存请运行 scripts/build_fork_snapshots.py")
+        return payload
 
     @app.post("/code/search")
     def code_search(req: CodeSearchRequest):

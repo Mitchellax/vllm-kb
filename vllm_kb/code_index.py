@@ -45,6 +45,8 @@ _CPP_KEYWORD_STOP = {
     "while", "switch", "if", "for", "return", "sizeof", "delete", "new",
     "catch", "try", "do", "else", "case", "default", "goto", "throw",
 }
+# fork 命名空间（0day 开发分支快照）模型目录名白名单（防路径穿越）
+_FORK_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _OP_ATTR_RE = re.compile(r"\b(aclnn[A-Z][A-Za-z0-9_]*|npu[A-Z][A-Za-z0-9_]*)")
 _KERNEL_NAME_RE = re.compile(r"\b(dispatch_ffn_combine|mega_moe|[a-z0-9_]+_combine|[a-z0-9_]+_dispatch)\b")
 _ENV_NAME_RE = re.compile(r"\b(VLLM_ASCEND_[A-Z0-9_]+|HCCL_[A-Z0-9_]+)")
@@ -67,14 +69,22 @@ class VersionedCode:
     """版本化代码仓访问器（只读）。
 
     cfg: AppConfig（读 storage.code_root / code.versions）
-    repo: 仓库子目录名——"vllm-ascend"（默认，data/code/）| "vllm"（data/code/vllm/）。
+    repo: 仓库子目录名——"vllm-ascend"（默认，data/code/）| "vllm"（data/code/vllm/）
+          | "fork:{model}"（0day 开发分支快照，data/code/forks/{model}/，
+            模型名仅限字母/数字/./_/-，防路径穿越）。
     """
 
     def __init__(self, cfg: AppConfig, repo: str = "vllm-ascend"):
         self.cfg = cfg
         self.repo = repo
         self.root = cfg.resolve(cfg.storage.code_root)
-        if repo and repo != "vllm-ascend":
+        if repo.startswith("fork:"):
+            model = repo[5:]
+            if not _FORK_MODEL_RE.match(model) or model in (".", ".."):
+                raise CodeIndexError(
+                    f"非法 fork 模型名 {model!r}（仅限字母/数字/./_/-）")
+            self.root = self.root / "forks" / model
+        elif repo and repo != "vllm-ascend":
             self.root = self.root / repo
         self.index_path = self.root / "index.sqlite3"
         self.zips_dir = self.root / "zips"
@@ -301,7 +311,8 @@ class VersionedCode:
         snap = self.ensure_snapshot(version)
         conn = self._connect_index(write=True)
         count = 0
-        indexed_dirs = ("vllm",) if self.repo == "vllm" else _INDEXED_SUBDIRS
+        indexed_dirs = ("vllm",) if (self.repo == "vllm" or self.repo.startswith("fork:")) \
+            else _INDEXED_SUBDIRS
         try:
             conn.execute("DELETE FROM symbols WHERE version = ?", (version,))
             # 兼容 zip 解压带顶层目录（vllm-ascend-0.23.0rc1/）：统一到真实根
