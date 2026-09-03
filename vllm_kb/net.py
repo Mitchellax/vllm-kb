@@ -27,15 +27,32 @@ def insecure_from_env() -> bool:
 
 
 def get_session(insecure: bool) -> object:
-    """返回 requests.Session（insecure 时 verify=False + 抑制告警）。"""
+    """返回 requests.Session（insecure 时跳过 SSL 证书校验 + 抑制告警）。
+
+    insecure 实现为 **请求级 verify=False hook**（包装 session.request 缺省注入），
+    而非仅设 session.verify=False：requests 的 merge_environment_settings 只在
+    请求级 verify 为 True/None 时读 REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE 覆盖，
+    而 merge_setting 请求级优先——session.verify=False 在不传请求级 verify 时
+    是 None，会被这两个环境变量**覆盖成 CA bundle 路径**，校验"复活"
+    （requests 2.34 实测复现；内网环境常设这两个变量让其他工具过 MITM）。
+    请求级显式 False 不进覆盖分支，merge_setting 直接取 False——与
+    requests.get(verify=False) 行为严格一致。trust_env 保持 True（代理不受影响）。
+    """
     import requests
 
     s = requests.Session()
     if insecure:
         import urllib3
 
+        orig_request = s.request
+
+        def _request(method, url, **kwargs):
+            kwargs.setdefault("verify", False)
+            return orig_request(method, url, **kwargs)
+
+        s.request = _request  # 实例属性遮蔽；get/post/redirect 均经此入口
+        s.verify = False      # 双保险（请求级缺省时 merge_setting 的 session 级值）
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        s.verify = False
     return s
 
 
