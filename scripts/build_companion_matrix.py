@@ -133,10 +133,11 @@ def fetch_image_config(tag_info: dict, token: str, timeout: int = 30, max_retrie
                        insecure: bool = False, qbase: str = "https://quay.io") -> dict:
     """拉取镜像 config（manifest list -> amd64 子清单 -> config blob）。
 
-    返回 {"env": [...], "history": [{"created_by": str, "empty_layer": bool}, ...]}；
-    失败返回 {"env": [], "history": []}。history 的 created_by 含 buildkit 构建参数
+    返回 {"env": [...], "history": [{"created_by": str, "empty_layer": bool}, ...],
+    "layers": [digest, ...]}；失败返回全空。history 的 created_by 含 buildkit 构建参数
     （ARG 值 / RUN 内联参数 / git clone 命令行），是 vllm 配套版本与 fork 仓信息
-    的最直接证据（Env 里通常没有）。
+    的最直接证据（Env 里通常没有）；layers 为子 manifest 层 digest 列表（按序对应
+    history 非空条目，供 clone 层定位）。
     """
     from vllm_kb.net import get_session
 
@@ -173,15 +174,16 @@ def fetch_image_config(tag_info: dict, token: str, timeout: int = 30, max_retrie
                 }
                 for h in cfg.get("history", []) or []
             ]
-            return {"env": [str(e) for e in env], "history": history}
+            layers = [str(l.get("digest") or "") for l in md.get("layers", []) or []]
+            return {"env": [str(e) for e in env], "history": history, "layers": layers}
         except Exception as e:
             if attempt == max_retries:
                 print(f"[matrix] 拉取 {tag_info['name']} 镜像 config 失败: {e}")
-                return {"env": [], "history": []}
+                return {"env": [], "history": [], "layers": []}
             wait = 2 ** attempt
             print(f"[matrix] {tag_info['name']} 拉取失败({e})，{wait}s 后重试", flush=True)
             time.sleep(wait)
-    return {"env": [], "history": []}
+    return {"env": [], "history": [], "layers": []}
 
 
 def _repo_slug(url: str) -> str:
@@ -276,6 +278,181 @@ def extract_from_image(env: list[str], history: list) -> dict[str, str]:
             out["vllm_tag_src"] = "镜像buildkit(VLLM_TAG)"
     out["vllm_base"] = _fork_base_version(env, history, bk["ref"]) if bk["is_fork"] else ""
     return out
+
+
+# ---------------- fork 锁定 SHA（clone 层扫描） ----------------
+# 背景：0day fork 镜像按分支构建（git clone --branch X），分支会推进，但镜像层内
+# 的 .git（depth 1 浅克隆）固化了构建时的 commit——这是"镜像内实际代码"的唯一
+# 可靠锚点（GitHub 分支 HEAD 会漂移，buildkit 参数里也只有分支名）。
+
+# 包管理器前缀（出现在 git clone 之前的复合命令层，非 clone 专属层）
+_PKG_MGRS = ("apt-get", "yum ", "dnf ")
+
+
+def _is_dedicated_clone_cmd(cb: str) -> bool:
+    """created_by 是否为 git clone 专属命令（clone 前无包管理器安装段）。
+
+    hy4 形态：`RUN |4 ... /bin/bash -c git clone --depth 1 ... # buildkit`
+    glm5.2 形态：`RUN |2 ... /bin/bash -c git clone --depth 1 --branch glm52 <url> ...`
+    反例（排除）：apt-get 复合层 `... /bin/bash -c apt-get update && ... && git clone ...`
+    """
+    idx = cb.find("git clone")
+    if idx < 0:
+        return False
+    head = cb[:idx]
+    return not any(p in head for p in _PKG_MGRS)
+
+
+def _locate_clone_layer(history: list, layers: list) -> int:
+    """定位 git clone 专属层的索引（history 非空条目与 layers 按序一一对应）。
+
+    找不到返回 -1。OCI 规范：带 empty_layer=True 的 history 条目不占层，
+    其余按顺序对应 layers[]（实测 hy4-a3 15/15、glm5.2-a3 16/16 对应）。
+    """
+    j = -1
+    for h in history:
+        if h.get("empty_layer"):
+            continue
+        j += 1
+        if _is_dedicated_clone_cmd(h.get("created_by", "")):
+            return j
+    return -1
+
+
+def _scan_tar_for_git_sha(fileobj) -> str:
+    """流式扫 tar 层，读 .git 的锁定 commit。
+
+    证据优先级：shallow（浅克隆根，最可靠）> packed-refs > refs/heads/* > FETCH_HEAD。
+    """
+    import tarfile
+
+    sha = refs_sha = packed = fetch_head = ""
+    tf = tarfile.open(fileobj=fileobj, mode="r|")
+    for m in tf:
+        if not m.isfile() or m.size > 65536:
+            continue
+        low = m.name.lower()
+        if low.endswith("/.git/shallow") or low == ".git/shallow":
+            data = tf.extractfile(m).read().decode("utf-8", "replace").strip()
+            if _SHA_VALID_RE.match(data):
+                sha = data.lower()
+                break
+        elif low.endswith("/.git/packed-refs") or low == ".git/packed-refs":
+            packed = tf.extractfile(m).read().decode("utf-8", "replace")
+        elif "/.git/refs/heads/" in low and not refs_sha:
+            data = tf.extractfile(m).read().decode("utf-8", "replace").strip()
+            if _SHA_VALID_RE.match(data):
+                refs_sha = data.lower()
+        elif low.endswith("/.git/fetch_head") or low == ".git/fetch_head":
+            fetch_head = tf.extractfile(m).read().decode("utf-8", "replace")
+    if sha:
+        return sha
+    if packed:
+        m = re.search(r"^([0-9a-f]{40})\s+refs/", packed, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return m.group(1).lower()
+    if refs_sha:
+        return refs_sha
+    if fetch_head:
+        m = re.match(r"\s*([0-9a-f]{40})\b", fetch_head, re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    return ""
+
+
+def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
+                            timeout: int = 300) -> str:
+    """下载 clone 层 blob（~75MB）并扫描 .git，返回锁定 commit（失败 ''）。
+
+    先按 gzip 流解（docker 层标准存储格式），失败再按未压缩 tar 兜底。
+    """
+    import gzip
+    import io
+    import tarfile
+
+    r = session.get(f"{v2}/blobs/{layer_digest}",
+                    headers={"Authorization": "Bearer " + token}, timeout=timeout)
+    r.raise_for_status()
+    data = r.content
+    for open_ in (lambda: gzip.GzipFile(fileobj=io.BytesIO(data)),
+                  lambda: io.BytesIO(data)):
+        try:
+            sha = _scan_tar_for_git_sha(open_())
+        except (OSError, EOFError, tarfile.ReadError):
+            sha = ""
+        if sha:
+            return sha
+    return ""
+
+
+def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
+                     insecure: bool = False, qbase: str = "https://quay.io") -> dict:
+    """扫描 fork 镜像的 git clone 层，读出镜像内实际代码的锁定 commit。
+
+    返回 {"sha": 40-hex 或 "", "layer": 层 digest, "error": 失败原因}。
+    层内的 .git 是构建时 git clone 留下的（depth 1），不随 fork 分支推进漂移。
+    """
+    from vllm_kb.net import get_session
+
+    out = {"sha": "", "layer": "", "error": ""}
+    cfg = fetch_image_config(tag_info, token, timeout=timeout, max_retries=max_retries,
+                             insecure=insecure, qbase=qbase)
+    layers = cfg.get("layers", [])
+    j = _locate_clone_layer(cfg.get("history", []), layers)
+    if j < 0 or j >= len(layers):
+        out["error"] = "未定位到 git clone 层（非 fork 构建形态）"
+        return out
+    layer_digest = layers[j]
+    out["layer"] = layer_digest
+    session = get_session(insecure)
+    v2 = _quay_v2(qbase)
+    for attempt in range(2):
+        try:
+            sha = _scan_layer_for_git_sha(session, v2, layer_digest, token, timeout=max(timeout, 300))
+            if sha:
+                out["sha"] = sha
+            else:
+                out["error"] = "clone 层内未找到 .git commit（浅克隆元数据被清理？）"
+            return out
+        except Exception as e:
+            if attempt == 1:
+                out["error"] = str(e)
+                return out
+            time.sleep(2)
+
+
+def enrich_fork_sha(rows: list[dict], groups: dict, token: str,
+                    insecure: bool = False, qbase: str = "https://quay.io") -> None:
+    """就地回填 fork 行的 vllm_sha（镜像 clone 层内的锁定 commit）。
+
+    image_digest 锚定：tag 未重推（digest 不变）= 层内容不变 = SHA 不变，直接沿用
+    已有值（跳过 ~75MB 层下载）；digest 变化（镜像重推）才重新扫描。扫描失败
+    保留旧值并告警（不阻塞矩阵写回）。
+    """
+    fork_rows = [r for r in rows if r.get("vllm_repo")]
+    if not fork_rows:
+        return
+    print(f"[matrix] fork 行 {len(fork_rows)} 条：扫描 clone 层固化锁定 commit ...", flush=True)
+    for r in fork_rows:
+        g = groups.get(r["vllm-ascend"])
+        if not g:
+            print(f"[matrix]    {r['vllm-ascend']}: quay 无对应 tag 组，跳过", flush=True)
+            continue
+        rep = pick_representative(g)
+        cur = rep["manifest_digest"]
+        if r.get("vllm_sha") and r.get("image_digest") == cur:
+            print(f"[matrix]    {r['vllm-ascend']}: 镜像未重推（digest 锚命中），"
+                  f"SHA 沿用 {r['vllm_sha'][:12]}", flush=True)
+            continue
+        out = extract_fork_sha(rep, token, insecure=insecure, qbase=qbase)
+        if out["sha"]:
+            r["vllm_sha"] = out["sha"]
+            r["image_digest"] = cur
+            print(f"[matrix]    {r['vllm-ascend']}: 锁定 commit {out['sha'][:12]}"
+                  f"（{r['vllm_repo']}@{r.get('vllm_ref') or '?'}）", flush=True)
+        else:
+            print(f"[matrix]    [!] {r['vllm-ascend']}: SHA 扫描失败"
+                  f"（{out['error'] or '未知原因'}），保留旧值", flush=True)
 
 def extract_from_env(env: list[str]) -> dict[str, str]:
     """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本 / vllm tag。
@@ -729,6 +906,8 @@ def main() -> None:
 
     auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase, gbase=gbase)
     merged = merge_with_manual(auto_rows, manual_rows)
+    # fork 行：clone 层扫描固化锁定 commit（digest 锚定，镜像未重推则跳过层下载）
+    enrich_fork_sha(merged, groups, token, insecure=insecure, qbase=qbase)
     # 写回前版本号合法性校验：非法版本置空（不污染矩阵，缺口报告会列出）
     n_bad = validate_version_fields(merged)
     if n_bad:

@@ -1,4 +1,6 @@
-"""build_companion_matrix.py 纯逻辑测试（不触网）：去重、env 提取、release 提取、合并、缺口报告。"""
+"""build_companion_matrix.py 纯逻辑测试（不触网）：去重、env/buildkit 提取、release 提取、
+合并、缺口报告、fork 层扫描（内存构造 tar.gz，不触网）。"""
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -364,6 +366,184 @@ class TestBuildRowsFork(unittest.TestCase):
         self.assertEqual(r["vllm_base"], "")
         self.assertEqual(r["vllm_repo"], "ZYang6263/vllm")  # fork 信息仍在
         self.assertEqual(r["image_digest"], "sha256:rep")
+
+
+class TestForkShaExtraction(unittest.TestCase):
+    """clone 层定位/扫描 + enrich 的 digest 锚定（不触网，层字节为内存构造的 tar.gz）。"""
+
+    SHA = "9ab939da68de3acd6acd40365d4e1bc25ae15d79"
+
+    @staticmethod
+    def _layer_bytes(members, gz=True) -> bytes:
+        import gzip
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        mode = "w:gz" if gz else "w"
+        with tarfile.open(fileobj=buf, mode=mode) as tf:
+            for name, data in members:
+                ti = tarfile.TarInfo(name)
+                ti.size = len(data)
+                tf.addfile(ti, io.BytesIO(data))
+        return buf.getvalue()
+
+    # 镜像 history（glm5.2 形态：apt 复合层 + clone 专属层 + 空层）
+    HISTORY = [
+        {"created_by": "RUN |2 PIP_INDEX_URL=x /bin/bash -c apt-get update -y && "
+                       "apt-get install -y git cmake # buildkit", "empty_layer": False},
+        {"created_by": "RUN |2 PIP_INDEX_URL=x /bin/bash -c git clone --depth 1 --branch glm52 "
+                       "https://github.com/ZYang6263/vllm.git /vllm-workspace/vllm # buildkit",
+         "empty_layer": False},
+        {"created_by": "ENV PATH=/usr/bin", "empty_layer": True},
+    ]
+    LAYERS = ["sha256:apt", "sha256:clone"]
+
+    def _run_extract(self, layer_members, gz=True):
+        from unittest import mock
+
+        manifest_list = {"manifests": [
+            {"digest": "sha256:sub", "platform": {"architecture": "amd64"}}]}
+        sub_manifest = {"config": {"digest": "sha256:cfg"}, "layers": [
+            {"digest": d} for d in self.LAYERS]}
+        config_blob = {"config": {"Env": []}, "history": self.HISTORY}
+        layer_bytes = self._layer_bytes(layer_members, gz=gz)
+
+        class _Resp:
+            def __init__(self, json_data=None, content=b""):
+                self._json, self.content = json_data, content
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._json
+
+        def fake_get(url, **kw):
+            if url.endswith("/manifest/sha256:list"):
+                return _Resp({"manifest_data": json.dumps(manifest_list)})
+            if url.endswith("/manifest/sha256:sub"):
+                return _Resp({"manifest_data": json.dumps(sub_manifest)})
+            if url.endswith("/blobs/sha256:cfg"):
+                return _Resp(config_blob)
+            if url.endswith("/blobs/sha256:clone"):
+                return _Resp(content=layer_bytes)
+            raise AssertionError(f"意外 URL: {url}")
+
+        with mock.patch("vllm_kb.net.get_session") as ms:
+            ms.return_value.get.side_effect = fake_get
+            return bm.extract_fork_sha(
+                {"name": "glm5.2-a3", "manifest_digest": "sha256:list"}, "T")
+
+    def test_shallow_sha(self):
+        members = [
+            ("vllm-workspace/vllm/setup.py", b"x=1"),
+            ("vllm-workspace/vllm/.git/HEAD", b"ref: refs/heads/glm52\n"),
+            ("vllm-workspace/vllm/.git/shallow", self.SHA.encode() + b"\n"),
+        ]
+        out = self._run_extract(members)
+        self.assertEqual(out["sha"], self.SHA)
+        self.assertEqual(out["layer"], "sha256:clone")   # apt 层被正确跳过
+        self.assertEqual(out["error"], "")
+
+    def test_packed_refs_fallback(self):
+        members = [
+            ("vllm-workspace/vllm/.git/packed-refs",
+             b"# pack-refs with: peeled fully-peeled sorted \n" + self.SHA.encode()
+             + b" refs/remotes/origin/glm52\n"),
+        ]
+        out = self._run_extract(members)
+        self.assertEqual(out["sha"], self.SHA)
+
+    def test_plain_tar_layer(self):
+        # 未压缩层兜底（registry 直接存 tar 的罕见形态）
+        members = [("vllm-workspace/vllm/.git/shallow", self.SHA.encode() + b"\n")]
+        out = self._run_extract(members, gz=False)
+        self.assertEqual(out["sha"], self.SHA)
+
+    def test_no_git_in_layer(self):
+        out = self._run_extract([("vllm-workspace/vllm/setup.py", b"x=1")])
+        self.assertEqual(out["sha"], "")
+        self.assertIn("未找到", out["error"])
+
+    def test_no_clone_layer(self):
+        from unittest import mock
+
+        cfg = {"env": [], "history": [{"created_by": "RUN /bin/bash -c ls", "empty_layer": False}],
+               "layers": ["sha256:only"]}
+        with mock.patch("build_companion_matrix.fetch_image_config", return_value=cfg):
+            out = bm.extract_fork_sha({"name": "x", "manifest_digest": "d"}, "T")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("未定位到", out["error"])
+
+    def test_locate_clone_layer_indices(self):
+        # 非空层与 layers 按序对应：clone 是第 2 个非空层 -> layers[1]
+        self.assertEqual(bm._locate_clone_layer(self.HISTORY, self.LAYERS), 1)
+        # hy4 形态（ARG + -b 变量 clone）
+        hy4 = [
+            {"created_by": "RUN |4 /bin/bash -c git clone --depth 1 --single-branch -b $VLLM_TAG "
+                           "$VLLM_REPO /vllm-workspace/vllm # buildkit", "empty_layer": False},
+        ]
+        self.assertEqual(bm._locate_clone_layer(hy4, ["sha256:c"]), 0)
+        # clone 混在 apt 复合命令里 -> 不匹配（保守，宁可报未定位）
+        mixed = [{"created_by": "/bin/bash -c apt-get install git && git clone --depth 1 x y",
+                  "empty_layer": False}]
+        self.assertEqual(bm._locate_clone_layer(mixed, ["sha256:m"]), -1)
+
+
+class TestEnrichForkSha(unittest.TestCase):
+    """enrich_fork_sha：digest 锚定跳过 / 重推重扫 / 失败保留 / 非 fork 行不动。"""
+
+    def test_anchor_hit_skips_scan(self):
+        from unittest import mock
+
+        rows = [{"vllm-ascend": "hy4", "vllm_repo": "a/vllm", "vllm_ref": "dev_hy4",
+                 "vllm_sha": "b" * 40, "image_digest": "sha256:cur"}]
+        groups = {"hy4": [{"name": "hy4-a3", "manifest_digest": "sha256:cur"}]}
+        with mock.patch("build_companion_matrix.extract_fork_sha",
+                        side_effect=AssertionError("digest 锚命中不应触发扫描")):
+            bm.enrich_fork_sha(rows, groups, "T")
+        self.assertEqual(rows[0]["vllm_sha"], "b" * 40)
+
+    def test_digest_change_triggers_rescan(self):
+        from unittest import mock
+
+        rows = [{"vllm-ascend": "hy4", "vllm_repo": "a/vllm", "vllm_ref": "dev_hy4",
+                 "vllm_sha": "b" * 40, "image_digest": "sha256:old"}]
+        groups = {"hy4": [{"name": "hy4-a3", "manifest_digest": "sha256:new"}]}
+        with mock.patch("build_companion_matrix.extract_fork_sha",
+                        return_value={"sha": "c" * 40, "layer": "sha256:l", "error": ""}):
+            bm.enrich_fork_sha(rows, groups, "T")
+        self.assertEqual(rows[0]["vllm_sha"], "c" * 40)
+        self.assertEqual(rows[0]["image_digest"], "sha256:new")
+
+    def test_first_scan_fills_sha(self):
+        from unittest import mock
+
+        rows = [{"vllm-ascend": "hy4", "vllm_repo": "a/vllm", "vllm_ref": "dev_hy4",
+                 "vllm_base": "0.23.0", "image_digest": "sha256:cur"}]  # 无 vllm_sha
+        groups = {"hy4": [{"name": "hy4-a3", "manifest_digest": "sha256:cur"}]}
+        with mock.patch("build_companion_matrix.extract_fork_sha",
+                        return_value={"sha": "d" * 40, "layer": "sha256:l", "error": ""}):
+            bm.enrich_fork_sha(rows, groups, "T")
+        self.assertEqual(rows[0]["vllm_sha"], "d" * 40)
+
+    def test_scan_failure_keeps_old(self):
+        from unittest import mock
+
+        rows = [{"vllm-ascend": "hy4", "vllm_repo": "a/vllm",
+                 "vllm_sha": "b" * 40, "image_digest": "sha256:old"}]
+        groups = {"hy4": [{"name": "hy4-a3", "manifest_digest": "sha256:new"}]}
+        with mock.patch("build_companion_matrix.extract_fork_sha",
+                        return_value={"sha": "", "layer": "", "error": "网络抖动"}):
+            bm.enrich_fork_sha(rows, groups, "T")
+        self.assertEqual(rows[0]["vllm_sha"], "b" * 40)   # 旧值保留
+        self.assertEqual(rows[0]["image_digest"], "sha256:old")
+
+    def test_non_fork_rows_untouched(self):
+        rows = [{"vllm-ascend": "v0.23.0", "vllm": "0.23.0"}]  # 无 vllm_repo
+        bm.enrich_fork_sha(rows, {"v0.23.0": [{"name": "v0.23.0", "manifest_digest": "d"}]}, "T")
+        self.assertEqual(rows, [{"vllm-ascend": "v0.23.0", "vllm": "0.23.0"}])
 
 
 class TestExtractVllmFromRelease(unittest.TestCase):
