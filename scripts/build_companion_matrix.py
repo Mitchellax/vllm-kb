@@ -10,8 +10,12 @@
    （"aligns ... with upstream vLLM v0.23.0" / "based on vLLM v0.19.1"；
     无说明时启发式：vllm-ascend 版本号跟踪上游 vllm，剥 rc 后缀）。
 
-自动无法确定的（pytorch / pytorch-ascend / npu-driver 等）→ 告警并留空，人工修复：
-人工已填写的字段优先保留（merge 时自动只填空字段）。
+自动无法确定的（npu-driver 等）→ 告警并留空，人工修复：
+人工已填写的字段优先保留（merge 时手工非空替换，自动只填空字段）。
+
+torch / pytorch-ascend：requirements.txt 提取（本地快照 zip 优先——54 个版本逐
+tag 走 GitHub API 会撞未认证限流 60 次/小时；快照由 build_code_snapshots 预拉，
+同源同内容），快照未预存的 tag 走 GitHub API 兜底。
 
 用法：
     python scripts/build_companion_matrix.py                 # 下载+匹配+写回+缺口报告
@@ -535,15 +539,45 @@ def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com"
 
 # torch-npu 依赖行（requirements.txt）：torch-npu==2.10.0.post2 / torch_npu==2.6.0.post1
 _TORCH_NPU_RE = re.compile(r"^torch[-_]npu\s*==\s*(\d+\.\d+(?:\.\d+)?(?:\.post\d+)?)", re.IGNORECASE)
+# torch 依赖行（requirements.txt）：torch==2.10.0（torch 与 torch-npu 基础版本一致）
+_TORCH_RE = re.compile(r"^torch\s*==\s*(\d+\.\d+(?:\.\d+)?(?:\.post\d+)?)", re.IGNORECASE)
 
 
-def fetch_pta_from_requirements(tag: str, insecure: bool = False,
-                                gbase: str = "https://api.github.com") -> str:
-    """从 vllm-ascend 指定 tag 的 requirements.txt 提取 pytorch-ascend（torch-npu）版本。
+def default_code_root() -> str:
+    """本地快照根（config.json storage.code_root，默认 data/code）。"""
+    try:
+        cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+        return cfg.get("storage", {}).get("code_root", "data/code")
+    except Exception:
+        return "data/code"
 
-    返回 ""（无法获取）。GitHub API contents 端点（走内网镜像 gbase）。
-    带 2 次重试：内网环境单次请求可能超时，避免逐 tag 长时间静默。
+
+def _requirements_from_snapshot(tag: str) -> str:
+    """从本地 vllm-ascend 快照 zip（data/code/zips/{tag}.zip）读 requirements.txt。
+
+    返回文本（无 zip / 无文件返回 ""）。零网络：54 个版本逐 tag 走 GitHub API
+    contents 端点会撞未认证限流（60 次/小时），快照由 build_code_snapshots
+    预先拉取，同源同内容。
     """
+    import zipfile
+
+    zpath = Path(default_code_root()) / "zips" / f"{tag}.zip"
+    if not zpath.exists():
+        return ""
+    try:
+        with zipfile.ZipFile(zpath) as zf:
+            # codeload zip 顶层目录：vllm-ascend-{tag}/requirements.txt
+            for name in zf.namelist():
+                if name.count("/") == 1 and name.endswith("/requirements.txt"):
+                    return zf.read(name).decode("utf-8", "replace")
+    except Exception as e:
+        print(f"[matrix] {tag} 快照 zip 读取失败: {e}", flush=True)
+    return ""
+
+
+def _requirements_from_github(tag: str, insecure: bool = False,
+                              gbase: str = "https://api.github.com") -> str:
+    """GitHub API contents 端点兜底（快照未预存的 tag）。带 2 次重试。"""
     import time as _t
 
     from vllm_kb.net import get_session
@@ -556,14 +590,10 @@ def fetch_pta_from_requirements(tag: str, insecure: bool = False,
             r = session.get(url, headers={"User-Agent": "vllm-kb", "Accept": "application/vnd.github.raw"},
                             timeout=15)
             if r.status_code == 404:
-                print(f"[matrix] {tag} 无 requirements.txt（跳过 PTA 提取）", flush=True)
+                print(f"[matrix] {tag} 无 requirements.txt（跳过 torch/PTA 提取）", flush=True)
                 return ""
             r.raise_for_status()
-            for line in r.text.splitlines():
-                m = _TORCH_NPU_RE.match(line.strip())
-                if m:
-                    return m.group(1)
-            return ""
+            return r.text
         except Exception as e:
             if attempt == 2:
                 print(f"[matrix] {tag} requirements.txt 拉取失败: {e}", flush=True)
@@ -572,6 +602,37 @@ def fetch_pta_from_requirements(tag: str, insecure: bool = False,
             print(f"[matrix] {tag} requirements.txt 拉取失败({e})，{wait}s 后重试", flush=True)
             _t.sleep(wait)
     return ""
+
+
+def extract_torch_pair(text: str) -> tuple[str, str]:
+    """从 requirements.txt 文本提取 (torch, torch-npu) 版本。无对应行返回空。"""
+    torch_v = pta = ""
+    for line in text.splitlines():
+        s = line.strip()
+        if not torch_v:
+            m = _TORCH_RE.match(s)
+            if m:
+                torch_v = m.group(1)
+        if not pta:
+            m = _TORCH_NPU_RE.match(s)
+            if m:
+                pta = m.group(1)
+    return torch_v, pta
+
+
+def fetch_pta_from_requirements(tag: str, insecure: bool = False,
+                                gbase: str = "https://api.github.com") -> dict:
+    """提取指定 tag 的 torch / pytorch-ascend(torch-npu) 版本，返回 {torch, torch_npu, src}。
+
+    优先本地快照 zip（零网络、无限流），快照未预存时 GitHub API 兜底。
+    """
+    text = _requirements_from_snapshot(tag)
+    if text:
+        torch_v, pta = extract_torch_pair(text)
+        return {"torch": torch_v, "torch_npu": pta, "src": "requirements(本地快照)"}
+    text = _requirements_from_github(tag, insecure=insecure, gbase=gbase)
+    torch_v, pta = extract_torch_pair(text) if text else ("", "")
+    return {"torch": torch_v, "torch_npu": pta, "src": "requirements(github)" if text else ""}
 
 
 def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:
@@ -627,19 +688,24 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         if c:
             cann_by_base.setdefault(base_version_key(base), c)
 
-    # 版本型 tag：从各自 requirements.txt 提取 PTA（pytorch-ascend）
-    pta_by_tag: dict[str, str] = {}
+    # 版本型 tag：从 requirements.txt 提取 torch / PTA（本地快照优先，GitHub 兜底）
+    req_by_tag: dict[str, dict] = {}
     versioned = [b for b in sorted(groups) if base_version_key(b)]
     for i, base in enumerate(versioned, 1):
-        print(f"[matrix] PTA 提取 {i}/{len(versioned)}：{base} ...", flush=True)
-        p = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase)
-        if p:
-            pta_by_tag[base] = p
-            print(f"[matrix]    {base} -> pytorch-ascend {p}", flush=True)
-    # 基础版本号 -> PTA（同系列回退用）
+        print(f"[matrix] torch/PTA 提取 {i}/{len(versioned)}：{base} ...", flush=True)
+        r = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase)
+        if r["torch_npu"] or r["torch"]:
+            req_by_tag[base] = r
+            print(f"[matrix]    {base} -> torch {r['torch'] or '-'} "
+                  f"pytorch-ascend {r['torch_npu'] or '-'}（{r['src']}）", flush=True)
+    # 基础版本号 -> torch / PTA（同系列回退用）
+    torch_by_base: dict[str, str] = {}
     pta_by_base: dict[str, str] = {}
-    for base in sorted(pta_by_tag):
-        pta_by_base.setdefault(base_version_key(base), pta_by_tag[base])
+    for base in sorted(req_by_tag):
+        bv = base_version_key(base)
+        torch_by_base.setdefault(bv, req_by_tag[base]["torch"])
+        pta_by_base.setdefault(bv, req_by_tag[base]["torch_npu"])
+    pta_by_tag = {b: r["torch_npu"] for b, r in req_by_tag.items()}
 
     rows = []
     for i, base in enumerate(sorted(groups), 1):
@@ -664,22 +730,29 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         if not vllm_ver:
             vllm_ver, vllm_src = extract_vllm_from_release(
                 base, rel_body) if rel_body else extract_vllm_from_release(base, "")
-        # pytorch-ascend（PTA）：
-        #   版本型 tag -> 自身 requirements.txt（torch-npu==x.y.z.postN）；
-        #   0day 模型（无基础版本号）-> 参考其 vllm 版本对应 tag 的 PTA；
-        #   torch（pytorch 字段）不必须，留空。
-        pta = ""
+        # torch / pytorch-ascend（PTA）：
+        #   版本型 tag -> 自身 requirements.txt（torch==x / torch-npu==y）；
+        #   0day 模型（无基础版本号）-> 参考其 vllm 版本对应 tag 的组合；
+        #   requirements 无显式 torch 行时，由 torch-npu 基础版本推导（两者配套发布）。
+        pta = torch_v = ""
         pta_src = ""
         bv = base_version_key(base)
         if bv:
-            pta = pta_by_tag.get(base) or pta_by_base.get(bv, "")
-            pta_src = f"requirements({bv})"
+            r = req_by_tag.get(base) or {}
+            pta = r.get("torch_npu") or pta_by_base.get(bv, "")
+            torch_v = r.get("torch") or torch_by_base.get(bv, "")
+            pta_src = (r.get("src") or f"requirements({bv})") if (pta or torch_v) else ""
         elif vllm_ver:
-            # 0day：vllm 版本 -> 找 vllm-ascend tag（v{vllm_ver} 或 v{vllm_ver}rc*）的 PTA
+            # 0day：vllm 版本 -> 找 vllm-ascend tag（v{vllm_ver} 或 v{vllm_ver}rc*）的组合
             cand = f"v{vllm_ver}"
             pta = pta_by_tag.get(cand) or pta_by_base.get(vllm_ver, "")
+            torch_v = torch_by_base.get(vllm_ver, "")
             if pta:
                 pta_src = f"0day→v{vllm_ver}的requirements"
+        if pta and not torch_v:
+            # torch-npu==2.10.0.post4 -> torch 2.10.0（配套基础版本）
+            torch_v = re.match(r"^(\d+\.\d+(?:\.\d+)?)", pta).group(1) \
+                if re.match(r"^(\d+\.\d+(?:\.\d+)?)", pta) else ""
         notes = []
         if info["soc"]:
             notes.append(f"SOC={info['soc']}")
@@ -701,7 +774,7 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             "vllm-ascend": base,
             "vllm": vllm_ver,
             "cann": cann,
-            "pytorch": "",          # torch 不必须，留空
+            "pytorch": torch_v,    # requirements torch== 行，或由 torch-npu 基础版本推导
             "pytorch-ascend": pta,
             "npu-driver": "",
             "notes": "; ".join(notes),
@@ -718,7 +791,7 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         flag = "ok" if (cann or vllm_ver or pta) else "gap"
         print(
             f"[matrix] ({i}/{total}) {base:<28} cann={cann or '-':<8} vllm={vllm_ver or '-':<8} "
-            f"pta={pta or '-':<10} {vllm_src or ''} [{flag}]",
+            f"pta={pta or '-':<14} torch={torch_v or '-':<9} {vllm_src or ''} [{flag}]",
             flush=True,
         )
     return rows

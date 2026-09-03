@@ -2,6 +2,7 @@
 合并、缺口报告、fork 层扫描（内存构造 tar.gz，不触网）。"""
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -568,6 +569,69 @@ class TestExtractVllmFromRelease(unittest.TestCase):
         self.assertEqual(src, "")
 
 
+class TestRequirementsExtraction(unittest.TestCase):
+    """torch/PTA 提取：本地快照优先（零网络）、GitHub 兜底、torch-npu 推导。"""
+
+    REQ_TEXT = (
+        "torch==2.10.0\n"
+        "torch-npu==2.10.0.post4\n"
+        "torchvision==0.25.0\n"
+        "ray==2.43.0\n"
+    )
+
+    def test_extract_torch_pair(self):
+        t, p = bm.extract_torch_pair(self.REQ_TEXT)
+        self.assertEqual(t, "2.10.0")
+        self.assertEqual(p, "2.10.0.post4")
+        # 无 torch 行
+        t2, p2 = bm.extract_torch_pair("torch-npu==2.9.0\nray==1.0\n")
+        self.assertEqual(t2, "")
+        self.assertEqual(p2, "2.9.0")
+        # 空
+        self.assertEqual(bm.extract_torch_pair(""), ("", ""))
+
+    def test_snapshot_zip_local_first(self):
+        # 造一个本地快照 zip：fetch 优先读它、不触网
+        import zipfile
+
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td):
+                zdir = Path(td) / "zips"
+                zdir.mkdir(parents=True)
+                with zipfile.ZipFile(zdir / "v9.9.9.zip", "w") as zf:
+                    zf.writestr("vllm-ascend-v9.9.9/requirements.txt", self.REQ_TEXT)
+                    zf.writestr("vllm-ascend-v9.9.9/setup.py", "# unrelated")
+                with mock.patch("build_companion_matrix._requirements_from_github",
+                                side_effect=AssertionError("本地快照命中不应走 GitHub")):
+                    r = bm.fetch_pta_from_requirements("v9.9.9")
+            self.assertEqual(r["torch"], "2.10.0")
+            self.assertEqual(r["torch_npu"], "2.10.0.post4")
+            self.assertIn("本地快照", r["src"])
+
+    def test_snapshot_miss_falls_to_github(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix._requirements_from_github",
+                               return_value=self.REQ_TEXT) as gh:
+                r = bm.fetch_pta_from_requirements("v8.8.8")
+            gh.assert_called_once()
+            self.assertEqual(r["torch"], "2.10.0")
+            self.assertIn("github", r["src"])
+
+    def test_both_miss_returns_empty(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix._requirements_from_github", return_value=""):
+                r = bm.fetch_pta_from_requirements("v7.7.7")
+        self.assertEqual(r, {"torch": "", "torch_npu": "", "src": ""})
+
+
 class TestMergeWithManual(unittest.TestCase):
     def test_manual_wins_for_nonempty(self):
         auto = [
@@ -712,7 +776,9 @@ class TestPtaExtraction(unittest.TestCase):
         from unittest import mock
 
         def fake_req(tag, **kw):
-            return reqs.get(tag, "")
+            r = reqs.get(tag, {})
+            return {"torch": r.get("torch", ""), "torch_npu": r.get("pta", ""),
+                    "src": "requirements(测试)" if r else ""}
 
         with mock.patch("build_companion_matrix.fetch_image_config",
                         side_effect=lambda t, tk, **kw: {"env": envs[t["name"]], "history": []}), \
@@ -724,22 +790,32 @@ class TestPtaExtraction(unittest.TestCase):
                   "v0.18.0rc1": [{"name": "v0.18.0rc1", "manifest_digest": "d"}]}
         envs = {"v0.23.0rc1": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.1"],
                 "v0.18.0rc1": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.1"]}
-        reqs = {"v0.23.0rc1": "2.10.0.post2"}
+        reqs = {"v0.23.0rc1": {"torch": "2.10.0", "pta": "2.10.0.post2"}}
         rows = self._build(groups, envs, reqs)
         self.assertEqual(rows["v0.23.0rc1"]["pytorch-ascend"], "2.10.0.post2")
+        self.assertEqual(rows["v0.23.0rc1"]["pytorch"], "2.10.0")  # torch 同行提取
         self.assertIn("requirements", rows["v0.23.0rc1"]["source"])
-        self.assertEqual(rows["v0.23.0rc1"]["pytorch"], "")  # torch 不必须留空
         self.assertEqual(rows["v0.18.0rc1"]["pytorch-ascend"], "")  # 无 requirements 留空
+
+    def test_torch_derived_from_pta_base(self):
+        # requirements 无显式 torch 行 -> 由 torch-npu 基础版本推导（配套发布）
+        groups = {"v0.20.0": [{"name": "v0.20.0", "manifest_digest": "d"}]}
+        envs = {"v0.20.0": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.0.0"]}
+        reqs = {"v0.20.0": {"torch": "", "pta": "2.10.0.post4"}}
+        rows = self._build(groups, envs, reqs)
+        self.assertEqual(rows["v0.20.0"]["pytorch-ascend"], "2.10.0.post4")
+        self.assertEqual(rows["v0.20.0"]["pytorch"], "2.10.0")
 
     def test_0day_pta_via_vllm_version(self):
         groups = {"deepseekv4-flash-0731": [{"name": "deepseekv4-flash-0731", "manifest_digest": "d"}],
                   "v0.26.0": [{"name": "v0.26.0", "manifest_digest": "d"}]}
         envs = {"deepseekv4-flash-0731": ["VLLM_TAG=v0.26.0"],
                 "v0.26.0": ["VLLM_TAG=v0.26.0"]}
-        reqs = {"v0.26.0": "2.7.0.post1"}
+        reqs = {"v0.26.0": {"torch": "2.11.0", "pta": "2.7.0.post1"}}
         rows = self._build(groups, envs, reqs)
         m0 = rows["deepseekv4-flash-0731"]
         self.assertEqual(m0["pytorch-ascend"], "2.7.0.post1")  # 参考 v0.26.0 的 PTA
+        self.assertEqual(m0["pytorch"], "2.11.0")              # torch 同路径回退
         self.assertIn("0day", m0["source"])
 
     def test_0day_no_vllm_hit_kept_empty(self):
