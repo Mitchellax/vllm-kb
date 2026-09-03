@@ -44,10 +44,18 @@ class TestDataRootRedirect(unittest.TestCase):
     def test_resolve_redirects_data_root(self):
         from vllm_kb.config import AppConfig
 
+        # 临时 config（不读本机 config.json——gitignored，fresh clone/CI 无此文件；
+        # 相对路径还依赖 CWD=仓库根）。resolve 的重定向由 VLLM_KB_DATA_ROOT 驱动，与配置内容无关。
+        cfg_file = self.root / "config.json"
+        cfg_file.write_text(json.dumps({
+            "embedding": {"provider": "echo"},
+            "storage": {"sqlite_path": "data/kb.sqlite3"},
+        }), encoding="utf-8")
+
         old = os.environ.get("VLLM_KB_DATA_ROOT")
         os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "remote_data")
         try:
-            cfg = AppConfig.load("config.json")
+            cfg = AppConfig.load(str(cfg_file), require_keys=False)
             # data/kb.sqlite3 -> {root}/kb.sqlite3（剥掉 data/ 前缀）
             p = cfg.resolve("data/kb.sqlite3")
             self.assertEqual(str(p), str(self.root / "remote_data" / "kb.sqlite3"))

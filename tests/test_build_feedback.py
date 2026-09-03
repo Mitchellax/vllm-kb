@@ -22,10 +22,17 @@ from vllm_kb.feedback_model import DocFeedback, apply_feedback_event, load_feedb
 
 
 def _cfg(tmpdir):
-    cfg = AppConfig.load("config.json", require_keys=False)
-    cfg.confidence.feedback_enabled = True
-    cfg.confidence.telemetry_path = str(Path(tmpdir) / "telemetry.sqlite3")
-    cfg.confidence.feedback_path = str(Path(tmpdir) / "confidence_feedback.json")
+    """合成最小配置（不读本机 config.json——gitignored 文件不能作测试夹具，
+    且本机 confidence 值会让测试行为机器间漂移）。"""
+    cfg = AppConfig.model_validate({
+        "embedding": {"provider": "echo"},
+        "storage": {"sqlite_path": str(Path(tmpdir) / "kb.sqlite3")},
+        "confidence": {
+            "feedback_enabled": True,
+            "telemetry_path": str(Path(tmpdir) / "telemetry.sqlite3"),
+            "feedback_path": str(Path(tmpdir) / "confidence_feedback.json"),
+        },
+    })
     return cfg
 
 

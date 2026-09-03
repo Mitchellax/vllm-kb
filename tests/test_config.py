@@ -8,12 +8,16 @@ from vllm_kb.config import AppConfig, PROJECT_ROOT
 
 class TestConfig(unittest.TestCase):
     def test_load_default_config(self):
-        # 默认 config 为 openai_compatible，运行时校验要求 key：模拟环境变量后应可加载
+        # 部署配置冒烟：本机 config.json 存在时验证可加载且主源排序符合约定。
+        # config.json 被 gitignore（含密钥）——fresh clone/CI 无此文件时跳过而非报错。
+        cfg_path = PROJECT_ROOT / "config.json"
+        if not cfg_path.exists():
+            self.skipTest("config.json 不存在（fresh clone/CI）——部署配置冒烟仅在配置存在时运行")
         import os
 
         os.environ["EMBEDDING_API_KEY"] = "dummy-for-test"
         try:
-            cfg = AppConfig.load(PROJECT_ROOT / "config.json")
+            cfg = AppConfig.load(cfg_path)
             self.assertEqual(cfg.github, None)  # 已迁移为 sources 格式
             sources = cfg.effective_sources()
             by_id = {s.id: s for s in sources}
