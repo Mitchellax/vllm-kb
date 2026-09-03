@@ -749,6 +749,19 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             torch_v = torch_by_base.get(vllm_ver, "")
             if pta:
                 pta_src = f"0day→v{vllm_ver}的requirements"
+            else:
+                # 同 minor 系列回退：0.19.0 -> 0.19.x 任一 tag。0day 镜像引用的
+                # vllm 版本常无同名 vllm-ascend tag（bailing 的 0.19.0 只有
+                # v0.19.1rc1 存在；DeepSeekV4-flash 的 0.25.1 未发布，回退也
+                # 无果→留空人工）。torch-npu 随 minor 发布线，与 cann 同系列
+                # 回退同理。
+                minor = ".".join(vllm_ver.split(".")[:2])
+                for tb in sorted(req_by_tag):
+                    if base_version_key(tb).startswith(minor + "."):
+                        pta = req_by_tag[tb]["torch_npu"]
+                        torch_v = req_by_tag[tb]["torch"]
+                        pta_src = f"0day→同系列{minor}.x的requirements"
+                        break
         if pta and not torch_v:
             # torch-npu==2.10.0.post4 -> torch 2.10.0（配套基础版本）
             torch_v = re.match(r"^(\d+\.\d+(?:\.\d+)?)", pta).group(1) \

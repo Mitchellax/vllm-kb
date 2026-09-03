@@ -97,8 +97,12 @@ class TestExtractFromEnv(unittest.TestCase):
         def fake_env(tag_info, token, **kw):
             return envs[tag_info["name"]]
 
+        # build_rows 内部对版本型组调 fetch_pta_from_requirements——mock 掉防真网络
+        empty_req = {"torch": "", "torch_npu": "", "src": ""}
         with mock.patch("build_companion_matrix.fetch_image_config",
-                        side_effect=lambda t, tk, **kw: {"env": envs[t["name"]], "history": []}):
+                        side_effect=lambda t, tk, **kw: {"env": envs[t["name"]], "history": []}), \
+                mock.patch("build_companion_matrix.fetch_pta_from_requirements",
+                           return_value=empty_req):
             rows = bm.build_rows(groups, {}, "T")
         by_key = {r["vllm-ascend"]: r for r in rows}
         # rc1 从同系列回退得到 cann
@@ -121,8 +125,11 @@ class TestExtractFromEnv(unittest.TestCase):
         def fake_env(tag_info, token, **kw):
             return ["SOC_VERSION=ascend910b1"]  # 全部无 cann
 
+        empty_req = {"torch": "", "torch_npu": "", "src": ""}
         with mock.patch("build_companion_matrix.fetch_image_config",
-                        side_effect=lambda t, tk, **kw: {"env": ["SOC_VERSION=ascend910b1"], "history": []}):
+                        side_effect=lambda t, tk, **kw: {"env": ["SOC_VERSION=ascend910b1"], "history": []}), \
+                mock.patch("build_companion_matrix.fetch_pta_from_requirements",
+                           return_value=empty_req):
             rows = bm.build_rows(groups, {}, "T")
         for r in rows:
             self.assertEqual(r["cann"], "")
@@ -817,6 +824,31 @@ class TestPtaExtraction(unittest.TestCase):
         self.assertEqual(m0["pytorch-ascend"], "2.7.0.post1")  # 参考 v0.26.0 的 PTA
         self.assertEqual(m0["pytorch"], "2.11.0")              # torch 同路径回退
         self.assertIn("0day", m0["source"])
+
+    def test_0day_pta_series_fallback(self):
+        # 0day 引用的 vllm 版本无同名 tag（bailing 0.19.0 实况）-> 同 minor 系列回退
+        groups = {"bailing-flash-arm": [{"name": "bailing-flash-arm", "manifest_digest": "d"}],
+                  "v0.19.1rc1": [{"name": "v0.19.1rc1", "manifest_digest": "d"}]}
+        envs = {"bailing-flash-arm": ["VLLM_TAG=v0.19.0"],
+                "v0.19.1rc1": ["VLLM_TAG=v0.19.1"]}
+        reqs = {"v0.19.1rc1": {"torch": "2.9.0", "pta": "2.9.0"}}
+        rows = self._build(groups, envs, reqs)
+        m0 = rows["bailing-flash-arm"]
+        self.assertEqual(m0["pytorch-ascend"], "2.9.0")  # 0.19.0 -> 0.19.1rc1
+        self.assertEqual(m0["pytorch"], "2.9.0")
+        self.assertIn("同系列", m0["source"])
+
+    def test_0day_pta_unreleased_stays_empty(self):
+        # 0day 引用未发布版本（DeepSeekV4-flash 0.25.1 实况，无任何 0.25.x）-> 留空人工
+        groups = {"deepseekv4-flash-0731": [{"name": "deepseekv4-flash-0731", "manifest_digest": "d"}],
+                  "v0.23.0": [{"name": "v0.23.0", "manifest_digest": "d"}]}
+        envs = {"deepseekv4-flash-0731": ["VLLM_TAG=v0.25.1"],
+                "v0.23.0": ["VLLM_TAG=v0.23.0"]}
+        reqs = {"v0.23.0": {"torch": "2.10.0", "pta": "2.10.0.post4"}}
+        rows = self._build(groups, envs, reqs)
+        m0 = rows["deepseekv4-flash-0731"]
+        self.assertEqual(m0["pytorch-ascend"], "")  # 不跨 minor 猜（0.23 -> 0.25 不可靠）
+        self.assertEqual(m0["pytorch"], "")
 
     def test_0day_no_vllm_hit_kept_empty(self):
         groups = {"glm5": [{"name": "glm5", "manifest_digest": "d"}]}
