@@ -15,7 +15,16 @@
 
 torch / pytorch-ascend：requirements.txt 提取（本地快照 zip 优先——54 个版本逐
 tag 走 GitHub API 会撞未认证限流 60 次/小时；快照由 build_code_snapshots 预拉，
-同源同内容），快照未预存的 tag 走 GitHub API 兜底。
+同源同内容），快照未预存的 tag 走 GitHub API 兜底（结果跨运行缓存，tag 内容
+不可变 → 永久有效；缓存后全命中时 GitHub API 请求为 0）。
+
+跨运行缓存（data/cache/，--refresh-cache 强制刷新）：
+  fork_sha.json             clone 层 digest → 锁定 SHA（层不可变，永久有效；
+                            首次扫描后不再重下 75MB 层）
+  github_releases.json      release 说明（历史不可变，TTL 7 天兜底新 release）
+  github_requirements.json  requirements 兜底结果（含 404，永久有效）
+缓存消除两类重复网络成本：fork 层 75MB 下载（内网慢链路上分钟级）与
+GitHub API 用量（releases ~6 请求 + requirements ~40 请求/次 → 命中后 0）。
 
 用法：
     python scripts/build_companion_matrix.py                 # 下载+匹配+写回+缺口报告
@@ -404,7 +413,8 @@ def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
 
 
 def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
-                     insecure: bool = False, qbase: str = "https://quay.io") -> dict:
+                     insecure: bool = False, qbase: str = "https://quay.io",
+                     refresh: bool = False) -> dict:
     """扫描 fork 镜像的 git clone 层，读出镜像内实际代码的锁定 commit。
 
     返回 {"sha": 40-hex 或 "", "layer": 层 digest, "error": 失败原因}。
@@ -426,10 +436,11 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries:
     layer_digest = layers[j]
     out["layer"] = layer_digest
     cache = _cache_load(_FORK_SHA_CACHE)
-    hit = cache.get(layer_digest) or {}
-    if hit.get("sha"):
-        out["sha"] = hit["sha"]
-        return out
+    if not refresh:
+        hit = cache.get(layer_digest) or {}
+        if hit.get("sha"):
+            out["sha"] = hit["sha"]
+            return out
     session = get_session(insecure)
     v2 = _quay_v2(qbase)
     for attempt in range(2):
@@ -450,12 +461,14 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries:
 
 
 def enrich_fork_sha(rows: list[dict], groups: dict, token: str,
-                    insecure: bool = False, qbase: str = "https://quay.io") -> None:
+                    insecure: bool = False, qbase: str = "https://quay.io",
+                    refresh: bool = False) -> None:
     """就地回填 fork 行的 vllm_sha（镜像 clone 层内的锁定 commit）。
 
     image_digest 锚定：tag 未重推（digest 不变）= 层内容不变 = SHA 不变，直接沿用
     已有值（跳过 ~75MB 层下载）；digest 变化（镜像重推）才重新扫描。扫描失败
-    保留旧值并告警（不阻塞矩阵写回）。
+    保留旧值并告警（不阻塞矩阵写回）。层 SHA 磁盘缓存（extract_fork_sha 内）
+    进一步覆盖矩阵未写盘/新环境的场景。
     """
     fork_rows = [r for r in rows if r.get("vllm_repo")]
     if not fork_rows:
@@ -472,7 +485,7 @@ def enrich_fork_sha(rows: list[dict], groups: dict, token: str,
             print(f"[matrix]    {r['vllm-ascend']}: 镜像未重推（digest 锚命中），"
                   f"SHA 沿用 {r['vllm_sha'][:12]}", flush=True)
             continue
-        out = extract_fork_sha(rep, token, insecure=insecure, qbase=qbase)
+        out = extract_fork_sha(rep, token, insecure=insecure, qbase=qbase, refresh=refresh)
         if out["sha"]:
             r["vllm_sha"] = out["sha"]
             r["image_digest"] = cur
@@ -511,17 +524,33 @@ def extract_from_env(env: list[str]) -> dict[str, str]:
 
 # ---------------- GitHub release 说明 ----------------
 
-def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com") -> dict[str, str]:
+def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com",
+                   refresh: bool = False) -> dict[str, str]:
     """拉取 vllm-ascend 全部 release 说明，返回 {tag_name: body}。失败返回 {}。
 
     - 分页全量拉取（per_page=100，翻页直到取完，vllm-ascend release 已超 100 条）；
     - socket 级默认超时兜底：requests timeout 不覆盖 DNS 解析/代理握手，
       内网环境可能挂远超 timeout，先设 socket 超时保证任何阶段都限时；
     - 带重试（5xx/限流/网络抖动）；单页重试耗尽返回已拿到的部分，不阻塞矩阵。
+
+    缓存（data/cache/github_releases.json，key=API 前缀）：历史 release body
+    不可变，TTL 7 天兜底新 release/说明更新；**只有完整翻页到底才写缓存**
+    （部分数据不落盘，下次重拉）。--refresh-cache 强制刷新。省 ~6 个 API
+    请求/次——未认证限流 60 次/小时下的主要用量之一。
     """
     import time as _t
 
     from vllm_kb.net import get_session
+
+    cache_key = gbase.rstrip("/")
+    if not refresh:
+        ent = _cache_load(_RELEASES_CACHE).get(cache_key) or {}
+        rels = ent.get("releases")
+        if isinstance(rels, dict) and rels and \
+                time.time() - ent.get("fetched_at", 0) < 7 * 86400:
+            print(f"[matrix] release 说明 {len(rels)} 条（缓存命中，TTL 7 天内；"
+                  f"--refresh-cache 强制刷新）", flush=True)
+            return rels
 
     print(f"[matrix] 拉取 GitHub release 说明（{gbase}/repos/vllm-project/vllm-ascend/releases）...",
           flush=True)
@@ -551,12 +580,16 @@ def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com"
                     _t.sleep(wait)
                 else:
                     print(f"[matrix] 拉取 GitHub release 说明失败（page {page}）: {e}，"
-                          f"已返回部分数据 {len(releases)} 条", flush=True)
+                          f"已返回部分数据 {len(releases)} 条（不写缓存，下次重拉）", flush=True)
                     return releases
         if not ok:
             return releases
         print(f"[matrix] release 说明 {len(releases)} 条（page {page} 完成）", flush=True)
         if len(batch) < 100:
+            # 完整翻页到底：写缓存
+            cache = _cache_load(_RELEASES_CACHE)
+            cache[cache_key] = {"fetched_at": time.time(), "releases": releases}
+            _cache_save(_RELEASES_CACHE, cache)
             return releases
         page += 1
 
@@ -636,8 +669,12 @@ def _requirements_from_snapshot(tag: str) -> str:
 
 
 def _requirements_from_github(tag: str, insecure: bool = False,
-                              gbase: str = "https://api.github.com") -> str:
-    """GitHub API contents 端点兜底（快照未预存的 tag）。带 2 次重试。"""
+                              gbase: str = "https://api.github.com") -> "str | None":
+    """GitHub API contents 端点兜底（快照未预存的 tag）。带 2 次重试。
+
+    返回语义：文本 = 成功；"" = 404（该 tag 确定无 requirements.txt，结果
+    可缓存）；None = 拉取失败（网络/限流，不可缓存，下次重试）。
+    """
     import time as _t
 
     from vllm_kb.net import get_session
@@ -657,11 +694,11 @@ def _requirements_from_github(tag: str, insecure: bool = False,
         except Exception as e:
             if attempt == 2:
                 print(f"[matrix] {tag} requirements.txt 拉取失败: {e}", flush=True)
-                return ""
+                return None
             wait = 2 ** attempt
             print(f"[matrix] {tag} requirements.txt 拉取失败({e})，{wait}s 后重试", flush=True)
             _t.sleep(wait)
-    return ""
+    return None
 
 
 def extract_torch_pair(text: str) -> tuple[str, str]:
@@ -681,17 +718,34 @@ def extract_torch_pair(text: str) -> tuple[str, str]:
 
 
 def fetch_pta_from_requirements(tag: str, insecure: bool = False,
-                                gbase: str = "https://api.github.com") -> dict:
+                                gbase: str = "https://api.github.com",
+                                refresh: bool = False) -> dict:
     """提取指定 tag 的 torch / pytorch-ascend(torch-npu) 版本，返回 {torch, torch_npu, src}。
 
-    优先本地快照 zip（零网络、无限流），快照未预存时 GitHub API 兜底。
+    优先级：本地快照 zip（零网络）→ GitHub 结果缓存 → GitHub API 兜底。
+    缓存（data/cache/github_requirements.json，key=tag）：tag 内容不可变
+    （含 404——0day/未发布 tag 确定无 requirements），永久有效；拉取失败
+    （网络/限流）不缓存。缓存后矩阵全命中时 GitHub API 请求为 0，
+    未认证限流（60 次/小时）不再是约束。
     """
     text = _requirements_from_snapshot(tag)
     if text:
         torch_v, pta = extract_torch_pair(text)
         return {"torch": torch_v, "torch_npu": pta, "src": "requirements(本地快照)"}
+    cache = _cache_load(_REQ_CACHE)
+    if not refresh:
+        ent = cache.get(tag)
+        if isinstance(ent, dict):
+            torch_v, pta = ent.get("torch", ""), ent.get("torch_npu", "")
+            return {"torch": torch_v, "torch_npu": pta,
+                    "src": "requirements(github缓存)" if (torch_v or pta) else ""}
     text = _requirements_from_github(tag, insecure=insecure, gbase=gbase)
+    if text is None:
+        # 拉取失败（网络/限流）：不缓存，下次重试
+        return {"torch": "", "torch_npu": "", "src": ""}
     torch_v, pta = extract_torch_pair(text) if text else ("", "")
+    cache[tag] = {"torch": torch_v, "torch_npu": pta}  # 含空结果（404 不可变）
+    _cache_save(_REQ_CACHE, cache)
     return {"torch": torch_v, "torch_npu": pta, "src": "requirements(github)" if text else ""}
 
 
@@ -728,7 +782,8 @@ def base_version_key(tag: str) -> str:
 
 def build_rows(groups: dict, releases: dict[str, str], token: str,
                insecure: bool = False, qbase: str = "https://quay.io",
-               gbase: str = "https://api.github.com") -> list[dict]:
+               gbase: str = "https://api.github.com",
+               refresh_cache: bool = False) -> list[dict]:
     # 第一遍：收齐所有组的 env 信息（同基础版本的组共享 cann 用于回退）
     infos: dict[str, dict] = {}  # base(group key) -> extract_from_env 结果
     total = len(groups)
@@ -753,7 +808,8 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
     versioned = [b for b in sorted(groups) if base_version_key(b)]
     for i, base in enumerate(versioned, 1):
         print(f"[matrix] torch/PTA 提取 {i}/{len(versioned)}：{base} ...", flush=True)
-        r = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase)
+        r = fetch_pta_from_requirements(base, insecure=insecure, gbase=gbase,
+                                        refresh=refresh_cache)
         if r["torch_npu"] or r["torch"]:
             req_by_tag[base] = r
             print(f"[matrix]    {base} -> torch {r['torch'] or '-'} "
@@ -1013,6 +1069,8 @@ def main() -> None:
     ap.add_argument("--matrix", default=None, help="矩阵文件路径（默认取 config.json 的 storage.companion_file）")
     ap.add_argument("--strict", action="store_true", help="存在缺口时以退出码 1 结束（CI 用）")
     ap.add_argument("--no-write", action="store_true", help="只报告不写回")
+    ap.add_argument("--refresh-cache", action="store_true",
+                    help="强制刷新跨运行缓存（GitHub release 说明 / requirements 兜底结果 / fork 层 SHA）")
     ap.add_argument("--suggest-from-issues", nargs="?", const="data/raw/canonical.jsonl", metavar="CANONICAL",
                     help="从 canonical 的 issue 数据统计配套参考（真实部署众数，不写回矩阵）")
     add_insecure_args(ap)
@@ -1045,15 +1103,18 @@ def main() -> None:
     groups = group_base_versions(tags)
     print(f"[matrix] 看护 tag 分组为 {len(groups)} 个基础版本（含模型专属镜像）", flush=True)
 
-    # 2) 镜像 env + 3) release 说明
+    # 2) 镜像 env + 3) release 说明（跨运行缓存：release TTL 7 天 / requirements 永久）
     token = get_quay_token(insecure=insecure, qbase=qbase)
-    releases = fetch_releases(insecure=insecure, gbase=gbase)
+    releases = fetch_releases(insecure=insecure, gbase=gbase, refresh=args.refresh_cache)
     print(f"[matrix] 获取 GitHub release 说明 {len(releases)} 条", flush=True)
 
-    auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase, gbase=gbase)
+    auto_rows = build_rows(groups, releases, token, insecure=insecure, qbase=qbase,
+                           gbase=gbase, refresh_cache=args.refresh_cache)
     merged = merge_with_manual(auto_rows, manual_rows)
-    # fork 行：clone 层扫描固化锁定 commit（digest 锚定，镜像未重推则跳过层下载）
-    enrich_fork_sha(merged, groups, token, insecure=insecure, qbase=qbase)
+    # fork 行：clone 层扫描固化锁定 commit（digest 锚定 + 层 SHA 磁盘缓存，
+    # 首次扫描后跨运行零层下载；--refresh-cache 强制重扫）
+    enrich_fork_sha(merged, groups, token, insecure=insecure, qbase=qbase,
+                    refresh=args.refresh_cache)
     # 写回前版本号合法性校验：非法版本置空（不污染矩阵，缺口报告会列出）
     n_bad = validate_version_fields(merged)
     if n_bad:

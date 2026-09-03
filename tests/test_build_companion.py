@@ -660,6 +660,7 @@ class TestRequirementsExtraction(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix.default_cache_dir", return_value=Path(td)), \
                     mock.patch("build_companion_matrix._requirements_from_github",
                                return_value=self.REQ_TEXT) as gh:
                 r = bm.fetch_pta_from_requirements("v8.8.8")
@@ -668,13 +669,193 @@ class TestRequirementsExtraction(unittest.TestCase):
             self.assertIn("github", r["src"])
 
     def test_both_miss_returns_empty(self):
+        # "" = 404（确定无 requirements.txt）→ 结果为空并缓存（下次不再请求）
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
             with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix.default_cache_dir", return_value=Path(td)), \
                     mock.patch("build_companion_matrix._requirements_from_github", return_value=""):
                 r = bm.fetch_pta_from_requirements("v7.7.7")
         self.assertEqual(r, {"torch": "", "torch_npu": "", "src": ""})
+
+    def test_github_result_cached_across_calls(self):
+        """GitHub 兜底结果跨调用缓存：第二次不触网，src 标注缓存来源。"""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix.default_cache_dir", return_value=Path(td)), \
+                    mock.patch("build_companion_matrix._requirements_from_github",
+                               return_value=self.REQ_TEXT) as gh:
+                r1 = bm.fetch_pta_from_requirements("v6.6.6")
+                r2 = bm.fetch_pta_from_requirements("v6.6.6")
+            gh.assert_called_once()  # 只拉一次
+            self.assertEqual(r1["torch"], "2.10.0")
+            self.assertEqual(r2["torch_npu"], "2.10.0.post4")
+            self.assertIn("缓存", r2["src"])  # 来源诚实标注
+
+    def test_github_404_cached_no_refetch(self):
+        """404（0day/未发布 tag 确定无 requirements）也缓存——不再反复探测烧配额。"""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix.default_cache_dir", return_value=Path(td)), \
+                    mock.patch("build_companion_matrix._requirements_from_github",
+                               return_value="") as gh:
+                bm.fetch_pta_from_requirements("v5.5.5")
+                r2 = bm.fetch_pta_from_requirements("v5.5.5")
+            gh.assert_called_once()
+            self.assertEqual(r2, {"torch": "", "torch_npu": "", "src": ""})
+
+    def test_github_failure_not_cached(self):
+        """拉取失败（None：网络/限流）不缓存——下次重试。"""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix.default_cache_dir", return_value=Path(td)), \
+                    mock.patch("build_companion_matrix._requirements_from_github",
+                               return_value=None) as gh:
+                r1 = bm.fetch_pta_from_requirements("v4.4.4")
+                bm.fetch_pta_from_requirements("v4.4.4")
+            self.assertEqual(gh.call_count, 2)  # 失败不缓存,重试
+            self.assertEqual(r1, {"torch": "", "torch_npu": "", "src": ""})
+            # 缓存未写该 tag（失败不落盘）
+            p = Path(td) / "github_requirements.json"
+            if p.exists():
+                cache = json.loads(p.read_text(encoding="utf-8"))
+                self.assertNotIn("v4.4.4", cache)
+
+    def test_refresh_bypasses_requirements_cache(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("build_companion_matrix.default_code_root", return_value=td), \
+                    mock.patch("build_companion_matrix.default_cache_dir", return_value=Path(td)), \
+                    mock.patch("build_companion_matrix._requirements_from_github",
+                               return_value=self.REQ_TEXT) as gh:
+                bm.fetch_pta_from_requirements("v3.3.3")
+                r = bm.fetch_pta_from_requirements("v3.3.3", refresh=True)
+            self.assertEqual(gh.call_count, 2)  # refresh 强制重拉
+            self.assertIn("github", r["src"])   # 非"缓存"标注
+
+
+class TestReleasesCache(unittest.TestCase):
+    """fetch_releases 跨运行缓存：完整拉取才写缓存 / TTL / refresh / 失败不缓存。"""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _fake_session(pages: dict[int, list[dict]], fail_pages: set[int] = set()):
+        """构造假 session：pages = {页码: release 列表}；fail_pages 中的页始终抛错。"""
+        calls = {"n": 0, "pages": []}
+
+        class _Resp:
+            def __init__(self, data):
+                self._data = data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._data
+
+        class _Sess:
+            def get(self, url, params=None, headers=None, timeout=None):
+                page = (params or {}).get("page", 1)
+                calls["pages"].append(page)
+                if page in fail_pages:
+                    raise OSError("net down")
+                return _Resp(pages[page])
+
+        return _Sess(), calls
+
+    def _run(self, pages, fail_pages=set(), refresh=False):
+        from unittest import mock
+
+        sess, calls = self._fake_session(pages, fail_pages)
+        with mock.patch("vllm_kb.net.get_session", return_value=sess), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=self.cache_dir), \
+                mock.patch("time.sleep"):
+            rels = bm.fetch_releases(refresh=refresh)
+        return rels, calls
+
+    def test_complete_fetch_cached_and_reused(self):
+        # 两页（100 + 3）→ 完整拉取 → 写缓存；第二次零网络命中
+        pages = {1: [{"tag_name": f"v0.{i}.0", "body": f"b{i}"} for i in range(100)],
+                 2: [{"tag_name": "v9.9.9", "body": "last"}, {"tag_name": "v9.8.0", "body": "x"},
+                     {"tag_name": "v9.7.0", "body": "y"}]}
+        rels1, calls1 = self._run(pages)
+        self.assertEqual(len(rels1), 103)
+        self.assertEqual(calls1["pages"], [1, 2])
+        # 缓存已写
+        cache = json.loads((self.cache_dir / "github_releases.json").read_text(encoding="utf-8"))
+        ent = cache["https://api.github.com"]
+        self.assertEqual(len(ent["releases"]), 103)
+        # 第二次：零网络（session.get 不被调用）
+        from unittest import mock
+
+        sess, calls2 = self._fake_session({})
+        with mock.patch("vllm_kb.net.get_session", return_value=sess), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=self.cache_dir):
+            rels2 = bm.fetch_releases()
+        self.assertEqual(calls2["pages"], [])
+        self.assertEqual(rels2, rels1)
+
+    def test_partial_failure_not_cached(self):
+        # page 2 始终失败 → 返回部分数据（100 条）但**不写缓存**；下次重拉
+        pages = {1: [{"tag_name": f"v0.{i}.0", "body": ""} for i in range(100)]}
+        rels, _ = self._run(pages, fail_pages={2})
+        self.assertEqual(len(rels), 100)
+        self.assertFalse((self.cache_dir / "github_releases.json").exists())
+
+    def test_ttl_expiry_refetches(self):
+        pages = {1: [{"tag_name": "v1.0.0", "body": "b"}]}  # 1 条 < 100 → 完整
+        self._run(pages)
+        # 把 fetched_at 拨回 8 天前 → TTL 过期 → 重拉
+        p = self.cache_dir / "github_releases.json"
+        cache = json.loads(p.read_text(encoding="utf-8"))
+        cache["https://api.github.com"]["fetched_at"] -= 8 * 86400
+        p.write_text(json.dumps(cache), encoding="utf-8")
+        pages2 = {1: [{"tag_name": "v1.0.0", "body": "b"},
+                      {"tag_name": "v2.0.0", "body": "new"}]}
+        rels, calls = self._run(pages2)
+        self.assertEqual(len(rels), 2)
+        self.assertEqual(calls["pages"], [1])  # 真的重拉了
+
+    def test_refresh_forces_refetch(self):
+        pages = {1: [{"tag_name": "v1.0.0", "body": "b"}]}
+        self._run(pages)
+        pages2 = {1: [{"tag_name": "v1.0.0", "body": "updated"}]}
+        rels, calls = self._run(pages2, refresh=True)
+        self.assertEqual(calls["pages"], [1])  # 有缓存也重拉
+        self.assertEqual(rels["v1.0.0"], "updated")
+
+    def test_cache_keyed_by_gbase(self):
+        # 不同 API 前缀（内网镜像）缓存隔离：互不污染
+        pages = {1: [{"tag_name": "v1.0.0", "body": "mirror"}]}
+        sess, _ = self._fake_session(pages)
+        from unittest import mock
+
+        with mock.patch("vllm_kb.net.get_session", return_value=sess), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=self.cache_dir), \
+                mock.patch("time.sleep"):
+            bm.fetch_releases(gbase="http://mirror/api/v3")
+        cache = json.loads((self.cache_dir / "github_releases.json").read_text(encoding="utf-8"))
+        self.assertIn("http://mirror/api/v3", cache)
+        self.assertNotIn("https://api.github.com", cache)
 
 
 class TestMergeWithManual(unittest.TestCase):
@@ -745,7 +926,15 @@ class TestGapReport(unittest.TestCase):
 
 
 class TestFetchReleases(unittest.TestCase):
-    """fetch_releases：分页全量、重试、失败不阻塞。"""
+    """fetch_releases：分页全量、重试、失败不阻塞（缓存目录隔离，防污染 data/cache）。"""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
 
     def _resp(self, rows):
         r = unittest.mock.Mock()
@@ -756,7 +945,9 @@ class TestFetchReleases(unittest.TestCase):
     def test_single_page(self):
         from unittest import mock
 
-        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"):
+        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=Path(self._tmp.name)):
             ms.return_value.get.return_value = self._resp(
                 [{"tag_name": "v0.23.0", "body": "aligns with upstream vLLM v0.23.0"},
                  {"tag_name": "v0.22.1", "body": ""}])
@@ -772,7 +963,9 @@ class TestFetchReleases(unittest.TestCase):
                 return self._resp([{"tag_name": f"v0.20.{i}", "body": ""} for i in range(100)])
             return self._resp([{"tag_name": "v0.19.1", "body": "x"}, {}])
 
-        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"):
+        with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=Path(self._tmp.name)):
             ms.return_value.get.side_effect = fake_get
             rel = bm.fetch_releases()
         self.assertEqual(len(rel), 101)  # 100 + 1（空 dict 不计）
@@ -791,6 +984,8 @@ class TestFetchReleases(unittest.TestCase):
             return self._resp([{"tag_name": "v0.23.0", "body": ""}])
 
         with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=Path(self._tmp.name)), \
                 mock.patch("time.sleep"):
             ms.return_value.get.side_effect = flaky_get
             rel = bm.fetch_releases()
@@ -801,10 +996,14 @@ class TestFetchReleases(unittest.TestCase):
         from unittest import mock
 
         with mock.patch("vllm_kb.net.get_session") as ms, mock.patch("socket.setdefaulttimeout"), \
+                mock.patch("build_companion_matrix.default_cache_dir",
+                           return_value=Path(self._tmp.name)), \
                 mock.patch("time.sleep"):
             ms.return_value.get.side_effect = RuntimeError("total down")
             rel = bm.fetch_releases()
         self.assertEqual(rel, {})  # 不抛异常，矩阵生成不阻塞
+        # 失败不写缓存
+        self.assertFalse((Path(self._tmp.name) / "github_releases.json").exists())
 
 
 class TestPtaExtraction(unittest.TestCase):
