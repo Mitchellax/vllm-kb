@@ -4,8 +4,20 @@
     "name": "vllm-kb",
     "data_root": "data"
   },
-  "_comment_sources": "数据源列表（多来源可配置）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列，每行 cell 拼接入库，见 vllm_kb/sources.py)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
+  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列，每行 cell 拼接入库，见 vllm_kb/sources.py)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
   "sources": [
+    {
+      "id": "vllm-ascend",
+      "type": "github",
+      "repo": "vllm-project/vllm-ascend",
+      "token": "",
+      "token_env": "GITHUB_TOKEN",
+      "max_issues": 0,
+      "issue_state": "all",
+      "include_prs": true,
+      "fetch_comments": true,
+      "enabled": true
+    },
     {
       "id": "vllm",
       "type": "github",
@@ -25,18 +37,6 @@
       "retry_backoff_seconds": 5,
       "checkpoint_file": "data/checkpoints/github_issues.json",
       "raw_dir": "data/raw/github"
-    },
-    {
-      "id": "vllm-ascend",
-      "type": "github",
-      "repo": "vllm-project/vllm-ascend",
-      "token": "",
-      "token_env": "GITHUB_TOKEN",
-      "max_issues": 0,
-      "issue_state": "all",
-      "include_prs": true,
-      "fetch_comments": true,
-      "enabled": false
     },
     {
       "id": "engineer-troubleshooting",
