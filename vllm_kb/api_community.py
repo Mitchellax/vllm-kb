@@ -195,9 +195,9 @@ def register(app, ctx) -> None:
             ],
             "title_hits": [
                 {
-                    "doc_id": th.doc_id, "title": _out(th.title), "url": th.url,
-                    "component": th.component, "resolved": th.resolved,
-                    "signal": th.signal,
+                    "doc_id": th["doc_id"], "title": _out(th["title"]), "url": th["url"],
+                    "component": th["component"], "resolved": th["resolved"],
+                    "signal": th["signal"],
                 }
                 for th in title_hits[:10]
             ],
