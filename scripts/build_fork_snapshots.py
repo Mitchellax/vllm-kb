@@ -6,6 +6,14 @@ fork 分支会推进，但镜像构建时的 commit 已由 build_companion_matri
 扫描固化在矩阵（vllm_sha）——快照按 SHA 拉取，与镜像内实际代码严格一致
 （GitHub 分支 HEAD 会漂移，不能用）。
 
+拉取通道评估（当前 fork 均为公开仓）：
+- codeload.github.com/{repo}/zip/{sha} 是普通归档下载（非 REST API），公开仓
+  无认证、无限流配额，按 SHA 下载内容确定性锁定——公开仓场景此通道已足够；
+- 未来若出现私有 fork，需改走 api.github.com zipball + Authorization 头
+  （当前不实现，出现时再加）；
+- SHA 可能不可达：fork 删除/转私有，或分支 force-push 后旧 commit 被 GC。
+  下载失败时明确报错并保留矩阵内的 SHA（镜像层仍是事实源，可从镜像导出）。
+
 用法（在项目根）：
     python scripts/build_fork_snapshots.py                 # 拉取全部 fork 行
     python scripts/build_fork_snapshots.py --model hy4     # 只拉指定模型（可多次）
@@ -86,27 +94,60 @@ def model_root(cfg: AppConfig, model: str) -> Path:
 
 
 def download(repo: str, sha: str, dest: Path, insecure: bool = False,
-             base_url: str = DEFAULT_DOWNLOAD_BASE) -> bool:
-    """按锁定 SHA 下载 fork zip（幂等：已存在且非空跳过）。"""
+             base_url: str = DEFAULT_DOWNLOAD_BASE, max_retries: int = 3) -> bool:
+    """按锁定 SHA 下载 fork zip（幂等：已存在且非空跳过）。
+
+    鲁棒性：
+    - 重试 + 指数退避（网络抖动/代理抖动，实测内网偶发 SSL EOF）；
+    - 404/410 明确报错（fork 仓删除/转私有，或分支 force-push 后旧 commit 被回收
+      ——SHA 锁定在镜像层内，仓库侧不保证永久可取，需尽早暴露）；
+    - zip 魔数校验（PK\\x03\\x04）：404 的 HTML/JSON 错误页不落盘为 .zip，
+      避免污染快照与符号索引。
+    """
     if dest.exists() and dest.stat().st_size > 1000:
         return False
     url = f"{base_url.rstrip('/')}/{repo}/zip/{sha}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"[fork] 下载 {repo}@{sha12(sha)} ...", flush=True)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "vllm-kb"})
-        with _opener(insecure).open(req, timeout=300) as r, open(dest, "wb") as f:
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-    except Exception as e:
-        print(f"[warn] {repo}@{sha12(sha)} 下载失败: {e}")
-        dest.unlink(missing_ok=True)
-        return False
-    print(f"[fork] {repo}@{sha12(sha)} 下载完成 ({dest.stat().st_size / 1e6:.1f} MB)")
-    return True
+
+    import time as _t
+    import urllib.error
+
+    last_err = ""
+    for attempt in range(max_retries):
+        tmp = dest.with_suffix(".part")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "vllm-kb"})
+            with _opener(insecure).open(req, timeout=300) as r, open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            # zip 魔数校验（codeload 正常响应必为 zip 流）
+            with open(tmp, "rb") as f:
+                if f.read(4) != b"PK\x03\x04":
+                    raise ValueError("响应不是 zip（魔数校验失败，可能是错误页）")
+            tmp.replace(dest)
+            print(f"[fork] {repo}@{sha12(sha)} 下载完成 ({dest.stat().st_size / 1e6:.1f} MB)")
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                print(f"[fork] [!] {repo}@{sha12(sha)} HTTP {e.code}：fork 仓已删除/转私有，"
+                      f"或锁定 commit 因 force-push 被回收（镜像层内的 SHA 仍有效，"
+                      f"代码需从镜像本身导出）", flush=True)
+                tmp.unlink(missing_ok=True)
+                return False
+            last_err = f"HTTP {e.code}"
+        except Exception as e:
+            last_err = str(e)
+        tmp.unlink(missing_ok=True)
+        if attempt < max_retries - 1:
+            wait = 2 ** attempt
+            print(f"[fork] {repo}@{sha12(sha)} 下载失败({last_err})，{wait}s 后重试", flush=True)
+            _t.sleep(wait)
+    print(f"[warn] {repo}@{sha12(sha)} 下载失败（重试 {max_retries} 次）: {last_err}", flush=True)
+    return False
 
 
 def ensure_snapshot(root: Path, version: str) -> Path:

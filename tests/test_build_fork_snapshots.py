@@ -75,7 +75,7 @@ class TestDownload(unittest.TestCase):
 
             class _Resp:
                 def __init__(self):
-                    self._chunks = [b"PK-zip-bytes" * 100]
+                    self._chunks = [b"PK\x03\x04" + b"-zip-bytes" * 100]
 
                 def read(self, n=-1):
                     return self._chunks.pop(0) if self._chunks else b""
@@ -105,11 +105,92 @@ class TestDownload(unittest.TestCase):
     def test_download_failure_cleans_up(self):
         with tempfile.TemporaryDirectory() as td:
             dest = Path(td) / "zips" / f"{SHA[:12]}.zip"
-            with mock.patch("build_fork_snapshots._opener") as mo:
+            with mock.patch("build_fork_snapshots._opener") as mo, \
+                    mock.patch("time.sleep"):
                 mo.return_value.open.side_effect = OSError("net down")
                 ok = bfs.download("a/vllm", SHA, dest)
             self.assertFalse(ok)
             self.assertFalse(dest.exists())  # 失败清理残片
+
+    def test_retry_then_success(self):
+        # 网络抖动：前两次失败第三次成功
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "zips" / f"{SHA[:12]}.zip"
+            attempts = {"n": 0}
+
+            class _Resp:
+                def __init__(self):
+                    self._done = False
+
+                def read(self, n=-1):
+                    if self._done:
+                        return b""
+                    self._done = True
+                    return b"PK\x03\x04" + b"x" * 2000
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            def flaky_open(req, timeout=None):
+                attempts["n"] += 1
+                if attempts["n"] <= 2:
+                    raise OSError("ssl eof")
+                return _Resp()
+
+            with mock.patch("build_fork_snapshots._opener") as mo, \
+                    mock.patch("time.sleep"):
+                mo.return_value.open.side_effect = flaky_open
+                ok = bfs.download("a/vllm", SHA, dest)
+            self.assertTrue(ok)
+            self.assertEqual(attempts["n"], 3)
+            self.assertGreater(dest.stat().st_size, 1000)
+
+    def test_404_no_retry_clear_message(self):
+        # fork 删除/SHA 被回收：404 不重试（重试无意义），残片清理
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "zips" / f"{SHA[:12]}.zip"
+            with mock.patch("build_fork_snapshots._opener") as mo, \
+                    mock.patch("time.sleep") as ms:
+                mo.return_value.open.side_effect = urllib.error.HTTPError(
+                    "url", 404, "Not Found", None, None)  # type: ignore[arg-type]
+                ok = bfs.download("a/vllm", SHA, dest)
+            self.assertFalse(ok)
+            ms.assert_not_called()  # 404 立即失败，不退避重试
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_suffix(".part").exists())
+
+    def test_error_page_rejected_by_magic(self):
+        # 404/错误页（HTML）被魔数校验拒绝，不落盘为 .zip
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "zips" / f"{SHA[:12]}.zip"
+
+            class _Resp:
+                def __init__(self):
+                    self._done = False
+
+                def read(self, n=-1):
+                    if self._done:
+                        return b""
+                    self._done = True
+                    return b"<html>404 not found</html>"
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            with mock.patch("build_fork_snapshots._opener") as mo, \
+                    mock.patch("time.sleep"):
+                mo.return_value.open.return_value = _Resp()
+                ok = bfs.download("a/vllm", SHA, dest)
+            self.assertFalse(ok)
+            self.assertFalse(dest.exists())
 
 
 class TestIndexAndMeta(unittest.TestCase):
