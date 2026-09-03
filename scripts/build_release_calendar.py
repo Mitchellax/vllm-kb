@@ -21,7 +21,7 @@
     python scripts/build_release_calendar.py                     # 默认 vllm-ascend（config.code.repo）
     python scripts/build_release_calendar.py --repo vllm-project/vllm
     python scripts/build_release_calendar.py --all-repos
-    python scripts/build_release_calendar.py --insecure          # 内网：跳过 SSL 证书校验
+    python scripts/build_release_calendar.py --insecure          # 真实业务环境：跳过 SSL 证书校验
     python scripts/build_release_calendar.py --github-base http://mirror/api/v3
         # GitHub API 镜像（http/https 均可）；亦可用环境变量 VLLM_KB_GITHUB_BASE / VLLM_KB_INSECURE
 """
@@ -129,7 +129,7 @@ def main() -> None:
     insecure = args.insecure or insecure_from_env()
     gbase = github_api_base(args.github_base)
     if insecure:
-        print("[calendar] --insecure：跳过 SSL 证书校验（内网模式）")
+        print("[calendar] --insecure：跳过 SSL 证书校验（真实业务环境）")
     if gbase != "https://api.github.com":
         print(f"[calendar] GitHub API 镜像 {gbase}")
 

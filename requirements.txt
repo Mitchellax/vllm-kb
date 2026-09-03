@@ -1,5 +1,5 @@
 # ===== vllm-kb 依赖 =====
-# 离线业务环境：pip install -r requirements.txt 需可用内网 wheel 源；
+# 离线业务环境：pip install -r requirements.txt 需可用业务侧 wheel 源；
 # 或先在有网环境 `pip download -r requirements.txt -d wheels/` 打包离线安装。
 
 # ---- 核心（采集 + 检索 + 图，必装）----

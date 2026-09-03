@@ -58,7 +58,7 @@ class TestGithubConvert(unittest.TestCase):
         self.assertEqual(doc.component, "vllm")  # 仓库推断主组件
 
     def test_insecure_from_env(self):
-        """VLLM_KB_INSECURE=1 时 session 跳过 SSL 校验（内网增量拉取依赖）。"""
+        """VLLM_KB_INSECURE=1 时 session 跳过 SSL 校验（真实业务环境增量拉取依赖）。"""
         import os
         from unittest.mock import patch
 

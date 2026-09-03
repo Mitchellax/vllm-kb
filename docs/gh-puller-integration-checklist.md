@@ -17,22 +17,22 @@ vllm-kb 已接入 gh-puller 代码图谱检索（MCP Streamable HTTP 单端点�
 | 1 | project 标识 | **gh-puller server 端承诺适配客户端传入的任意参数**。vllm-kb 侧约定 `project` 传 `vllm-project/vllm-ascend` 形态（见下方范例），gh-puller 侧按此适配 |
 | 2 | 预索引触发 | gh-puller server 端适配（客户端传入参数即处理，含首次未索引场景的兜底） |
 | 3 | 版本维度 | gh-puller server 端适配（客户端传入版本参数即处理，见下方范例的 `version` 字段） |
-| 4 | 鉴权 | **暂不加**（内网工作流运行） |
+| 4 | 鉴权 | **暂不加**（真实业务环境运行） |
 | 5 | 端点路径 | **显式配置**：`base_url` + `path` 经审核工作台与 embedding/OCR/GitHub 同级管理（含连通性测试） |
 
 ## 工具面总览（6 工具 + 1 协议探测，全部为 vllm-kb 服务能力所必须）
 
 gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端点逐工具绑定，缺任一即对应命令不可用）：
 
-| # | MCP 工具 | vllm-kb 端点 | skill 命令 | 内网测试 |
+| # | MCP 工具 | vllm-kb 端点 | skill 命令 | 业务环境验证 |
 |---|---|---|---|---|
-| 1 | `search_graph` | POST /code-graph/search | `code-graph search` | ✅ 已测 |
-| 2 | `search_code` | POST /code-graph/code-search | `code-graph code-search` | ⬜ 待测 |
-| 3 | `trace_path` | POST /code-graph/trace | `code-graph trace` | ✅ 已测 |
-| 4 | `query_graph` | POST /code-graph/query | `code-graph query` | ✅ 已测 |
-| 5 | `get_architecture` | POST /code-graph/architecture | `code-graph architecture` | ⬜ 待测 |
-| 6 | `detect_changes` | POST /code-graph/changes | `code-graph changes` | ✅ 已测 |
-| — | `tools/list`（协议方法） | GET /code-graph/health；审核工作台连通性测试 | `code-graph health` | ⬜ 待测 |
+| 1 | `search_graph` | POST /code-graph/search | `code-graph search` | ✅ 已验证 |
+| 2 | `search_code` | POST /code-graph/code-search | `code-graph code-search` | ⬜ 待验证 |
+| 3 | `trace_path` | POST /code-graph/trace | `code-graph trace` | ✅ 已验证 |
+| 4 | `query_graph` | POST /code-graph/query | `code-graph query` | ✅ 已验证 |
+| 5 | `get_architecture` | POST /code-graph/architecture | `code-graph architecture` | ⬜ 待验证 |
+| 6 | `detect_changes` | POST /code-graph/changes | `code-graph changes` | ✅ 已验证 |
+| — | `tools/list`（协议方法） | GET /code-graph/health；审核工作台连通性测试 | `code-graph health` | ⬜ 待验证 |
 
 > `tools/list` 不是业务工具，是**连通性探测的协议依赖**（见下方"连通性探测"）——
 > `/code-graph/health` 与审核工作台的"测试连通"都发它，不通则健康检查报 unreachable。
@@ -49,7 +49,7 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
  }}}
 ```
 
-### search_code（grep + 图增强）—— ⬜ 待内网测试
+### search_code（grep + 图增强）—— ⬜ 待业务环境验证
 ```json
 {"jsonrpc":"2.0","id":5,"method":"tools/call",
  "params":{"name":"search_code","arguments":{
@@ -82,7 +82,7 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
  }}}
 ```
 
-### get_architecture（架构总览）—— ⬜ 待内网测试
+### get_architecture（架构总览）—— ⬜ 待业务环境验证
 ```json
 {"jsonrpc":"2.0","id":6,"method":"tools/call",
  "params":{"name":"get_architecture","arguments":{
@@ -105,7 +105,7 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
  }}}
 ```
 
-### tools/list（连通性探测，协议方法）—— ⬜ 待内网测试
+### tools/list（连通性探测，协议方法）—— ⬜ 待业务环境验证
 ```json
 {"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}
 ```

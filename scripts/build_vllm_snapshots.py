@@ -8,10 +8,10 @@
     python scripts/build_vllm_snapshots.py --version 0.22.1   # 只拉指定 vllm 版本
     python scripts/build_vllm_snapshots.py --list             # 只列出需要拉取的版本
     python scripts/build_vllm_snapshots.py --index-only       # 已下载的只重建索引
-    python scripts/build_vllm_snapshots.py --insecure         # 内网：跳过 SSL 证书校验
-    python scripts/build_vllm_snapshots.py --base-url http://mirror:8080   # 内网 http 镜像源
+    python scripts/build_vllm_snapshots.py --insecure         # 真实业务环境：跳过 SSL 证书校验
+    python scripts/build_vllm_snapshots.py --base-url http://mirror:8080   # 业务侧 http 镜像源
 
-内网场景（SSL 被禁/证书不受信）：--insecure 跳过证书校验；--base-url 换内网镜像
+真实业务环境（SSL 被禁/证书不受信）：--insecure 跳过证书校验；--base-url 换业务侧镜像
 （默认 https://codeload.github.com）；也可用环境变量 VLLM_KB_INSECURE=1 / VLLM_KB_CODE_BASE。
 
 存储（与 vllm-ascend 分开，避免符号表混淆）：
@@ -37,7 +37,7 @@ DEFAULT_DOWNLOAD_BASE = "https://codeload.github.com"
 
 
 def _opener(insecure: bool) -> urllib.request.OpenerDirector:
-    """按需构造跳过证书校验的 opener（内网自签证书/SSL 被禁时用）。"""
+    """按需构造跳过证书校验的 opener（真实业务环境自签证书/SSL 被禁时用）。"""
     if not insecure:
         return urllib.request.build_opener()
     ctx = ssl.create_default_context()
@@ -162,9 +162,9 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="只列出需要拉取的版本")
     ap.add_argument("--index-only", action="store_true", help="已下载的只重建索引")
     ap.add_argument("--insecure", action="store_true",
-                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--base-url", default=None,
-                    help=f"下载源前缀（内网镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
+                    help=f"下载源前缀（业务侧镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
                          f"亦可用环境变量 VLLM_KB_CODE_BASE）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
@@ -172,7 +172,7 @@ def main() -> None:
     insecure = args.insecure or os.environ.get("VLLM_KB_INSECURE", "").strip().lower() in ("1", "true", "yes", "on")
     base_url = args.base_url or os.environ.get("VLLM_KB_CODE_BASE", DEFAULT_DOWNLOAD_BASE)
     if insecure:
-        print("[vllm] --insecure：跳过 SSL 证书校验（内网模式）")
+        print("[vllm] --insecure：跳过 SSL 证书校验（真实业务环境）")
     if base_url != DEFAULT_DOWNLOAD_BASE:
         print(f"[vllm] 下载源 {base_url}")
 

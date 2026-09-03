@@ -23,7 +23,7 @@ GitHub 采集（66k canonical）   ──①──▶  部署：代码 + 初始�
 代码快照 + 版本日历               ──②──▶  业务数据采集 → 解析 → 入库 → 验证（后续全部在此）
 Phase 2 图（Kùzu）                    部署：serve_api + review_ui
                                       （业务环境可能无外网：GitHub 数据一次性迁入，
-                                        业务数据本地采集，embedding 走内网端点或本地模型）
+                                        业务数据本地采集，embedding 走业务侧端点或本地模型）
 ```
 
 ---
@@ -61,10 +61,10 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 | # | 项 | 说明 | 状态 |
 |---|---|---|---|
 | B1 | 部署脚本补全 | `deploy_remote.py` 打包缺 `data/graph/`（Kùzu 图）；`print_steps` 依赖清单补 kuzu/paddleocr/解析库；**本次已顺手修复 pack_data（加 graph）** | ✅ 修复 |
-| B2 | embedding/OCR 强制 API | **决策（2026）**：本地 embedding/OCR 不做（部署复杂）——embedding 用 OpenAI 兼容端点（**其他服务器 vLLM 部署**，config `embedding.base_url` 指向）；OCR 用 `ocr_provider: api`（`ocr_api_mode: custom|openai` 指向远端 OCR 服务）；`echo` 仅离线演示 | 内网端点连通实测 | ✅ 决策定案（强制 API）；连通性实测待业务环境 |
+| B2 | embedding/OCR 强制 API | **决策（2026）**：本地 embedding/OCR 不做（部署复杂）——embedding 用 OpenAI 兼容端点（**其他服务器 vLLM 部署**，config `embedding.base_url` 指向）；OCR 用 `ocr_provider: api`（`ocr_api_mode: custom|openai` 指向远端 OCR 服务）；`echo` 仅离线演示 | 业务侧端点连通实测 | ✅ 决策定案（强制 API）；连通性实测待业务环境 |
 | B3 | 服务与日志 | **总日志接口**（`vllm_kb/logging_setup.py`：打屏 + 可选落盘分卷，config `logging` 段）；状态经 `/health`、`/api/stats`；**图更新流程文档化**（先停 serve_api 再 build_graph，Kùzu 单写者） | 日志落盘分卷实测（✅ 测试）；业务环境启用 `logging.file=true` | ✅ 完成（不引入 systemd/服务管理器） |
 | B4 | 数据迁移 | 初始知识库（canonical/LanceDB/代码快照/图/compatibility）rsync 或 tar 迁入；后续业务数据在业务环境本地采集（见关键约定） | 🔲 |
-| B5 | 依赖安装 | `requirements.txt` 分组整理（核心/服务/业务来源/OCR）；离线环境 `pip download -r requirements.txt -d wheels/` 打包内网安装 | ✅ 整理；离线打包待业务环境 |
+| B5 | 依赖安装 | `requirements.txt` 分组整理（核心/服务/业务来源/OCR）；离线环境 `pip download -r requirements.txt -d wheels/` 打包业务侧安装 | ✅ 整理；离线打包待业务环境 |
 
 ### C. 安全/合规（需业务侧决策）
 

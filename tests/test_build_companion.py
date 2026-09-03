@@ -466,7 +466,7 @@ class TestForkShaExtraction(unittest.TestCase):
         """层 SHA 缓存：首次扫描落盘，二次运行不再下载 75MB 层 blob。
 
         回归：缓存按层 digest（不可变）键控，即使矩阵未写盘/行内无
-        vllm_sha（digest 锚不适用）也命中——内网慢链路每次重下 75MB 的痛点。"""
+        vllm_sha（digest 锚不适用）也命中——业务环境慢链路每次重下 75MB 的痛点。"""
         members = [("vllm-workspace/vllm/.git/shallow", self.SHA.encode() + b"\n")]
         out1 = self._run_extract(members)
         self.assertEqual(out1["sha"], self.SHA)
@@ -843,7 +843,7 @@ class TestReleasesCache(unittest.TestCase):
         self.assertEqual(rels["v1.0.0"], "updated")
 
     def test_cache_keyed_by_gbase(self):
-        # 不同 API 前缀（内网镜像）缓存隔离：互不污染
+        # 不同 API 前缀（业务侧镜像）缓存隔离：互不污染
         pages = {1: [{"tag_name": "v1.0.0", "body": "mirror"}]}
         sess, _ = self._fake_session(pages)
         from unittest import mock

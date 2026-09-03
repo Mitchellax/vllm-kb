@@ -1,7 +1,7 @@
 """端到端 TLS 故障注入测试：get_session 的 insecure 在真实 HTTPS 链路上的行为。
 
 固化 fix(0648964) 的故障注入验证（原为手工执行的探索脚本）：
-本地自签证书 HTTPS server + REQUESTS_CA_BUNDLE 指向**无关证书**——等价于内网
+本地自签证书 HTTPS server + REQUESTS_CA_BUNDLE 指向**无关证书**——等价于真实业务环境
 MITM 环境的常见配置（环境变量存在，但指向的 CA 不能验证目标站点证书）。
 
 场景矩阵（http://127.0.0.1:{port}，全部离线，不依赖外网）：

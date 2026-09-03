@@ -2,7 +2,7 @@
 
 回归：requests 的 merge_environment_settings 在请求级 verify 为 None 时会用
 环境变量 REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE 覆盖 session.verify=False——
-insecure 因此失效（内网常设这两个变量过 MITM，实测 requests 2.34 复现）。
+insecure 因此失效（真实业务环境常设这两个变量过 MITM，实测 requests 2.34 复现）。
 修复为请求级 verify=False hook，本测试锁定该行为。
 """
 import os
@@ -40,7 +40,7 @@ class _FakeAdapter:
 
 class TestGetSessionInsecure(unittest.TestCase):
     def setUp(self):
-        # 模拟内网环境：REQUESTS_CA_BUNDLE 指向陌生 CA（MITM 修复常用配置）
+        # 模拟真实业务环境：REQUESTS_CA_BUNDLE 指向陌生 CA（MITM 修复常用配置）
         self._saved = {k: os.environ.get(k) for k in
                        ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")}
         os.environ["REQUESTS_CA_BUNDLE"] = "Z:/fake/ca.pem"
@@ -72,7 +72,7 @@ class TestGetSessionInsecure(unittest.TestCase):
         self.assertEqual(self._capture_verify(False), "Z:/fake/ca.pem")
 
     def test_insecure_keeps_trust_env_for_proxies(self):
-        """insecure 不能禁用 trust_env——内网靠环境/系统代理出网。"""
+        """insecure 不能禁用 trust_env——真实业务环境靠环境/系统代理出网。"""
         s = get_session(True)
         self.assertTrue(s.trust_env)
 

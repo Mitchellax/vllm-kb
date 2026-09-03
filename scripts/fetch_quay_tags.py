@@ -41,7 +41,7 @@ VERSION_RE = re.compile(r"^v?\d+\.\d+\.\d+")
 
 
 def _tags_url(base: str) -> str:
-    """quay tag 列表 URL（base 可换内网镜像前缀，默认 https://quay.io）。"""
+    """quay tag 列表 URL（base 可换业务侧镜像前缀，默认 https://quay.io）。"""
     return f"{base.rstrip('/')}/api/v1/repository/ascend/vllm-ascend/tag/"
 
 

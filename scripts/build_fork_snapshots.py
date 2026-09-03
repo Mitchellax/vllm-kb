@@ -19,10 +19,10 @@ fork 分支会推进，但镜像构建时的 commit 已由 build_companion_matri
     python scripts/build_fork_snapshots.py --model hy4     # 只拉指定模型（可多次）
     python scripts/build_fork_snapshots.py --list          # 只列出 fork 行状态
     python scripts/build_fork_snapshots.py --index-only    # 已下载的只重建索引
-    python scripts/build_fork_snapshots.py --insecure      # 内网：跳过 SSL 证书校验
-    python scripts/build_fork_snapshots.py --base-url http://mirror:8080   # 内网镜像源
+    python scripts/build_fork_snapshots.py --insecure      # 真实业务环境：跳过 SSL 证书校验
+    python scripts/build_fork_snapshots.py --base-url http://mirror:8080   # 业务侧镜像源
 
-内网场景（SSL 被禁/证书不受信）：--insecure 跳过证书校验；--base-url 换内网镜像
+真实业务环境（SSL 被禁/证书不受信）：--insecure 跳过证书校验；--base-url 换业务侧镜像
 （默认 https://codeload.github.com）；也可用环境变量 VLLM_KB_INSECURE=1 / VLLM_KB_CODE_BASE。
 
 存储（与官方 vllm / vllm-ascend 物理隔离，检索需显式 repo=fork:{model}）：
@@ -51,7 +51,7 @@ _SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _opener(insecure: bool) -> urllib.request.OpenerDirector:
-    """按需构造跳过证书校验的 opener（内网自签证书/SSL 被禁时用）。"""
+    """按需构造跳过证书校验的 opener（真实业务环境自签证书/SSL 被禁时用）。"""
     if not insecure:
         return urllib.request.build_opener()
     ctx = ssl.create_default_context()
@@ -98,7 +98,7 @@ def download(repo: str, sha: str, dest: Path, insecure: bool = False,
     """按锁定 SHA 下载 fork zip（幂等：已存在且非空跳过）。
 
     鲁棒性：
-    - 重试 + 指数退避（网络抖动/代理抖动，实测内网偶发 SSL EOF）；
+    - 重试 + 指数退避（网络抖动/代理抖动，实测真实业务环境偶发 SSL EOF）；
     - 404/410 明确报错（fork 仓删除/转私有，或分支 force-push 后旧 commit 被回收
       ——SHA 锁定在镜像层内，仓库侧不保证永久可取，需尽早暴露）；
     - zip 魔数校验（PK\\x03\\x04）：404 的 HTML/JSON 错误页不落盘为 .zip，
@@ -237,9 +237,9 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="只列出 fork 行状态")
     ap.add_argument("--index-only", action="store_true", help="已下载的只重建索引")
     ap.add_argument("--insecure", action="store_true",
-                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--base-url", default=None,
-                    help=f"下载源前缀（内网镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
+                    help=f"下载源前缀（业务侧镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
                          f"亦可用环境变量 VLLM_KB_CODE_BASE）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
@@ -248,7 +248,7 @@ def main() -> None:
         "VLLM_KB_INSECURE", "").strip().lower() in ("1", "true", "yes", "on")
     base_url = args.base_url or os.environ.get("VLLM_KB_CODE_BASE", DEFAULT_DOWNLOAD_BASE)
     if insecure:
-        print("[fork] --insecure：跳过 SSL 证书校验（内网模式）")
+        print("[fork] --insecure：跳过 SSL 证书校验（真实业务环境）")
     if base_url != DEFAULT_DOWNLOAD_BASE:
         print(f"[fork] 下载源 {base_url}")
 

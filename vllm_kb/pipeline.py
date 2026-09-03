@@ -184,7 +184,7 @@ def main() -> None:
     from .net import DEFAULT_GITHUB_BASE
 
     ap.add_argument("--insecure", action="store_true",
-                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--github-base", default=None,
                     help=f"GitHub API 镜像前缀（默认 {DEFAULT_GITHUB_BASE}；亦可用环境变量 VLLM_KB_GITHUB_BASE）")
     args = ap.parse_args()
@@ -205,7 +205,7 @@ def main() -> None:
     # GithubPuller（读 insecure_from_env / VLLM_KB_GITHUB_BASE）生效。
     if args.insecure:
         os.environ["VLLM_KB_INSECURE"] = "1"
-        print("[build] --insecure：跳过 SSL 证书校验（内网模式）")
+        print("[build] --insecure：跳过 SSL 证书校验（真实业务环境）")
     if args.github_base:
         os.environ["VLLM_KB_GITHUB_BASE"] = args.github_base
 

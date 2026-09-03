@@ -23,16 +23,16 @@ tag 走 GitHub API 会撞未认证限流 60 次/小时；快照由 build_code_sn
                             首次扫描后不再重下 75MB 层）
   github_releases.json      release 说明（历史不可变，TTL 7 天兜底新 release）
   github_requirements.json  requirements 兜底结果（含 404，永久有效）
-缓存消除两类重复网络成本：fork 层 75MB 下载（内网慢链路上分钟级）与
+缓存消除两类重复网络成本：fork 层 75MB 下载（业务环境慢链路上分钟级）与
 GitHub API 用量（releases ~6 请求 + requirements ~40 请求/次 → 命中后 0）。
 
 用法：
     python scripts/build_companion_matrix.py                 # 下载+匹配+写回+缺口报告
     python scripts/build_companion_matrix.py --strict        # 存在缺口时退出码 1（CI 用）
     python scripts/build_companion_matrix.py --no-write      # 只报告不写回
-    python scripts/build_companion_matrix.py --insecure      # 内网：跳过 SSL 证书校验
+    python scripts/build_companion_matrix.py --insecure      # 真实业务环境：跳过 SSL 证书校验
     python scripts/build_companion_matrix.py --quay-base http://mirror:8080 --github-base http://mirror/api/v3
-        # 内网 http 镜像（quay / GitHub API）；亦可用环境变量 VLLM_KB_QUAY_BASE / VLLM_KB_GITHUB_BASE / VLLM_KB_INSECURE
+        # 业务侧 http 镜像（quay / GitHub API）；亦可用环境变量 VLLM_KB_QUAY_BASE / VLLM_KB_GITHUB_BASE / VLLM_KB_INSECURE
 """
 import argparse
 import json
@@ -122,7 +122,7 @@ def pick_representative(group: list[dict]) -> dict:
 # ---------------- quay 镜像 env ----------------
 
 def _quay_api(qbase: str) -> str:
-    """quay API 前缀（内网镜像时替换域名）。"""
+    """quay API 前缀（业务侧镜像时替换域名）。"""
     return f"{qbase.rstrip('/')}/api/v1/repository/ascend/vllm-ascend"
 
 
@@ -377,7 +377,7 @@ def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
                             timeout: int = 300) -> str:
     """下载 clone 层 blob（~75MB）并扫描 .git，返回锁定 commit（失败 ''）。
 
-    流式下载 + 每 10MB 进度行（75MB 层在内网慢链路上要跑数分钟，静默会被
+    流式下载 + 每 10MB 进度行（75MB 层在业务环境慢链路上要跑数分钟，静默会被
     误判为卡死）。先按 gzip 流解（docker 层标准存储格式），失败再按未压缩
     tar 兜底。
     """
@@ -530,7 +530,7 @@ def fetch_releases(insecure: bool = False, gbase: str = "https://api.github.com"
 
     - 分页全量拉取（per_page=100，翻页直到取完，vllm-ascend release 已超 100 条）；
     - socket 级默认超时兜底：requests timeout 不覆盖 DNS 解析/代理握手，
-      内网环境可能挂远超 timeout，先设 socket 超时保证任何阶段都限时；
+      真实业务环境可能挂远超 timeout，先设 socket 超时保证任何阶段都限时；
     - 带重试（5xx/限流/网络抖动）；单页重试耗尽返回已拿到的部分，不阻塞矩阵。
 
     缓存（data/cache/github_releases.json，key=API 前缀）：历史 release body
@@ -1080,7 +1080,7 @@ def main() -> None:
     qbase = quay_base(args.quay_base)
     gbase = github_api_base(args.github_base)
     if insecure:
-        print("[matrix] --insecure：跳过 SSL 证书校验（内网模式）")
+        print("[matrix] --insecure：跳过 SSL 证书校验（真实业务环境）")
     if qbase != "https://quay.io" or gbase != "https://api.github.com":
         print(f"[matrix] 镜像源 quay={qbase} github={gbase}")
 

@@ -5,12 +5,12 @@
     python scripts/build_code_snapshots.py --version v0.23.0rc1   # 只预存指定版本
     python scripts/build_code_snapshots.py --index-only    # 已下载的版本只重建符号索引
     python scripts/build_code_snapshots.py --all           # 预存仓库全部 tag（41 个，~570MB）
-    python scripts/build_code_snapshots.py --insecure      # 内网：跳过 SSL 证书校验
-    python scripts/build_code_snapshots.py --base-url http://mirror:8080   # 内网 http 镜像源
+    python scripts/build_code_snapshots.py --insecure      # 真实业务环境：跳过 SSL 证书校验
+    python scripts/build_code_snapshots.py --base-url http://mirror:8080   # 业务侧 http 镜像源
 
-内网场景（SSL 被禁/证书不受信）：
+真实业务环境（SSL 被禁/证书不受信）：
     - --insecure：urllib 用不校验证书的 context（自签证书/代理拦截时）；
-    - --base-url：把下载源换成内网镜像（http 或 https 均可），默认 https://codeload.github.com；
+    - --base-url：把下载源换成业务侧镜像（http 或 https 均可），默认 https://codeload.github.com；
     - 两者也可经环境变量 VLLM_KB_INSECURE=1 / VLLM_KB_CODE_BASE=<url> 指定（脚本外统一配置）。
 
 下载后每个版本 zip 存 data/code/zips/{version}.zip（~14MB），
@@ -36,7 +36,7 @@ DEFAULT_API_BASE = "https://api.github.com"
 
 
 def _opener(insecure: bool) -> urllib.request.OpenerDirector:
-    """按需构造跳过证书校验的 opener（内网自签证书/SSL 被禁时用）。"""
+    """按需构造跳过证书校验的 opener（真实业务环境自签证书/SSL 被禁时用）。"""
     if not insecure:
         return urllib.request.build_opener()
     ctx = ssl.create_default_context()
@@ -50,7 +50,7 @@ def _insecure_from_env() -> bool:
 
 
 def list_tags(repo: str, insecure: bool = False, api_base: str = DEFAULT_API_BASE) -> list[str]:
-    """GitHub REST 列出全部 tag（无 git 依赖）。api_base 可换内网 API 镜像。"""
+    """GitHub REST 列出全部 tag（无 git 依赖）。api_base 可换业务侧 API 镜像。"""
     tags: list[str] = []
     page = 1
     opener = _opener(insecure)
@@ -74,7 +74,7 @@ def list_tags(repo: str, insecure: bool = False, api_base: str = DEFAULT_API_BAS
 
 def download_zip(repo: str, version: str, dest: Path, insecure: bool = False,
                  base_url: str = DEFAULT_DOWNLOAD_BASE) -> bool:
-    """下载版本源码 zip 到 dest（幂等：已存在跳过）。base_url 可换内网镜像源。"""
+    """下载版本源码 zip 到 dest（幂等：已存在跳过）。base_url 可换业务侧镜像源。"""
     if dest.exists() and dest.stat().st_size > 1000:
         return False
     url = f"{base_url.rstrip('/')}/{repo}/zip/refs/tags/{version}"
@@ -144,9 +144,9 @@ def main() -> None:
                          "方便人工更新 config.code.versions")
     ap.add_argument("--index-only", action="store_true", help="只重建索引，不下载")
     ap.add_argument("--insecure", action="store_true",
-                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--base-url", default=None,
-                    help=f"下载源前缀（内网镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
+                    help=f"下载源前缀（业务侧镜像，http/https 均可；默认 {DEFAULT_DOWNLOAD_BASE}；"
                          f"亦可用环境变量 VLLM_KB_CODE_BASE）")
     ap.add_argument("--api-base", default=None,
                     help=f"列 tag 的 API 地址（默认 {DEFAULT_API_BASE}；亦可用环境变量 VLLM_KB_CODE_API）")
@@ -157,7 +157,7 @@ def main() -> None:
     base_url = args.base_url or os.environ.get("VLLM_KB_CODE_BASE", DEFAULT_DOWNLOAD_BASE)
     api_base = args.api_base or os.environ.get("VLLM_KB_CODE_API", DEFAULT_API_BASE)
     if insecure:
-        print(f"[code] --insecure：跳过 SSL 证书校验（内网模式）")
+        print(f"[code] --insecure：跳过 SSL 证书校验（真实业务环境）")
     if base_url != DEFAULT_DOWNLOAD_BASE or api_base != DEFAULT_API_BASE:
         print(f"[code] 下载源 {base_url} / API {api_base}")
 

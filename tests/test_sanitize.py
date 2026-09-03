@@ -8,7 +8,7 @@ class TestSanitize(unittest.TestCase):
     def test_internal_ip_masked(self):
         self.assertIn("<IP>", sanitize_text("节点 10.0.0.5 超时"))
         self.assertNotIn("10.0.0.5", sanitize_text("节点 10.0.0.5 超时"))
-        # 172.16-31 / 192.168 内网段同样脱敏
+        # 172.16-31 / 192.168 私有网段同样脱敏
         self.assertIn("<IP>", sanitize_text("172.16.3.2"))
         self.assertIn("<IP>", sanitize_text("192.168.1.100"))
         # 公网 IP 也脱敏

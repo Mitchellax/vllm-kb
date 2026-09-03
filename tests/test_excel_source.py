@@ -128,7 +128,7 @@ class TestExcelSource(unittest.TestCase):
         try:
             cfg = AppConfig.model_validate({"sanitize": {
                 "keep_paths": ["/home/user/logs"],  # 覆盖默认：业务日志目录保留（不收集）
-                "keep_ips": ["10.0.0.5"],           # 覆盖默认：该内网 IP 保留（不收集）
+                "keep_ips": ["10.0.0.5"],           # 覆盖默认：该私有 IP 保留（不收集）
             }})
             src = ExcelSource(self.cfg, project_root=self.root, app_cfg=cfg)
             src.pull()

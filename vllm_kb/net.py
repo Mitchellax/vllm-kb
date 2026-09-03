@@ -1,11 +1,11 @@
-"""网络访问统一入口：内网模式（SSL 被禁 / 镜像源）支持。
+"""网络访问统一入口：真实业务环境（SSL 被禁 / 镜像源）支持。
 
 供脚本（build_companion_matrix / fetch_quay_tags / build_release_calendar /
 build_code_snapshots 等）共用，避免每个脚本重复实现。
 
 - **insecure**：跳过 SSL 证书校验（自签证书/SSL 被禁），requests 传 verify=False，
   urllib 用 CERT_NONE opener；
-- **base 覆盖**：把外网域名前缀换成内网镜像（http/https 均可）。
+- **base 覆盖**：把公网域名前缀换成业务侧镜像（http/https 均可）。
 
 配置来源（优先级：命令行参数 > 环境变量 > 默认）：
     --insecure / VLLM_KB_INSECURE=1
@@ -34,7 +34,7 @@ def get_session(insecure: bool) -> object:
     请求级 verify 为 True/None 时读 REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE 覆盖，
     而 merge_setting 请求级优先——session.verify=False 在不传请求级 verify 时
     是 None，会被这两个环境变量**覆盖成 CA bundle 路径**，校验"复活"
-    （requests 2.34 实测复现；内网环境常设这两个变量让其他工具过 MITM）。
+    （requests 2.34 实测复现；真实业务环境常设这两个变量让其他工具过 MITM）。
     请求级显式 False 不进覆盖分支，merge_setting 直接取 False——与
     requests.get(verify=False) 行为严格一致。trust_env 保持 True（代理不受影响）。
     """
@@ -81,7 +81,7 @@ def quay_base(args_base: Optional[str]) -> str:
 def add_insecure_args(ap) -> None:
     """给 argparse 统一加 --insecure / --github-base / --quay-base 参数。"""
     ap.add_argument("--insecure", action="store_true",
-                    help="跳过 SSL 证书校验（内网自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
+                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--github-base", default=None,
                     help=f"GitHub API 镜像前缀（默认 {DEFAULT_GITHUB_BASE}；亦可用环境变量 VLLM_KB_GITHUB_BASE）")
     ap.add_argument("--quay-base", default=None,

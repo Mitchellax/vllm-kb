@@ -53,8 +53,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   启动与操作见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)
 - **平稳降级**：embedding 服务不可用时检索自动降级为全文检索——查询用快速失败客户端（5s）+ 熔断器
   （连续失败 3 次熔断 60s，零等待降级，到期自动探测恢复）；`/health` 暴露 embedding 状态
-- **内网部署支持**：所有联网脚本（代码快照/版本日历/配套矩阵）支持 `--insecure` 跳过 SSL 校验 +
-  `--github-base/--quay-base/--base-url` 换内网 http 镜像，环境变量统一配置；
+- **真实业务环境接入**：所有联网脚本（代码快照/版本日历/配套矩阵）支持 `--insecure` 跳过 SSL 校验 +
+  `--github-base/--quay-base/--base-url` 换业务侧 http 镜像，环境变量统一配置；
   **注意：Kùzu 图库路径（`data/graph` / `VLLM_KB_DATA_ROOT`）不能含非 ASCII 字符**（中文/emoji，
   中文部署根会打不开图库——数据根放纯 ASCII 路径，详见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）
 - **存算分离**：skill 仅两个文件（`SKILL.md` + `client.py`，约 50KB，标准库实现零依赖），
@@ -385,7 +385,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 + 知识缺口展示 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔 |
-| `net.py` | 网络统一入口：内网模式（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
+| `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
 | `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册） |
 

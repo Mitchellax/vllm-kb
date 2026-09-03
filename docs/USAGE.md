@@ -32,7 +32,7 @@ export EMBEDDING_API_KEY=sk-xxx
 所有路径相对 `data/`，可整体迁移。
 
 > **URL 可写裸地址**：`embedding.base_url` / OCR `ocr_api_base` 可写 `10.0.0.5:8000/v1` 这种
-> 裸 ip:port（内网 vLLM/OCR 服务），配置加载时自动补 `http://` 前缀并告警；https 需显式写全。
+> 裸 ip:port（业务侧 vLLM/OCR 服务），配置加载时自动补 `http://` 前缀并告警；https 需显式写全。
 
 > **离线体验**：不想配 token / embedding key 时，用仓库自带的 `config.offline.json`
 > （`echo` 嵌入 + 纯 Python 向量后端）+ 模拟数据跑通全链路：
@@ -75,7 +75,7 @@ python scripts/build_kb.py --limit 100
 >   连续 3 页无新增停止，并把窗口推进到本次所见 `max createdAt`（首次增量无历史窗口时从头枚举
 >   一次）——**只覆盖近期新增/更新，补不到历史旧条目**；
 > - **`--pull-missing`（补差拉取）**：从头枚举（created desc），**跳过 raw 目录与 checkpoint 中
->   已有的编号，只拉缺失条目**——补历史旧条目（如内网数据缺失的单条 PR），翻到最新后置 done；
+>   已有的编号，只拉缺失条目**——补历史旧条目（如业务数据缺失的单条 PR），翻到最新后置 done；
 > - **`--numbers N1,N2,...`（REST 单条补拉）**：对指定编号先试 `/pulls/{n}`（404 则 `/issues/{n}`）
 >   + 评论落 raw（隐含 missing 语义，**走 REST 不需要 GraphQL token**）——已知缺失编号时最精准。
 > **全量重拉**（数据刷新/补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
@@ -156,7 +156,7 @@ python scripts/build_tag_candidates.py --include-github   # 也处理 github iss
 **向量库不受影响**（原文嵌入，无需重嵌）。升级 jieba/分词规则后跑一次
 `scripts/build_fts.py` 重建索引即可。未装 jieba 时 FTS 行为与旧版一致（无需重建）。
 
-**内网（SSL 被禁/镜像源）**：以上联网脚本均支持 `--insecure`（跳过 SSL 校验）与镜像源参数，
+**真实业务环境（SSL 被禁/镜像源）**：以上联网脚本均支持 `--insecure`（跳过 SSL 校验）与镜像源参数，
 也可用环境变量统一配置（多脚本共享）：
 
 ```bash
@@ -164,7 +164,7 @@ export VLLM_KB_INSECURE=1                        # 跳过 SSL 证书校验
 export VLLM_KB_GITHUB_BASE=http://<镜像>/api/v3  # GitHub API 镜像
 export VLLM_KB_QUAY_BASE=http://<镜像>           # quay 镜像
 export VLLM_KB_CODE_BASE=http://<镜像>           # codeload 源码 zip 镜像
-python scripts/build_companion_matrix.py         # 全部脚本自动走内网配置
+python scripts/build_companion_matrix.py         # 全部脚本自动走业务环境配置
 ```
 
 **配套矩阵自动匹配规则**（`build_companion_matrix.py`）：
@@ -277,7 +277,7 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 - md 正文里的图片引用自动收集：相对路径（以 md 所在目录为基准）、绝对路径、base64 内嵌 → 复制到
   `data/assets/images/`，**正文引用改为不透明占位 `[图片]`**（不暴露路径），`extra.evidence`
   记录 asset_id/sha256（管理员侧经 asset_registry 找回原图）；
-- 网络 URL 图片：标记 `remote` 不阻塞导入（业务环境内网可达时可后续补抓）；
+- 网络 URL 图片：标记 `remote` 不阻塞导入（业务环境网络可达时可后续补抓）；
 - 引用不存在的本地图片：标记 `unresolved`（不保留路径形态引用）；
 - 图片的 OCR 由 image source 完成（见下）。
 
@@ -834,19 +834,19 @@ A: 干净向量库约 **0.8GB**（122K chunks × 1024 维）。体积膨胀是 L
 数据完整时用 `db.open_table('chunks').cleanup_old_versions()` 清理即可恢复 ~772MB；
 业务环境 `--rebuild` 全新库天然无历史版本。也可存算分离把数据放远程，或换更小维度模型。
 
-**Q: 内网 SSL 被禁 / 证书不受信？**
+**Q: 真实业务环境 SSL 被禁 / 证书不受信？**
 A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳过证书校验；若域名不可达
-需用内网 http 镜像（`--github-base/--quay-base/--base-url`，或环境变量 `VLLM_KB_GITHUB_BASE` 等）；
+需用业务侧 http 镜像（`--github-base/--quay-base/--base-url`，或环境变量 `VLLM_KB_GITHUB_BASE` 等）；
 `embedding.base_url` 可写裸 ip:port 自动补 `http://`。
 注意 `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` 环境变量会**覆盖** `--insecure`
 （requests 的 `merge_environment_settings` 会用环境 CA 串复活 SSL 校验，
-内网 MITM 场景典型症状：`CERTIFICATE_VERIFY_FAILED ... HTTPSConnectionPool`）。
+业务环境 MITM 场景典型症状：`CERTIFICATE_VERIFY_FAILED ... HTTPSConnectionPool`）。
 本库已内置请求级 `verify=False` hook 修正（`vllm_kb/net.py`，端到端测试固化
 `tests/test_net_tls.py`）；若用自己的脚本复用 `get_session(insecure=True)` 即可，
 不要裸设 `session.verify = False`（会被环境变量覆盖）。
 
 **Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
-A: fork 行要下载 ~75MB clone 层 blob，内网慢链路需数分钟——脚本每 10MB 打一行进度，
+A: fork 行要下载 ~75MB clone 层 blob，业务环境慢链路需数分钟——脚本每 10MB 打一行进度，
 静默 ≠ 卡死。扫描结果按层 digest 缓存到 `data/cache/fork_sha.json`（层不可变，
 永久有效），**第二次运行起零层下载**；GitHub releases/requirements 同样有跨运行缓存
 （全命中时 API 请求为 0）。怀疑缓存脏数据时 `--refresh-cache` 强制重拉。
@@ -874,7 +874,7 @@ python scripts/build_kb.py --skip-pull     # 回填文档重入库（body 为 ch
 `extra` 原样带出（图构建依赖 `repo/github_number/merged_at` 建 FIXES/MERGED_IN 边）；
 `tags` 取 `doc_tags.auto_snapshot`（canonical 语义 = 自动标签）。
 
-若 **kb 中也不存在**该文档（从未采集过，如内网历史缺失的单条 PR），backfill 无法补——
+若 **kb 中也不存在**该文档（从未采集过，如业务数据历史缺失的单条 PR），backfill 无法补——
 需重新拉取：`--incremental`（补不到历史单条，见 §2.1）或全量重拉（删 raw + checkpoint 重跑）
 或手补该条的 raw 快照（`data/raw/{source_id}/{prs,comments}/{number}.json`，格式同 REST 响应）
 后再 `build_kb.py --skip-pull`。

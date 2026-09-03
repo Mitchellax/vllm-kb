@@ -21,7 +21,7 @@ def ensure_url_scheme(url: str, what: str = "url") -> str:
     """URL 缺 scheme（裸 ip:port）时补全 http://，避免 requests/urllib 报
     'no connection adapters were found' / 'unknown url type' 且请求从未发出。
 
-    内网 vLLM/OCR 服务常见裸地址配置；https 应显式写全（本函数只补 http://）。
+    业务侧 vLLM/OCR 服务常见裸地址配置；https 应显式写全（本函数只补 http://）。
     """
     if url and "://" not in url:
         fixed = "http://" + url
@@ -206,7 +206,7 @@ class SanitizeCfg(BaseModel):
 
     - keep_paths: 保留的**默认路径前缀**（白名单内绝对路径保留——昇腾默认安装/系统日志/
       配置目录诊断价值高；白名单外内部路径 → <PATH>）。空列表 = 全部绝对路径脱敏；
-    - keep_ips: 保留的 IP（默认回环/通配）；其余 IPv4（内网段/公网）→ <IP>。
+    - keep_ips: 保留的 IP（默认回环/通配）；其余 IPv4（私有网段/公网）→ <IP>。
       空列表 = 全部 IP 脱敏；
     - sources: **启用脱敏的源 type 列表**（excel/markdown/pdf...；github 公开数据不脱敏）。
       None = 默认业务来源 ["excel", "markdown"]（PDF 手册默认不脱敏，加 "pdf" 即启用）；
