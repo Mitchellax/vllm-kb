@@ -20,18 +20,25 @@ class TestApiCodeGraph(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         from vllm_kb.api import create_app
-
-        # 造一个 enabled=True 的临时 config，复用 config.json 的其余字段
-        base = "config.json"
         from vllm_kb.config import AppConfig
 
-        cfg = AppConfig.load(base, require_keys=False)
-        cfg.code_graph.enabled = True
-        cfg.code_graph.base_url = "http://localhost:8001"
-
+        # 合成配置（不读本机 config.json——gitignored，fresh clone/CI 无此文件且相对路径依赖 CWD）；
+        # /code-graph/* 测试全部 mock CodeGraphClient，不需要真实 KB 数据
         self._cfg_dir = tempfile.mkdtemp()
         path = os.path.join(self._cfg_dir, "config.json")
-        # round-trip 保证 extra 字段不丢
+        cfg = AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 64},
+            "storage": {
+                "vector_backend": "python",
+                "lancedb_path": os.path.join(self._cfg_dir, "lancedb"),
+                "sqlite_path": os.path.join(self._cfg_dir, "kb.sqlite3"),
+                "canonical_file": os.path.join(self._cfg_dir, "canonical.jsonl"),
+            },
+            "code_graph": {
+                "enabled": True,
+                "base_url": "http://localhost:8001",
+            },
+        })
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg.model_dump(by_alias=True), f, ensure_ascii=False)
 
@@ -98,24 +105,46 @@ class TestApiCodeGraphDisabled(unittest.TestCase):
     """code_graph.enabled=False（默认）时端点不注册（404 比 503 更干净）。"""
 
     def setUp(self):
+        import json
         import os
 
         from fastapi.testclient import TestClient
 
         from vllm_kb.api import create_app
+        from vllm_kb.config import AppConfig
+
+        # 合成配置不含 code_graph 段（默认 disabled）→ 端点不注册；
+        # 不读本机 config.json——本机若启用 code_graph 会导致 404 断言翻转
+        self._cfg_dir = tempfile.mkdtemp()
+        path = os.path.join(self._cfg_dir, "config.json")
+        cfg = AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 64},
+            "storage": {
+                "vector_backend": "python",
+                "lancedb_path": os.path.join(self._cfg_dir, "lancedb"),
+                "sqlite_path": os.path.join(self._cfg_dir, "kb.sqlite3"),
+                "canonical_file": os.path.join(self._cfg_dir, "canonical.jsonl"),
+            },
+        })
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg.model_dump(by_alias=True), f, ensure_ascii=False)
 
         self._old_e = os.environ.get("EMBEDDING_API_KEY")
         self._old_g = os.environ.get("GITHUB_TOKEN")
         os.environ["EMBEDDING_API_KEY"] = "dummy"
         os.environ["GITHUB_TOKEN"] = "dummy"
-        self.client = TestClient(create_app("config.json"))
+        self.client = TestClient(create_app(path))
 
     def tearDown(self):
+        import os
+        import shutil
+
         for name, old in (("EMBEDDING_API_KEY", self._old_e), ("GITHUB_TOKEN", self._old_g)):
             if old is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = old
+        shutil.rmtree(self._cfg_dir, ignore_errors=True)
 
     def test_endpoints_not_registered(self):
         self.assertEqual(self.client.get("/code-graph/health").status_code, 404)

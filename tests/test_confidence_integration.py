@@ -108,17 +108,24 @@ class TestFinalScoreWithWHist(unittest.TestCase):
 class TestApiSearchExposesHistFields(unittest.TestCase):
     def test_search_response_has_hist_fields(self):
         import os
+        from pathlib import Path
 
         from fastapi.testclient import TestClient
 
         from vllm_kb.api import create_app
+        from vllm_kb.config import PROJECT_ROOT
+
+        # 部署冒烟：/search 需真实 KB。config.json 被 gitignore——fresh clone/CI 跳过。
+        cfg_path = PROJECT_ROOT / "config.json"
+        if not cfg_path.exists():
+            self.skipTest("config.json 不存在（fresh clone/CI）——/search 冒烟仅在部署机运行")
 
         old_e = os.environ.get("EMBEDDING_API_KEY")
         old_g = os.environ.get("GITHUB_TOKEN")
         os.environ["EMBEDDING_API_KEY"] = "dummy"
         os.environ["GITHUB_TOKEN"] = "dummy"
         try:
-            client = TestClient(create_app("config.json"))
+            client = TestClient(create_app(str(cfg_path)))
             r = client.post("/search", json={"query": "test", "top_k": 1})
             self.assertEqual(r.status_code, 200)
             results = r.json().get("results", [])

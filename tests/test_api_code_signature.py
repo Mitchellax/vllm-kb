@@ -16,17 +16,25 @@ from vllm_kb.signature import extract_signatures, format_hits, signature_search
 class TestApiCodeAndSignature(unittest.TestCase):
     def setUp(self):
         import os
+        from pathlib import Path
 
         from fastapi.testclient import TestClient
 
         from vllm_kb.api import create_app
+        from vllm_kb.config import PROJECT_ROOT
+
+        # 部署冒烟：端点行为需真实 KB/代码索引，仅在 config.json 存在的部署机上运行。
+        # config.json 被 gitignore——fresh clone/CI 跳过；绝对路径不依赖 CWD。
+        cfg_path = PROJECT_ROOT / "config.json"
+        if not cfg_path.exists():
+            self.skipTest("config.json 不存在（fresh clone/CI）——端点冒烟仅在部署机运行")
 
         # config.json 密钥走环境变量（脱敏后无明文 api_key）
         self._old_key = os.environ.get("EMBEDDING_API_KEY")
         self._old_gh = os.environ.get("GITHUB_TOKEN")
         os.environ["EMBEDDING_API_KEY"] = "dummy-for-test"
         os.environ["GITHUB_TOKEN"] = "dummy-for-test"
-        self.client = TestClient(create_app("config.json"))
+        self.client = TestClient(create_app(str(cfg_path)))
 
     def tearDown(self):
         import os
@@ -50,6 +58,11 @@ class TestApiCodeAndSignature(unittest.TestCase):
         d = r.json()
         self.assertTrue(d["signatures"])
         self.assertIsInstance(d["results"], list)
+        # title_hits 序列化契约：dict 键访问（曾因属性访问 500）
+        self.assertIsInstance(d["title_hits"], list)
+        for th in d["title_hits"]:
+            for key in ("doc_id", "title", "url", "component", "resolved", "signal"):
+                self.assertIn(key, th)
 
     def test_code_versions_endpoint(self):
         r = self.client.get("/code/versions")
