@@ -715,6 +715,15 @@ client.py code-graph health
 `data/telemetry.sqlite3`（不碰只读 `kb.sqlite3`）。会话归属经 `VLLM_KB_SESSION` 环境变量
 → `X-Session-Id` header 透传（agent 侧管），缺失回退 ip+时间窗。
 
+**探索/测试行为打标（probe，不进反馈推断）**：agent/新同事初接触 skill 时的验证安装、
+复现文档示例、占位测试查询会污染 w_hist 统计。双层防线：
+- **显式约定（主）**：探索请求带 `--probe`（client.py）或 `VLLM_KB_PROBE=1` →
+  `X-VLLM-KB-Probe: 1` header → 遥测 `probe=1`
+- **启发式兜底（辅）**：查询正规化后精确命中 SKILL.md 范例词/占位探测词（test/hello/
+  测试 等）→ 自动 `probe=2`，覆盖未读约定的探索行为
+打标不删除（审计可逆）——推断层 `build_feedback.py` 排除 `probe≠0` 事件并输出排除统计，
+规则调整后重跑即恢复；原始行保留供易用性分析（哪些命令被探索过）。
+
 **数据流（三段分离，审计可逆）**：
 ```
 serve_api (只读)                    离线周期

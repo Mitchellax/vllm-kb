@@ -38,7 +38,12 @@ _REPHRASE_WINDOW = 60  # 60s
 
 
 def _load_events(telemetry_path: Path) -> list[dict]:
-    """加载全部遥测事件，按 (session_id, ts) 排序。"""
+    """加载遥测事件（排除探索/测试打标 probe≠0），按 (session_id, ts) 排序。
+
+    probe 语义见 vllm_kb/telemetry.py（0 真实 / 1 显式声明 / 2 启发式识别）；
+    探索行为打标不删除——排除发生在推断层，规则调整后重跑即恢复（原始数据不丢）。
+    旧库无 probe 列时视为 0（全量进推断，与打标机制引入前行为一致）。
+    """
     if not telemetry_path.exists():
         print(f"[feedback] 遥测库不存在: {telemetry_path}（先启用 feedback_enabled 跑 serve_api 积累数据）")
         return []
@@ -50,7 +55,19 @@ def _load_events(telemetry_path: Path) -> list[dict]:
         ).fetchall()
     finally:
         conn.close()
-    return [dict(r) for r in rows]
+    events = [dict(r) for r in rows]
+    kept = [e for e in events if not e.get("probe", 0)]
+    excluded = len(events) - len(kept)
+    if excluded:
+        by_reason = {}
+        for e in events:
+            p = e.get("probe", 0)
+            if p:
+                by_reason[p] = by_reason.get(p, 0) + 1
+        detail = ", ".join(f"probe={p}({'显式声明' if p == 1 else '启发式识别'})×{n}"
+                           for p, n in sorted(by_reason.items()))
+        print(f"[feedback] 排除探索/测试事件 {excluded} 条（{detail}），不进反馈推断")
+    return kept
 
 
 def _group_sessions(events: list[dict]) -> dict[str, list[dict]]:

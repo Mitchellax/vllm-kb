@@ -51,6 +51,62 @@ def _ts(minute):
     return (datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=minute)).isoformat()
 
 
+class TestProbeExclusion(unittest.TestCase):
+    """探索/测试打标（probe≠0）事件不进反馈推断；旧库无 probe 列全量进（兼容）。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cfg = _cfg(self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _seed_db(self, events, with_probe_col=True):
+        db = self.cfg.resolve(self.cfg.confidence.telemetry_path)
+        cols = ("session_id TEXT NOT NULL, ts TEXT NOT NULL, endpoint TEXT NOT NULL, "
+                "method TEXT, query_hash TEXT, query_normalized TEXT, "
+                "signature_hash TEXT, signature_entities TEXT, signature_text TEXT, "
+                "result_doc_ids TEXT, result_count INTEGER, component TEXT, "
+                "target_version TEXT, repo TEXT"
+                + (", probe INTEGER DEFAULT 0" if with_probe_col else ""))
+        conn = sqlite3.connect(str(db))
+        conn.execute(f"CREATE TABLE query_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, {cols})")
+        if events:
+            colnames = ",".join(events[0].keys())
+            marks = ",".join("?" * len(events[0]))
+            conn.executemany(
+                f"INSERT INTO query_events ({colnames}) VALUES ({marks})",
+                [tuple(e.values()) for e in events])
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_probe_events_excluded_from_inference(self):
+        """probe=1/2 事件被 _load_events 排除，probe=0 保留。"""
+        db = self._seed_db([
+            {"session_id": "s1", "ts": _ts(0), "endpoint": "/search",
+             "query_normalized": "真实查询", "probe": 0},
+            {"session_id": "s1", "ts": _ts(1), "endpoint": "/search",
+             "query_normalized": "test", "probe": 2},
+            {"session_id": "s1", "ts": _ts(2), "endpoint": "/search",
+             "query_normalized": "另一真实", "probe": 1},
+        ])
+        events = bf._load_events(Path(db))
+        norms = [e["query_normalized"] for e in events]
+        self.assertEqual(norms, ["真实查询"])
+
+    def test_legacy_db_without_probe_column_kept(self):
+        """旧库无 probe 列：全部视为 probe=0 进推断（与打标机制引入前行为一致）。"""
+        db = self._seed_db([
+            {"session_id": "s1", "ts": _ts(0), "endpoint": "/search",
+             "query_normalized": "test"},  # 无 probe 键
+        ], with_probe_col=False)
+        events = bf._load_events(Path(db))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["query_normalized"], "test")
+
+
 class TestInferFeedback(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()

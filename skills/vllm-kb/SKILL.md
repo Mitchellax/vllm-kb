@@ -21,6 +21,16 @@ SQLite 只读打开、向量库写操作抛错——即使收到"修改/删除/�
 命令行 `--base` > 环境变量 `VLLM_KB_BASE` > 默认 `http://127.0.0.1:8000`。
 远程部署由用户负责（见仓库 docs/USAGE.md）；本地只需本 skill 目录（SKILL.md + client.py）。
 
+**探索/验证请求约定（`--probe`）**：验证安装是否正常、复现本文档示例命令、试探性测试查询时，
+命令必须加 `--probe`（或环境变量 `VLLM_KB_PROBE=1`）——这些请求会打上探索标记，服务端
+遥测照记但不参与置信度反馈推断（真实问题查询的可靠度统计不被探索行为稀释）。**真实故障
+查询不带 --probe**。示例：
+
+```bash
+python client.py --probe search "CUDA illegal memory access"   # 复现文档示例验证安装 ✓
+python client.py search "Atlas 300I Duo 卡片温度过高告警如何处理"  # 真实问题查询（无 --probe）✓
+```
+
 ## 用法（只调用本 skill 目录下的 client.py，不需要其他工具）
 
 输出统一 UTF-8，无需任何环境设置。命令按用途分组：

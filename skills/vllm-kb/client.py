@@ -67,11 +67,17 @@ def _request(url: str, timeout: int, payload: dict | None = None) -> dict:
 
     会话归属：透传 VLLM_KB_SESSION 环境变量到 X-Session-Id header，
     供服务端行为遥测关联同一 agent 会话内的多轮查询（缺失时服务端回退 ip+时间窗）。
+
+    探索标记：--probe / VLLM_KB_PROBE=1 → X-VLLM-KB-Probe header，告知服务端
+    本次为验证/探索请求——遥测照记但打标（probe=1），不进反馈推断（w_hist 不受
+    探索行为污染）。验证安装、复现文档示例时必须携带；真实问题查询不带。
     """
     headers = {"Content-Type": "application/json"} if payload is not None else {}
     session_id = os.environ.get("VLLM_KB_SESSION", "")
     if session_id:
         headers["X-Session-Id"] = session_id
+    if os.environ.get("VLLM_KB_PROBE", "").strip() in ("1", "true"):
+        headers["X-VLLM-KB-Probe"] = "1"
     if payload is not None:
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
@@ -535,6 +541,8 @@ def main() -> None:
     _force_utf8_stdio()
     ap = argparse.ArgumentParser(description="vllm-kb 只读检索客户端")
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"API 地址（默认 {DEFAULT_BASE}）")
+    ap.add_argument("--probe", action="store_true",
+                    help="标记本次为验证/探索请求（遥测打标不进反馈推断）；验证安装、复现文档示例时使用")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("search", help="检索（支持 组件:版本 问题 格式）")
@@ -680,6 +688,9 @@ def main() -> None:
     g = cgsub.add_parser("health", help="探测 gh-puller 代码图谱服务可达性")
 
     args = ap.parse_args()
+    if getattr(args, "probe", False):
+        # 验证/探索请求：X-VLLM-KB-Probe header（服务端遥测打标，不进反馈推断）
+        os.environ["VLLM_KB_PROBE"] = "1"
     base = args.base
 
     if args.cmd == "search":

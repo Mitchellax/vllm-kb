@@ -6,6 +6,13 @@
 会话归属：X-Session-Id header（agent 侧管，经 VLLM_KB_SESSION 环境变量透传）；
 缺失时回退 client_ip + 30min 时间窗聚类（粗粒度兜底，多 agent 同机/NAT 后可能冲突）。
 
+探索/测试行为打标（probe 列，记录不删除——推断层按标排除，原始行保留可审计）：
+- 0 真实查询（进反馈推断）
+- 1 显式声明：请求带 X-VLLM-KB-Probe: 1（agent/人工验证安装、复现文档示例时约定携带，
+  client.py `--probe` / VLLM_KB_PROBE=1 自动加）
+- 2 启发式识别：查询正规化后精确命中文档范例词/占位探测词（覆盖未读约定的探索行为）
+推断层（build_feedback.py）排除 probe≠0 的事件；规则调整后可重算（原始数据不丢）。
+
 只读姿态不受影响：只写 telemetry.sqlite3（mode=rw，独立库），不碰 kb.sqlite3。
 """
 from __future__ import annotations
@@ -27,6 +34,33 @@ if TYPE_CHECKING:
 _TRACKED_PREFIXES = ("/search", "/signature-search", "/title", "/doc/", "/code/search", "/code/diff")
 # 会话回退：ip + 时间窗聚类窗口（秒）
 _SESSION_FALLBACK_WINDOW = 1800  # 30min
+
+# ---- 探索/测试行为启发式（probe=2）----
+# 文档范例词：SKILL.md 各命令节的示例查询正规化形式（小写+去空白标点、保留字母数字下划线，
+# 与 _query_normalized 同规则）。新 agent 接触 skill 时原样复现示例属探索验证，
+# 不应进反馈推断。**与 skills/vllm-kb/SKILL.md 示例同步维护**（tests 固化对齐）。
+_PROBE_EXEMPLARS = {
+    # search 示例
+    "vllmascend0180glm51pd分离p节点挂死", "cudaillegalmemoryaccess", "hccl超时", "查询npu",
+    # signature 示例（整段报错原文；下划线是 word 字符，正规化保留）
+    "halmemcreatefaileddrvretcode6kernel_namedispatchffncombineerrorstrtimeoutortraperror",
+    "runtimeerroraclnnmoedistributedispatchv4failederrorcodeis561000",
+    # title 示例
+    "vectorcore", "npusmi",
+    # code 检索示例（keyword）
+    "dispatchffncombine", "halmemcreate", "wait_for_remote", "memoryleak",
+    # diff --keyword 示例（fill_(-1) → 去标点保留下划线）
+    "fill_1",
+}
+# 占位探测词：明显非领域查询（自编测试），保守精确匹配——零误判（真实故障查询不会是这些）
+_PROBE_PLACEHOLDERS = {
+    "test", "testing", "tests", "测试", "测试一下", "试一下", "试测",
+    "hello", "hi", "你好", "ping", "aaa", "aaaa", "abc", "123", "1234",
+    "test123", "asdf", "asdfg", "asdfgh", "qwer", "dummy", "example",
+    "示例", "例子", "sample", "样本", "查询测试",
+}
+# 范例 doc_id（/doc/ 端点，query_text 为空故按 doc_id 匹配）
+_PROBE_DOC_IDS = {"github:vllm-project-vllm-ascend:issue:13042"}
 
 
 def _now_iso() -> str:
@@ -75,8 +109,6 @@ def _extract_request_info(request, body: Optional[bytes]) -> dict:
             info["query_text"] = payload.get("keyword", "")
             info["component"] = "code"
             info["repo"] = payload.get("repo", "vllm-ascend")
-        elif path == "/tags/match":
-            info["query_text"] = payload.get("text", "")
     # GET 请求参数（title/doc/code-diff）
     elif method == "GET":
         qs = parse_qs(urlparse(str(request.url)).query)
@@ -133,6 +165,22 @@ def _resolve_session(request) -> str:
     return f"ip:{client_ip}:{window}"
 
 
+def classify_probe(request, info: dict) -> int:
+    """探索/测试行为分级：0 真实 / 1 显式声明 / 2 启发式识别。
+
+    显式：X-VLLM-KB-Probe header（agent 侧约定，见模块 docstring）。
+    启发式：查询正规化形式精确命中范例词/占位词集合，或 doc_id 为范例文档。
+    """
+    if request.headers.get("x-vllm-kb-probe", "").strip() in ("1", "true"):
+        return 1
+    norm = info.get("query_normalized", "")
+    if norm and (norm in _PROBE_EXEMPLARS or norm in _PROBE_PLACEHOLDERS):
+        return 2
+    if info.get("doc_id") in _PROBE_DOC_IDS:
+        return 2
+    return 0
+
+
 class TelemetryStore:
     """遥测库访问器（mode=rw，独立于只读 kb.sqlite3）。"""
 
@@ -163,12 +211,17 @@ class TelemetryStore:
                     result_count INTEGER,
                     component   TEXT,
                     target_version TEXT,
-                    repo        TEXT
+                    repo        TEXT,
+                    probe       INTEGER DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_ts ON query_events(session_id, ts);
                 CREATE INDEX IF NOT EXISTS idx_signature_hash ON query_events(signature_hash);
                 CREATE INDEX IF NOT EXISTS idx_query_normalized ON query_events(query_normalized);
             """)
+            # 旧库迁移：probe 列缺失则补（CREATE TABLE IF NOT EXISTS 不改已有表）
+            cols = {r[1] for r in c.execute("PRAGMA table_info(query_events)").fetchall()}
+            if "probe" not in cols:
+                c.execute("ALTER TABLE query_events ADD COLUMN probe INTEGER DEFAULT 0")
 
     def record(self, **fields) -> None:
         """写一条行为事件（中间件调用）。"""
@@ -176,7 +229,7 @@ class TelemetryStore:
                 "query_hash", "query_normalized", "signature_hash",
                 "signature_entities", "signature_text",
                 "result_doc_ids", "result_count", "component",
-                "target_version", "repo")
+                "target_version", "repo", "probe")
         vals = [fields.get(c) for c in cols]
         placeholders = ",".join("?" * len(cols))
         with self._conn() as c:
@@ -248,6 +301,7 @@ def make_middleware(app, cfg: "AppConfig"):
                 component=req_info.get("component", ""),
                 target_version=req_info.get("target_version", ""),
                 repo=req_info.get("repo", ""),
+                probe=classify_probe(request, req_info),
             )
         except Exception as e:
             # 遥测失败不影响检索（宁可丢遥测不丢查询）
