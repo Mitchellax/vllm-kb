@@ -73,6 +73,15 @@ class TestApiCodeGraph(unittest.TestCase):
         detail = r.json().get("detail", "")
         self.assertIn("code", detail)  # 引导用 code 命令
 
+    def test_tool_error_returns_400_with_detail(self):
+        """工具级错误（isError：未知函数/参数错）→ 400 非 503——服务健康，参数问题。"""
+        from vllm_kb.code_graph import CodeGraphToolError
+        with mock.patch("vllm_kb.code_graph.CodeGraphClient.search_graph",
+                        side_effect=CodeGraphToolError("代码图谱工具 search_graph 报错: unknown function: zzz")):
+            r = self.client.post("/code-graph/search", json={"query": "zzz"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("unknown function", r.json().get("detail", ""))
+
     def test_mock_success_passthrough(self):
         with mock.patch("vllm_kb.code_graph.CodeGraphClient.search_graph",
                         return_value={"results": [{"name": "foo"}]}):

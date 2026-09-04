@@ -127,7 +127,10 @@ python client.py code-graph health                                        # 探�
 
 - `code`（本地）强在：版本化定位、报错字面量索引、离线、跨版本 diff
 - `code-graph`（gh-puller）强在：跨函数调用链/数据流、变更影响面、架构聚类、跨仓边、语义搜索
-- gh-puller 不可达时 `code-graph` 返回 503 → 改用 `code` 查本地索引（手动）
+- `trace` 的函数名可传短名（`do_auth`）或 `search` 返回的完整 qn（自动取末段短名）；
+  同名多节点时不静默取其一——返回候选列表（name/file/lines），确认目标后用其短名重试
+- gh-puller 不可达时 `code-graph` 返回 503 → 改用 `code` 查本地索引（手动）；
+  返回 400 = 服务健康但参数问题（如未知函数）→ 按 detail 换函数名形态重试，勿放弃
 - `--graph-base` / `VLLM_KB_CODE_GRAPH_BASE` 独立寻址（缺省沿用 `--base`）
 
 ### 10) 文档标签（能力发现）`tags` / `context` —— "知识库有哪些文档能帮上这个问题"

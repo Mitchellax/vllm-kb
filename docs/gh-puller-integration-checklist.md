@@ -27,10 +27,10 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
 | # | MCP 工具 | vllm-kb 端点 | skill 命令 | 业务环境验证 |
 |---|---|---|---|---|
 | 1 | `search_graph` | POST /code-graph/search | `code-graph search` | ✅ 已验证 |
-| 2 | `search_code` | POST /code-graph/code-search | `code-graph code-search` | ⬜ 待验证 |
+| 2 | `search_code` | POST /code-graph/code-search | `code-graph code-search` | ⬜ 待验证（依赖 gh-puller 侧放行，见"待适配项"） |
 | 3 | `trace_path` | POST /code-graph/trace | `code-graph trace` | ✅ 已验证 |
 | 4 | `query_graph` | POST /code-graph/query | `code-graph query` | ✅ 已验证 |
-| 5 | `get_architecture` | POST /code-graph/architecture | `code-graph architecture` | ⬜ 待验证 |
+| 5 | `get_architecture` | POST /code-graph/architecture | `code-graph architecture` | ⬜ 待验证（依赖 gh-puller 侧放行，见"待适配项"） |
 | 6 | `detect_changes` | POST /code-graph/changes | `code-graph changes` | ✅ 已验证 |
 | — | `tools/list`（协议方法） | GET /code-graph/health；审核工作台连通性测试 | `code-graph health` | ⬜ 待验证 |
 
@@ -72,6 +72,23 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
    "direction":"outbound","depth":3,"mode":"calls","limit":100
  }}}
 ```
+
+`function_name` **双形态约定**（vllm-kb 侧已实现归一化，见下）：
+
+| 形态 | 例 | 说明 |
+|---|---|---|
+| 短名 | `do_auth` | 上游按短名匹配（实测 200） |
+| 完整 qn | `vllm-kb-vllm-0.23.0.tests.utils.do_auth` | search_graph 返回标识；上游原生不识别（含索引前缀，实测报错） |
+
+- 上游原生精确形态是 `模块.函数`（如 `pkg.f`，无索引前缀）——gh-puller 侧 search 返回的 qn
+  带 `{index_name}.` 前缀（`vllm-kb-{repo}-{version}`），直接传给 trace_path 不被识别。
+- **vllm-kb 侧归一化（已实现）**：每次 trace 前先以末段短名做 search_graph 唯一性预检——
+  唯一命中 → 末段短名透传；多命中 → 返回 `{"status":"ambiguous","candidates":[...]}` 候选
+  结构（HTTP 200，agent 拿候选定位后重试）；预检不可达/无精确同名 → 原样透传（不阻塞）。
+  翻页（`cursor`）跳过预检。
+- **gh-puller 侧适配建议**：adapter 转发前剥离 `{index_name}.` 前缀（索引前缀即
+  `project` 参数本身，剥离后正是上游期望的 `模块.函数` 形态）——落地后 qn 可原样直传，
+  vllm-kb 侧预检继续承担消歧。
 
 ### query_graph（Cypher 查询）
 ```json
@@ -117,6 +134,25 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
 > **注**：`version` 字段（detect_changes 等）是 vllm-kb 侧约定的版本限定参数范例。
 > gh-puller server 端适配时，若支持版本/tag/commit 切片则按 `version` 过滤图谱范围；
 > 若暂不支持则忽略该字段（按当前主干态返回），vllm-kb 侧会把版本信息拼进 `query`/`diff` 文本兜底。
+
+## 错误语义（vllm-kb 侧已实现，gh-puller 侧无需改动）
+
+| 情形 | vllm-kb 返回 | 语义 |
+|---|---|---|
+| gh-puller 不可达（连接失败/超时/非 2xx/非 JSON） | **503** + 引导用 `code` 命令 | 服务故障，触发熔断计数 |
+| 工具级错误（响应 `isError:true`：未知函数/参数错） | **400** + 上游错误详情 | 服务健康，参数问题——agent 应换函数名形态/参数重试而非放弃 |
+
+gh-puller 侧只需照常返回 MCP 标准信封（`isError` 字段区分工具级错误），vllm-kb 侧据此分流。
+
+## gh-puller 侧待适配项（当前已知缺口）
+
+以下为 vllm-kb 侧已核实、需 gh-puller 侧实施的适配点（不影响已验证的 4 工具路径）：
+
+1. **search_code / get_architecture 未放行**：vllm-kb-adapter 的工具白名单
+   （`CHECKLIST_TOOLS`）当前只含 4 个 checklist 工具，这两个工具会被
+   `unknown tool` 拒绝——需扩白名单（两者均为纯转发，适配成本低）。
+2. **trace_path 的 qn 前缀剥离**（建议）：见 trace_path 参数范例段——
+   落地后 search 返回的完整 qn 可原样直传 trace_path。
 
 ## vllm-kb 侧配置（审核工作台管理）
 

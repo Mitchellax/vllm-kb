@@ -17,6 +17,9 @@ gh-puller 经 **MCP Streamable HTTP** 暴露工具桌（stateless 单端点，�
 
 不可达语义：gh-puller 不可达时本模块抛 CodeGraphUnavailable，api_code_graph
 转 503 + 引导用 code 命令查本地索引——不回退本地（本地无等价图谱能力，回退无意义）。
+工具级错误（isError：未知函数/参数错）抛 CodeGraphToolError，api 层转 400 +
+行动建议——服务健康时不再误报 503（agent 会误判服务挂了而放弃，实际只需
+换个函数名形态重试）。
 """
 from __future__ import annotations
 
@@ -30,9 +33,17 @@ from .config import CodeGraphCfg
 
 
 class CodeGraphUnavailable(Exception):
-    """gh-puller 代码图谱服务不可达（连接失败/超时/5xx/isError/熔断打开）。
+    """gh-puller 代码图谱服务不可达（连接失败/超时/5xx/熔断打开）。
 
     消息可直接展示给 agent：含上游错误 + 引导用 code 命令查本地版本化索引。
+    """
+
+
+class CodeGraphToolError(Exception):
+    """gh-puller 工具级错误（isError=true：未知函数/参数错/预检零建议）。
+
+    与不可达分开：服务本身健康，问题在请求参数——API 层转 400（含行动
+    建议），不触发熔断计数（工具级错误不代表服务故障）。
     """
 
 
@@ -85,7 +96,8 @@ class CodeGraphClient:
     def _call_tool(self, name: str, arguments: dict) -> Any:
         """发 tools/call JSON-RPC 到 gh-puller 单端点，解包返回 structuredContent（优先）或 text。
 
-        不可达/超时/非 2xx/非 JSON/isError 一律转 CodeGraphUnavailable（触发熔断计数）。
+        不可达/超时/非 2xx/非 JSON 转 CodeGraphUnavailable（触发熔断计数）；
+        工具级错误（isError）转 CodeGraphToolError（不计数——服务健康，参数问题）。
         """
         if self._circuit_open():
             raise CodeGraphUnavailable(
@@ -143,7 +155,7 @@ class CodeGraphClient:
                 f"代码图谱服务响应缺 result 信封（{name}）；引导用 `code <符号>` 查本地索引"
             ))
 
-        # 工具级错误（isError=true：未知工具/参数错/profile 拦截）
+        # 工具级错误（isError=true：未知工具/未知函数/参数错）——服务健康，参数问题
         if result.get("isError"):
             text = ""
             content = result.get("content")
@@ -153,9 +165,9 @@ class CodeGraphClient:
             detail = ""
             if isinstance(sc, dict) and sc.get("error"):
                 detail = str(sc["error"])
-            raise self._on_fail(CodeGraphUnavailable(
-                f"代码图谱工具 {name} 报错: {detail or text or 'isError'}；引导用 `code <符号>` 查本地索引"
-            ))
+            raise CodeGraphToolError(
+                f"代码图谱工具 {name} 报错: {detail or text or 'isError'}"
+            )
 
         self._on_success()
         # 优先返回结构化结果；无则退回 content[0].text（纯文本工具结果）
@@ -193,12 +205,90 @@ class CodeGraphClient:
     def trace_path(self, *, project: str, function_name: str, direction: str = "both",
                    depth: int = 3, limit: int = 100, cursor: Optional[str] = None,
                    mode: str = "calls") -> Any:
-        """trace_path：调用链/数据流/跨服务路径追踪。mode: calls|data_flow|cross_service。"""
+        """trace_path：调用链/数据流/跨服务路径追踪。mode: calls|data_flow|cross_service。
+
+        function_name 双形态：短名（如 do_auth）或 search 返回的完整 qn
+        （{index}.{module}.{func}，末段即函数名）。上游按短名匹配（完整 qn
+        含索引前缀不被识别），故 qn 形态取末段透传。
+
+        每次调用先经 search_graph 预检唯一性（cursor 翻页除外）：
+        - 唯一命中 → 以末段短名透传（预检已证唯一，杜绝同名静默错配）；
+        - 多命中 → 返回 {"status": "ambiguous", "candidates": [...]} 结构
+          （200，不透传，agent 从候选取准确标识重试）；
+        - 零命中 → 透传原输入（保留旧行为兜底：search 未匹配不代表上游
+          不认该形态——如 name_pattern 不匹配的类方法 qn）；
+        - 预检不可达 → 透传原输入（预检不引入新的失败模式）。
+        """
         args: dict[str, Any] = {"project": project, "function_name": function_name,
                                 "direction": direction, "depth": depth, "limit": limit, "mode": mode}
         if cursor is not None:
             args["cursor"] = cursor
+            return self._call_tool("trace_path", args)
+
+        short = function_name.rsplit(".", 1)[-1]
+        pre = self._precheck_unique(project, short)
+        if pre:
+            if len(pre) > 1:
+                return {
+                    "status": "ambiguous",
+                    "function_name": function_name,
+                    "matched": len(pre),
+                    "candidates": pre[:20],
+                    "hint": "同名多个节点；从候选确认目标（file/lines 定位），用其 name 短名或 qn 末段重试",
+                }
+            args["function_name"] = short  # 唯一命中：透传末段短名（上游匹配语义）
         return self._call_tool("trace_path", args)
+
+    _PRECHECK_LIMIT = 51  # >50 视为大量候选，按多命中处理
+
+    def _precheck_unique(self, project: str, short: str):
+        """search_graph 预检短名唯一性。
+
+        返回 name 精确等于短名的候选行列表；None = 跳过预检（预检不可达/
+        工具级错/返回非预期结构/无精确同名行）——调用方按旧行为透传原输入，
+        预检不引入新的失败模式（无精确同名行时替换函数名反而可能错配）。
+        """
+        import re as _re
+
+        try:
+            pre = self.search_graph(project=project,
+                                    name_pattern="^" + _re.escape(short) + "$",
+                                    limit=self._PRECHECK_LIMIT)
+        except (CodeGraphUnavailable, CodeGraphToolError):
+            return None
+        rows = self._search_rows(pre)
+        if not rows:
+            return None
+        exact = [r for r in rows if r.get("name") == short]
+        return exact or None
+
+    @staticmethod
+    def _search_rows(pre: Any):
+        """search_graph 结果提取候选行（rows/groups 两种归一形态）。
+
+        行字段 name/label/qn/file/lines（分组树 flatten 后 name=短名、qn=完整）。
+        非预期结构返回 None。
+        """
+        if not isinstance(pre, dict):
+            return None
+        rows = pre.get("rows")
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)]
+        groups = pre.get("groups")
+        out = []
+        if isinstance(groups, list):
+            for g in groups:
+                if not isinstance(g, dict):
+                    continue
+                prefix = g.get("group") or g.get("prefix") or ""
+                for m in g.get("members") or []:
+                    if isinstance(m, dict):
+                        row = dict(m)
+                        row.setdefault("name", m.get("name") or "")
+                        if prefix and not row.get("qn"):
+                            row["qn"] = f"{prefix}.{m.get('name', '')}"
+                        out.append(row)
+        return out or None
 
     def query_graph(self, *, project: str, query: str, max_rows: Optional[int] = None) -> Any:
         """query_graph：执行 Cypher 查询知识图谱（多跳/聚合/跨服务分析）。"""

@@ -77,7 +77,7 @@ class DetectChangesRequest(BaseModel):
 def register(app, ctx) -> None:
     from fastapi import HTTPException
 
-    from .code_graph import CodeGraphClient, CodeGraphUnavailable
+    from .code_graph import CodeGraphClient, CodeGraphToolError, CodeGraphUnavailable
 
     client = CodeGraphClient(ctx.cfg.code_graph)
 
@@ -88,9 +88,13 @@ def register(app, ctx) -> None:
         return p
 
     def _call(fn, *args, **kwargs):
-        """统一图谱调用异常：不可达 → 503 + 引导用 code 命令；不向客户端泄漏堆栈。"""
+        """统一图谱调用异常：工具级错误 → 400（行动建议）；不可达 → 503 + 引导。
+
+        不向客户端泄漏堆栈。"""
         try:
             return fn(*args, **kwargs)
+        except CodeGraphToolError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except CodeGraphUnavailable as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
 

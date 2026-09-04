@@ -669,7 +669,8 @@ python skills/vllm-kb/client.py graph evidence pdf:Atlas A3 中心推理和训�
 **启用**：config `code_graph.enabled = true` + `base_url`（gh-puller Streamable HTTP 地址，
 默认端口 8787，路径 `/gh-puller/graph`）。未启用时 `serve_api` 不注册 `/code-graph/*`
 端点（404 比 503 干净）。**不可达时端点直接 503 + 引导用 `code` 命令查本地索引**——
-本地无等价图谱能力，不走回退（回退无意义）。
+本地无等价图谱能力，不走回退（回退无意义）。**工具级错误（未知函数/参数错）返回 400 +
+上游错误详情**——服务健康、参数问题，换函数名形态重试即可，勿按服务故障处理。
 
 **命令**（skill，`--graph-base` / `VLLM_KB_CODE_GRAPH_BASE` 独立寻址，缺省沿用 `--base`）：
 
@@ -680,6 +681,9 @@ client.py code-graph code-search "DispatchFFNCombine" --mode full --path-filter 
 
 # 调用链追踪（替代手写 grep 找调用关系）
 client.py code-graph trace do_auth --direction outbound --depth 5 --mode data_flow
+# trace 函数名双形态：短名（do_auth）或 search 返回的完整 qn（自动取末段短名透传）。
+# 同名多节点 → 返回候选列表（name/file/lines）而非静默取其一；确认后用短名重试。
+# 每次调用先做唯一性预检（翻页 cursor 除外）——多一次 search 往返，换取零错配。
 
 # Cypher 查知识图谱（多跳/聚合/跨服务分析）
 client.py code-graph query "MATCH (n:Function)-[:CALLS]->(m) RETURN n.name, count(m)"

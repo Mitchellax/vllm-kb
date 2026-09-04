@@ -434,10 +434,22 @@ def fmt_graph_search(data):
 
 
 def fmt_graph_trace(data):
-    """trace_path 结果：调用链/数据流树（callees/callers 分组）。"""
+    """trace_path 结果：调用链/数据流树（callees/callers 分组）或同名候选列表。"""
     lines = ["调用链追踪:"]
     if not isinstance(data, dict):
         return "调用链追踪: (无数据)"
+    if data.get("status") == "ambiguous":
+        # 同名多个节点：预检拦下，列出候选（file/lines 定位），不静默取其一
+        lines.append(f"函数名 {data.get('function_name', '')} 命中 {data.get('matched', '?')} 个同名节点，"
+                     "需消歧后重试：")
+        for c in (data.get("candidates") or [])[:20]:
+            name = c.get("name") or c.get("qn") or ""
+            label = c.get("label", "")
+            f = c.get("file") or ""
+            loc = f"  {f}:{c.get('lines') or c.get('line') or ''}" if f else ""
+            lines.append(f"  {name}  [{label}]{loc}")
+        lines.append("提示: 确认目标后用其 name 短名（file 一致的那个）重试 trace。")
+        return "\n".join(lines)
     for key, label in (("callees", "调用方→"), ("callers", "←被调用")):
         rows = data.get(key)
         if rows:

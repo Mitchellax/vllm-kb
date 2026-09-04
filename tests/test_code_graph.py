@@ -7,7 +7,7 @@ import json
 import unittest
 from unittest import mock
 
-from vllm_kb.code_graph import CodeGraphClient, CodeGraphUnavailable
+from vllm_kb.code_graph import CodeGraphClient, CodeGraphToolError, CodeGraphUnavailable
 from vllm_kb.config import CodeGraphCfg
 
 
@@ -89,7 +89,7 @@ class TestUnavailableConditions(unittest.TestCase):
         self.assertIn("JSON-RPC", str(cm.exception))
 
     def test_tool_iserror_raises_with_detail(self):
-        """工具级 isError=true（未知工具/参数错）→ CodeGraphUnavailable，含工具名。"""
+        """工具级 isError=true（未知工具/参数错）→ CodeGraphToolError（非不可达），含工具名。"""
         m = _rpc_response({
             "content": [{"type": "text", "text": "unknown tool: bogus"}],
             "structuredContent": {"error": "unknown tool: bogus"},
@@ -97,10 +97,26 @@ class TestUnavailableConditions(unittest.TestCase):
         })
         c = CodeGraphClient(_cfg())
         with mock.patch("urllib.request.urlopen", return_value=m):
-            with self.assertRaises(CodeGraphUnavailable) as cm:
+            with self.assertRaises(CodeGraphToolError) as cm:
                 c.search_graph(project="p", query="q")
         self.assertIn("search_graph", str(cm.exception))
         self.assertIn("unknown tool", str(cm.exception))
+
+    def test_tool_iserror_does_not_trip_circuit(self):
+        """工具级错误（参数问题）不计熔断：连续 isError 后网络失败仍走正常重试。"""
+        m = _rpc_response({
+            "content": [{"type": "text", "text": "x"}],
+            "structuredContent": {"error": "unknown function"}, "isError": True,
+        })
+        c = CodeGraphClient(_cfg(max_retries=1))
+        with mock.patch("urllib.request.urlopen", return_value=m):
+            for _ in range(5):
+                with self.assertRaises(CodeGraphToolError):
+                    c.search_graph(project="p", query="q")
+        # 熔断未打开（工具级错误不计数）：下一次网络失败照常走重试链路
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            with self.assertRaises(CodeGraphUnavailable):
+                c.search_graph(project="p", query="q")
 
     def test_non_json_raises(self):
         c = CodeGraphClient(_cfg())
@@ -146,6 +162,109 @@ class TestCircuitBreaker(unittest.TestCase):
             with self.assertRaises(CodeGraphUnavailable):
                 c.search_graph(project="p", query="q")
         self.assertFalse(c._circuit_open())  # 仅 1 次连续，未熔断
+
+
+class TestTracePathPrecheck(unittest.TestCase):
+    """trace_path 唯一性预检：短名/qn 双形态、同名候选、预检失败不阻塞。"""
+
+    def _client(self):
+        return CodeGraphClient(_cfg())
+
+    @staticmethod
+    def _search_ok(rows):
+        """预检 search 响应：归一化 rows 形态（name/qn/label/file）。"""
+        return _ok_response({"rows": rows})
+
+    def _requests_for(self, responses, **trace_kwargs):
+        """依次喂响应（search 预检 → trace），返回发出的全部请求体列表。"""
+        c = self._client()
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(json.loads(req.data.decode("utf-8")))
+            return responses.pop(0)
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            c.trace_path(**trace_kwargs)
+        return sent
+
+    def test_unique_short_name_passes_through(self):
+        """预检唯一命中 → 原样透传短名（不替换；输入本来就是短名）。"""
+        sent = self._requests_for(
+            [self._search_ok([{"name": "do_auth", "qn": "idx.mod.do_auth", "label": "Function"}]),
+             _ok_response({"callees": []})],
+            project="p", function_name="do_auth")
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]["params"]["name"], "search_graph")
+        self.assertEqual(sent[0]["params"]["arguments"]["name_pattern"], "^do_auth$")
+        self.assertEqual(sent[1]["params"]["name"], "trace_path")
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "do_auth")
+
+    def test_qn_input_replaced_by_tail_short_name(self):
+        """完整 qn（含索引前缀）→ 取末段短名预检；唯一命中 → 透传末段短名。"""
+        sent = self._requests_for(
+            [self._search_ok([{"name": "do_auth", "qn": "vllm-kb-vllm-0.23.0.tests.utils.do_auth"}]),
+             _ok_response({"callees": []})],
+            project="p", function_name="vllm-kb-vllm-0.23.0.tests.utils.do_auth")
+        self.assertEqual(sent[0]["params"]["arguments"]["name_pattern"], "^do_auth$")
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "do_auth")
+
+    def test_ambiguous_returns_candidates(self):
+        """同名多命中 → 200 + ambiguous 结构（candidates），不透传 trace。"""
+        c = self._client()
+        rows = [{"name": "f", "qn": "idx.a.f", "label": "Function", "file": "a.py"},
+                {"name": "f", "qn": "idx.b.f", "label": "Function", "file": "b.py"}]
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data.decode("utf-8"))
+            if body["params"]["name"] == "search_graph":
+                return self._search_ok(rows)
+            raise AssertionError("ambiguous 不应透传 trace")
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            out = c.trace_path(project="p", function_name="f")
+        self.assertEqual(out["status"], "ambiguous")
+        self.assertEqual(out["matched"], 2)
+        self.assertEqual(len(out["candidates"]), 2)
+        self.assertIn("hint", out)
+
+    def test_precheck_unreachable_falls_back_to_passthrough(self):
+        """预检不可达 → 透传原输入（预检不引入新失败模式）：1 包 search 失败 + 1 包 trace。"""
+        sent = []
+        responses = [OSError("refused"), _ok_response({"callees": []})]
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(json.loads(req.data.decode("utf-8")))
+            r = responses.pop(0)
+            if isinstance(r, OSError):
+                raise r
+            return r
+
+        c = self._client()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            c.trace_path(project="p", function_name="pkg.f")
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]["params"]["name"], "search_graph")
+        self.assertEqual(sent[1]["params"]["name"], "trace_path")
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "pkg.f")
+
+    def test_no_exact_match_passes_through(self):
+        """预检无精确同名行（如 name_pattern 未命中或全是子串命中）→ 透传原输入。"""
+        sent = self._requests_for(
+            [self._search_ok([{"name": "other", "qn": "idx.mod.other"}]),
+             _ok_response({"callees": []})],
+            project="p", function_name="pkg.f")
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "pkg.f")
+
+    def test_cursor_skips_precheck(self):
+        """翻页（cursor）不再预检——函数名已在前一次调用中确定。"""
+        sent = self._requests_for(
+            [_ok_response({"callees": [], "next": "CUR"})],
+            project="p", function_name="f", cursor="CUR")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["params"]["name"], "trace_path")
+        self.assertEqual(sent[0]["params"]["arguments"]["cursor"], "CUR")
 
 
 class TestRpcEnvelopeAndPassthrough(unittest.TestCase):
