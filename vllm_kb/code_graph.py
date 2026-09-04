@@ -202,22 +202,24 @@ class CodeGraphClient:
             args["path_filter"] = path_filter
         return self._call_tool("search_code", args)
 
+    _NOT_FOUND_MARKERS = ("not found", "unknown function")  # 上游零命中错误特征（大小写不敏感）
+
     def trace_path(self, *, project: str, function_name: str, direction: str = "both",
                    depth: int = 3, limit: int = 100, cursor: Optional[str] = None,
                    mode: str = "calls") -> Any:
         """trace_path：调用链/数据流/跨服务路径追踪。mode: calls|data_flow|cross_service。
 
         function_name 双形态：短名（如 do_auth）或 search 返回的完整 qn
-        （{index}.{module}.{func}，末段即函数名）。上游按短名匹配（完整 qn
-        含索引前缀不被识别），故 qn 形态取末段透传。
+        （{index}.{module}.{func}）。上游按短名匹配（完整 qn 含索引前缀不被识别）。
 
-        每次调用先经 search_graph 预检唯一性（cursor 翻页除外）：
-        - 唯一命中 → 以末段短名透传（预检已证唯一，杜绝同名静默错配）；
-        - 多命中 → 返回 {"status": "ambiguous", "candidates": [...]} 结构
-          （200，不透传，agent 从候选取准确标识重试）；
-        - 零命中 → 透传原输入（保留旧行为兜底：search 未匹配不代表上游
-          不认该形态——如 name_pattern 不匹配的类方法 qn）；
-        - 预检不可达 → 透传原输入（预检不引入新的失败模式）。
+        预检 + 末两段兜底（cursor 翻页除外）：
+        - search_graph 唯一性预检：唯一 → 末段短名透传；多命中 → ambiguous
+          候选（200，agent 拿候选定位重试）；零命中/预检不可达 → 原样透传。
+        - 上游零命中（function not found——实测 search 合法枚举的 property/
+          descriptor 节点不被 trace 匹配，上游只认函数/方法节点）→ 追加末两段
+          （Class.member，取自预检 qn 或原输入）重试一次；gh-puller 落地 qn
+          尾段解析后此形态直接命中。仍失败 → 可读错误：预检 label 含 property/
+          field/attribute 时明确指出属性节点 + 引导改 trace 宿主类方法。
         """
         args: dict[str, Any] = {"project": project, "function_name": function_name,
                                 "direction": direction, "depth": depth, "limit": limit, "mode": mode}
@@ -226,7 +228,9 @@ class CodeGraphClient:
             return self._call_tool("trace_path", args)
 
         short = function_name.rsplit(".", 1)[-1]
+        fallback = self._tail_two(function_name)
         pre = self._precheck_unique(project, short)
+        label = ""
         if pre:
             if len(pre) > 1:
                 return {
@@ -237,7 +241,49 @@ class CodeGraphClient:
                     "hint": "同名多个节点；从候选确认目标（file/lines 定位），用其 name 短名或 qn 末段重试",
                 }
             args["function_name"] = short  # 唯一命中：透传末段短名（上游匹配语义）
-        return self._call_tool("trace_path", args)
+            label = str(pre[0].get("label", ""))
+            qn = str(pre[0].get("qn", ""))
+            if qn:
+                fallback = self._tail_two(qn)  # 兜底名以预检 qn 为准（含宿主类，比输入可靠）
+        try:
+            return self._call_tool("trace_path", args)
+        except CodeGraphToolError as e:
+            if not any(m in str(e).lower() for m in self._NOT_FOUND_MARKERS):
+                raise  # 参数错等非零命中错误：不重试
+            if fallback and fallback != args["function_name"]:
+                try:
+                    return self._call_tool("trace_path", {**args, "function_name": fallback})
+                except CodeGraphToolError:
+                    pass
+            raise self._trace_not_found_error(function_name, args["function_name"], fallback, label) from e
+
+    @staticmethod
+    def _tail_two(qn: str) -> Optional[str]:
+        """qn 末两段（Class.member / module.func 形态）；不足两段返回 None。
+
+        边缘：索引前缀本身含版本号点（无模块路径的 qn）会切进版本段——
+        产生无效形态，仅导致兜底重试失败落入可读错误，可接受。
+        """
+        parts = qn.rsplit(".", 2)[-2:] if qn else []
+        return ".".join(parts) if len(parts) == 2 else None
+
+    @staticmethod
+    def _trace_not_found_error(original: str, tried: str, fallback: Optional[str],
+                               label: str) -> "CodeGraphToolError":
+        """零命中可读错误：属性节点判定 + 行动引导（API 层转 400 detail 展示给 agent）。"""
+        attempts = tried + (f"/{fallback}" if fallback and fallback != tried else "")
+        if label and any(k in label.lower() for k in ("property", "field", "attribute")):
+            return CodeGraphToolError(
+                f"节点 {original}（label={label}）为属性/descriptor 节点——上游 trace_path 当前"
+                f"仅匹配函数/方法节点（尝试 {attempts} 零命中）。建议：改 trace 宿主类或其方法"
+                f"（code-graph search 查 label=Function/Method 节点）；属性节点解析依赖"
+                f"gh-puller 侧适配（见 docs/gh-puller-integration-checklist.md 待适配项）"
+            )
+        return CodeGraphToolError(
+            f"函数 {original} 上游 trace 零命中（尝试 {attempts}）。可能为属性/descriptor 节点"
+            f"（上游仅匹配函数/方法）或名称形态不匹配；建议 code-graph search 确认目标节点后"
+            f"用短名或末两段（Class.member）重试"
+        )
 
     _PRECHECK_LIMIT = 51  # >50 视为大量候选，按多命中处理
 

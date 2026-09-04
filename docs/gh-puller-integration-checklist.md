@@ -86,6 +86,10 @@ gh-puller 侧需实现下表全部 MCP 面（vllm-kb 的 skill 命令 / REST 端
   唯一命中 → 末段短名透传；多命中 → 返回 `{"status":"ambiguous","candidates":[...]}` 候选
   结构（HTTP 200，agent 拿候选定位后重试）；预检不可达/无精确同名 → 原样透传（不阻塞）。
   翻页（`cursor`）跳过预检。
+- **vllm-kb 侧末两段兜底（已实现）**：上游零命中（function not found）时自动追加末两段
+  （`Class.member`，取预检 qn 或原输入）重试一次；仍失败 → 400 可读错误——预检 label 含
+  property/field/attribute 时明确指出属性节点 + 引导改 trace 宿主类方法。gh-puller 落地
+  qn 尾段解析后该形态直接命中，vllm-kb 无需再改。
 - **gh-puller 侧适配建议**：adapter 转发前剥离 `{index_name}.` 前缀（索引前缀即
   `project` 参数本身，剥离后正是上游期望的 `模块.函数` 形态）——落地后 qn 可原样直传，
   vllm-kb 侧预检继续承担消歧。
@@ -153,6 +157,18 @@ gh-puller 侧只需照常返回 MCP 标准信封（`isError` 字段区分工具�
    `unknown tool` 拒绝——需扩白名单（两者均为纯转发，适配成本低）。
 2. **trace_path 的 qn 前缀剥离**（建议）：见 trace_path 参数范例段——
    落地后 search 返回的完整 qn 可原样直传 trace_path。
+3. **trace_path 节点覆盖缺口——属性/descriptor 节点不可追踪**（实测，主要修复项）：
+   search_graph 合法枚举的节点传入 trace_path 报 function not found。实测案例：
+   `vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry`（label=Method/property 类节点）
+   ——短名 `registry` 与末两段 `ModelConfig.registry` 上游均不认。需：
+   - **qn 尾段解析**：function_name 支持至少末两段（`Class.member`）形态——
+     比裸短名更精确，且是 qn 剥索引前缀后的自然形态；
+   - **属性节点解析到宿主类**：property/descriptor/field 节点无法直接追踪时，
+     解析到宿主类（如 `ModelConfig.registry` → `ModelConfig`）以其为锚追踪调用方
+     （属性访问即宿主类使用），而非直接拒绝；
+   - **search↔trace 闭环契约**：search_graph 枚举的每个节点，以其 qn（或末两段）
+     传 trace_path 必须可消费——枚举即承诺可追踪；不可追踪的节点类型应在 search
+     结果中显式标注（vllm-kb 侧据此提前引导，而非等 trace 报错）。
 
 ## vllm-kb 侧配置（审核工作台管理）
 

@@ -267,6 +267,120 @@ class TestTracePathPrecheck(unittest.TestCase):
         self.assertEqual(sent[0]["params"]["arguments"]["cursor"], "CUR")
 
 
+class TestTracePathFallback(unittest.TestCase):
+    """上游零命中（function not found）→ 末两段（Class.member）兜底重试；仍失败 → 可读错误。
+
+    实测背景：search 合法枚举的 property/descriptor 节点（如 ModelConfig.registry）
+    上游 trace_path 只匹配函数/方法节点——裸短名与末两段均零命中时需给出
+    属性节点判定 + 宿主类行动引导（gh-puller 侧待适配）。
+    """
+
+    @staticmethod
+    def _trace_error(msg):
+        return _rpc_response({
+            "content": [{"type": "text", "text": msg}],
+            "structuredContent": {"error": msg},
+            "isError": True,
+        })
+
+    def _run(self, responses, **trace_kwargs):
+        c = CodeGraphClient(_cfg())
+        sent = []
+        out = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(json.loads(req.data.decode("utf-8")))
+            r = responses.pop(0)
+            if isinstance(r, OSError):
+                raise r
+            return r
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            try:
+                out["result"] = c.trace_path(**trace_kwargs)
+            except Exception as e:  # noqa: BLE001 —— 测试需捕获全部异常形态
+                out["error"] = e
+        return sent, out
+
+    def test_tail_two_segments(self):
+        self.assertEqual(CodeGraphClient._tail_two("a.b.C.f"), "C.f")
+        self.assertEqual(CodeGraphClient._tail_two("C.f"), "C.f")
+        self.assertIsNone(CodeGraphClient._tail_two("f"))
+
+    def test_not_found_retries_tail_two_segments(self):
+        """零命中 → 末两段重试（取预检 qn，含宿主类）；重试成功即返回。"""
+        search = _ok_response({"rows": [
+            {"name": "registry", "qn": "vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry",
+             "label": "Property", "file": "vllm/config/model.py"}]})
+        sent, out = self._run(
+            [search, self._trace_error("function not found: registry"),
+             _ok_response({"callees": [{"name": "x"}]})],
+            project="p",
+            function_name="vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry")
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "registry")
+        self.assertEqual(sent[2]["params"]["arguments"]["function_name"], "ModelConfig.registry")
+        self.assertIn("callees", out["result"])
+
+    def test_retry_fail_raises_readable_property_hint(self):
+        """重试仍零命中 → 可读错误：label 含 property 明确指出属性节点 + 宿主类引导。"""
+        search = _ok_response({"rows": [
+            {"name": "registry", "qn": "idx.a.ModelConfig.registry", "label": "Method/property"}]})
+        sent, out = self._run(
+            [search, self._trace_error("function not found: registry"),
+             self._trace_error("function not found: ModelConfig.registry")],
+            project="p", function_name="idx.a.ModelConfig.registry")
+        self.assertEqual(len(sent), 3)
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        msg = str(out["error"])
+        self.assertIn("属性", msg)
+        self.assertIn("Method/property", msg)
+        self.assertIn("宿主类", msg)
+        self.assertIn("ModelConfig.registry", msg)
+
+    def test_retry_fail_generic_hint_without_property_label(self):
+        """无 property label 时 → 通用可读错误（属性可能 + search 引导），不武断判定。"""
+        search = _ok_response({"rows": [
+            {"name": "f", "qn": "idx.a.C.f", "label": "Function"}]})
+        _, out = self._run(
+            [search, self._trace_error("unknown function: f"),
+             self._trace_error("unknown function: C.f")],
+            project="p", function_name="f")
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        msg = str(out["error"])
+        self.assertIn("零命中", msg)
+        self.assertIn("search", msg)
+        self.assertNotIn("label=", msg)
+
+    def test_non_notfound_error_no_retry(self):
+        """非零命中错误（参数错等）→ 不重试，原样抛出。"""
+        search = _ok_response({"rows": [{"name": "f", "qn": "idx.a.C.f", "label": "Function"}]})
+        sent, out = self._run(
+            [search, self._trace_error("invalid direction value")],
+            project="p", function_name="f")
+        self.assertEqual(len(sent), 2)
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        self.assertIn("invalid direction", str(out["error"]))
+
+    def test_single_segment_no_fallback_readable(self):
+        """裸短名输入 + 预检零命中 → 无兜底可用，直接可读错误（仅 2 包）。"""
+        sent, out = self._run(
+            [_ok_response({"rows": []}), self._trace_error("function not found: zzz")],
+            project="p", function_name="zzz")
+        self.assertEqual(len(sent), 2)
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        self.assertIn("零命中", str(out["error"]))
+
+    def test_cursor_not_found_no_retry(self):
+        """cursor 翻页零命中 → 原样透传上游错误（不进入兜底链路）。"""
+        sent, out = self._run(
+            [self._trace_error("function not found: f")],
+            project="p", function_name="f", cursor="C")
+        self.assertEqual(len(sent), 1)
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        self.assertIn("function not found", str(out["error"]))
+
+
 class TestRpcEnvelopeAndPassthrough(unittest.TestCase):
     """验证客户端发出的是 MCP JSON-RPC tools/call，且正确解包 structuredContent。"""
 
