@@ -681,11 +681,11 @@ client.py code-graph code-search "DispatchFFNCombine" --mode full --path-filter 
 
 # 调用链追踪（替代手写 grep 找调用关系）
 client.py code-graph trace do_auth --direction outbound --depth 5 --mode data_flow
-# trace 函数名双形态：短名（do_auth）或 search 返回的完整 qn（自动取末段短名透传）。
-# 同名多节点 → 返回候选列表（name/file/lines）而非静默取其一；确认后用短名重试。
-# 每次调用先做唯一性预检（翻页 cursor 除外）——多一次 search 往返，换取零错配。
-# 上游零命中 → 自动追加末两段（Class.member）重试；属性/descriptor 节点（label 含
-# property）上游暂不支持直接追踪，400 错误给出宿主类引导（gh-puller 侧适配中）。
+# trace 函数名双形态：短名（do_auth，bare name 匹配）或 search 返回的完整 qn（原样透传，
+# 上游按 project+qn 精确回退——索引前缀是规范 qn 的一部分，勿手动剥离）。
+# 裸短名同名多节点 → 返回候选列表（name/qn/file/lines）而非静默取其一；用候选完整 qn 精确重试。
+# 属性/descriptor 节点（label 含 property）上游暂不支持直接追踪，400 错误给出宿主类引导
+# （gh-puller 侧适配中）。
 
 # Cypher 查知识图谱（多跳/聚合/跨服务分析）
 client.py code-graph query "MATCH (n:Function)-[:CALLS]->(m) RETURN n.name, count(m)"

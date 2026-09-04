@@ -137,10 +137,11 @@ python client.py code-graph health                                        # 探�
 
 - `code`（本地）强在：版本化定位、报错字面量索引、离线、跨版本 diff
 - `code-graph`（gh-puller）强在：跨函数调用链/数据流、变更影响面、架构聚类、跨仓边、语义搜索
-- `trace` 的函数名可传短名（`do_auth`）或 `search` 返回的完整 qn（自动取末段短名）；
-  同名多节点时不静默取其一——返回候选列表（name/file/lines），确认目标后用其短名重试；
-  上游零命中时自动追加末两段（`Class.member`）重试。属性/descriptor 节点（label 含
-  property）上游暂不支持直接追踪——400 错误会给出宿主类引导，改 trace 宿主类方法即可
+- `trace` 的函数名可传短名（`do_auth`）或 `search` 返回的完整 qn（原样透传，上游按
+  project+qn 精确匹配——前缀是规范 qn 的一部分，勿手动剥离）；裸短名同名多节点时不
+  静默取其一——返回候选列表（name/qn/file/lines），用候选完整 qn 精确重试。
+  属性/descriptor 节点（label 含 property）上游暂不支持直接追踪——400 错误会给出
+  宿主类引导，改 trace 宿主类方法即可
 - gh-puller 不可达时 `code-graph` 返回 503 → 改用 `code` 查本地索引（手动）；
   返回 400 = 服务健康但参数问题（如未知函数）→ 按 detail 换函数名形态重试，勿放弃
 - `--graph-base` / `VLLM_KB_CODE_GRAPH_BASE` 独立寻址（缺省沿用 `--base`）

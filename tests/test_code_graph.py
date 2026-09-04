@@ -165,7 +165,7 @@ class TestCircuitBreaker(unittest.TestCase):
 
 
 class TestTracePathPrecheck(unittest.TestCase):
-    """trace_path 唯一性预检：短名/qn 双形态、同名候选、预检失败不阻塞。"""
+    """trace_path 原样透传策略：裸短名预检消歧、dotted(qn) 直传不预检。"""
 
     def _client(self):
         return CodeGraphClient(_cfg())
@@ -176,7 +176,7 @@ class TestTracePathPrecheck(unittest.TestCase):
         return _ok_response({"rows": rows})
 
     def _requests_for(self, responses, **trace_kwargs):
-        """依次喂响应（search 预检 → trace），返回发出的全部请求体列表。"""
+        """依次喂响应，返回发出的全部请求体列表。"""
         c = self._client()
         sent = []
 
@@ -189,7 +189,7 @@ class TestTracePathPrecheck(unittest.TestCase):
         return sent
 
     def test_unique_short_name_passes_through(self):
-        """预检唯一命中 → 原样透传短名（不替换；输入本来就是短名）。"""
+        """裸短名唯一命中 → 原样透传短名（预检已证唯一，bare name 匹配）。"""
         sent = self._requests_for(
             [self._search_ok([{"name": "do_auth", "qn": "idx.mod.do_auth", "label": "Function"}]),
              _ok_response({"callees": []})],
@@ -200,17 +200,19 @@ class TestTracePathPrecheck(unittest.TestCase):
         self.assertEqual(sent[1]["params"]["name"], "trace_path")
         self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "do_auth")
 
-    def test_qn_input_replaced_by_tail_short_name(self):
-        """完整 qn（含索引前缀）→ 取末段短名预检；唯一命中 → 透传末段短名。"""
+    def test_qn_input_passthrough_without_precheck(self):
+        """完整 qn 原样透传、不预检不改写——qn 自身已精确（CBM project+qn 回退匹配），
+        且保 cursor 翻页参数一致（上游要求 cursor 与原参数完全相同）。"""
         sent = self._requests_for(
-            [self._search_ok([{"name": "do_auth", "qn": "vllm-kb-vllm-0.23.0.tests.utils.do_auth"}]),
-             _ok_response({"callees": []})],
+            [_ok_response({"callees": []})],
             project="p", function_name="vllm-kb-vllm-0.23.0.tests.utils.do_auth")
-        self.assertEqual(sent[0]["params"]["arguments"]["name_pattern"], "^do_auth$")
-        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "do_auth")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["params"]["name"], "trace_path")
+        self.assertEqual(sent[0]["params"]["arguments"]["function_name"],
+                         "vllm-kb-vllm-0.23.0.tests.utils.do_auth")
 
     def test_ambiguous_returns_candidates(self):
-        """同名多命中 → 200 + ambiguous 结构（candidates），不透传 trace。"""
+        """裸短名同名多命中 → 200 + ambiguous 结构（候选含完整 qn），不透传 trace。"""
         c = self._client()
         rows = [{"name": "f", "qn": "idx.a.f", "label": "Function", "file": "a.py"},
                 {"name": "f", "qn": "idx.b.f", "label": "Function", "file": "b.py"}]
@@ -226,7 +228,7 @@ class TestTracePathPrecheck(unittest.TestCase):
         self.assertEqual(out["status"], "ambiguous")
         self.assertEqual(out["matched"], 2)
         self.assertEqual(len(out["candidates"]), 2)
-        self.assertIn("hint", out)
+        self.assertIn("qn", out["hint"])  # 引导用完整 qn 精确重试
 
     def test_precheck_unreachable_falls_back_to_passthrough(self):
         """预检不可达 → 透传原输入（预检不引入新失败模式）：1 包 search 失败 + 1 包 trace。"""
@@ -242,20 +244,20 @@ class TestTracePathPrecheck(unittest.TestCase):
 
         c = self._client()
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            c.trace_path(project="p", function_name="pkg.f")
+            c.trace_path(project="p", function_name="pkg_f")
         self.assertEqual(len(sent), 2)
         self.assertEqual(sent[0]["params"]["name"], "search_graph")
         self.assertEqual(sent[1]["params"]["name"], "trace_path")
-        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "pkg.f")
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "pkg_f")
 
     def test_no_exact_match_passes_through(self):
-        """预检无精确同名行（如 name_pattern 未命中或全是子串命中）→ 透传原输入。"""
+        """预检无精确同名行 → 透传原输入。"""
         sent = self._requests_for(
             [self._search_ok([{"name": "other", "qn": "idx.mod.other"}]),
              _ok_response({"callees": []})],
-            project="p", function_name="pkg.f")
+            project="p", function_name="pkg_f")
         self.assertEqual(len(sent), 2)
-        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "pkg.f")
+        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "pkg_f")
 
     def test_cursor_skips_precheck(self):
         """翻页（cursor）不再预检——函数名已在前一次调用中确定。"""
@@ -267,12 +269,12 @@ class TestTracePathPrecheck(unittest.TestCase):
         self.assertEqual(sent[0]["params"]["arguments"]["cursor"], "CUR")
 
 
-class TestTracePathFallback(unittest.TestCase):
-    """上游零命中（function not found）→ 末两段（Class.member）兜底重试；仍失败 → 可读错误。
+class TestTracePathNotFound(unittest.TestCase):
+    """上游零命中（function not found）→ 可读错误（属性节点判定 + 宿主类引导）。
 
     实测背景：search 合法枚举的 property/descriptor 节点（如 ModelConfig.registry）
-    上游 trace_path 只匹配函数/方法节点——裸短名与末两段均零命中时需给出
-    属性节点判定 + 宿主类行动引导（gh-puller 侧待适配）。
+    上游 trace_path 只匹配函数/方法节点——完整 qn/短名均零命中时给出可读引导
+    （gh-puller 侧待适配属性节点解析）。
     """
 
     @staticmethod
@@ -302,49 +304,47 @@ class TestTracePathFallback(unittest.TestCase):
                 out["error"] = e
         return sent, out
 
-    def test_tail_two_segments(self):
-        self.assertEqual(CodeGraphClient._tail_two("a.b.C.f"), "C.f")
-        self.assertEqual(CodeGraphClient._tail_two("C.f"), "C.f")
-        self.assertIsNone(CodeGraphClient._tail_two("f"))
+    @staticmethod
+    def _search_ok(rows):
+        return _ok_response({"rows": rows})
 
-    def test_not_found_retries_tail_two_segments(self):
-        """零命中 → 末两段重试（取预检 qn，含宿主类）；重试成功即返回。"""
-        search = _ok_response({"rows": [
-            {"name": "registry", "qn": "vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry",
-             "label": "Property", "file": "vllm/config/model.py"}]})
+    def test_short_name_not_found_property_hint(self):
+        """裸短名 + 预检唯一（property label）+ 零命中 → 可读错误：属性判定 + 宿主类引导。"""
+        search = self._search_ok([
+            {"name": "registry", "qn": "idx.a.ModelConfig.registry", "label": "Method/property"}])
         sent, out = self._run(
-            [search, self._trace_error("function not found: registry"),
-             _ok_response({"callees": [{"name": "x"}]})],
-            project="p",
-            function_name="vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry")
-        self.assertEqual(len(sent), 3)
-        self.assertEqual(sent[1]["params"]["arguments"]["function_name"], "registry")
-        self.assertEqual(sent[2]["params"]["arguments"]["function_name"], "ModelConfig.registry")
-        self.assertIn("callees", out["result"])
-
-    def test_retry_fail_raises_readable_property_hint(self):
-        """重试仍零命中 → 可读错误：label 含 property 明确指出属性节点 + 宿主类引导。"""
-        search = _ok_response({"rows": [
-            {"name": "registry", "qn": "idx.a.ModelConfig.registry", "label": "Method/property"}]})
-        sent, out = self._run(
-            [search, self._trace_error("function not found: registry"),
-             self._trace_error("function not found: ModelConfig.registry")],
-            project="p", function_name="idx.a.ModelConfig.registry")
-        self.assertEqual(len(sent), 3)
+            [search, self._trace_error("function not found: registry")],
+            project="p", function_name="registry")
+        self.assertEqual(len(sent), 2)  # search 预检 + trace（复用预检结果，不再补查）
         self.assertIsInstance(out["error"], CodeGraphToolError)
         msg = str(out["error"])
         self.assertIn("属性", msg)
         self.assertIn("Method/property", msg)
         self.assertIn("宿主类", msg)
-        self.assertIn("ModelConfig.registry", msg)
+        self.assertIn("registry", msg)
 
-    def test_retry_fail_generic_hint_without_property_label(self):
-        """无 property label 时 → 通用可读错误（属性可能 + search 引导），不武断判定。"""
-        search = _ok_response({"rows": [
-            {"name": "f", "qn": "idx.a.C.f", "label": "Function"}]})
+    def test_qn_not_found_lightweight_precheck_for_label(self):
+        """qn 输入（未预检）+ 零命中 → 补一次轻量预检取 label → 属性判定可读错误。"""
+        search = self._search_ok([
+            {"name": "registry", "qn": "vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry",
+             "label": "Method/property"}])
+        sent, out = self._run(
+            [self._trace_error("function not found"),
+             search,  # 轻量预检（错误增强路径）
+             self._trace_error("function not found")],  # 预检后 trace 不再重试——不会发第 3 包
+            project="p",
+            function_name="vllm-kb-vllm-0.23.0.vllm.config.model.ModelConfig.registry")
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[1]["params"]["name"], "search_graph")
+        self.assertEqual(sent[1]["params"]["arguments"]["name_pattern"], "^registry$")
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        self.assertIn("属性", str(out["error"]))
+
+    def test_not_found_generic_hint_without_property_label(self):
+        """预检 label 无 property 证据 → 通用可读错误（不武断判定属性）。"""
+        search = self._search_ok([{"name": "f", "qn": "idx.a.f", "label": "Function"}])
         _, out = self._run(
-            [search, self._trace_error("unknown function: f"),
-             self._trace_error("unknown function: C.f")],
+            [search, self._trace_error("unknown function: f")],
             project="p", function_name="f")
         self.assertIsInstance(out["error"], CodeGraphToolError)
         msg = str(out["error"])
@@ -352,9 +352,17 @@ class TestTracePathFallback(unittest.TestCase):
         self.assertIn("search", msg)
         self.assertNotIn("label=", msg)
 
-    def test_non_notfound_error_no_retry(self):
-        """非零命中错误（参数错等）→ 不重试，原样抛出。"""
-        search = _ok_response({"rows": [{"name": "f", "qn": "idx.a.C.f", "label": "Function"}]})
+    def test_not_found_no_rows_generic_hint(self):
+        """预检零行（无节点信息）→ 通用可读错误。"""
+        _, out = self._run(
+            [self._search_ok([]), self._trace_error("function not found: zzz")],
+            project="p", function_name="zzz")
+        self.assertIsInstance(out["error"], CodeGraphToolError)
+        self.assertIn("零命中", str(out["error"]))
+
+    def test_non_notfound_error_raised_verbatim(self):
+        """非零命中错误（参数错等）→ 原样抛出，不进错误增强。"""
+        search = self._search_ok([{"name": "f", "qn": "idx.a.f", "label": "Function"}])
         sent, out = self._run(
             [search, self._trace_error("invalid direction value")],
             project="p", function_name="f")
@@ -362,17 +370,8 @@ class TestTracePathFallback(unittest.TestCase):
         self.assertIsInstance(out["error"], CodeGraphToolError)
         self.assertIn("invalid direction", str(out["error"]))
 
-    def test_single_segment_no_fallback_readable(self):
-        """裸短名输入 + 预检零命中 → 无兜底可用，直接可读错误（仅 2 包）。"""
-        sent, out = self._run(
-            [_ok_response({"rows": []}), self._trace_error("function not found: zzz")],
-            project="p", function_name="zzz")
-        self.assertEqual(len(sent), 2)
-        self.assertIsInstance(out["error"], CodeGraphToolError)
-        self.assertIn("零命中", str(out["error"]))
-
-    def test_cursor_not_found_no_retry(self):
-        """cursor 翻页零命中 → 原样透传上游错误（不进入兜底链路）。"""
+    def test_cursor_not_found_raised_verbatim(self):
+        """cursor 翻页零命中 → 原样透传上游错误（不进错误增强链路）。"""
         sent, out = self._run(
             [self._trace_error("function not found: f")],
             project="p", function_name="f", cursor="C")
