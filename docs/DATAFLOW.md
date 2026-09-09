@@ -87,7 +87,7 @@
 | 命令 | 产物 | 用途 |
 |---|---|---|
 | `python scripts/build_release_calendar.py --all-repos` | `data/compatibility/release_calendar.{repo}.json`（分仓，slug 如 `vllm-project-vllm-ascend`；单仓模式写无后缀的 `release_calendar.json`） | 版本形态判断（release/rc/pre）+ 置信度版本上界（查询期现算） |
-| `python scripts/build_companion_matrix.py`（`fetch_quay_tags.py` 辅助） | `data/compatibility/vllm-ascend.json`（fork 行含 `vllm_repo/ref/base/sha/image_digest`）+ 跨运行缓存 `data/cache/`（fork 层 SHA 永久 / GitHub releases TTL 7 天 / requirements 永久，`--refresh-cache` 强制刷新） | 组件配套反向展开（vllm-ascend:0.18.0 → vllm/cann/pytorch-ascend）；fork 行锁定 commit 供 `build_fork_snapshots.py` 按 SHA 拉快照 |
+| `python scripts/build_companion_matrix.py`（`fetch_quay_tags.py` 辅助） | `data/compatibility/vllm-ascend.json`（每行含 `image_created`（镜像最后推送时间）、`vllm_commit`/`vllm_commit_date`（vllm 代码 commit 与提交日期）；fork 行另有 `vllm_repo/ref/base/sha/image_digest`）+ 跨运行缓存 `data/cache/`（fork 层 SHA 永久 / GitHub releases TTL 7 天 / requirements 永久 / tag→commit 永久，`--refresh-cache` 强制刷新） | 组件配套反向展开（vllm-ascend:0.18.0 → vllm/cann/pytorch-ascend）；commit 溯源回答"这个镜像对应哪个 commit"（官方行 tag→commit，fork 行 `vllm_sha`）；fork 行锁定 commit 供 `build_fork_snapshots.py` 按 SHA 拉快照 |
 
 ### 2.5 图存储（Kùzu）
 
@@ -133,8 +133,8 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | `python scripts/build_fts.py` | 重建 `kb.sqlite3` 的 `chunks_fts`（读现有 chunk 原文重新 jieba 分词，chunk_id 与向量库严格一致） | 升级分词规则/旧库升级后使用；**不重新分块、不重嵌向量**，普通增量入库自动分词无需运行 |
 | `python scripts/review_ui.py` | `data/review.sqlite3`（`review_items` 审核队列 / `asset_registry` 资产路径注册 / `doc_tags` 标签覆盖层） | 审核工作台独立端口，**只读检索 API 全程不碰该库**；资产路径只存 `asset_id → rel_path`，不进 canonical/检索库 |
 
-> 审核队列的 6 类人工确认项、API 配置中心、知识缺口展示见
-> [使用指南 §3.5](USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)。
+> 审核队列的 7 类人工确认项、API 配置中心、知识缺口展示见
+> [使用指南 §3.2](USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)。
 
 ## 3. 查询数据流
 
@@ -277,7 +277,7 @@ serve_api（只读）                            离线周期
   tag_candidate **按词聚合** → 采纳 = 入词典（config.json）+ 对全部提及文档写 `doc_tags.manual` +
   同步 `docs.tags`（检索侧立即生效；图侧重建后入图；向量 chunk meta 是入库快照，需重入库才一致）；
   正文 TF-IDF 候选（`build_tag_candidates.py` → `data/tag_candidates_manual.json`）是独立手动路径，
-  不自动打标。详见 [使用指南 §3.5](USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)；
+  不自动打标。详见 [使用指南 §3.2](USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)；
 - **后置脱敏**：库中存原文（原文检索），只在 serve_api 出口统一脱敏——改白名单即时生效、无需重嵌；
 - **查询期现算**：修复落地版本上界（version_span_max 历史派生值有跨仓库错配风险）不落库，
   查询期按文档仓库的分仓日历实时计算，仅参与打分；

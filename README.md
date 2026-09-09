@@ -30,8 +30,10 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 - **组件配套矩阵**：vllm-ascend → vllm/cann/pytorch-ascend 自动匹配——vllm 取镜像 `VLLM_TAG`
   （构建锁定，优先于 release 说明）、cann 缺失按同系列回退、torch/PTA 从对应 tag 的
   `requirements.txt` 提取（**本地快照优先**，0day 模型同 minor 系列回退）；
+  **commit 溯源**：每行记镜像最后推送时间 `image_created`，并按镜像锁定的 vllm tag 解析
+  `vllm_commit`/`vllm_commit_date`（未配 `GITHUB_TOKEN` 且缓存未命中时跳过，留空待补）；
   **fork 行**（0day 模型镜像）自动扫描 git clone 层固化锁定 commit（digest 锚定 + 层 digest
-  磁盘缓存，跨运行零重复下载）；GitHub releases/requirements 跨运行缓存——全命中时
+  磁盘缓存，跨运行零重复下载）；GitHub releases/requirements/tag→commit 跨运行缓存——全命中时
   API 请求为 0，不受未认证限流约束；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
   Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
@@ -50,14 +52,14 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   图侧重建后入图，向量侧重入库后一致）；同 stem 重名告警）、
   **API 配置中心**（embedding/OCR/GitHub 配置编辑，密钥脱敏存 `data/secrets.local.json`，连通性测试）、
   **文档管理**（外源文档列表 + 彻底删除：docs+chunks+向量四层，本地文件保留可重新入库）——
-  启动与操作见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)
+  启动与操作见 [使用指南 §3.2](docs/USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)
 - **平稳降级**：embedding 服务不可用时检索自动降级为全文检索——查询用快速失败客户端（5s）+ 熔断器
   （连续失败 3 次熔断 60s，零等待降级，到期自动探测恢复）；`/health` 暴露 embedding 状态
 - **真实业务环境接入**：所有联网脚本（代码快照/版本日历/配套矩阵）支持 `--insecure` 跳过 SSL 校验 +
   `--github-base/--quay-base/--base-url` 换业务侧 http 镜像，环境变量统一配置；
   **注意：Kùzu 图库路径（`data/graph` / `VLLM_KB_DATA_ROOT`）不能含非 ASCII 字符**（中文/emoji，
-  中文部署根会打不开图库——数据根放纯 ASCII 路径，详见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）
-- **存算分离**：skill 仅两个文件（`SKILL.md` + `client.py`，约 50KB，标准库实现零依赖），
+  中文部署根会打不开图库——数据根放纯 ASCII 路径，详见 [使用指南](docs/USAGE.md#33-图更新流程kùzu-单写者约束)）
+- **存算分离**：skill 仅两个文件（`SKILL.md` + `client.py`，约 68KB，标准库实现零依赖），
   数据（向量库/索引/图，本仓库样例 ~1GB，全量构建 4~6GB）放远程服务器，本地只发 HTTP 查询；
   `scripts/pack_migrate.py` 打包迁移（业务环境重新嵌入，不传向量库）、`scripts/deploy_remote.py` 远程部署辅助
 - **结构只读**：SQLite `mode=ro` + 向量库只读包装 + 无写端点，Agent 提示注入也无法修改知识库
@@ -118,7 +120,7 @@ python scripts/build_graph.py
 python scripts/serve_api.py            # http://127.0.0.1:8000（fastapi/uvicorn 已含在 requirements.txt）
 ```
 
-> 更新图（`build_graph.py`）前必须先停止检索服务（Kùzu 单写者，见 [使用指南](docs/USAGE.md#32-图更新流程kùzu-单写者约束)）。
+> 更新图（`build_graph.py`）前必须先停止检索服务（Kùzu 单写者，见 [使用指南](docs/USAGE.md#33-图更新流程kùzu-单写者约束)）。
 
 ### 启动审核工作台（Web UI）
 
@@ -129,10 +131,10 @@ python scripts/review_ui.py            # http://127.0.0.1:8010（自动补单，
 ```
 
 - **审核**：未验证文档补标、案例标题待审核、OCR 图文不一致、低置信度签名、跨来源合并候选等
-  6 类待办，逐条 **✓ 认证 / ？存疑 / 🗑 标记删除 / ↩ 撤回**（删除只动数据库记录、原始文件保留）；
+  7 类待办，逐条 **✓ 认证 / ？存疑 / 🗑 标记删除 / ↩ 撤回**（删除只动数据库记录、原始文件保留）；
 - **API 配置中心**：集中编辑 embedding / OCR / GitHub 配置（非密钥进 config.json，
   密钥脱敏存 `data/secrets.local.json`），embedding / OCR 均支持连通性测试；
-- 完整操作说明（含审核状态机、待实际删除列表）见 [使用指南 §3.5](docs/USAGE.md#35-审核工作台人工确认统一入口--api-配置中心)。
+- 完整操作说明（含审核状态机、待实际删除列表）见 [使用指南 §3.2](docs/USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)。
 
 ### 查询
 

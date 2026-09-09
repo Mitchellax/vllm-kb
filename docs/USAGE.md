@@ -1,7 +1,27 @@
 # vllm-kb 使用指南
 
-本指南覆盖：环境准备、数据采集与更新、全部查询命令、故障处理推荐流程、远程部署（存算分离）。
-数据如何入库、查询时请求打到哪个接口/查哪些存储，见 [数据流说明](DATAFLOW.md)。
+本指南覆盖：环境准备、数据采集与更新、查询命令、审核工作台、故障处理推荐流程、远程部署（存算分离）。
+数据如何入库、查询请求打到哪个接口 / 查哪些存储，见 [数据流说明](DATAFLOW.md)。
+
+**目录**
+
+- [1. 环境准备](#1-环境准备) —— [1.1 依赖](#11-依赖) / [1.2 配置](#12-配置密钥走环境变量)
+- [2. 数据采集与构建](#2-数据采集与构建) —— [2.1 增量与重建](#21-增量与重建) /
+  [2.2 辅助数据构建](#22-辅助数据构建) / [2.3 业务来源导入（PDF / Markdown）](#23-业务来源导入pdf-手册--markdown-文档--完整实操) /
+  [2.4 Excel 登记表导入](#24-excel-登记表导入schema-free--完整实操)
+- [3. 启动检索服务](#3-启动检索服务) —— [3.1 日志与降级](#31-总日志接口打屏--可选落盘分卷) /
+  [3.2 审核工作台](#32-审核工作台人工确认统一入口--api-配置中心) /
+  [3.3 图更新流程](#33-图更新流程kùzu-单写者约束)
+- [4. 查询命令（skill）](#4-查询命令skill) —— [4.1 search](#41-search--语义检索) /
+  [4.2 signature](#42-signature--签名精确检索) / [4.3 title](#43-title--标题精确检索) /
+  [4.4 version](#44-version--版本形态判断) / [4.5 code](#45-code--对应版本源码定位) /
+  [4.6 其他](#46-其他) / [4.7 tags / context](#47-文档标签能力发现--tags--context) /
+  [4.8 graph](#48-graph--phase-2-图检索关系追溯) /
+  [4.9 code-graph](#49-code-graph--代码图谱检索gh-puller-接入) /
+  [4.10 行为遥测与反馈](#410-行为遥测与置信度反馈feedbackenabled)
+- [5. 故障处理推荐流程](#5-故障处理推荐流程)
+- [6. 远程部署（存算分离）](#6-远程部署存算分离)
+- [7. 常见问题](#7-常见问题)
 
 ## 1. 环境准备
 
@@ -11,7 +31,9 @@
 pip install -r requirements.txt        # 核心：requests / pydantic / lancedb / kuzu / fastapi / uvicorn
 ```
 
-> **Windows PowerShell**：设 `PYTHONUTF8=1`（`[Environment]::SetEnvironmentVariable("PYTHONUTF8","1","User")` 或会话内 `$env:PYTHONUTF8=1`）避免 GBK 输出乱码。client.py 已在进程内 reconfigure stdout 为 UTF-8，但子进程（如 test_doc_commands 的 `--help` 子进程）和管道场景仍需此变量。
+> **Windows PowerShell**：设 `PYTHONUTF8=1` 避免 GBK 输出乱码——会话内 `$env:PYTHONUTF8=1`，
+> 或持久化 `[Environment]::SetEnvironmentVariable("PYTHONUTF8","1","User")`。
+> client.py 已在进程内把 stdout 重设为 UTF-8，但子进程（如 `--help`）与管道场景仍需该变量。
 
 ### 1.2 配置（密钥走环境变量）
 
@@ -25,14 +47,21 @@ export GITHUB_TOKEN=ghp_xxx
 export EMBEDDING_API_KEY=sk-xxx
 ```
 
-`config.json` 中 `sources` 定义了数据源（默认 vllm-ascend + vllm 两个 GitHub 仓库；可加
-`type: pdf/markdown/excel/image` 业务来源，见 §2.3/§2.4），`embedding` 定义嵌入端点，
-`storage` 定义数据目录（含 `code_root`：版本化代码仓根），`code` 定义代码仓快照来源与预存版本列表，
-`tags` 定义标签词典（两级分类，见 §4.7），`sanitize` 定义内部数据脱敏白名单（后置，见 §2.4）。
+`config.json` 主要配置段：
+
+| 段 | 作用 |
+|---|---|
+| `sources` | 数据源（默认 vllm-ascend + vllm 两个 GitHub 仓库；可加 `type: pdf/markdown/excel/image` 业务来源，见 §2.3 / §2.4） |
+| `embedding` | 嵌入端点（OpenAI 兼容 `/embeddings`；`echo` 仅离线演示） |
+| `storage` | 数据目录（含 `code_root`：版本化代码仓根） |
+| `code` | 代码仓快照来源与预存版本列表 |
+| `tags` | 标签词典（两级分类，见 §4.7） |
+| `sanitize` | 内部数据脱敏白名单（后置，见 §2.4） |
+
 所有路径相对 `data/`，可整体迁移。
 
 > **URL 可写裸地址**：`embedding.base_url` / OCR `ocr_api_base` 可写 `10.0.0.5:8000/v1` 这种
-> 裸 ip:port（业务侧 vLLM/OCR 服务），配置加载时自动补 `http://` 前缀并告警；https 需显式写全。
+> 裸 `ip:port`（业务侧 vLLM/OCR 服务），配置加载时自动补 `http://` 前缀并告警；https 需显式写全。
 
 > **离线体验**：不想配 token / embedding key 时，用仓库自带的 `config.offline.json`
 > （`echo` 嵌入 + 纯 Python 向量后端）+ 模拟数据跑通全链路：
@@ -57,6 +86,8 @@ python scripts/build_kb.py --limit 100
 
 ### 2.1 增量与重建
 
+**常用命令**
+
 | 场景 | 命令 |
 |---|---|
 | 日常更新（增量入库；GitHub 默认不重拉） | `python scripts/build_kb.py` |
@@ -67,53 +98,61 @@ python scripts/build_kb.py --limit 100
 | 只再生 canonical（不入库，供建图） | `python scripts/build_canonical.py` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
 
-> **GitHub 拉取策略**：首次拉取完成后置 `done`（checkpoint），此后默认**不再拉取**（日志打印
-> "已拉取完成（done），默认跳过——如需增量请用 --incremental"）；中断后重跑同一命令自动
-> **断点续传**。三种拉取模式（互斥）：
-> - **`--incremental`（时间窗增量）**：从 checkpoint 记录的上次增量 `max createdAt` 起，
->   issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走 `UPDATED_AT DESC` 排序，跳过已有编号、
->   连续 3 页无新增停止，并把窗口推进到本次所见 `max createdAt`（首次增量无历史窗口时从头枚举
->   一次）——**只覆盖近期新增/更新，补不到历史旧条目**；
-> - **`--pull-missing`（补差拉取）**：从头枚举（created desc），**跳过 raw 目录与 checkpoint 中
->   已有的编号，只拉缺失条目**——补历史旧条目（如业务数据缺失的单条 PR），翻到最新后置 done；
-> - **`--numbers N1,N2,...`（REST 单条补拉）**：对指定编号先试 `/pulls/{n}`（404 则 `/issues/{n}`）
->   + 评论落 raw（隐含 missing 语义，**走 REST 不需要 GraphQL token**）——已知缺失编号时最精准。
-> **全量重拉**（数据刷新/补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
-> `data/checkpoints/{source_id}.json` 后重跑 `build_kb.py`。
+**拉取策略（GitHub）**
 
-> **只再生 canonical（`build_canonical.py`）**：提取逻辑（版本/kind/组件/标签规则）升级后，
-> 只需重新生成 canonical.jsonl 再跑 `build_graph.py` 建图——**不重嵌向量、不碰 kb.sqlite3**；
-> 如需连带重入库（重嵌向量）再跑 `build_kb.py --skip-pull`（与旧参数 `--recanonicalize` 等价）。
+首次拉取完成后置 `done`（checkpoint），此后默认**不再拉取**（日志打印
+"已拉取完成（done），默认跳过——如需增量请用 `--incremental`"）；中断后重跑同一命令自动
+**断点续传**。三种拉取模式互斥：
 
-> **`--rebuild` 高危确认**：会清空向量库 + 删除 kb.sqlite3 后全量重嵌（66K 文档约数小时）。
-> 执行前强制确认——TTY 交互输入 `y/yes`；**非交互环境（agent/CI）必须加 `--yes`**，否则拒绝执行。
-> canonical/raw/图/审核库不受影响；中断后重跑仍会先清空再重建。
+| 模式 | 行为 | 补得到历史旧条目吗 |
+|---|---|---|
+| `--incremental`（时间窗增量） | 从 checkpoint 记录的上次增量 `max createdAt` 起；issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走 `UPDATED_AT DESC` 排序，跳过已有编号、连续 3 页无新增停止，并把窗口推进到本次所见 `max createdAt`（首次增量无历史窗口时从头枚举一次） | **不能**——只覆盖近期新增/更新 |
+| `--pull-missing`（补差拉取） | 从头枚举（created desc），**跳过 raw 目录与 checkpoint 中已有的编号，只拉缺失条目**；翻到最新后置 done | **能**——补历史旧条目（如业务数据缺失的单条 PR） |
+| `--numbers N1,N2,...`（REST 单条） | 对指定编号先试 `/pulls/{n}`（404 则 `/issues/{n}`）+ 评论落 raw（隐含 missing 语义，**走 REST 不需要 GraphQL token**） | 能——已知缺失编号时最精准 |
 
-> **日常维护流程（推荐节奏）**——知识库是"离线数据 + 定期刷新"，不需要实时：
->
-> ```bash
-> # 1. 拉取社区增量 + 增量入库（新增 issue/PR；时间窗口见上；中断后重跑同一命令续传）
-> python scripts/build_kb.py --incremental
->
-> # 2. （可选）业务来源有新增文件（data/imports/）时再跑一次不带参数的 build_kb.py
-> #    （本地来源 pull 资产 + 入库；GitHub 源已 done 会打印跳过）
->
-> # 3. 重建图（增量入库后图不含新文档——graph 查询要覆盖新增条目必须重建）：
-> #    停 serve_api（Kùzu 单写者）→ 重建 → 重启
-> python scripts/build_graph.py
->
-> # 4. 抽查：python skills/vllm-kb/client.py stats   /  graph stats
-> ```
->
-> 注意：
-> - **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图；
-> - **FTS 全文索引不需要日常重建**：增量入库时新文档已实时写入 `chunks_fts`（含 jieba 分词）；
->   仅当升级 jieba / 分词规则 / 标签词典（`tags.registry`）后，才跑 `build_fts.py` 让存量文档
->   也用新分词（不重嵌向量；旧库无分词列升级时 ingest 会打印提示）；
-> - **`--incremental` 补不到历史单条**（窗口从上次 `max createdAt` 起、PR 按更新时间排序、
->   连续 3 页无新增即停）——缺旧条目时用 §7 的 `backfill_canonical.py`（canonical 层、无需网络）
->   或全量重拉（raw 层也要补时）；
-> - 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
+**全量重拉**（数据刷新 / 补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
+`data/checkpoints/{source_id}.json` 后重跑 `build_kb.py`。
+
+**只再生 canonical（`build_canonical.py`）**
+
+提取逻辑（版本 / kind / 组件 / 标签规则）升级后，只需重新生成 `canonical.jsonl` 再跑
+`build_graph.py` 建图——**不重嵌向量、不碰 kb.sqlite3**；如需连带重入库（重嵌向量）再跑
+`build_kb.py --skip-pull`（与旧参数 `--recanonicalize` 等价）。
+
+**`--rebuild` 高危确认**
+
+会清空向量库 + 删除 kb.sqlite3 后全量重嵌（66K 文档约数小时）。执行前强制确认——
+TTY 交互输入 `y/yes`；**非交互环境（agent/CI）必须加 `--yes`**，否则拒绝执行。
+canonical / raw / 图 / 审核库不受影响；中断后重跑仍会先清空再重建。
+
+**日常维护节奏（推荐）**
+
+知识库是"离线数据 + 定期刷新"，不需要实时：
+
+```bash
+# 1. 拉取社区增量 + 增量入库（新增 issue/PR；时间窗口见上；中断后重跑同一命令续传）
+python scripts/build_kb.py --incremental
+
+# 2. （可选）业务来源有新增文件（data/imports/）时再跑一次不带参数的 build_kb.py
+#    （本地来源 pull 资产 + 入库；GitHub 源已 done 会打印跳过）
+
+# 3. 重建图（增量入库后图不含新文档——graph 查询要覆盖新增条目必须重建）：
+#    停 serve_api（Kùzu 单写者）→ 重建 → 重启
+python scripts/build_graph.py
+
+# 4. 抽查：python skills/vllm-kb/client.py stats   /   graph stats
+```
+
+注意：
+
+- **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图；
+- **FTS 全文索引不需要日常重建**：增量入库时新文档已实时写入 `chunks_fts`（含 jieba 分词）；
+  仅当升级 jieba / 分词规则 / 标签词典（`tags.registry`）后，才跑 `build_fts.py` 让存量文档
+  也用新分词（不重嵌向量；旧库无分词列升级时 ingest 会打印提示）；
+- **`--incremental` 补不到历史单条**（窗口从上次 `max createdAt` 起、PR 按更新时间排序、
+  连续 3 页无新增即停）——缺旧条目时用 §7 的 `backfill_canonical.py`（canonical 层、无需网络）
+  或全量重拉（raw 层也要补时）；
+- 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
 
 ### 2.2 辅助数据构建
 
@@ -139,13 +178,16 @@ python scripts/build_fork_snapshots.py --model hy4 # 只拉指定模型
 python scripts/build_companion_matrix.py
 python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（默认按 TTL/不可变语义命中）
 
+# 社区高频信号词（issue 标题 TF-IDF → data/code/signal_words.json，供 agent 判断用，不参与过滤）
+python scripts/build_signal_words.py
+
 # FTS5 全文索引重建（jieba 中文分词——可选，不重嵌向量；装 jieba 或升级分词规则后重跑）
 python scripts/build_fts.py                     # 读现有 chunk 原文重新分词重建 chunks_fts
 python scripts/build_fts.py --limit 1000        # 试跑前 N 个 chunk
 
 # 正文 TF-IDF 标签候选导出（jieba——输出文件，人工审阅后手动写入 config.tags.registry）
 # 注意：与审核队列的 tag_candidate 是两条独立路径——本脚本只产文件、不自动打标；
-# 审核队列候选来自文件名/标题提取（自动、可一键采纳打标），见 §3.5。
+# 审核队列候选来自文件名/标题提取（自动、可一键采纳打标），见 §3.2。
 python scripts/build_tag_candidates.py          # 业务文档（doc_*）正文候选 → data/tag_candidates_manual.json
 python scripts/build_tag_candidates.py --include-github   # 也处理 github issue/PR（默认仅业务文档）
 ```
@@ -153,10 +195,10 @@ python scripts/build_tag_candidates.py --include-github   # 也处理 github iss
 **FTS5 中文分词说明（`jieba` 可选依赖）**：SQLite FTS5 默认把连续中文整段当一个 token
 （"超时"无法命中"超时排查"）。安装 `jieba`（`pip install jieba`，离线 wheel 可装）后，
 入库自动对 chunk 文本分词写入 FTS 索引、查询侧同步分词——中文词可独立命中；
-**向量库不受影响**（原文嵌入，无需重嵌）。升级 jieba/分词规则后跑一次
+**向量库不受影响**（原文嵌入，无需重嵌）。升级 jieba / 分词规则后跑一次
 `scripts/build_fts.py` 重建索引即可。未装 jieba 时 FTS 行为与旧版一致（无需重建）。
 
-**真实业务环境（SSL 被禁/镜像源）**：以上联网脚本均支持 `--insecure`（跳过 SSL 校验）与镜像源参数，
+**真实业务环境（SSL 被禁 / 镜像源）**：以上联网脚本均支持 `--insecure`（跳过 SSL 校验）与镜像源参数，
 也可用环境变量统一配置（多脚本共享）：
 
 ```bash
@@ -169,20 +211,24 @@ python scripts/build_companion_matrix.py         # 全部脚本自动走业务�
 
 **配套矩阵自动匹配规则**（`build_companion_matrix.py`）：
 
-- `vllm`：镜像 Env 的 `VLLM_TAG`（构建时锁定，最可靠）> 镜像 buildkit history（fork 仓
-  `VLLM_REPO/VLLM_REF/VLLM_BASE`）> GitHub release 说明 > 版本号启发式；
-- **fork 行**（0day 模型镜像，如 `hy4`/`glm5.2`）：除上表字段外自动带 `vllm_repo`（fork 仓）、
-  `vllm_ref`（分支）、`vllm_base`（基线版本）、`vllm_sha`（**clone 层扫描固化的锁定 commit**）、
-  `image_digest`（digest 锚定：镜像未重推则跳过重扫）。配套代码快照用
-  `build_fork_snapshots.py` 按锁定 SHA 拉取（见上）；
-- `cann`：镜像 Env 的 `cann-X.Y.Z` 路径；缺失时按**基础版本号**回退同系列其他形态
-  （如 `v0.13.0rc1` 用 `0.13.0` 系列的 cann），同系列也没有则留空人工看护；
-- `pytorch-ascend`（PTA）与 `pytorch`（torch）：对应 tag 的 `requirements.txt`
-  （`torch-npu==X.Y.Z.postN` / `torch==X.Y.Z`）——**本地快照 zip 优先**（零网络），
-  快照未预存的 tag 走 GitHub API 兜底；0day 模型（非版本 tag）无 requirements 时回退
-  **同 minor 系列已发布 tag**（bailing 0.19.0 → 0.19.x 系列），系列内无 release 或
-  未发布版本留空人工；
-- 写回前**版本号正则校验**：非法值（`latest`、带前缀等）置空 + 告警，不污染矩阵。
+| 字段 | 来源与回退顺序 |
+|---|---|
+| `vllm` | 镜像 Env 的 `VLLM_TAG`（构建时锁定，最可靠）> 镜像 buildkit history（fork 仓 `VLLM_REPO/VLLM_REF/VLLM_BASE`）> GitHub release 说明 > 版本号启发式 |
+| `image_created` | quay tag 最后推送时间（`last_modified` → ISO-8601 UTC，如 `2026-07-27T15:39:42Z`）；与 `image_digest` 同源（同取代表 tag） |
+| `vllm_commit` / `vllm_commit_date` | 镜像锁定的 vllm 版本 tag → GitHub 解析出的 commit SHA 与提交日期（`GET /repos/{repo}/commits/tags/{tag}`）；**未配置 `GITHUB_TOKEN` 且缓存未命中时跳过**（45+ 个 tag 会打满未认证限流），留空待带 token 重跑 |
+| fork 行（0day 模型镜像，如 `hy4`/`glm5.2`） | 除上表字段外自动带 `vllm_repo`（fork 仓）、`vllm_ref`（分支）、`vllm_base`（基线版本）、`vllm_sha`（**clone 层扫描固化的锁定 commit**）、`image_digest`（digest 锚定：镜像未重推则跳过重扫）、`vllm_commit_date`（该 fork SHA 的提交日期）；配套代码快照用 `build_fork_snapshots.py` 按锁定 SHA 拉取 |
+| `cann` | 镜像 Env 的 `cann-X.Y.Z` 路径；缺失时按**基础版本号**回退同系列其他形态（如 `v0.13.0rc1` 用 `0.13.0` 系列的 cann），同系列也没有则留空人工看护 |
+| `pytorch-ascend`（PTA）/ `pytorch`（torch） | 对应 tag 的 `requirements.txt`（`torch-npu==X.Y.Z.postN` / `torch==X.Y.Z`）——**本地快照 zip 优先**（零网络），快照未预存的 tag 走 GitHub API 兜底；0day 模型（非版本 tag）无 requirements 时回退**同 minor 系列已发布 tag**（bailing 0.19.0 → 0.19.x 系列），系列内无 release 或未发布版本留空人工 |
+
+> **"这个镜像对应哪个 commit"**：官方仓镜像（如 `kimi-k3`）看 `vllm_commit` + `vllm_commit_date`；
+> fork 镜像（`hy4`/`glm5.2`）看 `vllm_sha` + `vllm_commit_date`（锁的是 **fork 仓**的代码）。
+> **注意**：镜像里的 **vllm-ascend 插件代码是 `COPY .` 拷进去的**，镜像内没有版本/commit 痕迹，
+> 任何脚本都无法锁定它——需要插件代码审查时，只能按 `vllm` 基线版本对应的官方 tag 快照近似
+> （`data/code/snapshots/{version}/`），或由镜像构建方在构建时写入版本信息。
+> `matrix` 命令可查看全部字段；`companion` 只返回版本配套关系。
+
+写回前**版本号正则校验**：非法值（`latest`、带前缀等）置空 + 告警，不污染矩阵；
+`vllm_commit`/`vllm_sha` 校验 40 位 hex，`image_created`/`vllm_commit_date` 校验 ISO-8601。
 
 **跨运行缓存**（`data/cache/`，防限流与重复下载；`--refresh-cache` 强制刷新）：
 
@@ -191,6 +237,7 @@ python scripts/build_companion_matrix.py         # 全部脚本自动走业务�
 | `fork_sha.json` | clone 层 digest → 锁定 SHA | 层不可变，**永久有效**（首次扫描后不再重下 ~75MB 层） |
 | `github_releases.json` | release 说明（按 API 前缀键控） | TTL 7 天（兜底新 release） |
 | `github_requirements.json` | requirements 兜底结果（含 404） | tag 内容不可变，**永久有效** |
+| `github_tag_commits.json` | tag → commit SHA + 提交日期（key `{repo}@{tag}`） | tag 指向的 commit 不可变，**永久有效** |
 
 只有完整/确定性结果才落盘（翻页中途失败、网络/限流失败不缓存，下次自动重试）。
 缓存全命中时矩阵生成对 GitHub API 的请求为 **0**（未认证限流 60 次/小时不再是约束）。
@@ -241,20 +288,20 @@ python skills/vllm-kb/client.py stats                           # chunks 数应�
 **步骤 6：产物与质量规则**
 
 ```
-data/assets/pdf/<name>.pdf           # 原始文件（不可变层，sha256；路径不进库，以 asset_id 标识）
+data/assets/pdf/<name>.pdf               # 原始文件（不可变层，sha256；路径不进库，以 asset_id 标识）
 data/parsed/pdf/<asset_id>.tables.json   # 结构化表格（错误码表/命令表，asset_id 命名）
-data/raw/canonical.jsonl             # canonical 追加（verification/tags 等元数据）
+data/raw/canonical.jsonl                 # canonical 追加（verification/tags 等元数据）
 ```
 
 - PDF 表格转 Markdown 表格拼入正文（FTS 可检索）+ 另存结构化 JSON；
 - **自动标签（两级分类）**：入库时从文件名 + 内部标题确定性提取——**主题/领域类**（domain，
-  如 `npu-smi`/`Atlas`，=这是什么领域的知识）与**具体作用类**（purpose，如 `命令参考`/`错误码表`，
-  =文档能帮我做什么），与 `config.json` 的 `tags.registry` 词典子串命中为准；
+  如 `npu-smi`/`Atlas`，= 这是什么领域的知识）与**具体作用类**（purpose，如 `命令参考`/`错误码表`，
+  = 文档能帮我做什么），与 `config.json` 的 `tags.registry` 词典子串命中为准；
   未收录强候选进审核队列 `tag_candidate`，采纳后入词典并即时打标；
 - 验证状态默认：**PDF 手册 = `expert`**、**Markdown = `unverified`**（审核工作台补标）；
 - 检索结果显示 `验证=expert/unverified`；embedding key 有效时语义检索（向量）生效，
   无效时自动降级全文检索（`search` 仍可用）；
-- **路径不进库（安全约束）**：canonical/检索库不含服务器路径（资产以 asset_id 标识），
+- **路径不进库（安全约束）**：canonical / 检索库不含服务器路径（资产以 asset_id 标识），
   `/doc` 等 API 返回的 extra 经白名单清理；管理员侧路径仅存审核库（asset_registry）。
 
 **PDF 解析缓存（性能，增量入库 / recanonicalize 通用）**：PyMuPDF 逐页提取耗时较长
@@ -272,7 +319,7 @@ python scripts/serve_api.py          # http://127.0.0.1:8000
 python skills/vllm-kb/client.py health   # chunks 数与预期一致
 ```
 
-**Markdown 图片处理（随 md 一起入库）**：
+**Markdown 图片处理（随 md 一起入库）**
 
 - md 正文里的图片引用自动收集：相对路径（以 md 所在目录为基准）、绝对路径、base64 内嵌 → 复制到
   `data/assets/images/`，**正文引用改为不透明占位 `[图片]`**（不暴露路径），`extra.evidence`
@@ -281,7 +328,7 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 - 引用不存在的本地图片：标记 `unresolved`（不保留路径形态引用）；
 - 图片的 OCR 由 image source 完成（见下）。
 
-**图片 OCR（签名导向，provider 可插拔）**：
+**图片 OCR（签名导向，provider 可插拔）**
 
 ```bash
 # config 的 images source 选择 OCR 方式（ocr_provider）：
@@ -328,11 +375,19 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - 错误码/算子/模型/版本由 signature 三层提取**自动入图**（建图只依赖 canonical，无需图侧适配）；
 - 验证状态 `unverified`（登记表低优先级，按未解决 issue 处理）。
 
-**内部数据脱敏（后置，Excel/Markdown 源生效）**：
+**内部数据脱敏（后置，Excel/Markdown 源生效）**
 
-- **库中存原文、出口统一脱敏**：serve_api 返回给 agent 的正文/标题（/doc 全文、/search snippet、/title、/tags、/graph 等）按 `config.sanitize` 白名单脱敏（内部 IP → `<IP>`、内部路径 → `<PATH>`，默认路径如 `/var/log/npu/` 保留）——**内部检索用原文**（可按原 IP 检索），**改脱敏配置即时生效、无需重嵌**；
-- `config.sanitize`：`keep_paths`（保留的默认路径前缀）、`keep_ips`（保留的 IP，默认回环/通配）、`sources`（入库时扫描维护日志的源，默认 `["excel","markdown"]`）；`None`=用默认、显式 `[]`=全部脱敏/全部关闭；
-- **被脱敏的原始 IP/路径落盘 `data/sanitize_log.json`**（维护文件，不进库/不返回给 agent）——据此调整白名单；审核页（管理员）显示原文。
+- **库中存原文、出口统一脱敏**：serve_api 返回给 agent 的正文/标题（`/doc` 全文、`/search` snippet、
+  `/title`、`/tags`、`/graph` 等）按 `config.sanitize` 白名单脱敏（内部 IP → `<IP>`、
+  内部路径 → `<PATH>`，默认路径如 `/var/log/npu/` 保留）——**内部检索用原文**（可按原 IP 检索），
+  **改脱敏配置即时生效、无需重嵌**；
+- `config.sanitize` 三个字段：
+  - `keep_paths`：保留的默认路径前缀；
+  - `keep_ips`：保留的 IP（默认回环/通配）；
+  - `sources`：入库时扫描维护日志的源（默认 `["excel","markdown"]`）。
+  `None` = 用默认，显式 `[]` = 全部脱敏 / 全部关闭；
+- **被脱敏的原始 IP/路径落盘 `data/sanitize_log.json`**（维护文件，不进库、不返回给 agent）——
+  据此调整白名单；审核页（管理员）显示原文。
 
 > Word/HTML 适配在业务环境阶段开发。
 
@@ -366,25 +421,7 @@ python scripts/serve_api.py --host 0.0.0.0     # 远程访问（配合存算分�
 查询用快速失败客户端（5s 超时 × 1 重试），连续失败 3 次熔断 60s（期间跳过 embed 调用零等待降级），
 到期自动探测恢复；降级期间 `/search` 响应带 `degraded` 提示，agent 可见。
 
-### 3.2 图更新流程（Kùzu 单写者约束）
-
-**更新图（scripts/build_graph.py）前必须先停止检索 API**——检索服务持有图库读连接，
-Kùzu 单写者会拒绝建图（`Could not set lock on file: data/graph/db`）：
-
-```bash
-# 1. 停 serve_api（8000 端口进程）
-# 2. 重建图
-python scripts/build_graph.py
-# 3. 重启 serve_api
-python scripts/serve_api.py
-```
-
-**路径限制（Kùzu）**：图库路径（`storage.graph_path` = `data/graph`，或存算分离时的
-`VLLM_KB_DATA_ROOT`）**不能含非 ASCII 字符**（中文、emoji 等）——Kùzu 打开含非 ASCII
-路径的库会报错打不开。若部署根路径含中文（如 `C:\Users\张三\...`），请把数据根移到
-纯 ASCII 路径（如 `D:\vllm-kb-data`）后重建图。
-
-## 3.5 审核工作台（人工确认统一入口 + API 配置中心）
+### 3.2 审核工作台（人工确认统一入口 + API 配置中心）
 
 所有需要人工确认的位置（未验证文档补标、案例标题待审核/待修改、OCR 图文互证不一致、
 低置信度 OCR 签名、跨来源合并候选等）共用一个轻量级 Web UI；同时集中展示所有 API 配置。
@@ -396,7 +433,7 @@ python scripts/review_ui.py --seed-only        # 只补单不启动服务
 python scripts/review_ui.py --no-seed          # 启动但不自动补单
 ```
 
-**功能**：
+**功能**
 
 - **概览**：7 类审核项的待办/存疑数（verification_pending / case_title_flag / ocr_mismatch /
   low_confidence_ocr / equivalence_candidate / table_join_candidate / **tag_candidate**）
@@ -470,9 +507,42 @@ case_title_flag；`extra.tag_candidates`（未收录强候选）→ tag_candidat
 **与只读检索 API 的关系**：分离端口（检索 8000 / 审核 8010）、分离数据（kb.sqlite3 只读 /
 review.sqlite3 可写）；审核库检索 API 不碰。权限（谁能标注专家认证）由部署方加 nginx basic auth 等。
 
+### 3.3 图更新流程（Kùzu 单写者约束）
+
+**更新图（`scripts/build_graph.py`）前必须先停止检索 API**——检索服务持有图库读连接，
+Kùzu 单写者会拒绝建图（`Could not set lock on file: data/graph/db`）：
+
+```bash
+# 1. 停 serve_api（8000 端口进程）
+# 2. 重建图
+python scripts/build_graph.py
+# 3. 重启 serve_api
+python scripts/serve_api.py
+```
+
+**路径限制（Kùzu）**：图库路径（`storage.graph_path` = `data/graph`，或存算分离时的
+`VLLM_KB_DATA_ROOT`）**不能含非 ASCII 字符**（中文、emoji 等）——Kùzu 打开含非 ASCII
+路径的库会报错打不开。若部署根路径含中文（如 `C:\Users\张三\...`），请把数据根移到
+纯 ASCII 路径（如 `D:\vllm-kb-data`）后重建图。
+
+> 图的构建内容与查询命令见 [§4.8 graph](#48-graph--phase-2-图检索关系追溯)。
+
 ## 4. 查询命令（skill）
 
 所有查询经 `skills/vllm-kb/client.py`，服务地址解析：`--base` > 环境变量 `VLLM_KB_BASE` > 默认 `http://127.0.0.1:8000`。
+`--probe` 是全局开关（探索/测试请求打标，见 §4.10），任意子命令均可加。
+
+| 命令 | 一句话用途 | 详见 |
+|---|---|---|
+| `search` | 语义检索（推荐 `组件:版本 问题`） | §4.1 |
+| `signature` | 贴原始报错，签名精确检索 | §4.2 |
+| `title` | 标题/文档名精确检索（已知现象找 issue） | §4.3 |
+| `version` | 版本形态判断（release / rc / pre） | §4.4 |
+| `code` / `diff` | 版本化源码定位、跨版本 diff、报错字面量索引 | §4.5 |
+| `doc` / `companion` / `stats` / `health` 等 | 整篇读取、配套展开、规模与健康 | §4.6 |
+| `tags` / `context` | 文档能力发现（有哪些文档类别 / 能帮我做什么） | §4.7 |
+| `graph` | 关系追溯（issue→修复 PR→落地 release） | §4.8 |
+| `code-graph` | 代码图谱（调用链/影响面/架构，需 gh-puller） | §4.9 |
 
 ### 4.1 search —— 语义检索
 
@@ -482,9 +552,13 @@ python skills/vllm-kb/client.py search "vllm-ascend:0.23.0rc1 GLM5.1 PD分离P�
 
 # 普通查询 + 目标版本
 python skills/vllm-kb/client.py search "CUDA illegal memory access" --version 0.26.0 --top 5
+
+# 按文档标签过滤（可多次，多个标签取交集）
+python skills/vllm-kb/client.py search "HCCL 超时" --tag HCCL --tag 超时排查
 ```
 
-返回：结果标题/URL/是否已解决 + 置信度分解（w_time 时间衰退 / w_ver 版本匹配 / w_rel 来源可靠度）。
+返回：结果标题/URL/是否已解决 + 置信度分解（`w_time` 时间衰退 / `w_ver` 版本匹配 /
+`w_rel` 来源可靠度，启用遥测反馈时另有 `w_hist`，见 §4.10）。
 
 ### 4.2 signature —— 签名精确检索
 
@@ -565,6 +639,9 @@ python skills/vllm-kb/client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/mo
 python skills/vllm-kb/client.py code "memory leak" --kind msg --version v0.23.0rc1
 ```
 
+`--kind` 可选值：`def`（函数定义）/ `op`（算子）/ `env`（环境变量）/ `msg`（报错字面量）；
+不传则符号索引 + grep 兜底。
+
 命中新版本后，用 GitHub commits API 按文件路径过滤找引入 commit → PR 编号 →
 再用 `graph fixes/chain` 确认落地 release 与 backport。
 
@@ -579,15 +656,16 @@ python skills/vllm-kb/client.py code "memory leak" --kind msg --version v0.23.0r
 ```bash
 python skills/vllm-kb/client.py health                  # 服务健康（含 embedding 状态 ok/degraded）
 python skills/vllm-kb/client.py stats                   # 知识库规模
+python skills/vllm-kb/client.py components              # 各组件文档数分布
 python skills/vllm-kb/client.py doc github:vllm-project-vllm-ascend:issue:10700   # 整篇 issue 全文
 python skills/vllm-kb/client.py companion vllm-ascend 0.23.0rc1   # 组件配套版本展开
-# matrix/code-versions 为管理员调试命令（列全量配套矩阵/预存代码版本），故障流程不使用
+# matrix / code-versions 为管理员调试命令（列全量配套矩阵 / 预存代码版本），故障流程不使用
 ```
 
 ### 4.7 文档标签（能力发现）—— `tags` / `context`
 
-文档级标签两级分类：**主题/领域类**（domain：HCCL、网络、NPU、CANN…=这是什么领域的知识）与
-**具体作用类**（purpose：超时排查、命令参考、错误码表…=文档能帮我做什么）。
+文档级标签两级分类：**主题/领域类**（domain：HCCL、网络、NPU、CANN…= 这是什么领域的知识）与
+**具体作用类**（purpose：超时排查、命令参考、错误码表…= 文档能帮我做什么）。
 
 ```bash
 # 能力目录：两级分组 + 各标签文档数（agent 先看"知识库有哪些文档类别可提供知识"）
@@ -646,15 +724,17 @@ python skills/vllm-kb/client.py graph evidence pdf:Atlas A3 中心推理和训�
 **图内容说明**：Issue/PR/Release（修复链路）+ Operator/ErrorCode/Model/Version（签名实体）+
 **Doc**（PDF 手册/Markdown 等非 github 文档）+ **Interface**（手册"命令格式"段提取的工具.子命令，
 如 `hccn_tool.bandwidth`）+ **Tag**（文档级标签，两级分类）。文档经两条 `DOCUMENTS` 边入图：
+
 - **错误码表 → ErrorCode**：`graph doc pdf:<手册>` 的 `documents` 含该手册定义的错误码；
 - **命令格式段 → Interface**：`documents` 含该手册定义的接口/命令；
 - **标签 → Tag**：`TAGGED_WITH` 边（最终标签 = 自动 − 排除 ∪ 人工，与入库一致；
-  registry 全量标签也建节点——新增标签重建图即入图）；
+  registry 全量标签也建节点——新增标签重建图即入图）。
+
 错误码/命令与 GitHub issue 的 MENTIONS 共享节点——可回答"这个错误码在哪个手册定义、
 社区哪些 issue 提到"、"查带宽用哪个命令、命令在哪本手册"。
 
 图与检索 API 的关系：图由 `scripts/build_graph.py` 构建，`serve_api.py` 的 `/graph/*` 端点只读查询；
-**更新图前请停止检索 API**（Kùzu 单写者，构建期间不可并发查询）。
+**更新图前请停止检索 API**（Kùzu 单写者，构建期间不可并发查询，见 §3.3）。
 
 ### 4.9 code-graph —— 代码图谱检索（gh-puller 接入）
 
@@ -702,9 +782,10 @@ client.py code-graph health
 ```
 
 **何时用 code-graph vs code**：
-- 定位某版本某符号在哪定义、报错文本来自哪段代码 → `code`（本地快、版本化）
-- 谁调用了某函数、变更会影响什么、架构怎么分层、跨仓调用关系 → `code-graph`
-- gh-puller 不可达时降级思路：`code-graph` 503 → 改用 `code` 查本地索引（手动）
+
+- 定位某版本某符号在哪定义、报错文本来自哪段代码 → `code`（本地快、版本化）；
+- 谁调用了某函数、变更会影响什么、架构怎么分层、跨仓调用关系 → `code-graph`；
+- gh-puller 不可达时降级思路：`code-graph` 503 → 改用 `code` 查本地索引（手动）。
 
 ### 4.10 行为遥测与置信度反馈（feedback_enabled）
 
@@ -719,54 +800,62 @@ client.py code-graph health
 
 **探索/测试行为打标（probe，不进反馈推断）**：agent/新同事初接触 skill 时的验证安装、
 复现文档示例、占位测试查询会污染 w_hist 统计。双层防线：
+
 - **显式约定（主）**：探索请求带 `--probe`（client.py）或 `VLLM_KB_PROBE=1` →
-  `X-VLLM-KB-Probe: 1` header → 遥测 `probe=1`
+  `X-VLLM-KB-Probe: 1` header → 遥测 `probe=1`；
 - **启发式兜底（辅）**：查询正规化后精确命中 SKILL.md 范例词/占位探测词（test/hello/
-  测试 等）→ 自动 `probe=2`，覆盖未读约定的探索行为
+  测试 等）→ 自动 `probe=2`，覆盖未读约定的探索行为。
+
 打标不删除（审计可逆）——推断层 `build_feedback.py` 排除 `probe≠0` 事件并输出排除统计，
 规则调整后重跑即恢复；原始行保留供易用性分析（哪些命令被探索过）。
 
 **数据流（三段分离，审计可逆）**：
+
 ```
-serve_api (只读)                    离线周期
-┌─────────────────────────┐       ┌───────────────────────────┐
-│ middleware 记原始行为    │       │ scripts/build_feedback.py │
-│ → telemetry.sqlite3     │ ────▶ │ 会话重建+行为推断三态      │
-│ (独立库,不碰 kb.sqlite3) │       │ → confidence_feedback.json │
-│                         │       │ → knowledge_gaps 表        │
-│ compute_confidence      │       └───────────────────────────┘
-│ + w_hist(读 feedback.json)│ ◀──────── 重启 serve_api 生效
+serve_api (只读)                      离线周期
+┌─────────────────────────┐         ┌───────────────────────────┐
+│ middleware 记原始行为    │         │ scripts/build_feedback.py │
+│ → telemetry.sqlite3     │ ──────▶ │ 会话重建+行为推断三态      │
+│ (独立库,不碰 kb.sqlite3) │         │ → confidence_feedback.json │
+│                         │         │ → knowledge_gaps 表        │
+│ compute_confidence      │         └───────────────────────────┘
+│ + w_hist(读 feedback.json)│ ◀────── 重启 serve_api 生效
 │ final=sim^γ·conf^(1-γ)·lb^σ │
 └─────────────────────────┘
 ```
 
 **离线推断**：`python scripts/build_feedback.py` —— 扫遥测库重建会话序列，
-按行为模式推断三态（权重≤0.5，自证循环阻尼）：
-- search/signature 命中后拉 doc 不重查 → 弱正 hit（0.3）
-- signature 命中后会话直接结束 → 弱正 hit（0.3）
-- 有 doc 命中后调 code/diff → 中正 hit（0.5）
-- 60s 内改述重查 → 弱负 miss（0.3）
-- 命中后零后续 → unknown（不进 n_eff，单独计数）
-- 无命中的查询进缺口检测，不进后验
+按行为模式推断三态（权重 ≤ 0.5，自证循环阻尼）：
+
+- search/signature 命中后拉 doc 不重查 → 弱正 hit（0.3）；
+- signature 命中后会话直接结束 → 弱正 hit（0.3）；
+- 有 doc 命中后调 code/diff → 中正 hit（0.5）；
+- 60s 内改述重查 → 弱负 miss（0.3）；
+- 命中后零后续 → unknown（不进 n_eff，单独计数）；
+- 无命中的查询进缺口检测，不进后验。
 
 **后验更新（时间维度指数遗忘）**：`a <- a×2^(-Δt/HL) + w×hit`，HL 复用 config
 `half_life_days`（非事件次数衰减——克服版本漂移且冷门案例不异常）。seed=1+1 随遗忘
-衰减，HL 决定失效。**seed 强度 1+1=2，数据部分需≥3 超先验 1.5 倍才主导后验**
+衰减，HL 决定失效。**seed 强度 1+1=2，数据部分需 ≥3 超先验 1.5 倍才主导后验**
 （隐含前提：平均确认频率约每季度 1 条；冷门 domain 检索频率过低时 supported 状态
 不会出现——符合设计，冷门且无反馈证据的文档保持中性不被误杀）。
 
 **w_hist 三段式**（当期值不缓存，每次查询重算）：
-- `n_eff=0` → w_hist=1.0（中性，不用 seed 套 lb——避免误杀新文档），flag=new
-- `0<n_eff<n_min` → w_hist=lb（正常算），flag=accumulating/evidence_thin
-- `n_eff≥n_min` → w_hist=lb，flag=supported/used_but_unconfirmed/failing
+
+| n_eff | w_hist | history_flag |
+|---|---|---|
+| `=0` | 1.0（中性，不用 seed 套 lb——避免误杀新文档） | `new` |
+| `0 < n_eff < n_min` | `lb`（正常算） | `accumulating` / `evidence_thin` |
+| `n_eff ≥ n_min` | `lb` | `supported` / `used_but_unconfirmed` / `failing` |
 
 **关键约束**：
-- **z（检索侧排序）vs p_min（消费侧决策）分工**：vllm-kb 只输出 lb，不参与消费侧决断
-- **只标注不拦截**：history_flag 供消费侧决策，vllm-kb 永不过滤候选
-- **n_eff 是加权观察非次数**：w=0.4 的推断只贡献 0.4
-- **unknown 不进 n_eff**：统计正确，单独计数
 
-**知识缺口**：审核工作台 → "知识缺口" tab，展示同签名跨≥3会话反复查无果的缺口
+- **z（检索侧排序）vs p_min（消费侧决策）分工**：vllm-kb 只输出 lb，不参与消费侧决断；
+- **只标注不拦截**：history_flag 供消费侧决策，vllm-kb 永不过滤候选；
+- **n_eff 是加权观察非次数**：w=0.4 的推断只贡献 0.4；
+- **unknown 不进 n_eff**：统计正确，单独计数。
+
+**知识缺口**：审核工作台 → "知识缺口" tab，展示同签名跨 ≥3 会话反复查无果的缺口
 （hard_gap 强签名零命中 / soft_gap 命中无结论 / quality_gap 弱签名零命中）。
 serve_api 不暴露缺口端点（缺口不进检索）。
 
@@ -796,7 +885,7 @@ serve_api 不暴露缺口端点（缺口不进检索）。
 
 ## 6. 远程部署（存算分离）
 
-数据（向量库、索引、图）放远程服务器，本地 skill 只留 ~34KB 发 HTTP 查询。
+数据（向量库、索引、图）放远程服务器，本地 skill 只留 `client.py` + `SKILL.md`（约 68KB）发 HTTP 查询。
 
 ```bash
 # 远程服务器
@@ -822,7 +911,7 @@ python scripts/pack_migrate.py --with-code    # 无外网时连带 1.7GB 代码�
 包内含 canonical（重嵌入唯一输入）+ 业务数据 + 图；**不含 lancedb（向量库，业务环境 `--rebuild`
 重建，干净库约 0.8GB）与 kb.sqlite3（--rebuild 自动重建）**。详见脚本 docstring。
 
-辅助脚本：
+**辅助脚本**：
 
 ```bash
 python scripts/deploy_remote.py --gen-config    # 生成远程 config（已去 token/api_key）
@@ -835,7 +924,9 @@ python scripts/deploy_remote.py --print-steps   # 部署步骤说明
 ## 7. 常见问题
 
 **Q: 查询结果 w_ver 都是默认值？**
+
 A: 依次检查：
+
 1. 语义检索要传目标版本（`--version` 或 `组件:版本` 前缀）；
 2. 需先生成**分仓**版本日历（`python scripts/build_release_calendar.py --all-repos`，
    生成 `release_calendar.{repo_slug}.json`）——"修复落地版本"上界在**查询期**按文档
@@ -844,15 +935,17 @@ A: 依次检查：
    默认值——这属于数据侧信号缺失，不是配置问题。
 
 **Q: 向量库体积异常大（数十 GB）？**
+
 A: 干净向量库约 **0.8GB**（122K chunks × 1024 维）。体积膨胀是 LanceDB **历史版本累积**所致：
 每次入库提交新版本 manifest，旧版本从不清理（全量嵌入可累积 4 万+ 份历史快照，占体积 98%）。
 数据完整时用 `db.open_table('chunks').cleanup_old_versions()` 清理即可恢复 ~772MB；
 业务环境 `--rebuild` 全新库天然无历史版本。也可存算分离把数据放远程，或换更小维度模型。
 
 **Q: 真实业务环境 SSL 被禁 / 证书不受信？**
+
 A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳过证书校验；若域名不可达
 需用业务侧 http 镜像（`--github-base/--quay-base/--base-url`，或环境变量 `VLLM_KB_GITHUB_BASE` 等）；
-`embedding.base_url` 可写裸 ip:port 自动补 `http://`。
+`embedding.base_url` 可写裸 `ip:port` 自动补 `http://`。
 注意 `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` 环境变量会**覆盖** `--insecure`
 （requests 的 `merge_environment_settings` 会用环境 CA 串复活 SSL 校验，
 业务环境 MITM 场景典型症状：`CERTIFICATE_VERIFY_FAILED ... HTTPSConnectionPool`）。
@@ -861,15 +954,18 @@ A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳�
 不要裸设 `session.verify = False`（会被环境变量覆盖）。
 
 **Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
+
 A: fork 行要下载 ~75MB clone 层 blob，业务环境慢链路需数分钟——脚本每 10MB 打一行进度，
 静默 ≠ 卡死。扫描结果按层 digest 缓存到 `data/cache/fork_sha.json`（层不可变，
 永久有效），**第二次运行起零层下载**；GitHub releases/requirements 同样有跨运行缓存
 （全命中时 API 请求为 0）。怀疑缓存脏数据时 `--refresh-cache` 强制重拉。
 
 **Q: 离线能用吗？**
+
 A: 能。采集完成后全部检索离线；嵌入可用 `echo` provider 离线自测（效果粗糙）。
 
 **Q: kb 检索能命中（title/search），但 graph chain/fixes 查不到？**
+
 A: 典型的 **kb↔canonical 不同步**：`canonical.jsonl` 是 `build_graph` 与 `--rebuild` 的
 **唯一事实源**——kb 有、canonical 无的文档，图里没有（图从 canonical 建）、全量重建也会丢
 （rebuild 从 canonical 重嵌）。常规增量入库不会漂移（pipeline 先 upsert canonical 再 ingest）；
@@ -895,17 +991,20 @@ python scripts/build_kb.py --skip-pull     # 回填文档重入库（body 为 ch
 后再 `build_kb.py --skip-pull`。
 
 **Q: 图打不开 / build_graph 失败，数据根路径含中文？**
+
 A: Kùzu 图库路径**不能含非 ASCII 字符**（中文、emoji 等）——`data/graph` 或存算分离的
 `VLLM_KB_DATA_ROOT` 若在中文路径下（如 `C:\Users\张三\...`），建图/图查询会失败。
 把数据根移到纯 ASCII 路径（如 `D:\vllm-kb-data`）后重建图（`scripts/build_graph.py`）。
 
 **Q: PDF 重新入库很慢，怎么跳过已解析的？**
+
 A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.extract.json`），
 资产未变时自动复用（进度行标注"缓存命中"）；想强制重新解析（如 PyMuPDF 升级），
 删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。
 
 **Q: 想加自己的故障记录（excel/markdown）？**
+
 A: config.json 的 `sources` 加条目即可：`{"id":"engineer-troubleshooting","type":"excel",
 "path":"data/imports/...xlsx","enabled":true}`（schema-free 导入，见 §2.4）或
-`{"id":"mynotes","type":"markdown","path":"data/mynotes","enabled":true}`；github 源
-支持 `--incremental` 增量拉取（见 §2.2）。
+`{"id":"mynotes","type":"markdown","path":"data/mynotes","enabled":true}`；GitHub 源的
+增量拉取见 §2.1（`--incremental` / `--pull-missing` / `--numbers`）。
