@@ -193,7 +193,8 @@ def fmt_matrix(data: dict, limit: int = 100) -> str:
     shown = rows[:limit]
     head = f"配套矩阵共 {len(rows)} 行（调试/管理用；日常查询用 companion <组件> <版本>）"
     if data.get("generated_at"):
-        head += f"；生成于 {data['generated_at'][:19]}"
+        # 全量显示：截断到 19 字符会丢掉时区（"+00:00" → 看起来像 12:00:00 少一截）
+        head += f"；生成于 {data['generated_at']}"
     lines = [head + ":"]
     # 长字段缩略显示（commit/digest 全量太长，前缀足够核对）
     short = {"vllm_sha": 12, "vllm_commit": 12, "image_digest": 19}
