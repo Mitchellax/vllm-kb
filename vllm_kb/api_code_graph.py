@@ -10,7 +10,7 @@ code_graph.py 默认即可）：
 - POST /code-graph/code-search  search_code（grep + 图增强）
 - POST /code-graph/trace        trace_path（调用链/数据流/跨服务路径）
 - POST /code-graph/query        query_graph（Cypher 多跳/聚合）
-- GET  /code-graph/architecture get_architecture（架构总览/聚类/边界）
+- POST /code-graph/architecture get_architecture（架构总览/聚类/边界）
 - POST /code-graph/changes      detect_changes（git diff → 影响面）
 - GET  /code-graph/health       探测 gh-puller 可达性
 """
