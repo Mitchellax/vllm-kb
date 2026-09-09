@@ -592,6 +592,212 @@ class TestEnrichForkSha(unittest.TestCase):
         self.assertEqual(rows, [{"vllm-ascend": "v0.23.0", "vllm": "0.23.0"}])
 
 
+class TestCommitTraceability(unittest.TestCase):
+    """镜像时间戳 + GitHub tag→commit（回答"这个镜像对应哪个 commit"）。"""
+
+    SHA = "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665"
+    DATE = "2026-06-15T03:35:17Z"
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    # ---- 镜像时间戳 ----
+
+    def test_image_created_from_last_modified(self):
+        # 时区显式 -0000 → 原样转 UTC；+0800 → 减 8 小时
+        self.assertEqual(bm._image_created({"last_modified": "Mon, 27 Jul 2026 15:39:42 -0000"}),
+                         "2026-07-27T15:39:42Z")
+        self.assertEqual(bm._image_created({"last_modified": "Mon, 27 Jul 2026 15:39:42 +0800"}),
+                         "2026-07-27T07:39:42Z")
+
+    def test_image_created_fallback_to_start_ts(self):
+        self.assertEqual(bm._image_created({"start_ts": 1785166782}), "2026-07-27T15:39:42Z")
+        self.assertEqual(bm._image_created({}), "")
+        self.assertEqual(bm._image_created({"last_modified": "not-a-date"}), "")
+
+    # ---- tag → commit ----
+
+    def _fake_session(self, payloads, calls=None):
+        calls = calls if calls is not None else []
+
+        class _Resp:
+            def __init__(self, status, body):
+                self.status_code = status
+                self._body = body
+                self.text = json.dumps(body)
+
+            def json(self):
+                return self._body
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise OSError(f"HTTP {self.status_code}")
+
+        class _Sess:
+            def get(self, url, params=None, headers=None, timeout=None):
+                calls.append({"url": url, "headers": headers or {}})
+                for key, resp in payloads.items():
+                    if key in url:
+                        return resp
+                return _Resp(404, {})
+
+        return _Sess(), calls
+
+    def test_fetch_tag_commit_success_and_cache(self):
+        from unittest import mock
+
+        calls = []
+        sess, calls = self._fake_session(
+            {"commits/tags/v0.23.0": type("R", (), {
+                "status_code": 200,
+                "json": staticmethod(lambda: {"sha": self.SHA,
+                                              "commit": {"committer": {"date": self.DATE}}}),
+                "raise_for_status": staticmethod(lambda: None),
+            })()}, calls)
+        with mock.patch("vllm_kb.net.get_session", return_value=sess), \
+                mock.patch("build_companion_matrix.default_cache_dir", return_value=self.cache_dir):
+            r1 = bm.fetch_tag_commit("vllm-project/vllm", "v0.23.0")
+            self.assertEqual(r1["sha"], self.SHA)
+            self.assertEqual(r1["date"], self.DATE)
+            self.assertEqual(r1["src"], "github")
+            # 缓存落盘
+            cache = json.loads((self.cache_dir / "github_tag_commits.json").read_text(encoding="utf-8"))
+            self.assertEqual(cache["vllm-project/vllm@v0.23.0"]["sha"], self.SHA)
+            # 第二次：零网络命中
+            n_before = len(calls)
+            r2 = bm.fetch_tag_commit("vllm-project/vllm", "v0.23.0")
+            self.assertEqual(r2["sha"], self.SHA)
+            self.assertEqual(len(calls), n_before)
+            self.assertEqual(r2["src"], "github缓存")
+
+    def test_fetch_tag_commit_404_not_cached(self):
+        from unittest import mock
+
+        sess, _ = self._fake_session({})  # 全部 404
+        with mock.patch("vllm_kb.net.get_session", return_value=sess), \
+                mock.patch("build_companion_matrix.default_cache_dir", return_value=self.cache_dir):
+            r = bm.fetch_tag_commit("vllm-project/vllm", "v9.9.9")
+        self.assertEqual(r["sha"], "")
+        self.assertFalse((self.cache_dir / "github_tag_commits.json").exists())
+
+    def test_fetch_commit_by_sha_cached_offline(self):
+        from unittest import mock
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "github_tag_commits.json").write_text(json.dumps(
+            {f"a/vllm@{self.SHA}": {"sha": self.SHA, "date": self.DATE}}), encoding="utf-8")
+        with mock.patch("vllm_kb.net.get_session",
+                        side_effect=AssertionError("缓存命中不应触网")), \
+                mock.patch("build_companion_matrix.default_cache_dir", return_value=self.cache_dir):
+            r = bm.fetch_commit_by_sha("a/vllm", self.SHA)
+        self.assertEqual(r["date"], self.DATE)
+
+    def test_resolve_tag_commits_skips_without_token(self):
+        from unittest import mock
+
+        with mock.patch("build_companion_matrix.default_cache_dir", return_value=self.cache_dir), \
+                mock.patch("build_companion_matrix._github_token", return_value=""), \
+                mock.patch("build_companion_matrix.fetch_tag_commit",
+                           side_effect=AssertionError("无 token 不应触网")) as m:
+            out = bm.resolve_tag_commits([("vllm-project/vllm", "v0.23.0")])
+        self.assertEqual(out, {})
+        self.assertFalse(m.called)
+
+    def test_resolve_tag_commits_uses_cache_without_token(self):
+        from unittest import mock
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "github_tag_commits.json").write_text(json.dumps(
+            {f"vllm-project/vllm@v0.23.0": {"sha": self.SHA, "date": self.DATE}}),
+            encoding="utf-8")
+        with mock.patch("build_companion_matrix.default_cache_dir", return_value=self.cache_dir), \
+                mock.patch("build_companion_matrix._github_token", return_value=""):
+            out = bm.resolve_tag_commits([("vllm-project/vllm", "v0.23.0")])
+        self.assertEqual(out[("vllm-project/vllm", "v0.23.0")]["sha"], self.SHA)
+
+    def test_resolve_tag_commits_dedup_and_skip_branch(self):
+        from unittest import mock
+
+        with mock.patch("build_companion_matrix.default_cache_dir", return_value=self.cache_dir), \
+                mock.patch("build_companion_matrix._github_token", return_value="tok"), \
+                mock.patch("build_companion_matrix.fetch_tag_commit",
+                           return_value={"sha": self.SHA, "date": self.DATE, "src": "github"}) as m:
+            out = bm.resolve_tag_commits([
+                ("vllm-project/vllm", "v0.23.0"),
+                ("vllm-project/vllm", "v0.23.0"),   # 去重
+                ("voidvelocity/vllm", "dev_hy4"),   # 分支名：跳过（非版本号形态）
+                ("", "v0.1.0"),                     # repo 空：跳过
+            ])
+        self.assertEqual(m.call_count, 1)
+        self.assertIn(("vllm-project/vllm", "v0.23.0"), out)
+        self.assertNotIn(("voidvelocity/vllm", "dev_hy4"), out)
+
+    # ---- build_rows 接入 ----
+
+    def test_build_rows_sets_image_created_and_commit(self):
+        from unittest import mock
+
+        groups = {"v0.23.0": [{"name": "v0.23.0", "manifest_digest": "d1",
+                               "last_modified": "Mon, 27 Jul 2026 15:39:42 -0000"}]}
+        env = ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.1.0",
+               "ARG VLLM_TAG=v0.23.0"]
+        history = [{"created_by": "ARG VLLM_REPO=https://github.com/vllm-project/vllm.git",
+                    "empty_layer": True},
+                   {"created_by": "ARG VLLM_TAG=v0.23.0", "empty_layer": True}]
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        return_value={"env": env, "history": history}), \
+                mock.patch("build_companion_matrix.fetch_pta_from_requirements",
+                           return_value={"torch": "", "torch_npu": "", "src": ""}), \
+                mock.patch("build_companion_matrix.resolve_tag_commits",
+                           return_value={("vllm-project/vllm", "v0.23.0"):
+                                         {"sha": self.SHA, "date": self.DATE, "src": "github"}}):
+            rows = bm.build_rows(groups, {}, "T")
+        r = rows[0]
+        self.assertEqual(r["image_created"], "2026-07-27T15:39:42Z")
+        self.assertEqual(r["vllm_commit"], self.SHA)
+        self.assertEqual(r["vllm_commit_date"], self.DATE)
+        self.assertNotIn("vllm_repo", r)  # 非 fork 行不写 fork 字段
+
+    def test_build_rows_fork_has_no_official_commit(self):
+        from unittest import mock
+
+        groups = {"hy4": [{"name": "hy4-a3", "manifest_digest": "d1",
+                           "last_modified": "Mon, 27 Jul 2026 15:39:42 -0000"}]}
+        history = [{"created_by": "ARG VLLM_REPO=https://github.com/voidvelocity/vllm.git",
+                    "empty_layer": True},
+                   {"created_by": "ARG VLLM_TAG=dev_hy4", "empty_layer": True}]
+        with mock.patch("build_companion_matrix.fetch_image_config",
+                        return_value={"env": ["VLLM_VERSION=0.23.0"], "history": history}), \
+                mock.patch("build_companion_matrix.fetch_pta_from_requirements",
+                           return_value={"torch": "", "torch_npu": "", "src": ""}), \
+                mock.patch("build_companion_matrix.resolve_tag_commits",
+                           return_value={("vllm-project/vllm", "v0.23.0"):
+                                         {"sha": self.SHA, "date": self.DATE, "src": "github"}}):
+            rows = bm.build_rows(groups, {}, "T")
+        r = rows[0]
+        self.assertEqual(r["vllm_repo"], "voidvelocity/vllm")
+        self.assertEqual(r["vllm_base"], "0.23.0")
+        self.assertEqual(r["image_created"], "2026-07-27T15:39:42Z")
+        # fork 行不写官方仓 commit（其锁定 SHA 由 enrich_fork_sha 扫描得到）
+        self.assertNotIn("vllm_commit", r)
+
+    def test_validate_datetime_fields(self):
+        rows = [{"vllm-ascend": "kimi-k3", "image_created": "2026-07-27T15:39:42Z",
+                 "vllm_commit_date": "2026-06-15T03:35:17Z", "vllm_commit": self.SHA},
+                {"vllm-ascend": "bad", "image_created": "2026/07/27",   # 非法
+                 "vllm_commit_date": "yesterday", "vllm_commit": "not-a-sha"}]
+        self.assertEqual(bm.validate_version_fields([dict(rows[0])]), 0)
+        n = bm.validate_version_fields(rows[1:])
+        self.assertEqual(n, 3)
+        self.assertEqual(rows[1]["image_created"], "")
+        self.assertEqual(rows[1]["vllm_commit_date"], "")
+        self.assertEqual(rows[1]["vllm_commit"], "")
+
+
 class TestExtractVllmFromRelease(unittest.TestCase):
     def test_upstream_statement(self):
         body = "This release aligns the plugin with upstream vLLM v0.23.0 and expands model support."

@@ -8,7 +8,12 @@
     锁定 commit 由 clone 层 .git 扫描固化（见 extract_fork_sha）；
 3. vllm-ascend GitHub release 说明 → **vllm** 配套版本
    （"aligns ... with upstream vLLM v0.23.0" / "based on vLLM v0.19.1"；
-    无说明时启发式：vllm-ascend 版本号跟踪上游 vllm，剥 rc 后缀）。
+    无说明时启发式：vllm-ascend 版本号跟踪上游 vllm，剥 rc 后缀）；
+4. 镜像时间戳与 commit 溯源（回答"这个镜像对应哪个 commit"）：
+   - `image_created`：quay tag 最后推送时间（ISO-8601 UTC）；
+   - `vllm_commit` / `vllm_commit_date`：镜像锁定的 vllm tag 经 GitHub 解析出的
+     commit（`commits/tags/{tag}`）；fork 行改为扫描 clone 层得到的 fork 仓 SHA +
+     该 SHA 的 commit 日期（此时 `vllm_commit` 是 fork 仓的 commit，不是官方仓）。
 
 自动无法确定的（npu-driver 等）→ 告警并留空，人工修复：
 人工已填写的字段优先保留（merge 时手工非空替换，自动只填空字段）。
@@ -23,6 +28,7 @@ tag 走 GitHub API 会撞未认证限流 60 次/小时；快照由 build_code_sn
                             首次扫描后不再重下 75MB 层）
   github_releases.json      release 说明（历史不可变，TTL 7 天兜底新 release）
   github_requirements.json  requirements 兜底结果（含 404，永久有效）
+  github_tag_commits.json   tag → commit SHA + 日期（tag 指向的 commit 不可变，永久有效）
 缓存消除两类重复网络成本：fork 层 75MB 下载（业务环境慢链路上分钟级）与
 GitHub API 用量（releases ~6 请求 + requirements ~40 请求/次 → 命中后 0）。
 
@@ -36,6 +42,7 @@ GitHub API 用量（releases ~6 请求 + requirements ~40 请求/次 → 命中�
 """
 import argparse
 import json
+import os
 import re
 import socket
 import sys
@@ -462,13 +469,16 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries:
 
 def enrich_fork_sha(rows: list[dict], groups: dict, token: str,
                     insecure: bool = False, qbase: str = "https://quay.io",
-                    refresh: bool = False) -> None:
-    """就地回填 fork 行的 vllm_sha（镜像 clone 层内的锁定 commit）。
+                    refresh: bool = False, gbase: str = "https://api.github.com") -> None:
+    """就地回填 fork 行的 vllm_sha（镜像 clone 层内的锁定 commit）与 vllm_commit_date。
 
     image_digest 锚定：tag 未重推（digest 不变）= 层内容不变 = SHA 不变，直接沿用
     已有值（跳过 ~75MB 层下载）；digest 变化（镜像重推）才重新扫描。扫描失败
     保留旧值并告警（不阻塞矩阵写回）。层 SHA 磁盘缓存（extract_fork_sha 内）
     进一步覆盖矩阵未写盘/新环境的场景。
+
+    vllm_commit_date：fork SHA 所属仓的 commit 日期（fork 仓 + 该 SHA），
+    与官方行的 vllm_commit_date 同语义——"这份代码是什么时候的"。解析失败留空。
     """
     fork_rows = [r for r in rows if r.get("vllm_repo")]
     if not fork_rows:
@@ -484,16 +494,29 @@ def enrich_fork_sha(rows: list[dict], groups: dict, token: str,
         if r.get("vllm_sha") and r.get("image_digest") == cur:
             print(f"[matrix]    {r['vllm-ascend']}: 镜像未重推（digest 锚命中），"
                   f"SHA 沿用 {r['vllm_sha'][:12]}", flush=True)
-            continue
-        out = extract_fork_sha(rep, token, insecure=insecure, qbase=qbase, refresh=refresh)
-        if out["sha"]:
-            r["vllm_sha"] = out["sha"]
-            r["image_digest"] = cur
-            print(f"[matrix]    {r['vllm-ascend']}: 锁定 commit {out['sha'][:12]}"
-                  f"（{r['vllm_repo']}@{r.get('vllm_ref') or '?'}）", flush=True)
         else:
-            print(f"[matrix]    [!] {r['vllm-ascend']}: SHA 扫描失败"
-                  f"（{out['error'] or '未知原因'}），保留旧值", flush=True)
+            out = extract_fork_sha(rep, token, insecure=insecure, qbase=qbase, refresh=refresh)
+            if out["sha"]:
+                r["vllm_sha"] = out["sha"]
+                r["image_digest"] = cur
+                print(f"[matrix]    {r['vllm-ascend']}: 锁定 commit {out['sha'][:12]}"
+                      f"（{r['vllm_repo']}@{r.get('vllm_ref') or '?'}）", flush=True)
+            else:
+                print(f"[matrix]    [!] {r['vllm-ascend']}: SHA 扫描失败"
+                      f"（{out['error'] or '未知原因'}），保留旧值", flush=True)
+        # fork 仓 SHA 的 commit 日期（与官方行 vllm_commit_date 同语义）
+        sha = (r.get("vllm_sha") or "").strip()
+        repo = (r.get("vllm_repo") or "").strip()
+        if sha and repo and not r.get("vllm_commit_date"):
+            cache = _cache_load(_TAG_COMMIT_CACHE)
+            cached = cache.get(f"{repo}@{sha}") or {}
+            if isinstance(cached, dict) and cached.get("date"):
+                r["vllm_commit_date"] = cached["date"]
+            elif _github_token():
+                c = fetch_commit_by_sha(repo, sha, insecure=insecure, gbase=gbase, refresh=refresh)
+                if c.get("date"):
+                    r["vllm_commit_date"] = c["date"]
+
 
 def extract_from_env(env: list[str]) -> dict[str, str]:
     """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本 / vllm tag。
@@ -612,12 +635,14 @@ def default_code_root() -> str:
 # ---------------- 跨运行缓存（data/cache/，不可变对象的扫描/拉取结果复用） ----------------
 # fork clone 层 SHA：层 digest 不可变 → 扫描结果永久有效；
 # GitHub release 说明：历史 release body 不可变（TTL 兜底新 release 更新）；
-# requirements 兜底结果：tag 内容不可变（含 404）。
+# requirements 兜底结果：tag 内容不可变（含 404）；
+# GitHub tag → commit：git tag 指向的 commit 不可变（TTL 兜底 tag 被移动的异常情况）。
 # 网络失败/部分数据一律不写缓存（下次重试），--refresh-cache 强制重拉。
 
 _FORK_SHA_CACHE = "fork_sha.json"
 _RELEASES_CACHE = "github_releases.json"
 _REQ_CACHE = "github_requirements.json"
+_TAG_COMMIT_CACHE = "github_tag_commits.json"
 
 
 def default_cache_dir() -> Path:
@@ -767,6 +792,207 @@ def extract_vllm_from_release(tag: str, body: str) -> tuple[str, str]:
     return "", ""
 
 
+# ---------------- 镜像时间戳 + GitHub tag → commit（"这个镜像对应哪个 commit"） ----------------
+
+def _image_created(tag_info: dict) -> str:
+    """quay tag 的最后推送时间 → ISO-8601 UTC（如 2026-07-27T15:39:42Z）。
+
+    取 tag 的 `last_modified`（"Mon, 27 Jul 2026 15:39:42 -0000"）；缺失/解析失败
+    回退 `start_ts`（epoch 秒）；都不可用返回 ''。平台变体推送时间可能不同，
+    调用方按代表 tag 取值（与 image_digest 同源，保证行内自洽）。
+
+    注意 `-0000`：按 RFC 2822 语义是"UTC 但时区未知"，但 `parsedate_to_datetime`
+    会把它当**本地时区**——这里显式归一化为 UTC，避免机器时区污染时间戳。
+    """
+    raw = (tag_info.get("last_modified") or "").strip()
+    if raw:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            dt = parsedate_to_datetime(re.sub(r"\s-0000$", " +0000", raw))
+            if dt is not None:
+                return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+    ts = tag_info.get("start_ts")
+    if ts:
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+    return ""
+
+
+def _github_token() -> str:
+    """GitHub token：config.json 的 github source（token / token_env）→ GITHUB_TOKEN 环境变量。
+
+    未配置时返回 ''（未认证限流 60 次/小时，tag→commit 解析靠缓存摊薄）。
+    """
+    try:
+        cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+        for s in cfg.get("sources", []) or []:
+            if s.get("type") == "github":
+                tok = (s.get("token") or "").strip()
+                if tok:
+                    return tok
+                env_name = (s.get("token_env") or "GITHUB_TOKEN").strip()
+                tok = (os.environ.get(env_name) or "").strip()
+                if tok:
+                    return tok
+    except Exception:
+        pass
+    return (os.environ.get("GITHUB_TOKEN") or "").strip()
+
+
+def fetch_tag_commit(repo: str, tag: str, insecure: bool = False,
+                     gbase: str = "https://api.github.com",
+                     refresh: bool = False) -> dict:
+    """GitHub tag → {sha, date, src}；失败返回全空（不缓存，下次重试）。
+
+    - `GET /repos/{repo}/commits/tags/{tag}`：一次拿到 tag 指向的 commit SHA +
+      committer 日期（annotated tag 会自动解引用到 commit）；
+    - 兜底 `GET /repos/{repo}/git/ref/tags/{tag}` 取 SHA（无日期）；
+    - 缓存（data/cache/github_tag_commits.json，key="{repo}@{tag}"）：tag 指向的
+      commit 不可变 → 永久有效（`--refresh-cache` 强制重拉，应对 tag 被移动的异常）。
+    """
+    import time as _t
+
+    from vllm_kb.net import get_session
+
+    key = f"{repo}@{tag}"
+    cache = _cache_load(_TAG_COMMIT_CACHE)
+    if not refresh:
+        ent = cache.get(key)
+        if isinstance(ent, dict) and ent.get("sha"):
+            return {"sha": ent["sha"], "date": ent.get("date", ""),
+                    "src": "github缓存"}
+
+    base = gbase.rstrip("/")
+    session = get_session(insecure)
+    headers = {"User-Agent": "vllm-kb", "Accept": "application/vnd.github+json"}
+    tok = _github_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    sha = date = ""
+    for attempt in range(3):
+        try:
+            r = session.get(f"{base}/repos/{repo}/commits/tags/{tag}",
+                            headers=headers, timeout=20)
+            if r.status_code == 200:
+                body = r.json()
+                sha = str(body.get("sha") or "")
+                date = str((body.get("commit") or {}).get("committer", {}).get("date") or "")
+                break
+            if r.status_code in (403, 429):
+                raise RuntimeError(f"HTTP {r.status_code}（限流？）")
+            if r.status_code == 404:
+                break  # tag 不存在：下面的 ref 兜底也没戏
+            r.raise_for_status()
+        except Exception as e:
+            if attempt == 2:
+                print(f"[matrix] tag→commit 解析失败 {key}: {e}", flush=True)
+                return {"sha": "", "date": "", "src": ""}
+            _t.sleep(2 ** attempt)
+    if not sha:
+        try:
+            r = session.get(f"{base}/repos/{repo}/git/ref/tags/{tag}",
+                            headers=headers, timeout=20)
+            if r.status_code == 200:
+                sha = str(((r.json().get("object") or {}).get("sha")) or "")
+        except Exception:
+            pass
+    if not sha:
+        return {"sha": "", "date": "", "src": ""}
+    cache[key] = {"sha": sha, "date": date, "resolved_at": time.time()}
+    _cache_save(_TAG_COMMIT_CACHE, cache)
+    return {"sha": sha, "date": date, "src": "github"}
+
+
+def fetch_commit_by_sha(repo: str, sha: str, insecure: bool = False,
+                        gbase: str = "https://api.github.com",
+                        refresh: bool = False) -> dict:
+    """按 SHA 查 commit 详情（fork 仓 SHA 的日期用）：返回 {sha, date, src}。
+
+    `GET /repos/{repo}/commits/{sha}`；缓存同 tag→commit（key="{repo}@{sha}"，
+    commit 不可变 → 永久有效）。失败返回全空。
+    """
+    import time as _t
+
+    from vllm_kb.net import get_session
+
+    key = f"{repo}@{sha}"
+    cache = _cache_load(_TAG_COMMIT_CACHE)
+    if not refresh:
+        ent = cache.get(key)
+        if isinstance(ent, dict) and ent.get("date"):
+            return {"sha": sha, "date": ent["date"], "src": "github缓存"}
+    base = gbase.rstrip("/")
+    session = get_session(insecure)
+    headers = {"User-Agent": "vllm-kb", "Accept": "application/vnd.github+json"}
+    tok = _github_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    for attempt in range(3):
+        try:
+            r = session.get(f"{base}/repos/{repo}/commits/{sha}",
+                            headers=headers, timeout=20)
+            if r.status_code == 200:
+                body = r.json()
+                date = str((body.get("commit") or {}).get("committer", {}).get("date") or "")
+                if date:
+                    cache[key] = {"sha": sha, "date": date, "resolved_at": time.time()}
+                    _cache_save(_TAG_COMMIT_CACHE, cache)
+                    return {"sha": sha, "date": date, "src": "github"}
+                return {"sha": sha, "date": "", "src": ""}
+            if r.status_code in (403, 429):
+                raise RuntimeError(f"HTTP {r.status_code}（限流？）")
+            r.raise_for_status()
+        except Exception as e:
+            if attempt == 2:
+                print(f"[matrix] commit 日期解析失败 {key}: {e}", flush=True)
+                return {"sha": sha, "date": "", "src": ""}
+            _t.sleep(2 ** attempt)
+    return {"sha": sha, "date": "", "src": ""}
+
+
+def resolve_tag_commits(pairs: list[tuple[str, str]], insecure: bool = False,
+                        gbase: str = "https://api.github.com",
+                        refresh: bool = False) -> dict[tuple[str, str], dict]:
+    """批量解析 (repo, tag) → commit，去重后逐个查缓存/网络。返回 {(repo, tag): {...}}。
+
+    repo 为空或 tag 为空/非版本号形态（如 fork 分支名 dev_hy4）直接跳过——
+    分支不是不可变引用，SHA 只能靠 clone 层扫描（见 enrich_fork_sha）。
+
+    未配置 GitHub token 且缓存未命中时**跳过网络解析**：45+ 个 tag 会瞬间打满
+    未认证限流（60 次/小时），宁可留空（矩阵其他字段照常），由人工或带 token 重跑补。
+    """
+    out: dict[tuple[str, str], dict] = {}
+    todo = sorted({(r, t) for r, t in pairs if r and t and _REF_VERSION_RE.match(t)})
+    if not todo:
+        return out
+    cache = _cache_load(_TAG_COMMIT_CACHE)
+    uncached = [(r, t) for r, t in todo
+                if not (isinstance(cache.get(f"{r}@{t}"), dict)
+                        and cache[f"{r}@{t}"].get("sha"))]
+    if uncached and not _github_token():
+        print(f"[matrix] 未配置 GITHUB_TOKEN：跳过 {len(uncached)} 个 tag 的 commit 解析"
+              f"（未认证限流 60 次/小时不够；配置 token 后重跑即可补齐，已缓存的不受影响）",
+              flush=True)
+        todo = [(r, t) for r, t in todo if (r, t) not in set(uncached)]
+        if not todo:
+            return out
+    print(f"[matrix] 解析 vllm tag→commit 共 {len(todo)} 个（缓存优先）...", flush=True)
+    for i, (repo, tag) in enumerate(todo, 1):
+        res = fetch_tag_commit(repo, tag, insecure=insecure, gbase=gbase, refresh=refresh)
+        out[(repo, tag)] = res
+        if res.get("sha"):
+            print(f"[matrix]   {i}/{len(todo)} {repo}@{tag} -> {res['sha'][:12]}"
+                  f"（{res.get('date', '')[:10]}，{res.get('src')}）", flush=True)
+        else:
+            print(f"[matrix]   {i}/{len(todo)} {repo}@{tag} -> 未解析到 commit", flush=True)
+    return out
+
+
 # ---------------- 构建与合并 ----------------
 
 def base_version_key(tag: str) -> str:
@@ -822,6 +1048,22 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         torch_by_base.setdefault(bv, req_by_tag[base]["torch"])
         pta_by_base.setdefault(bv, req_by_tag[base]["torch_npu"])
     pta_by_tag = {b: r["torch_npu"] for b, r in req_by_tag.items()}
+
+    # 镜像时间戳（代表 tag 的最后推送时间）+ 行级 vllm 版本参考（供 tag→commit 解析）
+    img_created: dict[str, str] = {}
+    vllm_ref_by_base: dict[str, tuple[str, str]] = {}  # base -> (repo, tag)
+    for base in sorted(groups):
+        rep = pick_representative(groups[base])
+        img_created[base] = _image_created(rep)
+        info = infos[base]
+        if info.get("is_fork"):
+            # fork：基线版本对应的官方 tag（vllm_base 是版本号，不是分支名）
+            if info.get("vllm_base"):
+                vllm_ref_by_base[base] = (OFFICIAL_VLLM_REPO, f"v{info['vllm_base']}")
+        elif info.get("vllm_tag"):
+            vllm_ref_by_base[base] = (OFFICIAL_VLLM_REPO, f"v{info['vllm_tag']}")
+    commits = resolve_tag_commits(list(vllm_ref_by_base.values()), insecure=insecure,
+                                  gbase=gbase, refresh=refresh_cache)
 
     rows = []
     for i, base in enumerate(sorted(groups), 1):
@@ -909,6 +1151,17 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             "notes": "; ".join(notes),
             "source": "自动(" + "+".join(provenance) + ")" if provenance else "待人工",
         }
+        if img_created.get(base):
+            # 镜像最后推送时间（quay tag last_modified）：与 image_digest 同源、行内自洽
+            row["image_created"] = img_created[base]
+        # vllm 代码 commit（非 fork 行）：镜像锁定的官方 tag 解析出的 commit
+        ref = vllm_ref_by_base.get(base)
+        if ref and not info.get("is_fork"):
+            c = commits.get(ref) or {}
+            if c.get("sha"):
+                row["vllm_commit"] = c["sha"]
+                if c.get("date"):
+                    row["vllm_commit_date"] = c["date"]
         if info.get("is_fork"):
             # fork 行（0day 开发分支镜像）：记录 fork 仓/分支/基线 + 镜像 digest
             # （digest 是锁定 SHA 扫描的不可变锚：未重推即可跳过 75MB 层下载）
@@ -929,7 +1182,8 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
 # merge 输出列序：已知字段在前，未知透传字段按字母序追加（新增字段不影响旧文件）
 _FIELD_ORDER = [
     "vllm-ascend", "vllm", "cann", "pytorch", "pytorch-ascend", "npu-driver",
-    "vllm_repo", "vllm_ref", "vllm_base", "vllm_sha", "image_digest",
+    "vllm_repo", "vllm_ref", "vllm_base", "vllm_sha",
+    "vllm_commit", "vllm_commit_date", "image_digest", "image_created",
     "notes", "source",
 ]
 
@@ -987,17 +1241,20 @@ def report_gaps(rows: list[dict]) -> int:
 # 合法版本号：x.y[.z][rcN/.postN]（vllm/cann/pytorch/pytorch-ascend/vllm_base 数字版本，含 rc/post 后缀）
 _VERSION_VALID_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?(?:rc\d+|\.post\d+)*$", re.IGNORECASE)
 # fork 行附加字段格式（非版本号，单独规则）
-_SHA_VALID_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)                 # vllm_sha：git commit
+_SHA_VALID_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)                 # vllm_sha/vllm_commit：git commit
 _DIGEST_VALID_RE = re.compile(r"^sha256:[0-9a-f]{64}$", re.IGNORECASE)       # image_digest：镜像 manifest
 _REPO_SLUG_VALID_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")      # vllm_repo：owner/name
+# 时间戳：image_created = ISO-8601 UTC；vllm_commit_date = GitHub committer date
+_DATETIME_VALID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$")
 
 
 def validate_version_fields(rows: list[dict]) -> int:
     """写回前校验所有版本/格式字段合法性：非法值置空 + 告警，避免非法值存入矩阵。
 
     返回非法字段数。合法格式示例：0.26.0 / 8.5.1 / 2.6.0 / 0.13.0rc1；
-    fork 附加字段：vllm_base 同版本规则，vllm_sha 40 位 hex，
-    image_digest 形如 sha256:<64hex>，vllm_repo 形如 owner/name。
+    fork 附加字段：vllm_base 同版本规则，vllm_sha/vllm_commit 40 位 hex，
+    image_digest 形如 sha256:<64hex>，vllm_repo 形如 owner/name，
+    image_created/vllm_commit_date 为 ISO-8601（如 2026-07-27T07:39:42Z）。
     """
     bad = 0
 
@@ -1013,6 +1270,9 @@ def validate_version_fields(rows: list[dict]) -> int:
         for f in COMPANION_FIELDS:
             _check(r, f, _VERSION_VALID_RE)
         _check(r, "vllm_sha", _SHA_VALID_RE)
+        _check(r, "vllm_commit", _SHA_VALID_RE)
+        _check(r, "image_created", _DATETIME_VALID_RE)
+        _check(r, "vllm_commit_date", _DATETIME_VALID_RE)
         _check(r, "image_digest", _DIGEST_VALID_RE)
         _check(r, "vllm_repo", _REPO_SLUG_VALID_RE)
     return bad
@@ -1112,14 +1372,19 @@ def main() -> None:
                            gbase=gbase, refresh_cache=args.refresh_cache)
     merged = merge_with_manual(auto_rows, manual_rows)
     # fork 行：clone 层扫描固化锁定 commit（digest 锚定 + 层 SHA 磁盘缓存，
-    # 首次扫描后跨运行零层下载；--refresh-cache 强制重扫）
+    # 首次扫描后跨运行零层下载；--refresh-cache 强制重扫）+ fork SHA 的 commit 日期
     enrich_fork_sha(merged, groups, token, insecure=insecure, qbase=qbase,
-                    refresh=args.refresh_cache)
+                    refresh=args.refresh_cache, gbase=gbase)
     # 写回前版本号合法性校验：非法版本置空（不污染矩阵，缺口报告会列出）
     n_bad = validate_version_fields(merged)
     if n_bad:
         print(f"[matrix] [!] {n_bad} 个非法版本字段已置空（详见上方）", flush=True)
     n_gaps = report_gaps(merged)
+    # commit 溯源统计：让"镜像 → commit"覆盖情况一眼可见
+    n_img = sum(1 for r in merged if r.get("image_created"))
+    n_com = sum(1 for r in merged if r.get("vllm_commit") or r.get("vllm_sha"))
+    print(f"[matrix] commit 溯源: image_created {n_img}/{len(merged)} 行，"
+          f"commit(vllm_commit 或 fork vllm_sha) {n_com}/{len(merged)} 行", flush=True)
 
     if not args.no_write:
         matrix_path.parent.mkdir(parents=True, exist_ok=True)

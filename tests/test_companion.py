@@ -120,5 +120,69 @@ class TestCompanionMatrix(unittest.TestCase):
         self.assertIsNone(CompanionMatrix.load(""))
 
 
+class TestCommitTraceFields(unittest.TestCase):
+    """commit 溯源字段（image_created / vllm_commit / fork 字段）随 /matrix 暴露给 agent。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, rows, generated_at="2026-09-09T00:00:00+00:00"):
+        p = self.dir / "m.json"
+        p.write_text(json.dumps({"generated_at": generated_at, "rows": rows}), encoding="utf-8")
+        return CompanionMatrix.load(p)
+
+    def test_official_row_commit_fields_survive(self):
+        m = self._write([{
+            "vllm-ascend": "kimi-k3", "vllm": "0.23.0", "cann": "9.0.1",
+            "pytorch": "2.10.0", "pytorch-ascend": "2.10.0.post4", "npu-driver": "",
+            "image_created": "2026-07-27T15:39:42Z",
+            "vllm_commit": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665",
+            "vllm_commit_date": "2026-06-15T03:35:17Z",
+            "notes": "", "source": "自动",
+        }])
+        row = m.rows[0]
+        self.assertEqual(row.image_created, "2026-07-27T15:39:42Z")
+        self.assertEqual(row.vllm_commit[:12], "0fc695fc6d1d")
+        self.assertEqual(row.vllm_commit_date, "2026-06-15T03:35:17Z")
+        dump = row.model_dump(by_alias=True)   # /matrix 端点用的就是它
+        for k in ("image_created", "vllm_commit", "vllm_commit_date"):
+            self.assertIn(k, dump)
+            self.assertTrue(dump[k])
+
+    def test_fork_row_fields_survive(self):
+        m = self._write([{
+            "vllm-ascend": "glm5.2", "vllm": "0.23.0", "cann": "9.0.0",
+            "pytorch": "", "pytorch-ascend": "", "npu-driver": "",
+            "vllm_repo": "ZYang6263/vllm", "vllm_ref": "glm52", "vllm_base": "0.23.0",
+            "vllm_sha": "1" * 40, "image_digest": "sha256:" + "a" * 64,
+            "image_created": "2026-07-27T15:39:42Z",
+            "vllm_commit_date": "2026-07-20T01:02:03Z",
+            "notes": "", "source": "自动",
+        }])
+        row = m.rows[0]
+        self.assertEqual(row.vllm_repo, "ZYang6263/vllm")
+        self.assertEqual(row.vllm_sha, "1" * 40)
+        self.assertEqual(row.image_digest, "sha256:" + "a" * 64)
+        self.assertEqual(row.vllm_commit_date, "2026-07-20T01:02:03Z")
+
+    def test_generated_at_exposed(self):
+        m = self._write([{"vllm-ascend": "0.18.0", "vllm": "0.12.1", "cann": "8.1.RC2",
+                          "pytorch": "2.6.0", "pytorch-ascend": "2.6.0.post1"}],
+                        generated_at="2026-09-09T12:34:56+00:00")
+        self.assertEqual(m.generated_at, "2026-09-09T12:34:56+00:00")
+
+    def test_old_matrix_without_new_fields_ok(self):
+        m = self._write([{"vllm-ascend": "0.18.0", "vllm": "0.12.1", "cann": "8.1.RC2",
+                          "pytorch": "2.6.0", "pytorch-ascend": "2.6.0.post1"}])
+        row = m.rows[0]
+        self.assertEqual(row.image_created, "")
+        self.assertEqual(row.vllm_commit, "")
+        self.assertEqual(row.vllm_commit_date, "")
+
+
 if __name__ == "__main__":
     unittest.main()

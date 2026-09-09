@@ -51,10 +51,12 @@ def register(app, ctx) -> None:
 
     @app.get("/matrix")
     def matrix():
+        """全量配套矩阵（含 commit 溯源字段：image_created / vllm_commit / vllm_commit_date）。"""
         m = engine.companion
         if m is None:
-            return {"rows": []}
-        return {"rows": [r.model_dump(by_alias=True) for r in m.rows]}
+            return {"rows": [], "generated_at": ""}
+        return {"generated_at": m.generated_at,
+                "rows": [r.model_dump(by_alias=True) for r in m.rows]}
 
     @app.get("/stats")
     def stats():

@@ -191,14 +191,23 @@ def fmt_matrix(data: dict, limit: int = 100) -> str:
     if not rows:
         return "(配套矩阵未构建或为空 —— 运行 scripts/build_companion_matrix.py)"
     shown = rows[:limit]
-    lines = [f"配套矩阵共 {len(rows)} 行（调试/管理用；日常查询用 companion <组件> <版本>）:"]
+    head = f"配套矩阵共 {len(rows)} 行（调试/管理用；日常查询用 companion <组件> <版本>）"
+    if data.get("generated_at"):
+        head += f"；生成于 {data['generated_at'][:19]}"
+    lines = [head + ":"]
+    # 长字段缩略显示（commit/digest 全量太长，前缀足够核对）
+    short = {"vllm_sha": 12, "vllm_commit": 12, "image_digest": 19}
     for r in shown:
-        parts = "  ".join(
-            f"{k}={v}" for k, v in r.items() if v and k not in ("notes", "source")
-        )
+        parts = []
+        for k, v in r.items():
+            if not v or k in ("notes", "source"):
+                continue
+            if k in short and len(str(v)) > short[k]:
+                v = f"{str(v)[:short[k]]}…"
+            parts.append(f"{k}={v}")
         notes = f"  notes: {r.get('notes')}" if r.get("notes") else ""
         src = f"  source: {r.get('source')}" if r.get("source") else ""
-        lines.append(f"  {parts}{notes}{src}")
+        lines.append("  " + "  ".join(parts) + notes + src)
     if len(rows) > limit:
         lines.append(f"  … 共 {len(rows)} 行（显示前 {limit}；用 --limit 调整）")
     return "\n".join(lines)

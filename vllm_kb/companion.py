@@ -28,6 +28,13 @@ class CompanionRow(BaseModel):
 
     JSON 键使用组件名（含连字符，如 "vllm-ascend"），通过 alias 映射到字段。
     source 记录来源（自动匹配 / 人工），便于核对。
+
+    commit 溯源字段（回答"这个镜像对应哪个 commit"）：
+    - image_created：镜像最后推送时间（ISO-8601 UTC）；
+    - vllm_commit / vllm_commit_date：镜像锁定的 vllm 代码 commit 与其日期
+      （官方仓镜像按 tag 解析；fork 行改用 vllm_sha + vllm_commit_date）；
+    - vllm_repo / vllm_ref / vllm_base / vllm_sha / image_digest：fork 行（0day
+      开发分支镜像）的仓/分支/基线/锁定 commit/镜像 digest。
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -40,6 +47,15 @@ class CompanionRow(BaseModel):
     npu_driver: str = Field(default="", alias="npu-driver")
     notes: str = ""  # 已知问题/注意事项（可含 NPU 驱动已知问题、SOC/python 环境）
     source: str = ""  # 来源：自动(镜像env+release) / 人工 / 待人工
+    # ---- commit 溯源（矩阵自动写入；旧矩阵无这些字段时留空）----
+    vllm_commit: str = ""        # vllm 代码 commit（官方仓 tag 解析；fork 行同 vllm_sha）
+    vllm_commit_date: str = ""   # 上述 commit 的提交日期（ISO-8601）
+    image_created: str = ""      # 镜像最后推送时间（ISO-8601 UTC）
+    vllm_repo: str = ""          # fork 仓 owner/name
+    vllm_ref: str = ""           # fork 分支
+    vllm_base: str = ""          # fork 基线版本
+    vllm_sha: str = ""           # fork 镜像 clone 层锁定的 commit
+    image_digest: str = ""       # 镜像 manifest digest（fork SHA 扫描锚）
 
 
 class CompanionMatrix:
@@ -47,6 +63,7 @@ class CompanionMatrix:
 
     def __init__(self, rows: list[CompanionRow]):
         self.rows = rows
+        self.generated_at: str = ""  # 矩阵生成时间（文件顶层 generated_at）
         self._by: dict[tuple[str, str], list[CompanionRow]] = {}
         for r in rows:
             for comp, key in self._iter_versions(r):
@@ -75,6 +92,8 @@ class CompanionMatrix:
         if not rows:
             return None
         matrix = cls([CompanionRow.model_validate(r) for r in rows])
+        if isinstance(data, dict):
+            matrix.generated_at = str(data.get("generated_at") or "")
         matrix._warn_gaps()
         return matrix
 
