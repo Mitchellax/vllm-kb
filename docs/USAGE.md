@@ -181,6 +181,13 @@ python scripts/build_image_snapshots.py --tag glm5.2   # 只提指定镜像（�
 python scripts/build_image_snapshots.py --index-only   # 只重建索引（不联网）
 python scripts/build_image_snapshots.py --refresh      # 忽略 digest 锚，强制重取
 
+# 同上，离线归档导入（quay 直连困难时：内网预存镜像压缩包直接解析，不触网、
+# 不需要 docker——docker load 能导入的 docker save/OCI 归档即可用）
+python scripts/build_image_snapshots.py --archive D:\imgs\glm5.2.tar.gz      # 单个（tag=文件名主干）
+python scripts/build_image_snapshots.py --archive glm5.2=D:\imgs\x.tar.gz   # 显式指定 img: 键
+python scripts/build_image_snapshots.py --archive-dir D:\imgs\               # 批量（*.tar/.tar.gz/.tgz）
+python scripts/build_image_snapshots.py --list --archive-dir D:\imgs\        # 只看导入计划
+
 # 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配）
 python scripts/build_companion_matrix.py
 python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（默认按 TTL/不可变语义命中）
@@ -688,7 +695,10 @@ python skills/vllm-kb/client.py code-versions --repo img        # 已提取镜�
 - 第一列就是 `--repo img:{tag}` 里的 tag；**"组=…"** 对应用户口中的镜像名（例如用户说
   "hy4 镜像"，实际 quay tag 是 `hy4-a3`，检索要用 `--repo img:hy4-a3`）；
 - `code-versions --repo img:<tag>` 看该镜像元信息（digest / 镜像时间 / vllm commit / 层内插件 commit）；
-- 某镜像不在清单里 → 由管理员跑 `python scripts/build_image_snapshots.py --tag <tag>`
+- 某镜像不在清单里 → 由管理员跑 `python scripts/build_image_snapshots.py --tag <tag>`；
+  quay 直连困难（隔离网/离线）时，内网预存的 docker save/OCI 归档可直接离线导入：
+  `--archive <tar.gz>` / `--archive-dir <目录>`（不触网、不需要 docker；meta.source 标注
+  `archive:`，其余字段与在线提取一致）
   （agent 无写权限，不要尝试自行提取）。
 
 命中新版本后，用 GitHub commits API 按文件路径过滤找引入 commit → PR 编号 →

@@ -178,7 +178,9 @@ python client.py diff img:glm5.2 vllm-ascend:v0.23.0 vllm_ascend/worker/model_ru
 - 镜像快照的**版本键 = 镜像 tag**（如 `glm5.2`、`hy4-a3`），不是上游版本号；
   `code-versions --repo img:<tag>` 可看该镜像的元信息（digest / 镜像时间 / vllm commit / 插件 commit）。
 - 若某镜像未提取：`code-versions --repo img` 列表里没有它 → 提示管理员运行
-  `python scripts/build_image_snapshots.py --tag <tag>`（agent 无写权限，不要尝试自行提取）。
+  `python scripts/build_image_snapshots.py --tag <tag>`；quay 直连困难（隔离网/离线）时，
+  内网预存的 docker save/OCI 压缩包可离线导入（`--archive <tar.gz>` / `--archive-dir <目录>`，
+  不触网、不需要 docker），导入后检索方式不变（agent 无写权限，不要尝试自行提取）。
 - 插件代码**没有 git 元数据**（`COPY .` 拷入），无法给出它自身的上游 commit；
   需要"这份代码相对上游改了哪些行"就用 §6 的跨命名空间 diff。
 

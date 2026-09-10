@@ -80,7 +80,7 @@
 | `python scripts/build_code_snapshots.py` | vllm-ascend 各版本：`data/code/zips/{version}.zip` + 解压 `data/code/snapshots/{version}/` |
 | `python scripts/build_vllm_snapshots.py` | 对应 vllm 主仓快照（版本由配套矩阵映射，自动跟随） |
 | `python scripts/build_fork_snapshots.py` | 0day fork 仓快照（hy4/glm5.2 等模型开发分支）：`data/code/forks/{model}/`，版本=镜像锁定 commit（SHA 前 12 位）——检索走 `repo=fork:{model}` 命名空间，与官方版本物理隔离 |
-| `python scripts/build_image_snapshots.py` | **0day 镜像内的 vllm-ascend 插件源码**：只拉镜像的 `COPY . /vllm-workspace/vllm-ascend/` 层（实测 23~101MB；整镜像 6GB+ 中的 CANN/编译层属二进制，不拉），解到 `data/code/images/{tag}/snapshots/{tag}/` + `index.sqlite3` + `meta.json`（image_digest/镜像时间/vllm commit/插件层 digest/层内 `.git` 若有则记 plugin_commit）——检索走 `repo=img:{tag}`，版本键=镜像 tag；`repo=img` 为列举入口；镜像 digest 未变则跳过重取 |
+| `python scripts/build_image_snapshots.py` | **0day 镜像内的 vllm-ascend 插件源码**：只拉镜像的 `COPY . /vllm-workspace/vllm-ascend/` 层（实测 23~101MB；整镜像 6GB+ 中的 CANN/编译层属二进制，不拉），解到 `data/code/images/{tag}/snapshots/{tag}/` + `index.sqlite3` + `meta.json`（image_digest/镜像时间/vllm commit/插件层 digest/层内 `.git` 若有则记 plugin_commit）——检索走 `repo=img:{tag}`，版本键=镜像 tag；`repo=img` 为列举入口；镜像 digest 未变则跳过重取。**离线路径**：`--archive <tar.gz>` / `--archive-dir <目录>` 直接解析内网 docker save/OCI 归档（不触网、不需要 docker），meta.source 标注 `archive:`，目录契约与在线路径一致 |
 | `python scripts/build_code_snapshots.py --index-only` | 派生数据重建：`data/code/index.sqlite3`（符号索引 + 报错字面量索引）、`symbols.json`（三层签名符号表）、`signal_words.json`（社区高频信号词，统计实现 `scripts/build_signal_words.py`，可单独运行） |
 
 ### 2.4 辅助数据
