@@ -16,6 +16,11 @@
         index.sqlite3                  # 符号索引（只读连接）
         zips/{version}.zip             # 源码快照（zip）
         snapshots/{version}/...        # 解压缓存（可删，zip 是事实源）
+        forks/{model}/                 # 0day fork 仓（vllm 源码）快照 + 独立索引
+        images/{tag}/                  # 0day 镜像内 vllm-ascend 插件源码（从镜像层提取）
+
+命名空间（repo 参数）：
+    vllm-ascend（默认）/ vllm / fork:{model} / img:{tag}；img（无 tag）= 聚合视图（只列已提取镜像）。
 """
 from __future__ import annotations
 
@@ -47,6 +52,8 @@ _CPP_KEYWORD_STOP = {
 }
 # fork 命名空间（0day 开发分支快照）模型目录名白名单（防路径穿越）
 _FORK_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# 镜像 tag 白名单（img:{tag}；quay tag 形如 glm5.2 / hy4-a3 / DeepSeekV4-flash-0731）
+_IMG_TAG_RE = _FORK_MODEL_RE
 _OP_ATTR_RE = re.compile(r"\b(aclnn[A-Z][A-Za-z0-9_]*|npu[A-Z][A-Za-z0-9_]*)")
 _KERNEL_NAME_RE = re.compile(r"\b(dispatch_ffn_combine|mega_moe|[a-z0-9_]+_combine|[a-z0-9_]+_dispatch)\b")
 _ENV_NAME_RE = re.compile(r"\b(VLLM_ASCEND_[A-Z0-9_]+|HCCL_[A-Z0-9_]+)")
@@ -71,7 +78,9 @@ class VersionedCode:
     cfg: AppConfig（读 storage.code_root / code.versions）
     repo: 仓库子目录名——"vllm-ascend"（默认，data/code/）| "vllm"（data/code/vllm/）
           | "fork:{model}"（0day 开发分支快照，data/code/forks/{model}/，
-            模型名仅限字母/数字/./_/-，防路径穿越）。
+            模型名仅限字母/数字/./_/-，防路径穿越）
+          | "img:{tag}"（0day 镜像内 vllm-ascend 插件源码，data/code/images/{tag}/，
+            tag 为该镜像的 quay tag，字符集同上，防路径穿越）。
     """
 
     def __init__(self, cfg: AppConfig, repo: str = "vllm-ascend"):
@@ -84,11 +93,35 @@ class VersionedCode:
                 raise CodeIndexError(
                     f"非法 fork 模型名 {model!r}（仅限字母/数字/./_/-）")
             self.root = self.root / "forks" / model
+        elif repo.startswith("img:"):
+            tag = repo[4:]
+            if not _IMG_TAG_RE.match(tag) or tag in (".", ".."):
+                raise CodeIndexError(
+                    f"非法镜像 tag {tag!r}（仅限字母/数字/./_/-）")
+            self.root = self.root / "images" / tag
         elif repo and repo != "vllm-ascend":
             self.root = self.root / repo
         self.index_path = self.root / "index.sqlite3"
         self.zips_dir = self.root / "zips"
         self.snapshots_dir = self.root / "snapshots"
+
+    @property
+    def _preset_hint(self) -> str:
+        """命名空间对应的"如何预存"提示（错误信息里给 agent 可执行指引）。"""
+        if self.repo.startswith("img:"):
+            return f"运行 scripts/build_image_snapshots.py --tag {self.repo[4:]}"
+        if self.repo.startswith("fork:"):
+            return "运行 scripts/build_fork_snapshots.py"
+        if self.repo == "vllm":
+            return "运行 scripts/build_vllm_snapshots.py"
+        return "运行 scripts/build_code_snapshots.py"
+
+    @property
+    def _built_hint(self) -> str:
+        """索引重建提示（同上，按命名空间给对应脚本）。"""
+        if self.repo.startswith(("img:", "fork:")):
+            return f"{self._preset_hint} --index-only"
+        return "scripts/build_code_snapshots.py --index-only"
 
     # ---------------- 版本与快照 ----------------
 
@@ -120,11 +153,19 @@ class VersionedCode:
         snap = self._snapshot_dir(version)
         if snap.is_dir() and any(snap.iterdir()):
             return snap
+        if self.repo.startswith("img:"):
+            # img 命名空间：版本键就是镜像 tag；给出"已提取镜像"清单，便于 agent 自我纠正
+            extracted = [d.name for d in self.root.parent.iterdir()
+                         if d.is_dir()] if self.root.parent.is_dir() else []
+            raise CodeIndexError(
+                f"镜像 {self.repo[4:]!r} 的插件源码未提取（已提取：{extracted or '(无)'}）。"
+                f"{self._preset_hint} 提取。"
+            )
         zpath = self.zips_dir / f"{version}.zip"
         if not zpath.exists():
             raise CodeIndexError(
                 f"版本 {version} 未预存：可用版本 {self.available_versions or '(无)'}。"
-                "运行 scripts/build_code_snapshots.py 预存。"
+                f"{self._preset_hint} 预存。"
             )
         snap.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zpath) as zf:
@@ -182,14 +223,14 @@ class VersionedCode:
                 conn.execute("ALTER TABLE symbols ADD COLUMN kind TEXT")
             return conn
         if not self.index_path.exists():
-            raise CodeIndexError("符号索引不存在：运行 scripts/build_code_snapshots.py 构建")
+            raise CodeIndexError(f"符号索引不存在：{self._preset_hint} 构建")
         conn = sqlite3.connect(f"file:{self.index_path}?mode=ro", uri=True)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)")]
         if "kind" not in cols:
             conn.close()
             raise CodeIndexError(
                 "符号索引 schema 过旧（缺 kind 列，提取规则升级前构建）："
-                "先停检索 API，运行 scripts/build_code_snapshots.py --index-only 重建，再重启"
+                f"先停检索 API，{self._built_hint} 重建，再重启"
             )
         return conn
 
@@ -461,3 +502,38 @@ def _extract_pattern_symbols(text: str, lines: list[str], syms: set) -> None:
 def load_versioned_code(cfg: Optional[AppConfig] = None) -> VersionedCode:
     cfg = cfg or AppConfig.load()
     return VersionedCode(cfg)
+
+
+def list_image_snapshots(code_root: Path) -> list[dict]:
+    """列出已提取的镜像插件源码快照（data/code/images/*/meta.json）。
+
+    返回 [{tag, group, variants, image_digest, image_created, vllm_commit,
+    vllm_commit_date, vllm_baseline, layer_size, extracted_at, plugin_commit,
+    indexed, extracted}]（按 tag 排序）；无 meta.json 的目录也会列出（tag 从目录名取，
+    其余字段空），避免"拉了层但没写 meta"时对 agent 不可见。
+
+    group/variants：矩阵行键（组名）与平台变体 tag——agent 常按"用户说的镜像名"
+    （可能是组名，如 hy4）找前缀，两者都给出来便于对应。
+    """
+    root = Path(code_root) / "images"
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    for d in sorted(p for p in root.iterdir() if p.is_dir()):
+        ent: dict = {"tag": d.name, "group": d.name, "variants": [],
+                     "image_digest": "", "image_created": "",
+                     "vllm_commit": "", "vllm_commit_date": "", "vllm_baseline": "",
+                     "layer_size": 0, "extracted_at": "", "plugin_commit": "",
+                     "indexed": (d / "index.sqlite3").exists()}
+        meta_path = d / "meta.json"
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(meta, dict):
+                    ent.update({k: meta.get(k, ent[k]) for k in ent if k in meta})
+            except Exception:
+                pass
+        snaps = d / "snapshots"
+        ent["extracted"] = snaps.is_dir() and any(p.is_dir() for p in snaps.iterdir())
+        out.append(ent)
+    return out

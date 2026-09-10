@@ -215,12 +215,44 @@ def fmt_matrix(data: dict, limit: int = 100) -> str:
 
 
 def fmt_code_versions(data: dict) -> str:
-    versions = data.get("versions", [])
     repo = data.get("repo", "vllm-ascend")
+    # repo=img：已提取镜像聚合视图（agent 发现 img:{tag} 前缀的入口）
+    images = data.get("images")
+    if images is not None:
+        if not images:
+            return f"[img] (尚无已提取的镜像源码) {data.get('note', '')}"
+        lines = [f"[img] 已提取 {len(images)} 个镜像的插件源码"
+                 f"（检索：code <符号> --repo img:<tag>）："]
+        for i in images:
+            parts = [f"{i.get('tag')}"]
+            # 组名/变体：用户常按"组名"（如 hy4 镜像，实际 tag 是 hy4-a3）描述镜像
+            group = i.get("group") or ""
+            variants = i.get("variants") or []
+            if group and group != i.get("tag"):
+                parts.append(f"组={group}")
+            if len(variants) > 1:
+                parts.append(f"变体={len(variants)}")
+            if i.get("vllm_commit"):
+                parts.append(f"vllm_commit={str(i['vllm_commit'])[:12]}")
+            elif i.get("vllm_baseline"):
+                parts.append(f"vllm基线={i['vllm_baseline']}")
+            if i.get("image_created"):
+                parts.append(f"镜像时间={i['image_created']}")
+            if i.get("plugin_commit"):
+                parts.append(f"插件commit={str(i['plugin_commit'])[:12]}")
+            parts.append("索引=有" if i.get("indexed") else "索引=无")
+            lines.append("  " + "  ".join(parts))
+        lines.append(f"提示: {data.get('note', '')}")
+        return "\n".join(lines)
+    versions = data.get("versions", [])
     if not versions:
         return f"[{repo}] (未预存版本) {data.get('note', '')}"
-    return f"[{repo}] 可用版本:\n" + "\n".join(f"  {v}" for v in versions) + \
-           f"\n提示: {data.get('note', '')}"
+    head = f"[{repo}] 可用版本:\n" + "\n".join(f"  {v}" for v in versions)
+    meta = data.get("meta")
+    if isinstance(meta, dict) and meta:
+        bits = [f"{k}={v}" for k, v in meta.items() if v and k not in ("variants",)]
+        head += "\n镜像/来源元信息: " + "  ".join(str(b) for b in bits[:8])
+    return head + f"\n提示: {data.get('note', '')}"
 
 
 def fmt_code_hits(data: dict) -> str:
@@ -584,7 +616,9 @@ def main() -> None:
                    help="符号/关键词（如 DispatchFFNCombine、halMemCreate；--file 读取文件模式可省略）")
     p.add_argument("--version", default=None, help="限定版本（默认全部已预存版本）")
     p.add_argument("--limit", type=int, default=20)
-    p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
+    p.add_argument("--repo", default="vllm-ascend",
+                   help="仓库：vllm-ascend（默认）| vllm | fork:{model}（0day fork 仓 vllm 代码）"
+                        "| img:{tag}（0day 镜像内 vllm-ascend 插件代码，如 img:glm5.2）")
     p.add_argument("--file", dest="code_file", metavar="PATH", default=None,
                    help="直接读取指定版本源码文件（需配合 --version；此时忽略 keyword）")
     p.add_argument("--max-chars", dest="code_max_chars", type=int, default=20000,
@@ -597,16 +631,20 @@ def main() -> None:
                    help="限定符号类型：msg=报错字面量子串检索（raise/assert/logger.error 的字符串参数，"
                         "定位'报错文本来自哪段代码'）；默认全部类型")
 
-    p = sub.add_parser("code-versions", help="列出已预存的代码仓版本")
-    p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
+    p = sub.add_parser("code-versions", help="列出已预存的代码仓版本 / 已提取的镜像源码")
+    p.add_argument("--repo", default="vllm-ascend",
+                   help="仓库：vllm-ascend（默认）| vllm | fork:{model} | img:{tag}；"
+                        "repo=img 列出**全部已提取镜像**（发现 img: 前缀的入口）")
 
-    p = sub.add_parser("diff", help="跨版本精确 diff：对比两个版本同一文件的 unified diff")
-    p.add_argument("v1", help="旧版本（如 v0.22.1rc1）")
-    p.add_argument("v2", help="新版本（如 v0.23.0rc1）")
+    p = sub.add_parser("diff", help="精确 diff：两个版本/两个命名空间同一文件的 unified diff")
+    p.add_argument("v1", help="旧版本（如 v0.22.1rc1）；可带命名空间前缀：img:{tag} / fork:{model}@{sha12} / "
+                              "vllm-ascend:{版本} / vllm:{版本}")
+    p.add_argument("v2", help="新版本（同上，可带前缀；如 img:glm5.2 与 vllm-ascend:0.23.0 对比）")
     p.add_argument("path", help="文件路径（相对仓库根，如 vllm_ascend/worker/model_runner_v1.py）")
     p.add_argument("--keyword", default=None, help="只显示包含该关键词的差异行（定位修复代码）")
     p.add_argument("--context", type=int, default=3, help="diff 上下文行数")
-    p.add_argument("--repo", default="vllm-ascend", help="仓库：vllm-ascend（默认）| vllm")
+    p.add_argument("--repo", default="vllm-ascend",
+                   help="两侧都未带前缀时使用的仓库：vllm-ascend（默认）| vllm | fork:{model} | img:{tag}")
 
     p = sub.add_parser("doc", help="读取整篇文档")
     p.add_argument("doc_id")
