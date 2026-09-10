@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import build_image_snapshots as bis  # noqa: E402
@@ -192,6 +194,76 @@ class TestDownloadLayer(unittest.TestCase):
                 self.assertRaises(RuntimeError):
             bis.download_layer(meta, "sha256:l", 10, retries=3)
         self.assertEqual(sess.calls, 3)
+
+
+class _FakeResp:
+    """最小 HTTP 响应：状态码 + json 载荷 + raise_for_status 行为。"""
+
+    def __init__(self, status=200, payload=None):
+        self.status_code = status
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"HTTP {self.status_code}", response=self)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []  # (url, headers)
+
+    def get(self, url, **kw):
+        self.calls.append((url, kw.get("headers") or {}))
+        return self._responses.pop(0)
+
+
+class TestFetchImageLayersHardening(unittest.TestCase):
+    """在线路径加固：HTTP 错误态绝不流入解析；blob 401 刷新匿名 token 重试。
+
+    背景（真实事故）：匿名 token 有效期短，首个镜像下载重试耗掉有效期后，
+    后续 config blob 请求全部 401——旧代码不查状态码，错误 JSON 被解析成
+    空 history，整批镜像被误报"未找到插件层，跳过"。
+    """
+
+    MANIFEST = {"config": {"digest": "sha256:" + "c" * 64},
+                "layers": [{"digest": "sha256:" + "e" * 64, "size": 123}]}
+    CONFIG = {"history": [{"created_by": "COPY . /vllm-workspace/vllm-ascend/ # buildkit",
+                           "empty_layer": False}]}
+
+    def _run(self, session, token="expired"):
+        with mock.patch("vllm_kb.net.get_session", return_value=session), \
+                mock.patch("build_image_snapshots.time.sleep"):
+            return bis.fetch_image_layers({"manifest_digest": "sha256:" + "d" * 64},
+                                          token, insecure=False)
+
+    def test_blob_401_refreshes_token_and_retries(self):
+        sess = _FakeSession([
+            _FakeResp(200, {"manifest_data": json.dumps(self.MANIFEST)}),  # manifest
+            _FakeResp(401, {"errors": [{"code": "UNAUTHORIZED"}]}),        # blob：token 过期
+            _FakeResp(200, self.CONFIG),                                   # 刷新后成功
+        ])
+        with mock.patch.object(bis.bcm, "get_quay_token", return_value="fresh") as gt:
+            meta = self._run(sess)
+        self.assertTrue(gt.called)
+        self.assertEqual(meta["token"], "fresh")
+        self.assertEqual(meta["history"], self.CONFIG["history"])
+        self.assertEqual(sess.calls[2][1].get("Authorization"), "Bearer fresh")
+
+    def test_deterministic_4xx_raises_without_retry(self):
+        sess = _FakeSession([_FakeResp(404, {"error": "not found"})])
+        with self.assertRaises(requests.exceptions.HTTPError):
+            self._run(sess)
+        self.assertEqual(len(sess.calls), 1)  # 404 确定性错误：不重试
+
+    def test_429_still_retries_then_raises(self):
+        sess = _FakeSession([_FakeResp(429, {}) for _ in range(4)])
+        with self.assertRaises(requests.exceptions.HTTPError):
+            self._run(sess)
+        self.assertEqual(len(sess.calls), 4)
 
 
 class TestCandidates(unittest.TestCase):

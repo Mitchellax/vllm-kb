@@ -89,19 +89,43 @@ def fetch_image_layers(tag_info: dict, token: str, insecure: bool = False,
         for i in range(retries):
             try:
                 kw.setdefault("timeout", 90)
-                return session.get(url, **kw)
+                r = session.get(url, **kw)
+                r.raise_for_status()  # HTTP 错误态绝不流入 .json()——否则错误 JSON 会被
+                return r              # 当成 config 解析出空 history，伪装成"未找到插件层"
             except Exception as e:  # noqa: BLE001  （quay CDN 偶发握手/读超时）
                 last = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    raise  # 4xx（除 429）是确定性错误，重试无意义
                 time.sleep(2 ** i)
         raise last
+
+    def _blob_json(blob_digest: str) -> dict:
+        """config blob：401/403 = 匿名 token 过期 → 刷新一次重试。
+
+        quay 匿名 token 有效期短；首个镜像的下载重试就可能耗掉整段有效期，之后的
+        blob 请求全部 401——若不查状态码，错误 JSON 会让 history 变空表，把鉴权故障
+        伪装成"未找到插件层"（曾导致整批镜像被误报跳过）。
+        """
+        nonlocal token
+        url = f"{v2}/blobs/{blob_digest}"
+        try:
+            r = _get(url, headers={"Authorization": "Bearer " + token})
+        except Exception as e:  # noqa: BLE001
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (401, 403):
+                raise
+            print("[img]     匿名 token 失效（401/403），刷新后重试", flush=True)
+            token = bcm.get_quay_token(insecure=insecure, qbase=qbase)
+            r = _get(url, headers={"Authorization": "Bearer " + token})
+        return r.json()
 
     md = json.loads(_get(f"{api}/manifest/{digest}").json()["manifest_data"])
     if md.get("manifests"):
         arch = next((x for x in md["manifests"]
                      if x["platform"].get("architecture") == "amd64"), md["manifests"][0])
         md = json.loads(_get(f"{api}/manifest/{arch['digest']}").json()["manifest_data"])
-    cfg = _get(f"{v2}/blobs/{md['config']['digest']}",
-               headers={"Authorization": "Bearer " + token}).json()
+    cfg = _blob_json(md["config"]["digest"])
     return {"layers": [str(l.get("digest") or "") for l in md.get("layers", []) or []],
             "layer_sizes": [int(l.get("size") or 0) for l in md.get("layers", []) or []],
             "history": cfg.get("history", []) or [],
@@ -284,7 +308,10 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
         meta = fetch_image_layers(cand["tag_info"], token, insecure=insecure, qbase=qbase)
         idx = locate_plugin_layer(meta["history"], meta["layers"])
         if idx < 0:
-            print(f"[img] {tag}: 未找到插件层（{_COPY_MARK}），跳过", flush=True)
+            hint = ("（history=0 条：config 未读到——在线路径多为匿名 token 失效/被限流，"
+                    "非镜像结构问题）" if not meta["history"] else "")
+            print(f"[img] {tag}: 未找到插件层（{_COPY_MARK}，history={len(meta['history'])} 条）"
+                  f"{hint}，跳过", flush=True)
             return {"tag": tag, "status": "no-layer"}
         layer_digest = meta["layers"][idx]
         layer_size = meta["layer_sizes"][idx] if idx < len(meta["layer_sizes"]) else 0
