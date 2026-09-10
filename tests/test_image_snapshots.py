@@ -4,6 +4,7 @@
 `COPY . /vllm-workspace/vllm-ascend/` 那一层（插件源码），二进制层不拉。
 """
 import gzip
+import hashlib
 import io
 import json
 import sys
@@ -393,6 +394,241 @@ class TestExtractOne(unittest.TestCase):
                                   side_effect=AssertionError("无 token 不应触网")):
             r, _ = self._run()
         self.assertEqual(r["meta"]["vllm_commit"], "")
+
+
+# ---------------- 归档导入（docker save / OCI layout） ----------------
+
+def _plain_tar_bytes(entries: dict[str, str]) -> bytes:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
+        for name, content in entries.items():
+            data = content.encode("utf-8")
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return raw.getvalue()
+
+
+def _plugin_entries(with_git: bool = True) -> dict[str, str]:
+    ent = {"vllm-workspace/vllm-ascend/vllm_ascend/platform.py": "def archive_probe_sym():\n    return 1\n",
+           "vllm-workspace/vllm-ascend/csrc/a.cpp": "void a() {}\n"}
+    if with_git:
+        ent["vllm-workspace/vllm-ascend/.git/shallow"] = "a" * 40 + "\n"
+    return ent
+
+
+def _archive_history() -> list[dict]:
+    return [
+        {"created_by": "COPY /usr/local/Ascend /usr/local/Ascend # buildkit", "empty_layer": False},
+        {"created_by": "ARG VLLM_TAG=v0.23.0", "empty_layer": True},
+        {"created_by": "RUN |2 /bin/bash -c pip install -e /vllm-workspace/vllm # buildkit",
+         "empty_layer": False},
+        {"created_by": "COPY . /vllm-workspace/vllm-ascend/ # buildkit", "empty_layer": False},
+    ]
+
+
+def _docker_save_archive(tag: str = "glm5.2", outer_gz: bool = True,
+                         history: list[dict] | None = None) -> bytes:
+    """合成 docker save 归档：3 个未压缩层 + config + manifest（外层可选 gzip）。"""
+    layers = [
+        _plain_tar_bytes({"usr/local/ascend/bin/tool": "x"}),
+        _plain_tar_bytes({"usr/bin/app": "y"}),
+        _plain_tar_bytes(_plugin_entries()),
+    ]
+    cfg = {"architecture": "amd64", "created": "2026-07-27T15:39:42Z",
+           "history": history if history is not None else _archive_history(),
+           "rootfs": {"type": "layers", "diff_ids": ["d1", "d2", "d3"]}}
+    cfg_bytes = json.dumps(cfg).encode("utf-8")
+    cfg_name = hashlib.sha256(cfg_bytes).hexdigest() + ".json"
+    manifest = [{"Config": cfg_name,
+                 "RepoTags": [f"quay.io/ascend/vllm-ascend:{tag}"],
+                 "Layers": [f"{hashlib.sha256(l).hexdigest()[:12]}/layer.tar" for l in layers]}]
+    members: dict[str, bytes] = {cfg_name: cfg_bytes,
+                                 "manifest.json": json.dumps(manifest).encode("utf-8")}
+    for layer, layer_path in zip(layers, manifest[0]["Layers"]):
+        members[layer_path] = layer
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
+        for name, data in members.items():
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return gzip.compress(raw.getvalue()) if outer_gz else raw.getvalue()
+
+
+class TestArchiveDockerFormat(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "glm5.2.tar.gz"
+        self.path.write_bytes(_docker_save_archive())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_archive_layers(self):
+        arch = bis.load_archive_layers(self.path)
+        self.assertEqual(arch["format"], "docker")
+        self.assertEqual(len(arch["layers"]), 3)
+        self.assertEqual(len(arch["history"]), 4)  # 含 1 条 empty_layer
+        self.assertEqual(arch["repo_tags"], ["quay.io/ascend/vllm-ascend:glm5.2"])
+        self.assertEqual(arch["config_created"], "2026-07-27T15:39:42Z")
+        self.assertTrue(arch["image_digest"].startswith("sha256:"))
+        # COPY 是第 2 个非空 history 条目 → layers[2]，层大小来自成员表
+        idx = bis.locate_plugin_layer(arch["history"], arch["layers"])
+        self.assertEqual(idx, 2)
+        self.assertGreater(arch["layer_sizes"][idx], 0)
+
+    def test_read_and_extract_roundtrip(self):
+        arch = bis.load_archive_layers(self.path)
+        idx = bis.locate_plugin_layer(arch["history"], arch["layers"])
+        dest = Path(self.tmp.name) / "snap"
+        blob = bis.read_archive_layer(self.path, arch["layers"][idx], arch["layer_sizes"][idx])
+        info = bis.extract_plugin_tree(blob, dest)  # docker 层未压缩 → 魔数走裸 tar 分支
+        self.assertTrue((dest / "vllm_ascend" / "platform.py").exists())
+        self.assertTrue(info["has_git"])
+        self.assertEqual(info["plugin_commit"], "a" * 40)
+
+    def test_plain_tar_outer_also_works(self):
+        p = Path(self.tmp.name) / "glm5.2.tar"
+        p.write_bytes(_docker_save_archive(outer_gz=False))
+        self.assertEqual(bis.load_archive_layers(p)["format"], "docker")
+
+
+def _oci_archive_bytes(tag: str = "glm5.2") -> bytes:
+    """合成 OCI layout 归档：双架构 index（arm64/amd64），amd64 层为 gzip blob。"""
+    cfg = {"architecture": "amd64", "created": "2026-08-01T00:00:00Z",
+           "history": [{"created_by": "COPY . /vllm-workspace/vllm-ascend/ # buildkit",
+                        "empty_layer": False}],
+           "rootfs": {"type": "layers", "diff_ids": ["d1"]}}
+    layer_blob = gzip.compress(_plain_tar_bytes(_plugin_entries(with_git=False)))
+
+    def blob_entry(data: bytes, media: str) -> dict:
+        return {"digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                "mediaType": media, "size": len(data)}
+
+    cfg_blob = json.dumps(cfg).encode("utf-8")
+    amd64_manifest = {"schemaVersion": 2,
+                      "config": blob_entry(cfg_blob,
+                                           "application/vnd.oci.image.config.v1+json"),
+                      "layers": [blob_entry(layer_blob,
+                                            "application/vnd.oci.image.layer.v1.tar+gzip")]}
+    amd64_blob = json.dumps(amd64_manifest).encode("utf-8")
+    index = {"schemaVersion": 2, "manifests": [
+        {"digest": "sha256:" + "1" * 64,
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "arm64", "os": "linux"}},
+        {"digest": "sha256:" + hashlib.sha256(amd64_blob).hexdigest(),
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "amd64", "os": "linux"},
+         "annotations": {"org.opencontainers.image.ref.name": tag}},
+    ]}
+    members = {"oci-layout": b"{}",
+               "index.json": json.dumps(index).encode("utf-8"),
+               "blobs/sha256/" + hashlib.sha256(amd64_blob).hexdigest(): amd64_blob,
+               "blobs/sha256/" + hashlib.sha256(cfg_blob).hexdigest(): cfg_blob,
+               "blobs/sha256/" + hashlib.sha256(layer_blob).hexdigest(): layer_blob}
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
+        for name, data in members.items():
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return gzip.compress(raw.getvalue())
+
+
+class TestArchiveOciFormat(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "kimi.tar.gz"
+        self.path.write_bytes(_oci_archive_bytes())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_oci_picks_amd64_and_extracts(self):
+        arch = bis.load_archive_layers(self.path)
+        self.assertEqual(arch["format"], "oci")
+        self.assertEqual(len(arch["layers"]), 1)
+        self.assertEqual(arch["repo_tags"], ["glm5.2"])
+        self.assertTrue(arch["image_digest"].startswith("sha256:"))
+        idx = bis.locate_plugin_layer(arch["history"], arch["layers"])
+        self.assertEqual(idx, 0)
+        dest = Path(self.tmp.name) / "snap"
+        blob = bis.read_archive_layer(self.path, arch["layers"][idx], arch["layer_sizes"][idx])
+        bis.extract_plugin_tree(blob, dest)  # OCI 层 gzip → 魔数走 gz 分支
+        self.assertTrue((dest / "vllm_ascend" / "platform.py").exists())
+
+
+class TestArchiveTagInference(unittest.TestCase):
+    def test_repo_tags(self):
+        self.assertEqual(bis._tag_from_repo_tags(["quay.io/ascend/vllm-ascend:glm5.2"]), "glm5.2")
+        self.assertEqual(bis._tag_from_repo_tags(["glm5.2"]), "glm5.2")  # OCI 裸 tag
+        self.assertIsNone(bis._tag_from_repo_tags([]))
+        self.assertIsNone(bis._tag_from_repo_tags(["a:1", "b:2"]))  # 多值歧义
+
+    def test_stem(self):
+        self.assertEqual(bis._tag_from_stem(Path("D:/x/hy4-a3.tar.gz")), "hy4-a3")
+        self.assertEqual(bis._tag_from_stem(Path("hy4-a3.tar")), "hy4-a3")
+        self.assertEqual(bis._tag_from_stem(Path("hy4-a3.tgz")), "hy4-a3")
+
+    def test_resolve_archives(self):
+        out = bis.resolve_archives(["glm5.2=D:/a.tar.gz", "D:/b.tar"], None)
+        self.assertEqual(out, [(Path("D:/a.tar.gz"), "glm5.2"), (Path("D:/b.tar"), None)])
+
+
+class TestExtractArchiveOne(unittest.TestCase):
+    """extract_one 归档路径端到端（真归档文件，零触网）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cfg = make_cfg(self.root)
+        self.path = self.root / "glm5.2.tar.gz"
+        self.path.write_bytes(_docker_save_archive())
+        self.cand = {"group": TAG, "tag": TAG, "variants": [TAG], "tag_info": {}}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_extract_index_and_meta_from_archive(self):
+        r = bis.extract_one(self.cand, self.cfg, "", {}, archive=self.path)
+        self.assertEqual(r["status"], "ok")
+        root = bis.image_dir(TAG, self.cfg.resolve(self.cfg.storage.code_root))
+        meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+        self.assertTrue(meta["image_digest"].startswith("sha256:"))
+        self.assertEqual(meta["source"], "archive:glm5.2.tar.gz")
+        self.assertEqual(meta["image_created"], "2026-07-27T15:39:42Z")  # 无矩阵 → config.created
+        self.assertEqual(meta["vllm_commit"], "")  # 离线：不做 GitHub 解析
+        self.assertEqual(meta["plugin_layer_index"], 2)
+        self.assertTrue(meta["layer_digest"].endswith("/layer.tar"))
+        # 索引可用（检索侧）
+        code = VersionedCode(self.cfg, repo=f"img:{TAG}")
+        self.assertTrue(code.search_symbols("archive_probe_sym", TAG))
+
+    def test_matrix_enrichment(self):
+        matrix = {TAG: {"vllm-ascend": TAG, "vllm": "0.23.0", "vllm_commit": "c" * 40,
+                        "vllm_commit_date": "2026-06-15T03:35:17Z",
+                        "image_created": "2026-07-27T15:39:42Z"}}
+        r = bis.extract_one(self.cand, self.cfg, "", matrix, archive=self.path)
+        self.assertEqual(r["meta"]["vllm_commit"], "c" * 40)
+        self.assertEqual(r["meta"]["vllm_baseline"], "0.23.0")
+
+    def test_digest_anchor_skips_rescan(self):
+        arch = bis.load_archive_layers(self.path)
+        self.assertEqual(bis.extract_one(self.cand, self.cfg, "", {},
+                                         archive=self.path, archive_meta=arch)["status"], "ok")
+        with mock.patch.object(bis, "load_archive_layers",
+                               side_effect=AssertionError("digest 锚命中不应重复全量扫描")):
+            r = bis.extract_one(self.cand, self.cfg, "", {},
+                                archive=self.path, archive_meta=arch)
+        self.assertEqual(r["status"], "ok")
+
+    def test_no_plugin_layer_in_archive(self):
+        bad = self.root / "bad.tar.gz"
+        bad.write_bytes(_docker_save_archive(
+            history=[{"created_by": "RUN x", "empty_layer": False}]))
+        r = bis.extract_one(self.cand, self.cfg, "", {}, archive=bad)
+        self.assertEqual(r["status"], "no-layer")
 
 
 if __name__ == "__main__":

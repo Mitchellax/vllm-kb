@@ -17,6 +17,13 @@ vllm 主仓代码不提取：镜像里那份由 buildkit 的 VLLM_TAG/VLLM_REPO 
     python scripts/build_image_snapshots.py --refresh          # 忽略 digest 锚，强制重取
     python scripts/build_image_snapshots.py --insecure         # 真实业务环境：跳过 SSL 校验
 
+离线归档导入（quay 直连困难时：内网预存的 docker save / OCI layout 压缩包直接解析，
+不经 quay、不触网、不需要 docker 守护进程；docker load 能导入的归档即可用）：
+    python scripts/build_image_snapshots.py --archive D:\\imgs\\glm5.2.tar.gz
+    python scripts/build_image_snapshots.py --archive glm5.2=D:\\imgs\\任意文件名.tar.gz
+    python scripts/build_image_snapshots.py --archive-dir D:\\imgs\\          # 批量
+    python scripts/build_image_snapshots.py --list --archive-dir D:\\imgs\\   # 只看导入计划
+
 目录布局（与 forks/ 同构，检索端零改动复用 VersionedCode）：
     data/code/images/{tag}/snapshots/{tag}/vllm_ascend/... csrc/...   # 插件源码
     data/code/images/{tag}/index.sqlite3                             # 符号索引
@@ -25,6 +32,7 @@ vllm 主仓代码不提取：镜像里那份由 buildkit 的 VLLM_TAG/VLLM_REPO 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -162,7 +170,11 @@ def extract_plugin_tree(blob_stream, dest: Path, prefix: str = _PLUGIN_PREFIX,
     total = 0
     has_git = False
     plugin_commit = ""
-    tf = tarfile.open(fileobj=blob_stream, mode="r|gz")
+    head = blob_stream.read(2)
+    blob_stream.seek(0)
+    # quay 层 blob 是 tar.gz；docker save 归档层是未压缩 tar（OCI 层 blob 可能 gzip）
+    # ——魔数探测统一兼容，调用方传 BytesIO（可 seek）
+    tf = tarfile.open(fileobj=blob_stream, mode="r|gz" if head == b"\x1f\x8b" else "r|")
     for m in tf:
         if progress:
             if m.size:
@@ -239,6 +251,189 @@ def download_layer(meta: dict, layer_digest: str, layer_size: int,
     raise RuntimeError(f"层下载失败（重试 {retries} 次）：{last}")
 
 
+# ---------------- 归档导入（docker save / OCI layout——内网离线路径） ----------------
+#
+# 场景：quay 直连困难（隔离网/离线环境），内网有预存的镜像压缩包（docker load -i
+# 可导入的 docker save / OCI layout 归档）。归档自包含 manifest + config + 层 blob，
+# 把归档当数据源直接解析即可——不需要 docker 守护进程，也不触网。与在线路径共享
+# locate_plugin_layer / extract_plugin_tree / meta.json 目录契约，检索侧 img:{tag} 零改动。
+
+_DOCKER_CONFIG_RE = re.compile(r"^([0-9a-f]{64})\.json$")
+_OCI_BLOB_RE = re.compile(r"^blobs/sha256/([0-9a-f]{64})$")
+_SMALL_BLOB_MAX = 1 << 20  # config/manifest 类小 blob 上限（层 blob 都是几十 MB 起）
+
+
+def _norm_member(name: str) -> str:
+    return name[2:] if name.startswith("./") else name
+
+
+def _content_digest(cfg: dict) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(cfg, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def _scan_archive(archive: Path) -> dict:
+    """流式扫描归档一遍：manifest/index + config 类小 blob + 全部成员大小表。
+
+    归档可达 GB 级，只扫一遍收齐解析所需的小文件与成员大小；外层 tar/tar.gz 由
+    r|* 透明识别，始终流式、不整载。
+    """
+    small: dict[str, bytes] = {}
+    sizes: dict[str, int] = {}
+    with tarfile.open(str(archive), mode="r|*") as tf:
+        for m in tf:
+            if not m.isfile():
+                continue
+            name = _norm_member(m.name)
+            sizes[name] = m.size
+            if m.size <= _SMALL_BLOB_MAX and (
+                    name in ("manifest.json", "index.json", "oci-layout")
+                    or _DOCKER_CONFIG_RE.match(name) or _OCI_BLOB_RE.match(name)):
+                small[name] = tf.extractfile(m).read()
+    return {"small": small, "sizes": sizes}
+
+
+def _tag_from_repo_tags(repo_tags: list) -> str | None:
+    """RepoTags → 短 tag（quay.io/ascend/vllm-ascend:glm5.2 → glm5.2；OCI 裸 tag 原样）；
+    缺失/多值歧义返回 None。"""
+    shorts = set()
+    for t in (repo_tags or []):
+        t = str(t)
+        if not t:
+            continue
+        if ":" in t and "/" in t.rsplit(":", 1)[0]:
+            shorts.add(t.rsplit(":", 1)[-1])
+        else:
+            shorts.add(t)
+    return shorts.pop() if len(shorts) == 1 else None
+
+
+def _tag_from_stem(path: Path) -> str:
+    name = path.name
+    for suf in (".tar.gz", ".tgz", ".tar"):
+        if name.lower().endswith(suf):
+            return name[: -len(suf)]
+    return name
+
+
+def resolve_archives(archive_args: list | None, archive_dir: str | None) -> list:
+    """CLI 归档参数 → [(path, tag_hint)]；tag_hint 仅来自 tag= 前缀（显式指定优先）。"""
+    out: list = []
+    for a in archive_args or []:
+        tag, sep, p = a.partition("=")
+        out.append((Path(p if sep else a), tag if sep else None))
+    if archive_dir:
+        seen: set = set()
+        for ext in ("*.tar.gz", "*.tgz", "*.tar"):
+            for p in sorted(Path(archive_dir).glob(ext)):
+                if p not in seen:
+                    seen.add(p)
+                    out.append((p, None))
+    return out
+
+
+def load_archive_layers(archive: Path) -> dict:
+    """解析 docker save / OCI layout 归档 → 与 fetch_image_layers 同构的层信息。
+
+    - layers = 归档内成员路径（在线路径是 registry digest；层定位只依赖下标）；
+    - history 来自 config blob，是 locate_plugin_layer 的唯一依据；
+    - image_digest 锚取 config blob 的真实 sha256（docker 格式文件名即 digest、
+      OCI 从 manifest 声明；异常形态兜底 config 内容哈希）——保证重跑时
+      digest 锚命中、不重复提取；
+    - OCI 多架构 index 取 amd64（与在线路径同规则）。
+
+    返回 {format, layers, layer_sizes, history, config_created, image_digest, repo_tags}。
+    """
+    scan = _scan_archive(archive)
+    small, sizes = scan["small"], scan["sizes"]
+
+    def _blob(name: str) -> bytes:
+        if name not in small:
+            raise RuntimeError(f"归档缺少 {name}——不完整或不是 docker save / OCI layout 归档")
+        return small[name]
+
+    fmt = ""
+    layers: list[str] = []
+    cfg: dict = {}
+    image_digest = ""
+    repo_tags: list[str] = []
+
+    if "manifest.json" in small:
+        fmt = "docker"
+        mans = json.loads(small["manifest.json"])
+        if not (isinstance(mans, list) and mans):
+            raise RuntimeError("manifest.json 形态不符（docker save 归档应为非空数组）")
+        ent = next((m for m in mans if m.get("RepoTags")), mans[0])
+        repo_tags = [str(t) for t in ent.get("RepoTags") or []]
+        cfg_name = str(ent["Config"])
+        cfg = json.loads(_blob(cfg_name))
+        layers = [str(p) for p in ent.get("Layers") or []]
+        m = _DOCKER_CONFIG_RE.match(cfg_name)
+        image_digest = f"sha256:{m.group(1)}" if m else _content_digest(cfg)
+    elif "index.json" in small:
+        fmt = "oci"
+        idx = json.loads(small["index.json"])
+        mans = []
+        for m in idx.get("manifests", []) or []:
+            mt = str(m.get("mediaType", ""))
+            # image manifest（OCI: vnd.oci.image.manifest.v1+json / docker: manifest.v2+json）；
+            # 排除 index/list（多架构容器本身）；个别归档缺 mediaType，按候选兜底
+            if ("manifest" in mt and "list" not in mt and "index" not in mt) or not mt:
+                mans.append(m)
+        if not mans:
+            raise RuntimeError("index.json 无 image manifest（OCI layout 归档）")
+        ent = next((m for m in mans
+                    if (m.get("platform") or {}).get("architecture") == "amd64"), mans[0])
+        man = json.loads(_blob("blobs/sha256/" + str(ent["digest"]).split(":")[-1]))
+        cfg_digest = str(man["config"]["digest"]).split(":")[-1]
+        cfg = json.loads(_blob(f"blobs/sha256/{cfg_digest}"))
+        layers = [f"blobs/sha256/{str(l['digest']).split(':')[-1]}"
+                  for l in man.get("layers", []) or []]
+        image_digest = f"sha256:{cfg_digest}"
+        ref = (ent.get("annotations") or {}).get("org.opencontainers.image.ref.name", "")
+        repo_tags = [ref] if ref else []
+    else:
+        raise RuntimeError("归档缺 manifest.json / index.json——仅支持 docker save 与 OCI layout")
+
+    history = cfg.get("history", []) or []
+    missing = [p for p in layers if p not in sizes]
+    if missing:
+        raise RuntimeError(f"归档缺少 {len(missing)} 个层成员（如 {missing[0]}）——归档不完整")
+    return {"format": fmt,
+            "layers": layers,
+            "layer_sizes": [sizes[p] for p in layers],
+            "history": history,
+            "config_created": cfg.get("created") or "",
+            "image_digest": image_digest,
+            "repo_tags": repo_tags}
+
+
+def read_archive_layer(archive: Path, member: str, size: int,
+                       progress_every: int = 10 << 20) -> io.BytesIO:
+    """第二遍扫描：从归档读取指定层成员字节流（解压交给 extract_plugin_tree
+    的魔数探测——docker save 层未压缩、OCI 层 blob 可能 gzip）。"""
+    buf = io.BytesIO()
+    got = 0
+    mark = progress_every
+    with tarfile.open(str(archive), mode="r|*") as tf:
+        for m in tf:
+            if not m.isfile() or _norm_member(m.name) != member:
+                continue
+            src = tf.extractfile(m)
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                buf.write(chunk)
+                got += len(chunk)
+                if got >= mark:
+                    print(f"[img]     读取归档层 {got / 1e6:.0f}MB / {size / 1e6:.0f}MB", flush=True)
+                    mark += progress_every
+            buf.seek(0)
+            return buf
+    raise RuntimeError(f"归档中未找到层成员：{member}")
+
+
 # ---------------- 候选镜像 ----------------
 
 def candidate_images(tags: list[dict], only: list[str] | None = None) -> list[dict]:
@@ -281,15 +476,25 @@ def _matrix_rows(cfg) -> dict:
 
 def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = False,
                 qbase: str = "https://quay.io", refresh: bool = False,
-                index_only: bool = False) -> dict:
-    """提取单个镜像的插件源码 + 建索引 + 写 meta。返回状态 dict。"""
+                index_only: bool = False, archive: Path | None = None,
+                archive_meta: dict | None = None) -> dict:
+    """提取单个镜像的插件源码 + 建索引 + 写 meta。返回状态 dict。
+
+    archive 非空 = 离线归档导入（docker save / OCI layout，不经 quay 不触网）；
+    archive_meta 为已解析的归档层信息（main 侧解析一次传入，避免重复全量扫描）。
+    """
     from vllm_kb.code_index import VersionedCode
 
     tag = cand["tag"]
     root = image_dir(tag, cfg.resolve(cfg.storage.code_root))
     snap = root / "snapshots" / tag
     meta_path = root / "meta.json"
-    cur_digest = cand["tag_info"].get("manifest_digest", "")
+    if archive is not None:
+        if archive_meta is None:
+            archive_meta = load_archive_layers(archive)
+        cur_digest = archive_meta["image_digest"]
+    else:
+        cur_digest = cand["tag_info"].get("manifest_digest", "")
     old_meta: dict = {}
     if meta_path.exists():
         try:
@@ -305,7 +510,9 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
             print(f"[img] {tag}: 无快照，--index-only 跳过", flush=True)
             return {"tag": tag, "status": "skip"}
     else:
-        meta = fetch_image_layers(cand["tag_info"], token, insecure=insecure, qbase=qbase)
+        offline = archive is not None
+        meta = archive_meta if offline else fetch_image_layers(
+            cand["tag_info"], token, insecure=insecure, qbase=qbase)
         idx = locate_plugin_layer(meta["history"], meta["layers"])
         if idx < 0:
             hint = ("（history=0 条：config 未读到——在线路径多为匿名 token 失效/被限流，"
@@ -315,21 +522,25 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
             return {"tag": tag, "status": "no-layer"}
         layer_digest = meta["layers"][idx]
         layer_size = meta["layer_sizes"][idx] if idx < len(meta["layer_sizes"]) else 0
-        print(f"[img] {tag}: 插件层 layer[{idx}] {layer_size / 1e6:.1f}MB，下载并解包 ...", flush=True)
+        src_desc = (f"归档插件层 layer[{idx}]（{layer_size / 1e6:.1f}MB），读取并解包" if offline
+                    else f"插件层 layer[{idx}] {layer_size / 1e6:.1f}MB，下载并解包")
+        print(f"[img] {tag}: {src_desc} ...", flush=True)
         if snap.exists():
             # 清掉旧快照（镜像可能重推，文件集可能变化）
             import shutil
 
             shutil.rmtree(snap)
-        blob = download_layer(meta, layer_digest, layer_size)
+        blob = (read_archive_layer(archive, layer_digest, layer_size) if offline
+                else download_layer(meta, layer_digest, layer_size))
         info = extract_plugin_tree(blob, snap)
         print(f"[img] {tag}: 解出 {info['files']} 个文件（{info['bytes'] / 1e6:.1f}MB 原始）"
               f"{'，含 .git' if info['has_git'] else ''}", flush=True)
         row = matrix.get(cand["group"], {}) or {}
         vllm_commit = row.get("vllm_commit", "")
         vllm_commit_date = row.get("vllm_commit_date", "")
-        if not vllm_commit and row.get("vllm") and bcm._github_token():
-            # 矩阵没解析过 commit：现场按 tag 解析（未配 token 时跳过，留空待补）
+        if not vllm_commit and not offline and row.get("vllm") and bcm._github_token():
+            # 矩阵没解析过 commit：现场按 tag 解析（未配 token 时跳过，留空待补）；
+            # 归档导入是离线路径，不做 GitHub 解析（vllm_commit 留空待矩阵补齐）
             res = bcm.fetch_tag_commit(bcm.OFFICIAL_VLLM_REPO, f"v{row.get('vllm')}",
                                        insecure=insecure, gbase=os.environ.get(
                                            "VLLM_KB_GITHUB_BASE", "https://api.github.com"))
@@ -340,7 +551,9 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
             "group": cand["group"],
             "variants": cand["variants"],
             "image_digest": cur_digest,
-            "image_created": row.get("image_created", "") or bcm._image_created(cand["tag_info"]),
+            "image_created": row.get("image_created", "")
+                             or (meta.get("config_created", "") if offline
+                                 else bcm._image_created(cand["tag_info"])),
             "layer_digest": layer_digest,
             "layer_size": layer_size,
             "plugin_layer_index": idx,
@@ -349,6 +562,7 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
             "vllm_baseline": row.get("vllm", "") or row.get("vllm_base", ""),
             "vllm_commit": vllm_commit,
             "vllm_commit_date": vllm_commit_date,
+            "source": f"archive:{archive.name}" if offline else "quay",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
         }
         root.mkdir(parents=True, exist_ok=True)
@@ -366,12 +580,18 @@ def main() -> None:
     from vllm_kb.config import AppConfig
     from vllm_kb.net import add_insecure_args, insecure_from_env, quay_base
 
-    ap = argparse.ArgumentParser(description="提取 0day 镜像内的 vllm-ascend 插件源码（只拉插件层）")
+    ap = argparse.ArgumentParser(description="提取 0day 镜像内的 vllm-ascend 插件源码（在线只拉插件层；支持离线归档导入）")
     ap.add_argument("--tag", action="append", default=None,
                     help="只处理指定镜像（quay tag 或矩阵行键，可多次）")
     ap.add_argument("--list", action="store_true", help="只列出候选镜像与提取状态")
     ap.add_argument("--index-only", action="store_true", help="只重建索引（不联网）")
     ap.add_argument("--refresh", action="store_true", help="忽略 digest 锚，强制重取")
+    ap.add_argument("--archive", action="append", default=None, metavar="[TAG=]PATH",
+                    help="离线归档导入（docker save / OCI layout，不经 quay 不触网）："
+                         "归档路径，或 tag=路径 显式指定 img: 前缀键；可多次")
+    ap.add_argument("--archive-dir", default=None, metavar="DIR",
+                    help="批量归档导入：目录下 *.tar / *.tar.gz / *.tgz（tag=文件名主干，"
+                         "归档带唯一 RepoTag 时优先用其短 tag）")
     ap.add_argument("--config", default=None)
     add_insecure_args(ap)
     args = ap.parse_args()
@@ -381,6 +601,8 @@ def main() -> None:
     cfg = AppConfig.load(args.config, require_keys=False)
     matrix = _matrix_rows(cfg)
     dest_root = images_root(cfg.resolve(cfg.storage.code_root))
+
+    archives = resolve_archives(args.archive, args.archive_dir)
 
     if args.index_only:
         cands = []
@@ -393,6 +615,43 @@ def main() -> None:
         for c in cands:
             extract_one(c, cfg, "", matrix, insecure=insecure, qbase=qbase, index_only=True)
         print(f"[img] 索引重建完成：{len(cands)} 个镜像", flush=True)
+        return
+
+    if args.list and archives:
+        print(f"[img] 归档导入计划：{len(archives)} 个（tag=主干推断；归档带唯一 RepoTag 时"
+              f"导入时优先用其短 tag；导入后状态见 client.py code-versions --repo img）", flush=True)
+        for path, hint in archives:
+            print(f"  {path}  →  img:{hint or _tag_from_stem(path)}"
+                  f"{'  (显式 tag)' if hint else ''}", flush=True)
+        return
+
+    if archives:
+        ok = skipped = failed = 0
+        start = time.time()
+        for path, hint in archives:
+            try:
+                arch = load_archive_layers(path)
+                tag = hint or _tag_from_repo_tags(arch["repo_tags"]) or _tag_from_stem(path)
+                stem = _tag_from_stem(path)
+                if tag != stem:
+                    print(f"[img]     tag 取「{tag}」（文件名主干为 {stem}；"
+                          f"矩阵组对应请改用 --archive {tag}={path}）", flush=True)
+                print(f"[img] {path.name}: 导入为 img:{tag}（format={arch['format']}，"
+                      f"digest={arch['image_digest'][:19]}…）", flush=True)
+                cand = {"group": tag, "tag": tag, "tag_info": {}, "variants": [tag]}
+                r = extract_one(cand, cfg, "", matrix, refresh=args.refresh,
+                                archive=path, archive_meta=arch)
+                if r["status"] == "ok" and r.get("indexed"):
+                    ok += 1
+                else:
+                    skipped += 1
+            except Exception as e:  # noqa: BLE001  （单归档失败不阻塞其余）
+                failed += 1
+                print(f"[img] [!] {path.name} 导入失败：{type(e).__name__}: {e}", flush=True)
+        print(f"[img] 归档导入完成：成功 {ok}，跳过 {skipped}，失败 {failed}，"
+              f"耗时 {time.time() - start:.0f}s", flush=True)
+        print("[img] 检索：client.py code-versions --repo img   /   code <符号> --repo img:<tag>",
+              flush=True)
         return
 
     tags = fq.fetch_tags(insecure=insecure, base=qbase)
