@@ -174,6 +174,13 @@ python scripts/build_fork_snapshots.py --list      # fork 行状态（模型/锁
 python scripts/build_fork_snapshots.py             # 全部模型快照 + 建索引
 python scripts/build_fork_snapshots.py --model hy4 # 只拉指定模型
 
+# 0day 镜像内的 vllm-ascend 插件源码（只拉插件层，~23~101MB；不拉 6GB 整镜像）
+python scripts/build_image_snapshots.py --list         # 候选镜像与提取状态
+python scripts/build_image_snapshots.py               # 提取全部（镜像 digest 未变则跳过）
+python scripts/build_image_snapshots.py --tag glm5.2   # 只提指定镜像（可多次）
+python scripts/build_image_snapshots.py --index-only   # 只重建索引（不联网）
+python scripts/build_image_snapshots.py --refresh      # 忽略 digest 锚，强制重取
+
 # 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配）
 python scripts/build_companion_matrix.py
 python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（默认按 TTL/不可变语义命中）
@@ -608,6 +615,11 @@ python skills/vllm-kb/client.py code worker_busy_loop --repo vllm --version 0.22
 python skills/vllm-kb/client.py code mega_moe --repo fork:glm5.2 --version 418bd6273c03
 python skills/vllm-kb/client.py code-versions --repo fork:glm5.2   # 看该 fork 已预存哪些 SHA
 
+# 0day 镜像内实际部署的插件代码（--repo img:{tag}，版本=镜像 tag）
+python skills/vllm-kb/client.py code-versions --repo img            # 有哪些镜像已提取（前缀唯一入口）
+python skills/vllm-kb/client.py code DispatchFFNCombine --repo img:glm5.2
+python skills/vllm-kb/client.py code "memory leak" --kind msg --repo img:glm5.2
+
 # 列出已预存版本
 python skills/vllm-kb/client.py code-versions --repo vllm
 
@@ -641,6 +653,43 @@ python skills/vllm-kb/client.py code "memory leak" --kind msg --version v0.23.0r
 
 `--kind` 可选值：`def`（函数定义）/ `op`（算子）/ `env`（环境变量）/ `msg`（报错字面量）；
 不传则符号索引 + grep 兜底。
+
+**`--repo` 命名空间（四选一，互相物理隔离）**：
+
+| `--repo` | 指向的代码 | 版本键 |
+|---|---|---|
+| 缺省 `vllm-ascend` | 官方 vllm-ascend 快照（GitHub tag，`build_code_snapshots.py`） | `v0.23.0` 等 tag |
+| `vllm` | vllm 主仓快照（`build_vllm_snapshots.py`） | `0.22.1` 等版本号 |
+| `fork:{model}` | 0day fork 仓的 **vllm 代码**（`build_fork_snapshots.py`，按镜像锁定 SHA 拉） | SHA 前 12 位 |
+| `img:{tag}` | **某个 0day 镜像内实际部署的 vllm-ascend 插件代码**（`build_image_snapshots.py`） | 镜像 tag（如 `glm5.2`） |
+
+**跨命名空间 diff**：`diff` 的两个版本参数可带前缀，直接对比不同仓/命名空间的同一文件：
+
+```bash
+# 这个 0day 镜像的插件代码相对官方同基线改了什么（0day 定制点审查）
+python skills/vllm-kb/client.py diff img:glm5.2 vllm-ascend:v0.23.0 vllm_ascend/platform.py
+# 带关键词只看相关差异行
+python skills/vllm-kb/client.py diff img:glm5.2 vllm-ascend:v0.23.0 vllm_ascend/worker/model_runner.py --keyword "fill_(-1)"
+# fork 仓 vllm 代码 vs 官方版本（fork:{model} 只有一个 SHA 时可省 @{sha12}）
+python skills/vllm-kb/client.py diff fork:hy4 vllm:0.23.0 vllm/v1/executor/multiproc_executor.py
+```
+
+前缀形态：`vllm-ascend:{版本}` / `vllm:{版本}` / `img:{tag}` / `fork:{model}@{sha12}`；
+不带前缀时用 `--repo` 指定的仓（两侧可以是不同命名空间）。
+
+**`img:` 前缀怎么找（agent 的发现路径）**：
+
+```bash
+python skills/vllm-kb/client.py code-versions --repo img        # 已提取镜像清单（唯一入口）
+#   glm5.2  vllm_commit=0fc695fc6d1d  镜像时间=2026-07-27T15:39:42Z  索引=有
+#   hy4-a3  组=hy4  vllm基线=0.23.0   镜像时间=...                   索引=有
+```
+
+- 第一列就是 `--repo img:{tag}` 里的 tag；**"组=…"** 对应用户口中的镜像名（例如用户说
+  "hy4 镜像"，实际 quay tag 是 `hy4-a3`，检索要用 `--repo img:hy4-a3`）；
+- `code-versions --repo img:<tag>` 看该镜像元信息（digest / 镜像时间 / vllm commit / 层内插件 commit）；
+- 某镜像不在清单里 → 由管理员跑 `python scripts/build_image_snapshots.py --tag <tag>`
+  （agent 无写权限，不要尝试自行提取）。
 
 命中新版本后，用 GitHub commits API 按文件路径过滤找引入 commit → PR 编号 →
 再用 `graph fixes/chain` 确认落地 release 与 backport。

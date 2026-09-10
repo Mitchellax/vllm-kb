@@ -114,11 +114,26 @@ python client.py code halMemCreate                       # 不加版本 = 全部
 python client.py code --file csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp --version v0.23.0rc1 --max-chars 100000
 ```
 
-### 6) 跨版本精确 diff `diff` —— 定位"哪个版本引入/修改了某代码"
+### 6) 跨版本/跨命名空间精确 diff `diff` —— 定位"哪个版本引入/修改了某代码"
 
 ```bash
+# 同仓跨版本
 python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py
 python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"
+```
+
+版本参数可带**命名空间前缀**，用于跨仓对比（前缀与 `--repo` 同义）：
+
+| 前缀写法 | 指向 |
+|---|---|
+| `vllm-ascend:{版本}` / `vllm:{版本}` | 官方快照（默认仓 / vllm 主仓） |
+| `img:{tag}` | **某个 0day 镜像内实际部署的 vllm-ascend 插件代码**（版本键就是镜像 tag） |
+| `fork:{model}@{sha12}` | 0day fork 仓的 vllm 代码（`fork:{model}` 不带 `@` 时取该仓唯一版本） |
+
+```bash
+# "这个 0day 镜像相对官方同基线改了什么"（代码审查/定制点核对）
+python client.py diff img:glm5.2 vllm-ascend:v0.23.0 vllm_ascend/worker/model_runner.py
+python client.py diff img:glm5.2 vllm-ascend:v0.23.0 vllm_ascend/platform.py --keyword patch
 ```
 
 ### 7) 报错字面量索引 `code --kind msg` —— 报错文本 → 源码定义处 file:line
@@ -126,7 +141,46 @@ python client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.p
 ```bash
 python client.py code "memory leak" --kind msg --version v0.23.0rc1
 python client.py code "wait_for_remote" --kind msg --version v0.23.0rc1
+# 线上跑的是某个 0day 镜像时：直接在**该镜像的插件代码**里找这句报错
+python client.py code "memory leak" --kind msg --repo img:glm5.2
 ```
+
+### 7b) 0day 镜像代码审查 `code --repo img:{tag}` —— 部署镜像实际跑的插件代码
+
+镜像内的 vllm-ascend 插件代码由 `scripts/build_image_snapshots.py` 从镜像插件层提取
+（只拉插件层，~23–101MB），检索方式与官方版本完全一致。
+
+```bash
+# 第 1 步：不确定有哪些镜像可查 → 先列举（agent 获取 img: 前缀的唯一入口）
+python client.py code-versions --repo img
+#   → [img] 已提取 N 个镜像的插件源码（检索：code <符号> --repo img:<tag>）：
+#       glm5.2  vllm_commit=0fc695fc6d1d  镜像时间=2026-07-27T15:39:42Z  索引=有
+#       hy4-a3  组=hy4  vllm基线=0.23.0   镜像时间=...                   索引=有
+#   第一列即 repo=img:{tag} 的 tag；"组=..." 对应用户口中的镜像名
+#   （用户说"hy4 镜像"→ 实际 tag 是 hy4-a3 → 用 --repo img:hy4-a3）
+
+# 第 2 步：在该镜像的代码里定位（符号 / grep / 报错字面量 / 读文件）
+python client.py code DispatchFFNCombine --repo img:glm5.2
+python client.py code "fill_(-1)" --repo img:glm5.2 --in-file model_runner.py
+python client.py code "memory leak" --kind msg --repo img:glm5.2
+python client.py code --file vllm_ascend/worker/model_runner.py --repo img:glm5.2 --version glm5.2
+
+# 第 3 步：与官方基线对比，看定制点（见 §6 前缀语法）
+python client.py diff img:glm5.2 vllm-ascend:v0.23.0 vllm_ascend/worker/model_runner.py --keyword "fill_(-1)"
+```
+
+**适用场景与边界**：
+
+- 用户说"我们线上部署的是 `<镜像>` 镜像 / 是 0day 版本"时，代码问题**优先用 `img:<镜像>`**，
+  它才是真正在跑的代码；官方 tag 快照只能算近似基线。
+- 镜像里的 **vllm 主仓代码**不单独提取——用 `matrix` 看该镜像行的 `vllm_commit`（tag→commit），
+  再对照官方/fork 快照即可。
+- 镜像快照的**版本键 = 镜像 tag**（如 `glm5.2`、`hy4-a3`），不是上游版本号；
+  `code-versions --repo img:<tag>` 可看该镜像的元信息（digest / 镜像时间 / vllm commit / 插件 commit）。
+- 若某镜像未提取：`code-versions --repo img` 列表里没有它 → 提示管理员运行
+  `python scripts/build_image_snapshots.py --tag <tag>`（agent 无写权限，不要尝试自行提取）。
+- 插件代码**没有 git 元数据**（`COPY .` 拷入），无法给出它自身的上游 commit；
+  需要"这份代码相对上游改了哪些行"就用 §6 的跨命名空间 diff。
 
 ### 8) 其他只读查询
 
@@ -136,6 +190,8 @@ python client.py health
 python client.py components
 python client.py stats
 python client.py companion vllm-ascend 0.18.0
+python client.py code-versions --repo vllm            # 已预存官方版本清单
+python client.py code-versions --repo fork:glm5.2     # 该 fork 仓已锁定的 SHA
 ```
 
 ### 9) 图检索 `graph` —— 关系追溯（修复链路）
@@ -213,6 +269,8 @@ python client.py context "vllm-ascend:0.23.0 HCCL 超时"   # 问题→标签匹
 
 注：client 另有 `code-versions` / `matrix` 两个管理调试命令（列预存代码版本/全量配套矩阵），
 属管理员维护用途，**不在本 skill 的故障检索流程内使用**（故障回答只需上面文档化的命令）。
+唯一例外：`code-versions --repo img` 是**发现 0day 镜像检索前缀（`img:{tag}`）的必要入口**，
+按 §7b 使用是允许的；`code-versions --repo img:<tag>` 可看该镜像的元信息。
 
 ## 检索策略（故障处理时的推荐流程）
 
@@ -229,6 +287,9 @@ python client.py context "vllm-ascend:0.23.0 HCCL 超时"   # 问题→标签匹
 3. **然后 version + code**：用 `version` 确认部署版本形态（正式版/rc/pre），
    再用 `code <算子/关键词> --version <版本>` 定位对应版本源码，
    `--file` 读取关键文件片段（workspace 计算、tiling、buffer 分配等），判断是否为版本相关 bug；
+   **用户环境跑的是 0day 镜像**（如"线上是 glm5.2 镜像"）时改用
+   `code-versions --repo img` 找镜像前缀 → `code <符号> --repo img:<镜像>` 查**实际部署的代码**
+   （见 §7b）；需要看相对官方的定制点用 `diff img:<镜像> vllm-ascend:<基线版本> <路径>`（见 §6）；
 4. **最后 graph chain**：对最相关的 issue，用 `graph chain <repo>#<编号>` 追溯修复链路
    （issue→修复 PR→落地 release），结合 `version` 判断"该修复是否已进入我的部署版本"——
    这是语义/签名检索无法直接回答的结构化问题；
@@ -272,10 +333,14 @@ python client.py context "vllm-ascend:0.23.0 HCCL 超时"   # 问题→标签匹
    该文件的行号命中，对比即可定位"哪个版本引入/移除该代码"；
    如 `code "fill_(-1)" --in-file worker/model_runner_v1.py --per-version` 直接显示
    `blk_table.slot_mapping.gpu.fill_(-1)` 只在 v0.23.0rc1+ 出现 → 修复版本即 v0.23.0rc1；
+   部署的是 0day 镜像时把 `--repo img:<镜像>` 加上（该镜像的插件代码里有没有这段，才是
+   "我这套环境有没有这个问题"的直接证据）；
 3. **跨版本精确 diff**：`diff <旧版本> <新版本> <文件路径> [--keyword <特征>]`——对比两个版本
    同一文件的 unified diff，新增行 = 修复引入点。如
    `diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/model_runner_v1.py --keyword "fill_(-1)"`
    直接显示该文件两版本间的差异行（--keyword 过滤后只留相关行）；
+   镜像部署场景用前缀形态：`diff img:<镜像> vllm-ascend:<基线版本> <路径> --keyword <特征>`
+   ——看该镜像是否已经带上/缺了某个修复；
 4. **GitHub 溯源（可选外部步骤）**：命中新版本后，可用 GitHub commits API 按文件路径过滤
    （`/repos/{owner}/{repo}/commits?path=<文件>`）找引入 commit → commit 消息里的 PR 编号 →
    再用 `graph fixes/chain` 确认落地 release 与 backport 分支。此步需网络/GitHub 访问，

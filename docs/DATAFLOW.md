@@ -80,6 +80,7 @@
 | `python scripts/build_code_snapshots.py` | vllm-ascend 各版本：`data/code/zips/{version}.zip` + 解压 `data/code/snapshots/{version}/` |
 | `python scripts/build_vllm_snapshots.py` | 对应 vllm 主仓快照（版本由配套矩阵映射，自动跟随） |
 | `python scripts/build_fork_snapshots.py` | 0day fork 仓快照（hy4/glm5.2 等模型开发分支）：`data/code/forks/{model}/`，版本=镜像锁定 commit（SHA 前 12 位）——检索走 `repo=fork:{model}` 命名空间，与官方版本物理隔离 |
+| `python scripts/build_image_snapshots.py` | **0day 镜像内的 vllm-ascend 插件源码**：只拉镜像的 `COPY . /vllm-workspace/vllm-ascend/` 层（实测 23~101MB；整镜像 6GB+ 中的 CANN/编译层属二进制，不拉），解到 `data/code/images/{tag}/snapshots/{tag}/` + `index.sqlite3` + `meta.json`（image_digest/镜像时间/vllm commit/插件层 digest/层内 `.git` 若有则记 plugin_commit）——检索走 `repo=img:{tag}`，版本键=镜像 tag；`repo=img` 为列举入口；镜像 digest 未变则跳过重取 |
 | `python scripts/build_code_snapshots.py --index-only` | 派生数据重建：`data/code/index.sqlite3`（符号索引 + 报错字面量索引）、`symbols.json`（三层签名符号表）、`signal_words.json`（社区高频信号词，统计实现 `scripts/build_signal_words.py`，可单独运行） |
 
 ### 2.4 辅助数据
@@ -158,9 +159,10 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | `version 0.18.0` | `GET /version` | `data/compatibility/release_calendar.{repo}.json` | 版本形态判断 |
 | `code <关键词>` | `POST /code/search` | `data/code/index.sqlite3` 符号索引命中；未命中退 grep 版本快照（`snapshots/`，按需解压 zip）| `--in-file` 限文件、`--per-version` 分版本；`--kind msg` 走报错字面量索引 |
 | `code --repo vllm` / `--repo fork:{model}` | 同上（repo 参数路由） | vllm 主仓快照（`build_vllm_snapshots.py`）/ 0day fork 仓快照（`data/code/forks/{model}/`，版本=锁定 commit）| fork 命名空间与官方版本物理隔离，必须显式传 `repo=fork:` 才命中 |
+| `code --repo img:{tag}` | 同上（repo 参数路由） | **0day 镜像内插件源码**（`data/code/images/{tag}/`，版本键=镜像 tag；`build_image_snapshots.py` 提取） | 与官方/fork 三方隔离；`code --repo img`（无 tag）只用于列举已提取镜像 |
 | `code --file <路径>` | `GET /code/file` | `data/code` 指定版本快照文件（截断带标记） | |
-| `diff <v1> <v2> <路径>` | `GET /code/diff` | 两个版本快照同一文件的 unified diff（difflib） | `--keyword` 只留相关差异行 |
-| `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单 | 管理员调试 |
+| `diff <v1> <v2> <路径>` | `GET /code/diff` | 两个快照同一文件的 unified diff（difflib），**两侧可属不同命名空间** | 版本参数带前缀：`img:{tag}` / `fork:{model}@{sha12}` / `vllm-ascend:{版本}` / `vllm:{版本}`；`--keyword` 只留相关差异行 |
+| `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单；`repo=img` 返回 `images[]`（tag/digest/镜像时间/vllm commit/是否有索引） | 管理员调试；`repo=img` 是 agent 发现 `img:` 前缀的入口 |
 | `doc <source_id>` | `GET /doc/{source_id}` | `kb.sqlite3`：docs 行 + chunks_meta 排序 + chunks_fts 原文拼装 | extra 出口白名单清理（不返回服务器路径） |
 | `components` / `stats` / `health` | `GET` | `kb.sqlite3` 聚合 / 向量库 count | `/health` 含 embedding 状态 |
 | `companion` / `matrix` | `GET /companion` `/matrix` | `data/compatibility/vllm-ascend.json` | 配套反向展开 / 全量矩阵 |
@@ -284,4 +286,7 @@ serve_api（只读）                            离线周期
 - **历史可靠度正交**：`w_hist`（行为遥测后验）作为独立因子乘在 final 上，不乘进 `w_rel`——
   同一文档元数据不变时 conf 部分保持确定性可审计；反馈数据全在旁路库/文件，不写检索库；
 - **代码图谱是可选外挂**：`/code-graph/*` 由配置开关注册，数据在外部 gh-puller 服务，
-  本库不落库、不参与重建；不可达时明确 503 + 引导，不做静默降级。
+  本库不落库、不参与重建；不可达时明确 503 + 引导，不做静默降级；
+- **代码快照的三套命名空间互不混**：官方版本（`data/code/`）、fork 仓 vllm 代码（`data/code/forks/`）、
+  镜像插件源码（`data/code/images/`）——默认检索只命中官方版本，必须显式 `repo=fork:…` / `repo=img:…`
+  才检索 0day 代码；镜像插件代码无 git 元数据（`COPY` 拷入），只能靠跨命名空间 diff 定位定制点。

@@ -198,8 +198,10 @@ python scripts/build_release_calendar.py --all-repos
 python scripts/build_code_snapshots.py          # vllm-ascend 版本
 python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本（配套矩阵映射，自动跟随）
 python scripts/build_fork_snapshots.py          # 0day fork 仓（--model 指定模型；独立 forks 命名空间，按镜像锁定 SHA 拉取）
+python scripts/build_image_snapshots.py         # 0day 镜像内**实际部署的插件源码**（只拉插件层 ~23~101MB；repo=img:{tag} 检索）
 #    符号索引（index.sqlite3）是派生数据：提取规则/schema 升级后重建
 #    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
+#    python scripts/build_image_snapshots.py --index-only  # 镜像快照索引重建（不联网）
 
 # 7. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
 python scripts/build_companion_matrix.py        # 生成/更新 data/compatibility/vllm-ascend.json
@@ -323,6 +325,11 @@ ingest_docs()（幂等双哈希增量 + 断点续传）
 版本化代码仓：build_code_snapshots.py / build_vllm_snapshots.py
    ──▶ data/code/{zips,snapshots}/ 源码快照 + index.sqlite3 符号索引 + symbols.json / signal_words.json
 
+0day 代码（与官方版本物理隔离，检索需显式 repo 前缀）：
+  build_fork_snapshots.py  ──▶ data/code/forks/{model}/   镜像锁定 SHA 的 fork 仓 vllm 代码（repo=fork:{model}）
+  build_image_snapshots.py ──▶ data/code/images/{tag}/    镜像内**实际部署的 vllm-ascend 插件源码**
+                                                          （只拉插件层 ~23~101MB，不拉 6GB 整镜像；repo=img:{tag}）
+
 辅助数据：build_release_calendar.py ──▶ data/compatibility/release_calendar.{repo}.json
         build_companion_matrix.py + fetch_quay_tags.py ──▶ data/compatibility/vllm-ascend.json
 
@@ -339,6 +346,8 @@ ingest_docs()（幂等双哈希增量 + 断点续传）
 | `data/lancedb` | `ingest.py`（批量攒批写入） | chunk 向量 + 原文 + meta（title/组件/版本区间/标签/section…） |
 | `data/kb.sqlite3` | `ingest.py` | `docs`（文档元数据+哈希）、`chunks_fts`（jieba 分词全文）、`chunks_meta`（分块序号/章节）、`doc_tags`（人工标签覆盖层） |
 | `data/code/*` | `build_code_snapshots.py` / `build_vllm_snapshots.py` | 各版本源码 zip + 解压快照 + 符号/报错字面量索引 + 符号表/信号词 |
+| `data/code/forks/{model}/` | `build_fork_snapshots.py` | 0day fork 仓 vllm 代码（按镜像锁定 SHA）+ 独立符号索引 + meta（SHA↔镜像/分支/基线） |
+| `data/code/images/{tag}/` | `build_image_snapshots.py` | 0day 镜像内插件源码（插件层解包）+ 独立索引 + meta（image_digest/镜像时间/vllm commit/插件层 digest） |
 | `data/compatibility/*` | `build_release_calendar.py` / `build_companion_matrix.py` / `fetch_quay_tags.py` | 分仓版本日历 + 组件配套矩阵 |
 | `data/graph` | `build_graph.py` | Kùzu 图（Issue/PR/Release/Doc/Interface/Tag 节点 + 6 类边） |
 | `data/review.sqlite3` | `review_ui.py` 审核操作 | 审核队列（认证/存疑/删除），不参与检索 |
@@ -355,10 +364,10 @@ Agent 只调用 skill（`skills/vllm-kb/client.py`，标准库零依赖）→ HT
 | `signature` | `POST /signature-search` | 现场提取签名（`data/code/symbols.json` 符号表 + `signal_words.json`）→ kb.sqlite3 FTS 短语匹配 + 标题匹配 |
 | `title` | `GET /title` | kb.sqlite3 `docs` 表（title/source_id SQL LIKE） |
 | `version` | `GET /version` | `data/compatibility/release_calendar.{repo}.json`（版本形态判断） |
-| `code` | `POST /code/search` | `data/code/index.sqlite3` 符号/报错字面量索引命中，未命中退 grep 版本快照（snapshots/ 或 zips/）；`kind=msg` 走报错字面量索引 |
+| `code` | `POST /code/search` | `data/code/index.sqlite3` 符号/报错字面量索引命中，未命中退 grep 版本快照（snapshots/ 或 zips/）；`kind=msg` 走报错字面量索引；`--repo` 可切官方 / `fork:{model}` / `img:{tag}` |
 | `code --file` | `GET /code/file` | `data/code` 对应版本快照按需解压读取（截断带标记） |
-| `diff` | `GET /code/diff` | 两个版本快照同一文件的 unified diff |
-| `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单 |
+| `diff` | `GET /code/diff` | 两个快照同一文件的 unified diff；版本参数可带命名空间前缀（`img:` / `fork:` / `vllm-ascend:` / `vllm:`）跨仓对比 |
+| `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单；`repo=img` 列出**已提取镜像**（agent 发现 `img:` 前缀的入口） |
 | `doc` | `GET /doc/{source_id}` | kb.sqlite3 `docs` + `chunks_meta` + `chunks_fts` 按序拼装全文 |
 | `components` / `stats` / `health` | `GET` | kb.sqlite3 聚合 / 向量库 count（`/health` 含 embedding 状态） |
 | `companion` / `matrix` | `GET /companion` `/matrix` | `data/compatibility/vllm-ascend.json` 配套矩阵 |
@@ -382,7 +391,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `fts_tokenizer.py` | FTS5 中文分词（jieba 可选，未装降级原文）：入库侧分词写索引、查询侧分词构造 MATCH——中文词独立索引（"超时"可命中"超时排查"），词典词注册防拆分 |
 | `graph.py` / `graph_rels.py` | Kùzu 图：建图（FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH，含手册表格→错误码、命令格式→Interface、文档互证）+ 链路查询（tags/evidence/sig 大小写不敏感） |
 | `sanitize.py` | 内部数据脱敏（后置）：出口统一脱敏（IP/路径白名单 keep_paths/keep_ips）+ 入库命中收集（sources）→ `data/sanitize_log.json` |
-| `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布 |
+| `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布；`code_index` 承载四套命名空间：官方 / `fork:{model}` / `img:{tag}`（镜像插件层源码） |
 | `code_graph.py` | 代码图谱检索（gh-puller 接入）：MCP Streamable HTTP 客户端 + 熔断器，调用链/数据流/影响面/架构聚类/语义搜索——与 `code_index` 互补不重叠，不可达 503+引导不回退 |
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 + 知识缺口展示 |
