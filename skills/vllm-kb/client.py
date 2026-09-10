@@ -133,7 +133,7 @@ def fmt_search(data: dict) -> str:
         lines.append(f"    {r['title']}{sec_txt}")
         ver = r.get("verification") or ""
         ver_txt = f"  验证={ver}" if ver else ""
-        lines.append(f"    {r['url']}  status={r['status']}{ver_txt}  version_span={r['version_span']}")
+        lines.append(f"    {r['url']}  status={r['status']}{ver_txt}")
         lines.append(f"    ...{r['snippet'][:180]}...")
     return "\n".join(lines)
 

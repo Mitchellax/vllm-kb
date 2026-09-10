@@ -73,7 +73,9 @@ def register(app, ctx) -> None:
                     "verification": r.meta.get("verification", ""),
                     "tags": r.meta.get("tags", []),  # 文档最终标签（两级分类）
                     "version_ref": r.version_ref,
-                    "version_span": [r.meta.get("version_span_min"), r.meta.get("version_span_max")],
+                    # version_span 不再输出：min 是"知识产生时版本"（易被误读为修复版本），
+                    # max 上界查询期现算仅用于 w_ver 打分（search._derive_span_max），
+                    # 落地版本以 graph chain 的 MERGED_IN release 为准
                     "similarity": r.similarity,
                     "final": r.final,
                     "confidence": {

@@ -114,7 +114,7 @@ class TestFormatting(unittest.TestCase):
             "confidence": {"score": 0.5, "w_time": 0.9, "w_ver": 0.5, "w_rel": 0.6},
             "resolved": False, "component": "vllm", "version_ref": None,
             "title": "t", "url": "u", "status": "open", "verification": "expert",
-            "version_span": [], "snippet": "s",
+            "snippet": "s",
         }]}
         txt = client.fmt_search(data)
         self.assertIn("验证=expert", txt)
