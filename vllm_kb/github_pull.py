@@ -5,6 +5,10 @@
   不产生任何派生数据；canonical 由 recanonicalize() 从原始数据可再生（统一单文件），
   入库由 ingest 按内容哈希增量跳过 —— 换代码/换提取逻辑/补拉评论都不需要重拉 GitHub。
 
+  状态同步：原始 JSON 与 checkpoint 均记录 updatedAt（updated_at）。增量拉取时，
+  已拉条目若远端 updatedAt 更新（含 open→closed / 重新打开 / 正文评论变化）会**重拉覆盖**
+  raw 与评论，canonical/入库随 meta_hash 刷新（状态变化不重嵌，只刷新元数据）。
+
 - 同时拉 issue 与 PR（issues 接口含 PR，按 pull_request 字段分流）；
 - issue_state 支持 open/closed/all（all = 历史全量）；max_issues=0 表示全量；
 - source_id 带 repo 命名空间（如 github:vllm-project-vllm:issue:123），多仓库不冲突；
@@ -280,6 +284,7 @@ class GithubPuller:
             "body": node["body"] or "",
             "state": "open" if node["state"] == "OPEN" else "closed",
             "created_at": node["createdAt"],
+            "updated_at": node.get("updatedAt"),
             "closed_at": node["closedAt"],
             "html_url": node["url"],
             "labels": labels,
@@ -315,11 +320,28 @@ class GithubPuller:
             if c
         ]
 
+    @staticmethod
+    def _needs_refresh(node: dict, rec: dict, since: str | None) -> bool:
+        """增量窗口内已拉条目是否重拉：远端 updatedAt 比上次拉取新。
+
+        状态/正文/评论任一变化都会刷新 GitHub 的 updatedAt（open→closed、重新打开、
+        编辑正文、新评论等），重拉覆盖 raw 即可让 canonical/入库随之同步。
+
+        旧 checkpoint（升级前无 updated_at 记录）：since 有界窗口内重拉一次补记时间戳
+        （条目能进入窗口即说明最近有更新）；无 since（升级后首轮增量全扫）跳过，
+        避免把整库误当"已变化"重拉一遍。
+        """
+        server_updated = node.get("updatedAt") or ""
+        fetched_updated = rec.get("updated_at") or ""
+        if not fetched_updated:
+            return bool(since)
+        return bool(server_updated) and server_updated > fetched_updated
+
     def _collect_graphql(self, cp: dict, g: dict, kind: str, incremental: bool = False,
                          missing: bool = False) -> tuple[int, int]:
         """按游标枚举一类集合（issues/prs），落原始 JSON + checkpoint。
 
-        返回 (本轮新增, 本轮跳过)。进度行带 totalCount 完成度与新增/跳过计数。
+        返回 (本轮新增编号, 本轮重拉已有编号, 本轮跳过)。进度行带 totalCount 完成度与新增/跳过计数。
 
         **增量模式**（incremental=True，由 --incremental 触发）：
         - 窗口起点 = checkpoint 的 `{kind}_since`（上次增量看到的 max createdAt，
@@ -345,7 +367,8 @@ class GithubPuller:
         cursor = g.get(f"{kind}_cursor")
         states = self._graphql_states(self.issue_state, is_pr)
         owner, repo = self.repo.split("/", 1)
-        new_count = 0
+        new_count = 0  # 本轮真正新增的编号
+        refresh_count = 0  # 本轮重拉的已有编号（远端 updatedAt 已变化，如 open→closed）
         skip_count = 0
         pages = 0
         total = 0
@@ -436,6 +459,7 @@ class GithubPuller:
                     max_created = created
                 number = node["number"]
                 rec = cp["issues"].get(str(number))
+                freshly_pulled = True  # 默认：新编号；重拉分支会置 False
                 if missing:
                     # 补差：raw 目录或 checkpoint 已有且评论齐 → 跳过（跳过基准以 raw 为准）
                     comments_done = bool(rec and rec.get("comments")) or (
@@ -446,8 +470,15 @@ class GithubPuller:
                 else:
                     comments_done = bool(rec and rec.get("comments"))
                     if rec and (not self.fetch_comments or comments_done):
-                        skip_count += 1
-                        continue  # 已拉且评论已齐（断点续传/增量均跳过）
+                        # 状态/内容同步：远端 updatedAt 比上次拉取新（open→closed / 重新打开 /
+                        # 正文评论变化）→ 重拉覆盖 raw；旧 checkpoint（无 updated_at）在 since
+                        # 有界窗口内重拉一次补记时间戳，无 since 首轮跳过（防升级后整库重扫）。
+                        if not self._needs_refresh(node, rec, since):
+                            skip_count += 1
+                            continue  # 已拉且远端未变化（断点续传/增量均跳过）
+                        refresh_count += 1
+                        comments_done = False  # 重拉：评论一并重取
+                        freshly_pulled = False
                 item = self._item_from_node(node, is_pr)
                 comments = (
                     self._comments_from_node(node)
@@ -463,8 +494,10 @@ class GithubPuller:
                 cp["issues"][str(number)] = {
                     "fetched_at": _now_iso(),
                     "comments": comments_done or self.fetch_comments,
+                    "updated_at": node.get("updatedAt"),
                 }
-                new_count += 1
+                if freshly_pulled:
+                    new_count += 1
                 page_new += 1
                 collected_kind += 1
             pages += 1
@@ -483,7 +516,7 @@ class GithubPuller:
                 pct = f"累计 {collected_kind} / 窗口 {total}" if total else f"累计 {collected_kind}"
             print(
                 f"[github:{self.id}] {kind} 第 {pages} 页完成 | "
-                f"本轮 新增 {new_count} / 跳过 {skip_count} | "
+                f"本轮 新增 {new_count} / 重拉 {refresh_count} / 跳过 {skip_count} | "
                 f"{kind} 已收 {pct} | 全部已收 {len(cp['issues'])} | 游标 {pinfo['endCursor'][:12]}...",
                 flush=True,
             )
@@ -505,7 +538,7 @@ class GithubPuller:
             g[f"{kind}_since"] = max_created  # 正常翻完（hasNextPage=false）也推进窗口
         if not g.get(f"{kind}_done"):
             self._save_checkpoint(cp)
-        return new_count, skip_count
+        return new_count, refresh_count, skip_count
 
     def pull(self, incremental: bool = False, missing: bool = False,
              numbers: Optional[list[int]] = None) -> int:
@@ -518,6 +551,8 @@ class GithubPuller:
           从 checkpoint 的 `{kind}_since`（上次增量 max createdAt）起，issues 走
           filterBy.since 服务端过滤、PR 走 UPDATED_AT DESC 排序，跳过已有编号，
           连续 3 页无新增停止，把社区新增条目刷入并推进窗口；
+          额外：已拉条目若远端 updatedAt 更新（状态/正文/评论变化，含 open→closed）
+          会重拉覆盖 raw 与评论，状态同步到 canonical/入库；
         - **missing=True（--pull-missing）**：补差拉取——从头枚举（created desc），
           跳过 **raw 目录与 checkpoint 中已有的编号**，只拉缺失条目（补历史旧条目），
           翻到最新后置 done；与时间窗增量互补（增量只覆盖近期，补差不限新旧）；
@@ -554,6 +589,7 @@ class GithubPuller:
                 g["prs_since"] = since_prs
 
         new_count = 0
+        refresh_count = 0
         skip_count = 0
         # 1) issues（先）
         if g.get("issues_done") and not incremental and not missing:
@@ -561,9 +597,10 @@ class GithubPuller:
                   f"如需拉取社区增量请用 --incremental；补历史缺失用 --pull-missing；"
                   f"全量重拉请删除 raw 与 checkpoint")
         else:
-            n, s = self._collect_graphql(cp, g, kind="issues", incremental=incremental,
-                                         missing=missing)
+            n, r, s = self._collect_graphql(cp, g, kind="issues", incremental=incremental,
+                                            missing=missing)
             new_count += n
+            refresh_count += r
             skip_count += s
         # 2) PRs（后）
         if self.include_prs:
@@ -571,9 +608,10 @@ class GithubPuller:
                 print(f"[github:{self.id}] prs 已拉取完成（done），默认跳过——"
                       f"如需拉取社区增量请用 --incremental；补历史缺失用 --pull-missing")
             else:
-                n, s = self._collect_graphql(cp, g, kind="prs", incremental=incremental,
-                                             missing=missing)
+                n, r, s = self._collect_graphql(cp, g, kind="prs", incremental=incremental,
+                                                missing=missing)
                 new_count += n
+                refresh_count += r
                 skip_count += s
 
         cp["state"] = self.issue_state
@@ -581,10 +619,10 @@ class GithubPuller:
         cp["direction"] = self.direction
         self._save_checkpoint(cp)
         print(
-            f"[github:{self.id}] 完成：本轮新增 {new_count} / 跳过 {skip_count}，"
-            f"已收集 {len(cp['issues'])} 条"
+            f"[github:{self.id}] 完成：本轮新增 {new_count} / 重拉 {refresh_count} / "
+            f"跳过 {skip_count}，已收集 {len(cp['issues'])} 条"
         )
-        return new_count
+        return new_count + refresh_count
 
     def _get_comments(self, number: int) -> list[dict]:
         url = f"{self.base}/repos/{self.repo}/issues/{number}/comments"
@@ -737,6 +775,7 @@ class GithubPuller:
             "body": data.get("body") or "",
             "state": "open" if data.get("state") == "open" else "closed",
             "created_at": data.get("created_at"),
+            "updated_at": data.get("updated_at"),
             "closed_at": data.get("closed_at"),
             "html_url": data.get("html_url"),
             "labels": [{"name": l["name"]} for l in data.get("labels") or [] if l.get("name")],
@@ -806,7 +845,8 @@ class GithubPuller:
             self._save_raw(kind, n, item)
             if comments:
                 self._save_raw("comments", n, comments)
-            cp["issues"][sn] = {"fetched_at": _now_iso(), "comments": self.fetch_comments}
+            cp["issues"][sn] = {"fetched_at": _now_iso(), "comments": self.fetch_comments,
+                                "updated_at": item.get("updated_at")}
             new += 1
             print(f"[github:{self.id}] #{n} 补拉完成（{kind}）")
         self._save_checkpoint(cp)

@@ -326,6 +326,41 @@ class TestGithubConvert(unittest.TestCase):
         self.assertIsNone(item["pull_request"]["head_sha"])
         self.assertEqual(item["pull_request"]["head_branch"], "feature")
 
+    def test_item_from_node_records_updated_at(self):
+        """GraphQL 节点落盘 updated_at（状态同步锚点），_to_doc 透传到 doc.updated_at。"""
+        node = {
+            "number": 42, "title": "[Bug]: x", "body": "body text",
+            "state": "CLOSED", "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-05T00:00:00Z",
+            "closedAt": "2026-01-02T00:00:00Z", "url": "https://github.com/x/issues/42",
+            "author": {"login": "alice"},
+            "labels": {"nodes": [{"name": "bug"}]},
+        }
+        item = GithubPuller._item_from_node(node, is_pr=False)
+        self.assertEqual(item["updated_at"], "2026-01-05T00:00:00Z")
+        doc = GithubPuller(make_source(), PROJECT_ROOT)._to_doc(item, [])
+        self.assertEqual(doc.updated_at, "2026-01-05T00:00:00Z")
+        # 节点缺 updatedAt（老查询/异常形态）：落 None，不报错
+        item2 = GithubPuller._item_from_node(_node(3), is_pr=False)
+        self.assertIsNone(item2["updated_at"])
+
+    def test_item_from_rest_records_updated_at(self):
+        """REST 响应透传 updated_at（--numbers 单条补拉的 checkpoint 锚点）。"""
+        data = {
+            "number": 77, "title": "issue 77", "body": "b", "state": "open",
+            "created_at": "2026-05-01T00:00:00Z",
+            "updated_at": "2026-05-03T00:00:00Z",
+            "closed_at": None,
+            "html_url": "https://github.com/vllm-project/vllm/issues/77",
+            "labels": [], "user": {"login": "bob"},
+        }
+        item = GithubPuller._item_from_rest(data, is_pr=False)
+        self.assertEqual(item["updated_at"], "2026-05-03T00:00:00Z")
+        # REST 响应缺 updated_at：落 None
+        data2 = dict(data)
+        del data2["updated_at"]
+        self.assertIsNone(GithubPuller._item_from_rest(data2, is_pr=False)["updated_at"])
+
     def test_graphql_states_mapping(self):
         from vllm_kb.github_pull import GithubPuller as GP
 
@@ -357,8 +392,9 @@ class TestGithubConvert(unittest.TestCase):
             puller._graphql_request = fake_request
             cp = {"issues": {}}
             g = {}
-            new_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
+            new_count, refresh_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
             self.assertEqual(new_count, 3)
+            self.assertEqual(refresh_count, 0)
             self.assertEqual(skip_count, 0)
             self.assertEqual(after_values, [None, "C1"])  # 第二次请求必须带上第一页的 endCursor
             self.assertTrue(g["issues_done"])
@@ -383,10 +419,11 @@ class TestGithubConvert(unittest.TestCase):
             puller._graphql_request = stuck_request
             cp = {"issues": {}}
             g = {}
-            new_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
+            new_count, refresh_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
             # 首页已收 1 条；此后 endCursor 恒为 C1：首页 1 次 + 检测到重复 1 次 +
             # 重试 STALL_RETRIES 次后跳过，不再发请求、不抛异常、kind 不置 done（下次续传）。
             self.assertEqual(new_count, 1)
+            self.assertEqual(refresh_count, 0)
             self.assertEqual(requests["n"], 2 + GithubPuller.STALL_RETRIES)
             self.assertFalse(g.get("issues_done"))
             self.assertEqual(g.get("issues_cursor"), "C1")  # 停在本游标，续传不重复
@@ -420,7 +457,7 @@ class TestGithubConvert(unittest.TestCase):
             puller._graphql_request = flaky_request
             cp = {"issues": {}}
             g = {}
-            new_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
+            new_count, refresh_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
             self.assertEqual(new_count, 3)  # 1、2、3 全部入库
             self.assertEqual(requests["n"], 3)  # 首页 + 滑动页 + 重试恢复页
             self.assertTrue(g["issues_done"])
@@ -506,8 +543,9 @@ class TestGithubConvert(unittest.TestCase):
             puller._get_comments = lambda number: rest_calls.append(number) or []
             cp = {"issues": {}}
             g = {}
-            new_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
+            new_count, refresh_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
             self.assertEqual(new_count, 1)
+            self.assertEqual(refresh_count, 0)
             self.assertEqual(rest_calls, [])  # 评论全量走 GraphQL，REST 兜底零调用
             comments = json.loads((Path(td) / "raw" / "comments" / "11.json").read_text(encoding="utf-8"))
             self.assertEqual(comments[0]["user"]["login"], "bob")
@@ -791,6 +829,219 @@ class TestPullIncremental(unittest.TestCase):
             self.assertEqual(len(calls), 1)  # 只发一次请求（无停滞重试）
             self.assertTrue((Path(td) / "raw" / "issues" / "7.json").exists())
 
+    # ---------- 状态同步：已拉条目远端 updatedAt 更新（如 open→closed）时重拉 ----------
+
+    def _closed_node(self, number, updated_at, created_at="2025-06-01T00:00:00Z"):
+        """已关闭的 GraphQL issue 节点（updatedAt 晚于 createdAt，模拟 close 事件）。"""
+        node = _node(number, created_at=created_at)
+        node.update({
+            "updatedAt": updated_at,
+            "state": "CLOSED",
+            "closedAt": updated_at,
+            "title": f"[Bug]: issue {number} closed",
+        })
+        return node
+
+    def test_pull_incremental_refreshes_updated_item(self):
+        """已拉条目远端 updatedAt 更新（open→closed）：增量窗口内重拉覆盖 raw，
+        checkpoint 更新时间戳；计数计入"重拉"而非"新增"。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            cp["issues"]["1"] = {"fetched_at": "x", "comments": False,
+                                 "updated_at": "2025-07-01T00:00:00Z"}  # 上次拉取时还是 open
+            cp["graphql"]["issues_since"] = "2025-06-01T00:00:00Z"
+            puller._save_checkpoint(cp)
+            # 旧快照：open 状态
+            (Path(td) / "raw" / "issues").mkdir(parents=True)
+            (Path(td) / "raw" / "issues" / "1.json").write_text(
+                json.dumps({"number": 1, "state": "open", "title": "old"}), encoding="utf-8")
+
+            # 远端已关闭：updatedAt 推进
+            closed = self._closed_node(1, updated_at="2025-08-10T00:00:00Z")
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    self.assertEqual(variables["filter"], {"since": "2025-06-01T00:00:00Z"})
+                    return {"issues": {"totalCount": 1,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       "nodes": [closed]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 1)  # pull 返回值 = 新增 + 重拉
+            raw = json.loads((Path(td) / "raw" / "issues" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw["state"], "closed")  # 状态已同步
+            self.assertEqual(raw["updated_at"], "2025-08-10T00:00:00Z")
+            cp2 = puller._load_checkpoint()
+            self.assertEqual(cp2["issues"]["1"]["updated_at"], "2025-08-10T00:00:00Z")
+            self.assertEqual(len(cp2["issues"]), 1)  # 编号数不变（重拉不新增）
+
+    def test_pull_incremental_refresh_refetches_comments(self):
+        """重拉时评论一并重取（条目有更新，可能有新评论）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            src = make_source(token="fake-token",
+                              raw_dir=f"{td}/raw", checkpoint_file=f"{td}/cp.json",
+                              fetch_comments=True)
+            puller = GithubPuller(src, PROJECT_ROOT)
+            puller._save_checkpoint({
+                "issues": {"1": {"fetched_at": "x", "comments": True,
+                                 "updated_at": "2025-07-01T00:00:00Z"}},
+                "state": "all", "sort": "created", "direction": "desc",
+                "graphql": {"issues_done": True, "prs_done": True,
+                            "issues_since": "2025-06-01T00:00:00Z"},
+            })
+            # 旧评论
+            (Path(td) / "raw" / "comments").mkdir(parents=True)
+            (Path(td) / "raw" / "comments" / "1.json").write_text(
+                json.dumps([{"user": {"login": "a"}, "created_at": "2025-07-01T00:00:00Z", "body": "old"}]),
+                encoding="utf-8")
+
+            closed = self._closed_node(1, updated_at="2025-08-10T00:00:00Z")
+            closed["comments"] = {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [{"author": {"login": "bob"}, "createdAt": "2025-08-09T00:00:00Z",
+                           "body": "fixed by #999"}],
+            }
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 1,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       "nodes": [closed]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 1)
+            comments = json.loads((Path(td) / "raw" / "comments" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(comments[0]["body"], "fixed by #999")  # 评论已覆盖
+
+    def test_pull_incremental_skips_unchanged_item(self):
+        """已拉条目远端 updatedAt 未变：增量窗口内跳过，不重写 raw、不更新时间戳。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            cp["issues"]["1"] = {"fetched_at": "x", "comments": False,
+                                 "updated_at": "2025-07-01T00:00:00Z"}
+            cp["graphql"]["issues_since"] = "2025-06-01T00:00:00Z"
+            puller._save_checkpoint(cp)
+            (Path(td) / "raw" / "issues").mkdir(parents=True)
+            (Path(td) / "raw" / "issues" / "1.json").write_text(
+                json.dumps({"number": 1, "state": "open", "title": "old"}), encoding="utf-8")
+
+            # 远端 updatedAt 与 checkpoint 相同 → 未变化
+            node = _node(1, created_at="2025-06-01T00:00:00Z")
+            node["updatedAt"] = "2025-07-01T00:00:00Z"
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 1,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       "nodes": [node]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 0)
+            raw = json.loads((Path(td) / "raw" / "issues" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw["state"], "open")  # raw 未被覆盖
+            cp2 = puller._load_checkpoint()
+            self.assertEqual(cp2["issues"]["1"]["updated_at"], "2025-07-01T00:00:00Z")
+
+    def test_pull_incremental_legacy_item_refreshes_in_window_only(self):
+        """旧 checkpoint（无 updated_at）：since 有界窗口内重拉一次补记时间戳——
+        条目能进窗口说明最近有更新（如 open→closed）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            cp = puller._load_checkpoint()
+            # 旧格式：只有 fetched_at/comments，无 updated_at
+            cp["graphql"]["issues_since"] = "2025-06-01T00:00:00Z"
+            puller._save_checkpoint(cp)
+            (Path(td) / "raw" / "issues").mkdir(parents=True)
+            (Path(td) / "raw" / "issues" / "1.json").write_text(
+                json.dumps({"number": 1, "state": "open", "title": "old"}), encoding="utf-8")
+
+            closed = self._closed_node(1, updated_at="2025-08-10T00:00:00Z")
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 1,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       "nodes": [closed]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 1)  # 重拉一次
+            raw = json.loads((Path(td) / "raw" / "issues" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw["state"], "closed")
+            cp2 = puller._load_checkpoint()
+            self.assertEqual(cp2["issues"]["1"]["updated_at"], "2025-08-10T00:00:00Z")  # 已补记
+
+    def test_pull_incremental_legacy_item_skipped_without_since(self):
+        """旧 checkpoint 且无 since（升级后首轮增量全扫）：已有条目跳过，
+        避免把整库误当"已变化"重拉一遍（防升级后整库重扫）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            # 无 issues_since：首轮增量从头枚举
+            (Path(td) / "raw" / "issues").mkdir(parents=True)
+            (Path(td) / "raw" / "issues" / "1.json").write_text(
+                json.dumps({"number": 1, "state": "open", "title": "old"}), encoding="utf-8")
+
+            closed = self._closed_node(1, updated_at="2025-08-10T00:00:00Z")
+
+            def fake_request(query, variables):
+                if "issues" in query:
+                    return {"issues": {"totalCount": 1,
+                                       "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                       "nodes": [closed]}}
+                return {"pullRequests": {"totalCount": 0,
+                                         "pageInfo": {"hasNextPage": False, "endCursor": "P1"},
+                                         "nodes": []}}
+
+            puller._graphql_request = fake_request
+            with redirect_stdout(StringIO()):
+                n = puller.pull(incremental=True)
+            self.assertEqual(n, 0)  # 旧条目未重拉
+            raw = json.loads((Path(td) / "raw" / "issues" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw["state"], "open")  # raw 保持原样
+            cp2 = puller._load_checkpoint()
+            self.assertNotIn("updated_at", cp2["issues"]["1"])  # 未补记时间戳
+
 
 class TestPullMissing(unittest.TestCase):
     """--pull-missing 补差拉取 / --numbers REST 单条补拉（mock，不触网）。"""
@@ -874,6 +1125,7 @@ class TestPullMissing(unittest.TestCase):
         return {
             "number": number, "title": f"fix {number}", "body": "body",
             "state": "closed", "created_at": "2026-05-01T00:00:00Z",
+            "updated_at": "2026-06-02T00:00:00Z",
             "closed_at": "2026-06-01T00:00:00Z",
             "html_url": f"https://github.com/vllm-project/vllm/pull/{number}",
             "labels": [{"name": "bug"}], "user": {"login": "alice"},
@@ -919,6 +1171,7 @@ class TestPullMissing(unittest.TestCase):
             self.assertEqual(item["pull_request"]["head_sha"], "9" * 40)
             cp = puller._load_checkpoint()
             self.assertIn("42", cp["issues"])
+            self.assertEqual(cp["issues"]["42"]["updated_at"], "2026-06-02T00:00:00Z")  # checkpoint 锚点
             self.assertEqual(len(calls), 1)  # 只发 pulls 一次（fetch_comments=False 不拉评论）
 
     def test_pull_numbers_falls_back_to_issues_on_404(self):
