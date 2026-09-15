@@ -47,6 +47,7 @@
 ### 2.1 GitHub 社区来源（issue / PR / comment）
 
 触发命令：`python scripts/build_kb.py`（可加 `--limit N` / `--incremental` / `--pull-missing` / `--numbers` / `--numbers … --force-numbers`）。
+全量部署 / 增量更新另有 `python scripts/maintain.py deploy | update` 单指令入口（自动编排多步、自动降级）。
 拉取模式（互斥）：**断点续传**（默认，done 后跳过）/ **`--incremental` 时间窗增量**（近期新增 +
 已拉条目远端 updatedAt 更新时重拉覆盖状态/正文/评论，含 open→closed）/
 **`--pull-missing` 补差**（从头枚举，跳过 raw/checkpoint 已有，只拉缺失——补历史旧条目）/

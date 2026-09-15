@@ -96,6 +96,8 @@ python scripts/build_kb.py --limit 100
 | **GitHub 补差拉取**（补历史缺失条目，跳过已有） | `python scripts/build_kb.py --pull-missing` |
 | **REST 单条补拉**（指定编号，无需 GraphQL token） | `python scripts/build_kb.py --numbers 9749,9750` |
 | **强制重拉指定编号**（忽略 raw/checkpoint 已有记录） | `python scripts/build_kb.py --numbers 9749,9750 --force-numbers` |
+| **全量部署**（含建库+建图+建FTS+辅助数据，自动降级） | `python scripts/maintain.py deploy` |
+| **增量更新**（日常维护：增量拉取+入库+重建图） | `python scripts/maintain.py update` |
 | 只重入库不拉取 | `python scripts/build_kb.py --skip-pull` |
 | 只再生 canonical（不入库，供建图） | `python scripts/build_canonical.py` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
@@ -133,6 +135,10 @@ canonical / raw / 图 / 审核库不受影响；中断后重跑仍会先清空�
 知识库是"离线数据 + 定期刷新"，不需要实时：
 
 ```bash
+# 单指令增量更新（日常维护：增量拉取 + 入库 + 重建图，一步到位）
+python scripts/maintain.py update
+
+# 或分步执行（了解细节时）：
 # 1. 拉取社区增量 + 增量入库（新增 + 状态同步：已拉条目 open→closed/内容变化
 #    自动重拉覆盖；时间窗口见上；中断后重跑同一命令续传）
 python scripts/build_kb.py --incremental
@@ -149,7 +155,17 @@ python scripts/build_graph.py
 
 注意：
 
-- **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图；
+- **日常维护用 `python scripts/maintain.py update` 一步到位**：内部执行
+  `build_kb.py --incremental`（增量拉取+入库）→ `build_graph.py`（重建图）→ 提示重启 API；
+  分步命令（下）用于需要细粒度控制时；
+- **全量部署用 `python scripts/maintain.py deploy`**：内部按序执行
+  `build_kb.py`（全量拉取+入库）→ `build_graph.py` → `build_fts.py` → 版本日历 →
+  配套矩阵 → 代码快照（vllm-ascend + vllm 主仓）；**自动降级**：建图/FTS/日历/矩阵/
+  快照任一步失败只告警不中断（不影响已完成的入库结果）；`--insecure` / `--github-base` /
+  `--quay-base` 传给全部子步骤（也可用 `VLLM_KB_INSECURE` 等环境变量）；
+  `--skip-code-snapshots` 跳过代码快照；
+- **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图
+  （`maintain.py update` 已含此步）；
 - **FTS 全文索引不需要日常重建**：增量入库时新文档已实时写入 `chunks_fts`（含 jieba 分词）；
   仅当升级 jieba / 分词规则 / 标签词典（`tags.registry`）后，才跑 `build_fts.py` 让存量文档
   也用新分词（不重嵌向量；旧库无分词列升级时 ingest 会打印提示）；

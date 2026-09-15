@@ -194,10 +194,17 @@ python scripts/build_canonical.py
 # 4. 换 embedding 模型 / 全量重建（高危，需 TTY 确认或 --yes）
 python scripts/build_kb.py --rebuild
 
-# 5. 版本日历（GitHub Releases → 版本形态 + 置信度上界；--all-repos 生成 vllm/vllm-ascend 分仓日历）
+# 5. 单指令全量部署（建库+建图+建FTS+辅助数据，自动降级，继承 INSECURE）
+python scripts/maintain.py deploy
+python scripts/maintain.py deploy --skip-code-snapshots  # 跳过代码快照
+
+# 6. 单指令增量更新（日常维护：增量拉取+入库+重建图）
+python scripts/maintain.py update
+
+# 7. 版本日历（GitHub Releases → 版本形态 + 置信度上界；--all-repos 生成 vllm/vllm-ascend 分仓日历）
 python scripts/build_release_calendar.py --all-repos
 
-# 6. 版本化代码仓快照（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json）
+# 8. 版本化代码仓快照（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json）
 python scripts/build_code_snapshots.py          # vllm-ascend 版本
 python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本（配套矩阵映射，自动跟随）
 python scripts/build_fork_snapshots.py          # 0day fork 仓（--model 指定模型；独立 forks 命名空间，按镜像锁定 SHA 拉取）
@@ -206,21 +213,21 @@ python scripts/build_image_snapshots.py         # 0day 镜像内**实际部署�
 #    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
 #    python scripts/build_image_snapshots.py --index-only  # 镜像快照索引重建（不联网）
 
-# 7. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
+# 9. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
 python scripts/build_companion_matrix.py        # 生成/更新 data/compatibility/vllm-ascend.json
 python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（fork 层 SHA/GitHub 数据）
 python scripts/fetch_quay_tags.py               # 拉 quay.io 镜像 tag（看护策略过滤日构建/分支/主干）
 
-# 8. 图存储重建（修复链路/手册定义；需先停检索服务，Kùzu 单写者）
+# 10. 图存储重建（修复链路/手册定义；需先停检索服务，Kùzu 单写者）
 python scripts/build_graph.py
 
-# 9. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
+# 11. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
 python scripts/build_fts.py
 
-# 10. 社区高频信号词统计（issue 标题 TF-IDF → data/code/signal_words.json，供 agent 判断）
+# 12. 社区高频信号词统计（issue 标题 TF-IDF → data/code/signal_words.json，供 agent 判断）
 python scripts/build_signal_words.py
 
-# 11. 正文 TF-IDF 标签候选导出（jieba → candidates.json 文件，人工审阅后手动同步 config.tags.registry）
+# 13. 正文 TF-IDF 标签候选导出（jieba → candidates.json 文件，人工审阅后手动同步 config.tags.registry）
 python scripts/build_tag_candidates.py
 ```
 
