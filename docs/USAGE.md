@@ -6,7 +6,8 @@
 **目录**
 
 - [1. 环境准备](#1-环境准备) —— [1.1 依赖](#11-依赖) / [1.2 配置](#12-配置密钥走环境变量)
-- [2. 数据采集与构建](#2-数据采集与构建) —— [2.1 增量与重建](#21-增量与重建) /
+- [2. 数据采集与构建](#2-数据采集与构建) —— [2.0 快速运维（单指令）](#20-快速运维单指令) /
+  [2.1 增量与重建](#21-增量与重建) /
   [2.2 辅助数据构建](#22-辅助数据构建) / [2.3 业务来源导入（PDF / Markdown）](#23-业务来源导入pdf-手册--markdown-文档--完整实操) /
   [2.4 Excel 登记表导入](#24-excel-登记表导入schema-free--完整实操)
 - [3. 启动检索服务](#3-启动检索服务) —— [3.1 日志与降级](#31-总日志接口打屏--可选落盘分卷) /
@@ -76,6 +77,45 @@ export EMBEDDING_API_KEY=sk-xxx
 
 ## 2. 数据采集与构建
 
+### 2.0 快速运维（单指令）
+
+**不需要了解项目内部结构**——日常维护只有两个命令：首次部署用 `deploy`，之后每天用
+`update`。命令自动编排多步并**自动降级**（某一步缺依赖/断网只告警不中断），
+`--insecure` / `--github-base` / `--quay-base` 自动透传给所有子步骤。
+
+```bash
+# 🟢 首次部署 / 全量重建（拉取+入库 → 建图 → 建FTS → 版本日历 → 配套矩阵 → 代码快照）
+python scripts/maintain.py deploy
+
+# 🔄 日常增量更新（增量拉取+入库 → 重建图）
+python scripts/maintain.py update
+```
+
+> ⚠️ **更新前必须停止检索服务（`serve_api`）**：`deploy` / `update` 都包含建图步骤，
+> Kùzu 单写者——图被 API 占用时建图会失败。**流程：停 API → 跑更新 → 重启 API**。
+> API 不便停时用 `update --skip-graph` 只做增量入库，图稍后单独补建。
+
+**细分指令**（按需裁剪步骤，省时 / 适配环境）：
+
+| 指令 | 说明 |
+|---|---|
+| `deploy --skip-graph` | 跳过建图（Kùzu 未装 / 暂时不需要图） |
+| `deploy --skip-fts` | 跳过全文索引重建 |
+| `deploy --skip-calendar` | 跳过版本日历拉取（省一次 GitHub API 调用） |
+| `deploy --skip-matrix` | 跳过配套矩阵拉取（省 quay+GitHub 调用） |
+| `deploy --skip-code-snapshots` | 跳过代码快照下载（省时间 / 省网络） |
+| `update --skip-graph` | 仅增量入库不改图（API 不便停时；图稍后 `build_graph.py` 单独补） |
+| `deploy/update --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
+| `deploy/update --config path` | 指定 config.json（默认项目根自动发现） |
+
+**自动降级**（子步骤失败不中断，只打印告警）：
+
+- **kuzu 未装** → 建图步骤失败告警跳过（KB 入库不受影响，图查询暂不可用）；
+- **jieba 未装** → FTS 分词降级为原文（中文词无法独立命中，索引结构不变）；
+- **网络不可达** → 版本日历 / 配套矩阵 / 代码快照步骤失败告警跳过；
+- 唯一致命步骤是「数据拉取与入库」（`build_kb.py`）——它失败说明数据源/密钥有问题，
+  需人工处理后重跑；其余步骤失败均不影响已入库数据。
+
 ```bash
 # 全量拉取 + 入库（issues/PRs/comments/releases，数小时~数十小时，可 Ctrl-C 中断后重跑续传）
 python scripts/build_kb.py
@@ -96,11 +136,12 @@ python scripts/build_kb.py --limit 100
 | **GitHub 补差拉取**（补历史缺失条目，跳过已有） | `python scripts/build_kb.py --pull-missing` |
 | **REST 单条补拉**（指定编号，无需 GraphQL token） | `python scripts/build_kb.py --numbers 9749,9750` |
 | **强制重拉指定编号**（忽略 raw/checkpoint 已有记录） | `python scripts/build_kb.py --numbers 9749,9750 --force-numbers` |
-| **全量部署**（含建库+建图+建FTS+辅助数据，自动降级） | `python scripts/maintain.py deploy` |
-| **增量更新**（日常维护：增量拉取+入库+重建图） | `python scripts/maintain.py update` |
 | 只重入库不拉取 | `python scripts/build_kb.py --skip-pull` |
 | 只再生 canonical（不入库，供建图） | `python scripts/build_canonical.py` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
+
+> 日常维护（全量部署 / 增量更新）优先用 §2.0 的 `maintain.py deploy` / `update` 单指令；
+> 本表是细分脚本，供需要精确控制时单独调用。
 
 **拉取策略（GitHub）**
 
@@ -136,6 +177,7 @@ canonical / raw / 图 / 审核库不受影响；中断后重跑仍会先清空�
 
 ```bash
 # 单指令增量更新（日常维护：增量拉取 + 入库 + 重建图，一步到位）
+# ⚠️ 先停 serve_api（建图需 Kùzu 单写者）→ 更新 → 重启 API
 python scripts/maintain.py update
 
 # 或分步执行（了解细节时）：
@@ -155,15 +197,17 @@ python scripts/build_graph.py
 
 注意：
 
-- **日常维护用 `python scripts/maintain.py update` 一步到位**：内部执行
-  `build_kb.py --incremental`（增量拉取+入库）→ `build_graph.py`（重建图）→ 提示重启 API；
-  分步命令（下）用于需要细粒度控制时；
-- **全量部署用 `python scripts/maintain.py deploy`**：内部按序执行
+- **日常维护用 `python scripts/maintain.py update` 一步到位**（见 §2.0 快速运维）：
+  内部执行 `build_kb.py --incremental`（增量拉取+入库）→ `build_graph.py`（重建图）→
+  提示重启 API；分步命令（下）用于需要细粒度控制时；
+- **全量部署用 `python scripts/maintain.py deploy`**（见 §2.0）：内部按序执行
   `build_kb.py`（全量拉取+入库）→ `build_graph.py` → `build_fts.py` → 版本日历 →
   配套矩阵 → 代码快照（vllm-ascend + vllm 主仓）；**自动降级**：建图/FTS/日历/矩阵/
   快照任一步失败只告警不中断（不影响已完成的入库结果）；`--insecure` / `--github-base` /
   `--quay-base` 传给全部子步骤（也可用 `VLLM_KB_INSECURE` 等环境变量）；
-  `--skip-code-snapshots` 跳过代码快照；
+  细分指令（`--skip-graph` / `--skip-fts` / `--skip-code-snapshots` 等）见 §2.0 表格；
+- **更新前先停检索 API**：`deploy` / `update`（含建图步骤）都要先停 `serve_api`
+  （Kùzu 单写者），更新完再启动；
 - **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图
   （`maintain.py update` 已含此步）；
 - **FTS 全文索引不需要日常重建**：增量入库时新文档已实时写入 `chunks_fts`（含 jieba 分词）；
@@ -175,7 +219,6 @@ python scripts/build_graph.py
 - **状态同步是自动的**：`--incremental` 会对已拉但远端更新过的条目（含 open→closed）重拉覆盖，
   无需干预；若已知某个编号状态/内容已变、想立即同步（不等下一轮增量窗口），用
   `--numbers 编号 --force-numbers` 强制重拉单条；
-- 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
 
 ### 2.2 辅助数据构建
 

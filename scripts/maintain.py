@@ -6,10 +6,23 @@
 用法（在项目根）：
     python scripts/maintain.py deploy              # 全量部署：拉取+入库+建图+建FTS+辅助数据
     python scripts/maintain.py deploy --help       # 查看 deploy 选项
+    python scripts/maintain.py deploy --skip-graph # 跳过图构建（省时 / Kùzu 未装）
     python scripts/maintain.py deploy --skip-code-snapshots  # 跳过代码快照（省时）
 
     python scripts/maintain.py update              # 增量更新：增量拉取+入库+重建图
-    python scripts/maintain.py update --help
+    python scripts/maintain.py update --skip-graph # 仅增量入库，不改图（API 不便停时）
+
+前置要求：
+    - config.json 已配置（默认项目根 config.json，也可 --config 指定）
+    - GITHUB_TOKEN / EMBEDDING_API_KEY 等密钥已设置（环境变量）
+    - 首次部署需网络（后续增量更新离线可用）
+    - **更新前请停止 serve_api**（build_graph 需要 Kùzu 单写者）
+
+自动降级（非核心步骤失败不中断，只告警）：
+    - kuzu 未装 → build_graph 跳过（告警继续，不影响 KB）
+    - jieba 未装 → FTS 降级为原文（无中文分词，索引不变）
+    - 网络不可达 → 版本日历/配套矩阵/代码快照跳过
+    - 建图/FTS/日历/矩阵/快照任一步失败 → 告警继续，已完成的入库不受影响
 """
 from __future__ import annotations
 
@@ -44,6 +57,23 @@ _UPDATE_STEPS = [
     ("scripts/build_kb.py", ["--incremental"], True, "增量拉取与入库"),
     ("scripts/build_graph.py", [], False, "图重建（Kùzu）"),
 ]
+
+_STEP_KEY = {  # 步骤名 → key（供 --skip-* 过滤）
+    "图构建（Kùzu）": "graph",
+    "图重建（Kùzu）": "graph",
+    "全文索引重建（FTS5）": "fts",
+    "版本日历": "calendar",
+    "配套矩阵": "matrix",
+    "代码快照（vllm-ascend，config.code.versions）": "code_snapshots",
+    "代码快照（vllm 主仓，companion 对应）": "code_snapshots",
+}
+
+
+def _remind_stop_api(skip_keys: set[str]):
+    """在图相关步骤将执行时打印停服务提醒。"""
+    if "graph" not in skip_keys:
+        print("\n[maintain] ⚠️  注意：build_graph 要求停 serve_api（Kùzu 单写者）。")
+        print("[maintain]   如果 serve_api 仍在运行，请先 Ctrl-C 停止，更新完成后重启。\n")
 
 
 def _resolve(script: str) -> str:
@@ -124,6 +154,11 @@ def _insecure_env_from_args(args) -> dict[str, str]:
     return env
 
 
+def _filter_steps(steps, skip_keys: set[str]):
+    """按 --skip-* 过滤步骤（保留无对应 key 的步骤）。"""
+    return [s for s in steps if _STEP_KEY.get(s[3], "") not in skip_keys]
+
+
 def cmd_deploy(args) -> int:
     """全量部署。"""
     insecure_env = _insecure_env_from_args(args)
@@ -138,12 +173,16 @@ def cmd_deploy(args) -> int:
         steps.append(
             ("scripts/build_vllm_snapshots.py", [], False, "代码快照（vllm 主仓，companion 对应）")
         )
+    steps = _filter_steps(steps, args.skip)
 
     start = time.time()
     print(f"[maintain] 🚀 全量部署开始 ...")
     print(f"[maintain] 配置: {'默认 config.json' if args.config is None else args.config}")
     if insecure_env:
         print(f"[maintain] 不安全模式: {insecure_env}")
+    if args.skip:
+        print(f"[maintain] 跳过步骤: {', '.join(sorted(args.skip))}")
+    _remind_stop_api(args.skip)
     print()
 
     success_count = 0
@@ -165,16 +204,20 @@ def cmd_deploy(args) -> int:
 def cmd_update(args) -> int:
     """增量更新（日常维护）。"""
     insecure_env = _insecure_env_from_args(args)
+    steps = _filter_steps(_UPDATE_STEPS, args.skip)
     start = time.time()
     print(f"[maintain] 🔄 增量更新开始 ...")
     if args.config:
         print(f"[maintain] 配置: {args.config}")
     if insecure_env:
         print(f"[maintain] 不安全模式: {insecure_env}")
+    if args.skip:
+        print(f"[maintain] 跳过步骤: {', '.join(sorted(args.skip))}")
+    _remind_stop_api(args.skip)
     print()
 
     success_count = 0
-    for script, extra, fatal, tag in _UPDATE_STEPS:
+    for script, extra, fatal, tag in steps:
         ok = _run_step(script, extra, fatal, tag, insecure_env, args.config)
         if not ok:
             print(f"\n[maintain] 💥 增量更新中止。")
@@ -184,7 +227,7 @@ def cmd_update(args) -> int:
     elapsed = time.time() - start
     mins, secs = divmod(int(elapsed), 60)
     print(f"\n{'='*60}")
-    print(f"[maintain] ✅ 增量更新完成：{success_count}/{len(_UPDATE_STEPS)} 步骤成功")
+    print(f"[maintain] ✅ 增量更新完成：{success_count}/{len(steps)} 步骤成功")
     print(f"[maintain] 耗时：{mins} 分 {secs} 秒")
     print(f"[maintain] 提示：增量更新后图已重建，检索 API 需重启才能加载新图。")
     return 0
@@ -210,15 +253,38 @@ def main() -> None:
 
     # --- deploy ---
     p_deploy = sub.add_parser("deploy", help="全量部署：拉取+入库+建图+建FTS+辅助数据")
+    p_deploy.add_argument("--skip-graph", action="store_true",
+                          help="跳过图构建（Kùzu 未装或不想重建时）")
+    p_deploy.add_argument("--skip-fts", action="store_true",
+                          help="跳过全文索引重建")
+    p_deploy.add_argument("--skip-calendar", action="store_true",
+                          help="跳过版本日历拉取")
+    p_deploy.add_argument("--skip-matrix", action="store_true",
+                          help="跳过配套矩阵拉取")
     p_deploy.add_argument("--skip-code-snapshots", action="store_true",
                           help="跳过代码快照下载（省时省网络）")
     p_deploy.set_defaults(func=cmd_deploy)
 
     # --- update ---
     p_update = sub.add_parser("update", help="增量更新：增量拉取+入库+重建图")
+    p_update.add_argument("--skip-graph", action="store_true",
+                          help="跳过图重建（API 不便停时，仅增量入库）")
     p_update.set_defaults(func=cmd_update)
 
     args = ap.parse_args()
+    # 汇总 --skip-* 为步骤 key 集合，供步骤过滤
+    skip = set()
+    if getattr(args, "skip_graph", False):
+        skip.add("graph")
+    if getattr(args, "skip_fts", False):
+        skip.add("fts")
+    if getattr(args, "skip_calendar", False):
+        skip.add("calendar")
+    if getattr(args, "skip_matrix", False):
+        skip.add("matrix")
+    if getattr(args, "skip_code_snapshots", False):
+        skip.add("code_snapshots")
+    args.skip = skip
     sys.exit(args.func(args))
 
 

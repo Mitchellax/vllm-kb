@@ -101,7 +101,55 @@ export EMBEDDING_API_KEY=sk-xxx        # Embedding API key（OpenAI 兼容端点
 > python scripts/verify.py --config config.offline.json --version 0.6.1  # 验收查询
 > ```
 
-### 采集数据并构建知识库
+### 快速运维（日常维护两个命令，推荐）
+
+**不需要了解项目内部结构**——运维日常只有两个命令：首次部署用 `deploy`，之后每天
+用 `update`。两个命令自动编排多步、自动降级（某一步缺依赖/断网只告警不中断），
+并把 `--insecure` / `--github-base` / `--quay-base` 透传给所有子步骤。
+
+```bash
+# 🟢 首次部署 / 全量重建（拉取+入库 → 建图 → 建FTS → 版本日历 → 配套矩阵 → 代码快照）
+python scripts/maintain.py deploy
+
+# 🔄 日常增量更新（增量拉取+入库 → 重建图，一步到位）
+python scripts/maintain.py update
+```
+
+> ⚠️ **更新前必须停止检索服务**（`serve_api`）——`deploy`/`update` 都包含建图步骤，
+> Kùzu 是单写者（图被 API 占用时建图会失败）。更新完成后再启动 `serve_api` 即可。
+> 若 API 不便停（如线上有人用），用 `update --skip-graph` 只做增量入库，图稍后单独补建。
+
+**细分指令**（按需裁剪步骤，省时/适配环境）：
+
+| 指令 | 说明 |
+|---|---|
+| `deploy --skip-graph` | 跳过建图（Kùzu 未装 / 暂时不需要图） |
+| `deploy --skip-fts` | 跳过全文索引重建 |
+| `deploy --skip-calendar` | 跳过版本日历拉取（省一次 GitHub API） |
+| `deploy --skip-matrix` | 跳过配套矩阵拉取（省一次 quay+GitHub 调用） |
+| `deploy --skip-code-snapshots` | 跳过代码快照下载（省时间/省网络） |
+| `update --skip-graph` | 仅增量入库不改图（API 不便停时；图稍后 `build_graph.py` 单独补） |
+| `deploy/update --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
+| `deploy/update --config path` | 指定 config.json（默认项目根自动发现） |
+
+**自动降级**（子步骤失败不中断部署，只打印告警）：
+
+- **kuzu 未装** → 建图步骤失败告警，跳过继续（KB 入库不受影响，图查询暂不可用）；
+- **jieba 未装** → FTS 分词降级为原文（中文词无法独立命中，索引结构不变）；
+- **网络不可达** → 版本日历 / 配套矩阵 / 代码快照步骤失败告警，跳过继续；
+- 唯一致命步骤是「数据拉取与入库」（`build_kb.py`）——它失败说明数据源/密钥有问题，
+  需人工处理后重跑；其余步骤失败均不影响已入库的数据。
+
+### 启动检索服务（部署后 / 更新后）
+
+```bash
+python scripts/serve_api.py            # http://127.0.0.1:8000（fastapi/uvicorn 已含在 requirements.txt）
+```
+
+> **顺序提醒**：`deploy`/`update` **先停 API → 跑更新 → 再启动 API**；图更新
+> （`build_graph.py`）前必须先停检索服务（Kùzu 单写者，见 [使用指南](docs/USAGE.md#33-图更新流程kùzu-单写者约束)）。
+
+### 手动分步构建（了解内部流程时）
 
 ```bash
 # 全量拉取（issues/PRs/comments）+ 入库（可中断，重跑续传）
@@ -113,14 +161,6 @@ python scripts/build_kb.py --limit 100
 # 图存储（Kùzu：修复链路/手册定义查询）——需先采集入库
 python scripts/build_graph.py
 ```
-
-### 启动检索服务
-
-```bash
-python scripts/serve_api.py            # http://127.0.0.1:8000（fastapi/uvicorn 已含在 requirements.txt）
-```
-
-> 更新图（`build_graph.py`）前必须先停止检索服务（Kùzu 单写者，见 [使用指南](docs/USAGE.md#33-图更新流程kùzu-单写者约束)）。
 
 ### 启动审核工作台（Web UI）
 
@@ -194,17 +234,10 @@ python scripts/build_canonical.py
 # 4. 换 embedding 模型 / 全量重建（高危，需 TTY 确认或 --yes）
 python scripts/build_kb.py --rebuild
 
-# 5. 单指令全量部署（建库+建图+建FTS+辅助数据，自动降级，继承 INSECURE）
-python scripts/maintain.py deploy
-python scripts/maintain.py deploy --skip-code-snapshots  # 跳过代码快照
-
-# 6. 单指令增量更新（日常维护：增量拉取+入库+重建图）
-python scripts/maintain.py update
-
-# 7. 版本日历（GitHub Releases → 版本形态 + 置信度上界；--all-repos 生成 vllm/vllm-ascend 分仓日历）
+# 5. 版本日历（GitHub Releases → 版本形态 + 置信度上界；--all-repos 生成 vllm/vllm-ascend 分仓日历）
 python scripts/build_release_calendar.py --all-repos
 
-# 8. 版本化代码仓快照（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json）
+# 6. 版本化代码仓快照（zips/{version}.zip + snapshots/{version}/ + index.sqlite3 + symbols.json）
 python scripts/build_code_snapshots.py          # vllm-ascend 版本
 python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本（配套矩阵映射，自动跟随）
 python scripts/build_fork_snapshots.py          # 0day fork 仓（--model 指定模型；独立 forks 命名空间，按镜像锁定 SHA 拉取）
@@ -213,25 +246,26 @@ python scripts/build_image_snapshots.py         # 0day 镜像内**实际部署�
 #    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
 #    python scripts/build_image_snapshots.py --index-only  # 镜像快照索引重建（不联网）
 
-# 9. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
+# 7. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）
 python scripts/build_companion_matrix.py        # 生成/更新 data/compatibility/vllm-ascend.json
 python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运行缓存（fork 层 SHA/GitHub 数据）
 python scripts/fetch_quay_tags.py               # 拉 quay.io 镜像 tag（看护策略过滤日构建/分支/主干）
 
-# 10. 图存储重建（修复链路/手册定义；需先停检索服务，Kùzu 单写者）
+# 8. 图存储重建（修复链路/手册定义；需先停检索服务，Kùzu 单写者）
 python scripts/build_graph.py
 
-# 11. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
+# 9. FTS 全文索引重建（jieba 中文分词，可选——装 jieba 或升级分词规则后跑；不重嵌向量）
 python scripts/build_fts.py
 
-# 12. 社区高频信号词统计（issue 标题 TF-IDF → data/code/signal_words.json，供 agent 判断）
+# 10. 社区高频信号词统计（issue 标题 TF-IDF → data/code/signal_words.json，供 agent 判断）
 python scripts/build_signal_words.py
 
-# 13. 正文 TF-IDF 标签候选导出（jieba → candidates.json 文件，人工审阅后手动同步 config.tags.registry）
+# 11. 正文 TF-IDF 标签候选导出（jieba → candidates.json 文件，人工审阅后手动同步 config.tags.registry）
 python scripts/build_tag_candidates.py
 ```
 
-> 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
+> **快速运维（日常维护）请用 [快速运维](#快速运维日常维护两个命令推荐) 的单指令**
+> `maintain.py deploy` / `maintain.py update`，本节的细分脚本供需要精确控制时单独调用。
 
 **维护/验证脚本**：
 
