@@ -172,12 +172,15 @@ class GithubSource(BaseSource):
         self._recanonicalize = recanonicalize
 
     def pull(self, max_issues: int | None = None, incremental: bool = False,
-             missing: bool = False, numbers: list[int] | None = None) -> int:
+             missing: bool = False, numbers: list[int] | None = None,
+             force_numbers: bool = False) -> int:
         """拉取 GitHub 数据（incremental=True 时 done 后仍时间窗增量；missing=True 补差
-        只拉缺失；numbers 走 REST 单条补拉，见 GithubPuller.pull）。"""
+        只拉缺失；numbers 走 REST 单条补拉，force_numbers=True 强制重拉已有编号，
+        见 GithubPuller.pull）。"""
         if max_issues is not None:
             self.puller.max_issues = max_issues
-        return self.puller.pull(incremental=incremental, missing=missing, numbers=numbers)
+        return self.puller.pull(incremental=incremental, missing=missing, numbers=numbers,
+                                force_numbers=force_numbers)
 
     def canonicalize(self) -> list[KbDocument]:
         return self._recanonicalize(self.cfg, self.project_root)

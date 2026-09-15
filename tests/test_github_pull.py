@@ -1228,6 +1228,52 @@ class TestPullMissing(unittest.TestCase):
             self.assertEqual(n, 0)
             self.assertEqual(calls, [])  # 未发请求
 
+    def test_pull_numbers_force_refreshes_existing(self):
+        """--numbers --force-numbers：raw/checkpoint 已有也强制重拉覆盖（状态同步）。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            puller = self._make_puller(td)
+            # 旧快照：open 状态（raw + checkpoint 均已有）
+            (Path(td) / "raw" / "issues").mkdir(parents=True)
+            (Path(td) / "raw" / "issues" / "77.json").write_text(
+                json.dumps({"number": 77, "state": "open", "title": "old",
+                            "updated_at": "2026-04-01T00:00:00Z"}), encoding="utf-8")
+            cp = puller._load_checkpoint()
+            cp["issues"]["77"] = {"fetched_at": "x", "comments": False,
+                                  "updated_at": "2026-04-01T00:00:00Z"}
+            puller._save_checkpoint(cp)
+            issue_data = {
+                "number": 77, "title": "issue 77 closed", "body": "b", "state": "closed",
+                "created_at": "2026-05-01T00:00:00Z",
+                "updated_at": "2026-06-03T00:00:00Z",
+                "closed_at": "2026-06-03T00:00:00Z",
+                "html_url": "https://github.com/vllm-project/vllm/issues/77",
+                "labels": [], "user": {"login": "bob"},
+            }
+
+            from unittest import mock
+
+            def fake_get(url, params=None):
+                if "pulls/77" in url:
+                    err = requests.HTTPError("404 Client Error")
+                    err.response = mock.Mock(status_code=404)
+                    raise err
+                assert "issues/77" in url
+                return self._json_resp(issue_data)
+
+            puller._get = fake_get
+            with redirect_stdout(StringIO()):
+                n = puller.pull(numbers=[77], force_numbers=True)
+            self.assertEqual(n, 1)  # 强制重拉计 1
+            item = json.loads((Path(td) / "raw" / "issues" / "77.json").read_text(encoding="utf-8"))
+            self.assertEqual(item["state"], "closed")  # 状态已同步
+            self.assertEqual(item["updated_at"], "2026-06-03T00:00:00Z")
+            cp2 = puller._load_checkpoint()
+            self.assertEqual(cp2["issues"]["77"]["updated_at"], "2026-06-03T00:00:00Z")
+
 
 if __name__ == "__main__":
     unittest.main()

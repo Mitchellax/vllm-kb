@@ -15,6 +15,7 @@
     python -m vllm_kb.pipeline --incremental  # 时间窗增量拉取社区新增（done 后仍拉）
     python -m vllm_kb.pipeline --pull-missing # 补差拉取：跳过已有（raw/checkpoint），只拉缺失
     python -m vllm_kb.pipeline --numbers 9749,9750  # REST 单条补拉指定编号（隐含 missing）
+    python -m vllm_kb.pipeline --numbers 9749,9750 --force-numbers  # 强制重拉（已存在也覆盖）
     python -m vllm_kb.pipeline --rebuild      # 清库后全量重建（换 embedding 模型时）
     只再生 canonical（不入库）：scripts/build_canonical.py（提取逻辑升级后供建图用）
 """
@@ -125,12 +126,14 @@ def upsert_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> dict:
 
 def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | None,
                    incremental: bool = False, missing: bool = False,
-                   numbers: list[int] | None = None) -> dict:
+                   numbers: list[int] | None = None,
+                   force_numbers: bool = False) -> dict:
     """处理单个来源：拉取(可选) -> canonical -> 追加统一 canonical -> 增量入库。"""
     if pull:
         if isinstance(src, GithubSource):
             n = src.pull(max_issues=limit, incremental=incremental,
-                         missing=missing, numbers=numbers)
+                         missing=missing, numbers=numbers,
+                         force_numbers=force_numbers)
         else:
             n = src.pull()
         print(f"[build] 来源 {src.id} ({src.type}) 拉取新增 {n} 条")
@@ -149,13 +152,15 @@ def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | Non
 
 def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
               incremental: bool = False, missing: bool = False,
-              numbers: list[int] | None = None) -> dict:
+              numbers: list[int] | None = None,
+              force_numbers: bool = False) -> dict:
     """逐来源处理（先配置在前的来源）。全量马拉松期间，先完成的来源立即可用。"""
     grand = {"pulled": 0, "ingested_docs": 0}
     for src in build_sources(cfg):
         try:
             stats = process_source(src, cfg, pull, limit, incremental,
-                                   missing=missing, numbers=numbers)
+                                   missing=missing, numbers=numbers,
+                                   force_numbers=force_numbers)
             grand["pulled"] += stats.get("pulled", 0)
             grand["ingested_docs"] += stats.get("docs", 0)
         except NotImplementedError as e:
@@ -177,6 +182,9 @@ def main() -> None:
     ap.add_argument("--numbers", default=None, metavar="N1,N2,...",
                     help="REST 单条补拉指定编号（如 9749,9750；隐含 missing 语义，"
                          "不需要 GraphQL token；与 --incremental 互斥）")
+    ap.add_argument("--force-numbers", action="store_true",
+                    help="与 --numbers 搭配：忽略 raw/checkpoint 已有记录，强制重拉指定编号"
+                         "（覆盖 raw 与评论，刷新 checkpoint 时间戳；用于已知状态变化的编号）")
     ap.add_argument("--rebuild", action="store_true",
                     help="高危：清空向量库与 SQLite 后全量重建（需交互确认，或加 --yes）")
     ap.add_argument("--yes", action="store_true",
@@ -193,6 +201,8 @@ def main() -> None:
         ap.error("--incremental 与 --pull-missing / --numbers 互斥（拉取策略二选一）")
     if args.numbers and args.skip_pull:
         ap.error("--numbers 需要拉取，与 --skip-pull 互斥")
+    if args.force_numbers and not args.numbers:
+        ap.error("--force-numbers 需要 --numbers（强制重拉指定编号）")
     numbers: list[int] | None = None
     if args.numbers:
         try:
@@ -219,7 +229,7 @@ def main() -> None:
         return
     grand = run_build(cfg, pull=not args.skip_pull, limit=args.limit,
                       incremental=args.incremental, missing=args.pull_missing,
-                      numbers=numbers)
+                      numbers=numbers, force_numbers=args.force_numbers)
     print(f"[build] 本轮汇总: {grand}")
     print("[build] 提示：中途 Ctrl-C 后重跑同一命令即断点续传；逐来源处理，先完成的来源已可用。")
 

@@ -541,7 +541,8 @@ class GithubPuller:
         return new_count, refresh_count, skip_count
 
     def pull(self, incremental: bool = False, missing: bool = False,
-             numbers: Optional[list[int]] = None) -> int:
+             numbers: Optional[list[int]] = None,
+             force_numbers: bool = False) -> int:
         """拉取 GitHub 原始数据（issue + PR + 评论），返回新增条数。
 
         - **默认（断点续传）**：从 checkpoint 游标续拉；一次拉完后置 done——
@@ -559,10 +560,12 @@ class GithubPuller:
         - **numbers=[...]（--numbers）**：REST 单条补拉——对指定编号先试
           `/pulls/{n}`（404 则 `/issues/{n}`）+ 评论落 raw（隐含 missing 语义，
           走 REST 不需要 GraphQL token，未认证限流 60 次/小时够单条场景）；
+          默认跳过 raw/checkpoint 已有的编号；**force_numbers=True（--force-numbers）
+          强制重拉覆盖**（raw 与评论已存在也重新拉取，刷新 checkpoint 时间戳）；
         - **全量重拉**：删除 data/raw/{source_id}/ 与 checkpoint 后重跑（见 USAGE）。
         """
         if numbers is not None:
-            return self._pull_numbers(list(numbers))
+            return self._pull_numbers(list(numbers), force=force_numbers)
         if not self.session.headers.get("Authorization"):
             raise RuntimeError(
                 "拉取（GraphQL）需要 GitHub token：config.github.token 或 GITHUB_TOKEN"
@@ -794,10 +797,12 @@ class GithubPuller:
             }
         return item
 
-    def _pull_numbers(self, numbers: list[int]) -> int:
+    def _pull_numbers(self, numbers: list[int], force: bool = False) -> int:
         """REST 单条补拉（--numbers，隐含 missing 语义）：对每个编号先试 `/pulls/{n}`
-        （404 则 `/issues/{n}`）+ 评论落 raw，登记 checkpoint。已存在于 raw/checkpoint
-        的编号跳过；不要求 GraphQL token（未认证限流 60 次/小时够单条场景）。"""
+        （404 则 `/issues/{n}`）+ 评论落 raw，登记 checkpoint。默认跳过 raw/checkpoint
+        已有的编号；force=True（--force-numbers）时无视已有记录**强制重拉覆盖**——
+        用于外部已知该编号状态/内容已变化（如 open→closed）需立即同步的场景。
+        不要求 GraphQL token（未认证限流 60 次/小时够单条场景）。"""
         import requests
 
         cp = self._load_checkpoint()
@@ -805,13 +810,16 @@ class GithubPuller:
         for n in numbers:
             n = int(n)
             sn = str(n)
-            if (self.raw_dir / "prs" / f"{n}.json").exists() or \
-               (self.raw_dir / "issues" / f"{n}.json").exists():
-                print(f"[github:{self.id}] #{n} raw 已有，跳过")
-                continue
-            if sn in cp["issues"]:
-                print(f"[github:{self.id}] #{n} checkpoint 已有，跳过")
-                continue
+            if not force:
+                if (self.raw_dir / "prs" / f"{n}.json").exists() or \
+                   (self.raw_dir / "issues" / f"{n}.json").exists():
+                    print(f"[github:{self.id}] #{n} raw 已有，跳过"
+                          f"（如需强制重拉请加 --force-numbers）")
+                    continue
+                if sn in cp["issues"]:
+                    print(f"[github:{self.id}] #{n} checkpoint 已有，跳过"
+                          f"（如需强制重拉请加 --force-numbers）")
+                    continue
             # 先试 pulls（含 merged/merged_at/merge_commit_sha），404 再试 issues
             item: dict = {}
             kind = ""
@@ -848,7 +856,8 @@ class GithubPuller:
             cp["issues"][sn] = {"fetched_at": _now_iso(), "comments": self.fetch_comments,
                                 "updated_at": item.get("updated_at")}
             new += 1
-            print(f"[github:{self.id}] #{n} 补拉完成（{kind}）")
+            tag = "（强制重拉）" if force else ""
+            print(f"[github:{self.id}] #{n} 补拉完成（{kind}）{tag}")
         self._save_checkpoint(cp)
         return new
 
