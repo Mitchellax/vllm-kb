@@ -46,14 +46,16 @@
 
 ### 2.1 GitHub 社区来源（issue / PR / comment）
 
-触发命令：`python scripts/build_kb.py`（可加 `--limit N` / `--incremental` / `--pull-missing` / `--numbers`）。
-拉取模式（互斥）：**断点续传**（默认，done 后跳过）/ **`--incremental` 时间窗增量**（近期新增）/
+触发命令：`python scripts/build_kb.py`（可加 `--limit N` / `--incremental` / `--pull-missing` / `--numbers` / `--numbers … --force-numbers`）。
+拉取模式（互斥）：**断点续传**（默认，done 后跳过）/ **`--incremental` 时间窗增量**（近期新增 +
+已拉条目远端 updatedAt 更新时重拉覆盖状态/正文/评论，含 open→closed）/
 **`--pull-missing` 补差**（从头枚举，跳过 raw/checkpoint 已有，只拉缺失——补历史旧条目）/
-**`--numbers` REST 单条**（指定编号走 `/pulls/{n}`→`/issues/{n}`，无需 GraphQL token）。
+**`--numbers` REST 单条**（指定编号走 `/pulls/{n}`→`/issues/{n}`，无需 GraphQL token；
+**`--force-numbers`** 强制重拉，忽略已有覆盖 raw+评论）。
 
 | 阶段 | 处理 | 产物 |
 |---|---|---|
-| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR，PR 带 head 三元组 `head_repo/head_branch/head_sha`——fork PR 的来源仓/分支/锁定 commit，与 fork 快照对齐）+ 评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/`）原始 JSON 快照（**事实源**，可重放） |
+| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR，PR 带 head 三元组 `head_repo/head_branch/head_sha`——fork PR 的来源仓/分支/锁定 commit，与 fork 快照对齐）+ 评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传；raw 与 checkpoint 均记 `updated_at`，增量窗口内已拉条目远端更新（含 open→closed）自动重拉覆盖；`--numbers --force-numbers` 强制重拉单条 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/`）原始 JSON 快照（**事实源**，可重放） |
 | 2. 规范化 | `src.canonicalize()`：原始 JSON → 统一 `KbDocument`（source_id / title / body / 组件 / 版本区间 / status / extra） | 追加/upsert 到统一 `data/raw/canonical.jsonl`（按 source_id 幂等） |
 | 3. 入库 | `ingest_docs()`（见 2.6） | LanceDB 向量 + kb.sqlite3 |
 

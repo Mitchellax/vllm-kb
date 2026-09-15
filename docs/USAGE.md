@@ -91,9 +91,11 @@ python scripts/build_kb.py --limit 100
 | 场景 | 命令 |
 |---|---|
 | 日常更新（增量入库；GitHub 默认不重拉） | `python scripts/build_kb.py` |
-| 拉取 GitHub 社区增量（新增 issue/PR） | `python scripts/build_kb.py --incremental` |
+| 拉取 GitHub 社区增量（新增 + 状态同步） | `python scripts/build_kb.py --incremental` |
+| 增量模式下已拉条目状态自动同步（open→closed/文本变化） | 同上（`--incremental`，重拉记录日志标「重拉」） |
 | **GitHub 补差拉取**（补历史缺失条目，跳过已有） | `python scripts/build_kb.py --pull-missing` |
 | **REST 单条补拉**（指定编号，无需 GraphQL token） | `python scripts/build_kb.py --numbers 9749,9750` |
+| **强制重拉指定编号**（忽略 raw/checkpoint 已有记录） | `python scripts/build_kb.py --numbers 9749,9750 --force-numbers` |
 | 只重入库不拉取 | `python scripts/build_kb.py --skip-pull` |
 | 只再生 canonical（不入库，供建图） | `python scripts/build_canonical.py` |
 | 换 embedding 模型全量重建 | `python scripts/build_kb.py --rebuild` |
@@ -106,9 +108,10 @@ python scripts/build_kb.py --limit 100
 
 | 模式 | 行为 | 补得到历史旧条目吗 |
 |---|---|---|
-| `--incremental`（时间窗增量） | 从 checkpoint 记录的上次增量 `max createdAt` 起；issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走 `UPDATED_AT DESC` 排序，跳过已有编号、连续 3 页无新增停止，并把窗口推进到本次所见 `max createdAt`（首次增量无历史窗口时从头枚举一次） | **不能**——只覆盖近期新增/更新 |
+| `--incremental`（时间窗增量） | 从 checkpoint 记录的上次增量 `max createdAt` 起；issues 走 GraphQL `filterBy.since` 服务端过滤、PR 走 `UPDATED_AT DESC` 排序，连续 3 页无新增停止，并把窗口推进到本次所见 `max createdAt`（首次增量无历史窗口时从头枚举一次）。**状态同步**：已拉条目若远端 `updatedAt` 更新（open→closed / 重新打开 / 正文评论变化）自动**重拉覆盖** raw 与评论，canonical/入库随 `meta_hash` 刷新（状态变化不重嵌，只刷元数据） | **不能**——只覆盖近期新增/更新；历史单条用 `--numbers --force-numbers` 或 `--pull-missing` |
 | `--pull-missing`（补差拉取） | 从头枚举（created desc），**跳过 raw 目录与 checkpoint 中已有的编号，只拉缺失条目**；翻到最新后置 done | **能**——补历史旧条目（如业务数据缺失的单条 PR） |
-| `--numbers N1,N2,...`（REST 单条） | 对指定编号先试 `/pulls/{n}`（404 则 `/issues/{n}`）+ 评论落 raw（隐含 missing 语义，**走 REST 不需要 GraphQL token**） | 能——已知缺失编号时最精准 |
+| `--numbers N1,N2,...`（REST 单条） | 对指定编号先试 `/pulls/{n}`（404 则 `/issues/{n}`）+ 评论落 raw（隐含 missing 语义，**走 REST 不需要 GraphQL token**），**默认跳过已有**编号 | 能——已知缺失编号时最精准 |
+| `--numbers … --force-numbers`（REST 强制重拉） | 同上但**忽略 raw/checkpoint 已有记录强制重拉覆盖**（含评论），刷新 checkpoint 时间戳 + `updated_at` 锚点——用于外部已知该编号状态已变（如 open→closed）需立即同步 | 能——已知状态/内容变化时立即同步 |
 
 **全量重拉**（数据刷新 / 补拉旧条目评论）：删除 `data/raw/{source_id}/` 与
 `data/checkpoints/{source_id}.json` 后重跑 `build_kb.py`。
@@ -130,7 +133,8 @@ canonical / raw / 图 / 审核库不受影响；中断后重跑仍会先清空�
 知识库是"离线数据 + 定期刷新"，不需要实时：
 
 ```bash
-# 1. 拉取社区增量 + 增量入库（新增 issue/PR；时间窗口见上；中断后重跑同一命令续传）
+# 1. 拉取社区增量 + 增量入库（新增 + 状态同步：已拉条目 open→closed/内容变化
+#    自动重拉覆盖；时间窗口见上；中断后重跑同一命令续传）
 python scripts/build_kb.py --incremental
 
 # 2. （可选）业务来源有新增文件（data/imports/）时再跑一次不带参数的 build_kb.py
@@ -152,6 +156,9 @@ python scripts/build_graph.py
 - **`--incremental` 补不到历史单条**（窗口从上次 `max createdAt` 起、PR 按更新时间排序、
   连续 3 页无新增即停）——缺旧条目时用 §7 的 `backfill_canonical.py`（canonical 层、无需网络）
   或全量重拉（raw 层也要补时）；
+- **状态同步是自动的**：`--incremental` 会对已拉但远端更新过的条目（含 open→closed）重拉覆盖，
+  无需干预；若已知某个编号状态/内容已变、想立即同步（不等下一轮增量窗口），用
+  `--numbers 编号 --force-numbers` 强制重拉单条；
 - 更新前建议停止检索 API，更新完重启（尤其 `--rebuild` / `build_graph.py` 后必须重启）。
 
 ### 2.2 辅助数据构建
@@ -1066,4 +1073,4 @@ A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.ex
 A: config.json 的 `sources` 加条目即可：`{"id":"engineer-troubleshooting","type":"excel",
 "path":"data/imports/...xlsx","enabled":true}`（schema-free 导入，见 §2.4）或
 `{"id":"mynotes","type":"markdown","path":"data/mynotes","enabled":true}`；GitHub 源的
-增量拉取见 §2.1（`--incremental` / `--pull-missing` / `--numbers`）。
+增量拉取见 §2.1（`--incremental` / `--pull-missing` / `--numbers` / `--numbers … --force-numbers`）。

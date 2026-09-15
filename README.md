@@ -172,14 +172,17 @@ python skills/vllm-kb/client.py graph sig dispatch_ffn_combine
 # 1. 日常更新（增量入库；GitHub 首次全量后默认不再拉取——日志打印 done 跳过说明）
 python scripts/build_kb.py
 
-# 1b. 拉取 GitHub 社区增量（新增 issue/PR；时间窗口：上次增量 max createdAt 起，
-#     issues 服务端 filterBy.since 过滤 + PR UPDATED_AT DESC 排序，连续 3 页无新增停止）
+# 1b. 拉取 GitHub 社区增量（新增 + 状态同步：已拉条目若远端 updatedAt 更新——
+#     含 open→closed、重新打开、正文/评论变化——自动重拉覆盖 raw，无需手动干预）
+#     时间窗口：上次增量 max createdAt 起，issues 服务端 filterBy.since 过滤 +
+#     PR UPDATED_AT DESC 排序，连续 3 页无新增停止
 python scripts/build_kb.py --incremental
 #    全量重拉（数据刷新）：删除 data/raw/{source_id}/ 与 data/checkpoints/{source_id}.json 后重跑
 
 # 1c. 其他拉取模式（与 --incremental 互斥）：
 python scripts/build_kb.py --pull-missing         # 补差：从头枚举，跳过已有（raw/checkpoint），只拉缺失（补历史旧条目）
-python scripts/build_kb.py --numbers 9749,9750    # REST 单条补拉指定编号（走 REST，无需 GraphQL token）
+python scripts/build_kb.py --numbers 9749,9750    # REST 单条补拉指定编号（走 REST，无需 GraphQL token；跳过已有编号）
+python scripts/build_kb.py --numbers 9749,9750 --force-numbers  # 强制重拉（忽略 raw/checkpoint 已有，覆盖 raw+评论）
 
 # 2. 只重新入库，不拉取（改配置/规则后）
 python scripts/build_kb.py --skip-pull
@@ -381,7 +384,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 
 | 模块 | 职责 |
 |---|---|
-| `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量） |
+| `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量 + updatedAt 状态同步、`--numbers`/`--force-numbers` 单条） |
 | `models.py` / `config.py` | Canonical 统一中间格式 + 唯一配置入口（旧版单源折叠兼容；secrets 自动加载） |
 | `chunking.py` / `embed.py` | 讨论线按段切块 + 批量嵌入（攒批降 API 调用） |
 | `ingest.py` / `vectorstore.py` / `pipeline.py` | 幂等入库流水线：SQLite+FTS5、LanceDB 批量写入、`build_kb.py` 入口 |
