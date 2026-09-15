@@ -8,6 +8,7 @@
     python scripts/maintain.py deploy --help       # 查看 deploy 选项
     python scripts/maintain.py deploy --skip-graph # 跳过图构建（省时 / Kùzu 未装）
     python scripts/maintain.py deploy --skip-code-snapshots  # 跳过代码快照（省时）
+    python scripts/maintain.py deploy --all-code   # vllm-ascend 代码拉**全部 tag**（默认仅 config.code.versions）
 
     python scripts/maintain.py update              # 增量更新：增量拉取+入库+重建图
     python scripts/maintain.py update --skip-graph # 仅增量入库，不改图（API 不便停时）
@@ -65,6 +66,7 @@ _STEP_KEY = {  # 步骤名 → key（供 --skip-* 过滤）
     "版本日历": "calendar",
     "配套矩阵": "matrix",
     "代码快照（vllm-ascend，config.code.versions）": "code_snapshots",
+    "代码快照（vllm-ascend，全部 tag --all）": "code_snapshots",
     "代码快照（vllm 主仓，companion 对应）": "code_snapshots",
 }
 
@@ -164,11 +166,14 @@ def cmd_deploy(args) -> int:
     insecure_env = _insecure_env_from_args(args)
     steps = list(_DEPLOY_STEPS)
 
-    # 代码快照默认包含（非致命，降级）：vllm-ascend 用 config.code.versions
-    # （不传 --all 避免下载全部 tag），vllm 主仓用 companion 矩阵对应版本
+    # 代码快照默认包含（非致命，降级）：vllm-ascend 默认按 config.code.versions 拉取
+    # （精选版本，省时省磁盘）；--all-code 时传 --all 拉取全部 tag（数 GB、耗时，按需开启）；
+    # vllm 主仓用 companion 矩阵对应版本
     if not args.skip_code_snapshots:
+        code_extra = ["--all"] if args.all_code else []
         steps.append(
-            ("scripts/build_code_snapshots.py", [], False, "代码快照（vllm-ascend，config.code.versions）")
+            ("scripts/build_code_snapshots.py", code_extra, False,
+             "代码快照（vllm-ascend" + ("，全部 tag --all" if args.all_code else "，config.code.versions") + "）")
         )
         steps.append(
             ("scripts/build_vllm_snapshots.py", [], False, "代码快照（vllm 主仓，companion 对应）")
@@ -263,6 +268,9 @@ def main() -> None:
                           help="跳过配套矩阵拉取")
     p_deploy.add_argument("--skip-code-snapshots", action="store_true",
                           help="跳过代码快照下载（省时省网络）")
+    p_deploy.add_argument("--all-code", action="store_true",
+                          help="vllm-ascend 代码快照拉取**全部 tag**（默认只拉 "
+                               "config.code.versions 精选版本；全量数 GB、耗时长，按需开启）")
     p_deploy.set_defaults(func=cmd_deploy)
 
     # --- update ---

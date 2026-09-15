@@ -18,6 +18,7 @@ from scripts.maintain import (
     _insecure_env_from_args,
     _resolve,
     _run_step,
+    cmd_deploy,
 )
 
 
@@ -195,6 +196,50 @@ class TestKuzuDegradation(unittest.TestCase):
         import vllm_kb.graph  # noqa: F401
 
         self.assertTrue(hasattr(vllm_kb.graph, "GraphBuilder"))
+
+
+class TestAllCodeFlag(unittest.TestCase):
+    """--all-code 触发 build_code_snapshots --all 而非默认 config.code.versions。"""
+
+    @staticmethod
+    def _make_args(all_code=False, skip_code_snapshots=False):
+        import types
+        return types.SimpleNamespace(
+            skip={"code_snapshots"} if skip_code_snapshots else set(),
+            config=None, insecure=False, github_base=None, quay_base=None,
+            skip_code_snapshots=skip_code_snapshots, all_code=all_code,
+            skip_graph=False, skip_fts=False, skip_calendar=False, skip_matrix=False,
+        )
+
+    def _find_code_step_calls(self, args):
+        with mock.patch("scripts.maintain.subprocess.run") as m:
+            m.return_value.returncode = 0
+            with mock.patch("builtins.print"):
+                cmd_deploy(args)
+            calls = []
+            for call_args, kwargs in m.call_args_list:
+                cmd = call_args[0] if call_args else kwargs.get("args", [])
+                if any("build_code_snapshots" in str(part) for part in cmd):
+                    calls.append(cmd)
+            return calls
+
+    def test_deploy_all_code_passes_all_flag(self):
+        args = self._make_args(all_code=True)
+        calls = self._find_code_step_calls(args)
+        self.assertEqual(len(calls), 1, "build_code_snapshots 应被调用一次")
+        self.assertIn("--all", [str(a) for a in calls[0]])
+
+    def test_deploy_default_no_all_flag(self):
+        args = self._make_args(all_code=False)
+        calls = self._find_code_step_calls(args)
+        self.assertEqual(len(calls), 1, "build_code_snapshots 应被调用一次")
+        self.assertNotIn("--all", [str(a) for a in calls[0]],
+                         "默认 deploy 不应传递 --all")
+
+    def test_skip_code_snapshots_overrides_all_code(self):
+        args = self._make_args(all_code=True, skip_code_snapshots=True)
+        calls = self._find_code_step_calls(args)
+        self.assertEqual(len(calls), 0, "--skip-code-snapshots 时应不调用 build_code_snapshots")
 
 
 if __name__ == "__main__":

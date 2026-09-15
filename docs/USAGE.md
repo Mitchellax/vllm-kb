@@ -104,6 +104,7 @@ python scripts/maintain.py update
 | `deploy --skip-calendar` | 跳过版本日历拉取（省一次 GitHub API 调用） |
 | `deploy --skip-matrix` | 跳过配套矩阵拉取（省 quay+GitHub 调用） |
 | `deploy --skip-code-snapshots` | 跳过代码快照下载（省时间 / 省网络） |
+| `deploy --all-code` | vllm-ascend 代码拉**全部 tag**（默认仅 `config.code.versions` 精选版本；全量数 GB、耗时长，按需开启） |
 | `update --skip-graph` | 仅增量入库不改图（API 不便停时；图稍后 `build_graph.py` 单独补） |
 | `deploy/update --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
 | `deploy/update --config path` | 指定 config.json（默认项目根自动发现） |
