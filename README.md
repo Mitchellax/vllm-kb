@@ -183,6 +183,20 @@ python scripts/review_ui.py            # http://127.0.0.1:8010（自动补单，
   密钥脱敏存 `data/secrets.local.json`），embedding / OCR 均支持连通性测试；
 - 完整操作说明（含审核状态机、待实际删除列表）见 [使用指南 §3.2](docs/USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)。
 
+### 导入 Skill 到 Agent（一句话装好）
+
+API 启动后，把下面**一句话**发给你的 AI 编程助手（Claude Code / Codex CLI / Cline / Continue 等），
+它就会自动读取技能文件、配置服务器地址，无需手动复制命令：
+
+> 读取 skills/vllm-kb/SKILL.md 并安装 Skill，把 API 地址设为 VLLM_KB_BASE=http://\<your-server\>:8000
+
+**本地开发/自测**（API 在同一台机器）直接用默认参数：
+
+> 读取 skills/vllm-kb/SKILL.md 并安装 Skill
+
+> **存算分离场景**（本地只放 skill 文件，数据在远程服务器）：把 `\<your-server\>` 换成远程 API
+> 的实际 IP 或域名；详情与部署步骤见 [使用指南 §6](docs/USAGE.md#6-远程部署存算分离)。
+
 ### 查询
 
 ```bash
