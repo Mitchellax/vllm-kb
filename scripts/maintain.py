@@ -238,26 +238,38 @@ def cmd_update(args) -> int:
     return 0
 
 
+def _add_common_args(ap, *, suppress_defaults=False) -> None:
+    """公共参数（主命令与子命令都接受，位置灵活：`maintain.py --insecure deploy` 或
+    `maintain.py deploy --insecure` 均可）。
+
+    suppress_defaults：子命令用（用 argparse.SUPPRESS 避免子命令默认值覆盖父命令已解析值）。
+    """
+    cfg_def = argparse.SUPPRESS if suppress_defaults else None
+    ins_def = argparse.SUPPRESS if suppress_defaults else False
+    ap.add_argument("--config", default=cfg_def,
+                    help="config.json 路径（默认项目根 config.json，自动发现）")
+    ap.add_argument("--insecure", action="store_true", default=ins_def,
+                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；"
+                         "亦可用环境变量 VLLM_KB_INSECURE=1，子步骤自动继承）")
+    ap.add_argument("--github-base", default=cfg_def,
+                    help="GitHub API 镜像前缀（默认 https://api.github.com；"
+                         "亦可用环境变量 VLLM_KB_GITHUB_BASE，子步骤自动继承）")
+    ap.add_argument("--quay-base", default=cfg_def,
+                    help="quay 镜像前缀（默认 https://quay.io；"
+                         "亦可用环境变量 VLLM_KB_QUAY_BASE，子步骤自动继承）")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="vllm-kb 日常维护入口：单指令全量部署 / 单指令增量更新",
     )
-    ap.add_argument("--config", default=None,
-                    help="config.json 路径（默认项目根 config.json，自动发现）")
-    ap.add_argument("--insecure", action="store_true",
-                    help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；"
-                         "亦可用环境变量 VLLM_KB_INSECURE=1，子步骤自动继承）")
-    ap.add_argument("--github-base", default=None,
-                    help="GitHub API 镜像前缀（默认 https://api.github.com；"
-                         "亦可用环境变量 VLLM_KB_GITHUB_BASE，子步骤自动继承）")
-    ap.add_argument("--quay-base", default=None,
-                    help="quay 镜像前缀（默认 https://quay.io；"
-                         "亦可用环境变量 VLLM_KB_QUAY_BASE，子步骤自动继承）")
+    _add_common_args(ap)
 
     sub = ap.add_subparsers(dest="command", required=True)
 
     # --- deploy ---
     p_deploy = sub.add_parser("deploy", help="全量部署：拉取+入库+建图+建FTS+辅助数据")
+    _add_common_args(p_deploy, suppress_defaults=True)
     p_deploy.add_argument("--skip-graph", action="store_true",
                           help="跳过图构建（Kùzu 未装或不想重建时）")
     p_deploy.add_argument("--skip-fts", action="store_true",
@@ -275,6 +287,7 @@ def main() -> None:
 
     # --- update ---
     p_update = sub.add_parser("update", help="增量更新：增量拉取+入库+重建图")
+    _add_common_args(p_update, suppress_defaults=True)
     p_update.add_argument("--skip-graph", action="store_true",
                           help="跳过图重建（API 不便停时，仅增量入库）")
     p_update.set_defaults(func=cmd_update)

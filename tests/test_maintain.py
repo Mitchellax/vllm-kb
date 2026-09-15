@@ -19,6 +19,7 @@ from scripts.maintain import (
     _resolve,
     _run_step,
     cmd_deploy,
+    main,
 )
 
 
@@ -196,6 +197,58 @@ class TestKuzuDegradation(unittest.TestCase):
         import vllm_kb.graph  # noqa: F401
 
         self.assertTrue(hasattr(vllm_kb.graph, "GraphBuilder"))
+
+
+class TestArgparsePositions(unittest.TestCase):
+    """公共参数位置灵活：--insecure/--github-base/--quay-base/--config 可在子命令前后。"""
+
+    @staticmethod
+    def _parse(argv):
+        """构造与 main() 相同的 parser 并解析（不执行 cmd_*）。"""
+        import argparse
+        from scripts import maintain as M
+
+        ap = argparse.ArgumentParser()
+        M._add_common_args(ap)
+        sub = ap.add_subparsers(dest="command", required=True)
+        p = sub.add_parser("deploy")
+        M._add_common_args(p, suppress_defaults=True)
+        p.add_argument("--all-code", action="store_true")
+        p.set_defaults(func=lambda a: None)
+        return ap.parse_args(argv)
+
+    def test_insecure_after_subcommand(self):
+        args = self._parse(["deploy", "--insecure"])
+        self.assertTrue(args.insecure)
+
+    def test_insecure_before_subcommand(self):
+        args = self._parse(["--insecure", "deploy"])
+        self.assertTrue(args.insecure)
+
+    def test_both_positions_equal(self):
+        a = self._parse(["deploy", "--insecure", "--all-code"])
+        b = self._parse(["--insecure", "deploy", "--all-code"])
+        self.assertEqual(a.insecure, b.insecure)
+        self.assertEqual(a.all_code, b.all_code)
+
+    def test_github_base_after_subcommand(self):
+        args = self._parse(["deploy", "--github-base", "http://gh:8080"])
+        self.assertEqual(args.github_base, "http://gh:8080")
+
+    def test_github_base_before_subcommand(self):
+        args = self._parse(["--github-base", "http://gh:8080", "deploy"])
+        self.assertEqual(args.github_base, "http://gh:8080")
+
+    def test_config_before_subcommand(self):
+        args = self._parse(["--config", "cfg.json", "deploy"])
+        self.assertEqual(args.config, "cfg.json")
+
+    def test_no_common_args_defaults(self):
+        args = self._parse(["deploy"])
+        self.assertFalse(args.insecure)
+        self.assertIsNone(args.config)
+        self.assertIsNone(args.github_base)
+        self.assertIsNone(args.quay_base)
 
 
 class TestAllCodeFlag(unittest.TestCase):

@@ -89,6 +89,10 @@ python scripts/maintain.py deploy
 
 # 🔄 日常增量更新（增量拉取+入库 → 重建图）
 python scripts/maintain.py update
+
+# 真实业务环境（SSL 被禁 / 自签证书）：--insecure 放子命令前或后均可
+python scripts/maintain.py deploy --insecure --all-code
+python scripts/maintain.py --insecure update
 ```
 
 > ⚠️ **更新前必须停止检索服务（`serve_api`）**：`deploy` / `update` 都包含建图步骤，

@@ -113,13 +113,19 @@ python scripts/maintain.py deploy
 
 # 🔄 日常增量更新（增量拉取+入库 → 重建图，一步到位）
 python scripts/maintain.py update
+
+# 真实业务环境（SSL 被禁 / 自签证书）：--insecure 放子命令前或后均可
+python scripts/maintain.py deploy --insecure --all-code
+python scripts/maintain.py --insecure update
 ```
 
 > ⚠️ **更新前必须停止检索服务**（`serve_api`）——`deploy`/`update` 都包含建图步骤，
 > Kùzu 是单写者（图被 API 占用时建图会失败）。更新完成后再启动 `serve_api` 即可。
 > 若 API 不便停（如线上有人用），用 `update --skip-graph` 只做增量入库，图稍后单独补建。
 
-**细分指令**（按需裁剪步骤，省时/适配环境）：
+**细分指令**（公共参数 `--insecure`/`--github-base`/`--quay-base`/`--config` 可在子命令
+**前后**任意位置，例如 `maintain.py deploy --insecure --all-code` 或
+`maintain.py --insecure deploy --all-code` 均可）：
 
 | 指令 | 说明 |
 |---|---|
