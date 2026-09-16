@@ -185,17 +185,22 @@ python scripts/review_ui.py            # http://127.0.0.1:8010（自动补单，
 
 ### 导入 Skill 到 Agent（一句话装好）
 
-API 启动后，把下面**一句话**发给你的 AI 编程助手（Claude Code / Codex CLI / Cline / Continue 等），
-它就会自动读取技能文件、配置服务器地址，无需手动复制命令：
+API 启动后，把下面**一句话**发给你的 AI 编程助手，它就会自动读取技能文件并固化服务器地址。
 
-> 读取 skills/vllm-kb/SKILL.md 并安装 Skill，把 API 地址设为 VLLM_KB_BASE=http://\<your-server\>:8000
-
-**本地开发/自测**（API 在同一台机器）直接用默认参数：
+**本地开发/自测**（默认 `http://127.0.0.1:8000`，无需改地址）：
 
 > 读取 skills/vllm-kb/SKILL.md 并安装 Skill
 
-> **存算分离场景**（本地只放 skill 文件，数据在远程服务器）：把 `\<your-server\>` 换成远程 API
-> 的实际 IP 或域名；详情与部署步骤见 [使用指南 §6](docs/USAGE.md#6-远程部署存算分离)。
+**远程服务器**（存算分离，替换 `<server>` 为实际 IP 或域名）：
+
+> 读取 skills/vllm-kb/SKILL.md 并安装 Skill，然后把 skills/vllm-kb/client.py 中的
+> 默认 API 地址 DEFAULT_BASE 改为 http://\<server\>:8000，同步更新 SKILL.md 第 21 行
+> 的默认地址说明
+
+> **原理**：远程场景通过**直接修改 skill 源码**固化地址（`client.py` 第 20 行
+> `DEFAULT_BASE`），不依赖环境变量——重启/新终端也不会丢；`--base` 命令行参数
+> 和环境变量 `VLLM_KB_BASE` 优先级依然高于默认值，如需临时覆盖可照常使用。
+> 部署步骤见 [使用指南 §6](docs/USAGE.md#6-远程部署存算分离)。
 
 ### 查询
 
