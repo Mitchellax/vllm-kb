@@ -147,6 +147,65 @@ python scripts/maintain.py --insecure update
 - 唯一致命步骤是「数据拉取与入库」（`build_kb.py`）——它失败说明数据源/密钥有问题，
   需人工处理后重跑；其余步骤失败均不影响已入库的数据。
 
+### 定时自动更新（每晚停服务 → 增量更新 → 重启）
+
+需要每晚自动"停 API → `maintain.py update` → 重启 API"时，按运行环境选用以下范例
+（**范例需自适配**：容器名 `kb`、工程路径 `/app`、api 日志 `/var/log/api.log` 均按实际替换）。
+
+> 三个注意点：
+> 1. **Kùzu 单写者**：`update` 含建图步骤，必须先在停 API 后再执行；
+> 2. **`update` 建图步骤非致命**：即使停 API 失败，入库仍成功、图失败告警，下一晚自动补；
+> 3. Docker 场景**容器不重启**（重启会释放端口/GPU，窗口期可能被他人占用）——
+>    用 `docker exec` 在容器内 `pkill serve_api` 原地停/起，容器进程永远存活。
+
+**场景 A：宿主机 systemd（root 权限，更规范）**
+
+```ini
+# /etc/systemd/system/vllm-kb-update.service
+[Unit]
+Description=vllm-kb nightly incremental update
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 停 API → 增量更新 → 后台重启 API（全程容器内，不重启容器）
+ExecStart=docker exec kb bash -c "pkill -TERM -f serve_api.py; sleep 2; \
+  cd /app && python scripts/maintain.py update --insecure; \
+  nohup python scripts/serve_api.py >>/var/log/api.log 2>&1 &"
+```
+
+```ini
+# /etc/systemd/system/vllm-kb-update.timer
+[Unit]
+Description=Nightly vllm-kb update timer
+
+[Timer]
+OnCalendar=daily
+Persistent=true          # 错过（如关机）后补跑
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now vllm-kb-update.timer
+```
+
+> systemd 方式下如果 serve_api 本身由 systemd 管理（而非 docker exec），改用
+> `ExecStartPre=systemctl stop vllm-kb-api.service` / `ExecStart=/opt/vllm-kb/.venv/bin/python /opt/vllm-kb/scripts/maintain.py update`
+> / `ExecStartPost=systemctl start vllm-kb-api.service` 三行即可（无需 docker exec）。
+
+**场景 B：crontab（通用，无需 systemd）**
+
+```
+# 每晚 3:00 停 API → 增量更新 → 后台重启 API（全程 docker exec，容器不重启）
+0 3 * * * docker exec kb bash -c "pkill -TERM -f serve_api.py; sleep 2; cd /app && python scripts/maintain.py update --insecure; nohup python scripts/serve_api.py >>/var/log/api.log 2>&1 &"
+```
+
+> 宿主机直接跑（非容器）时，把 `docker exec kb bash -c "..."` 换成
+> `cd /path/to/vllm-kb && /path/to/.venv/bin/python scripts/maintain.py update --insecure`
+> 即可，停/起用各自进程管理方式（systemd `systemctl stop/start`、supervisorctl 等）。
+
 ### 启动检索服务（部署后 / 更新后）
 
 ```bash
