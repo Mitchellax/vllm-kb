@@ -250,5 +250,32 @@ class TestMessageIndex(unittest.TestCase):
         )
 
 
+class TestBuiltHint(unittest.TestCase):
+    """_built_hint 按命名空间给正确脚本提示。"""
+
+    def _code(self, repo: str) -> VersionedCode:
+        cfg = AppConfig.model_validate({
+            "project": {"name": "test", "data_root": "data"},
+            "embedding": {"provider": "echo", "dimensions": 64},
+            "storage": {"code_root": "/tmp/code"},
+            "code": {"repo": "x", "versions": []},
+        })
+        return VersionedCode(cfg, repo=repo)
+
+    def test_default_vllm_ascend(self):
+        self.assertIn("build_code_snapshots.py --index-only", self._code("vllm-ascend")._built_hint)
+
+    def test_vllm(self):
+        self.assertIn("build_vllm_snapshots.py --index-only", self._code("vllm")._built_hint)
+
+    def test_fork(self):
+        self.assertIn("build_fork_snapshots.py --index-only", self._code("fork:hy4")._built_hint)
+
+    def test_img(self):
+        # img 提示带 --tag（精确到该镜像）
+        self.assertIn("build_image_snapshots.py --tag glm5.2 --index-only",
+                      self._code("img:glm5.2")._built_hint)
+
+
 if __name__ == "__main__":
     unittest.main()

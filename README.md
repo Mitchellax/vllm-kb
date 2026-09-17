@@ -343,8 +343,10 @@ python scripts/build_code_snapshots.py          # vllm-ascend 版本
 python scripts/build_vllm_snapshots.py          # 对应 vllm 主仓版本（配套矩阵映射，自动跟随）
 python scripts/build_fork_snapshots.py          # 0day fork 仓（--model 指定模型；独立 forks 命名空间，按镜像锁定 SHA 拉取）
 python scripts/build_image_snapshots.py         # 0day 镜像内**实际部署的插件源码**（只拉插件层 ~23~101MB；repo=img:{tag} 检索）
-#    符号索引（index.sqlite3）是派生数据：提取规则/schema 升级后重建
-#    python scripts/build_code_snapshots.py --index-only   # 索引+符号表+信号词，无需迁移
+#    符号索引（index.sqlite3）是派生数据：提取规则/schema 升级后按命名空间重建（旧索引缺 kind 列自动补）
+#    python scripts/build_code_snapshots.py --index-only   # vllm-ascend（默认）
+#    python scripts/build_vllm_snapshots.py --index-only   # vllm 主仓（companion 对应）
+#    python scripts/build_fork_snapshots.py --index-only   # 0day fork 仓（--model 指定）
 #    python scripts/build_image_snapshots.py --index-only  # 镜像快照索引重建（不联网）
 
 # 7. 组件配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend 自动匹配；quay tag 辅助获取）

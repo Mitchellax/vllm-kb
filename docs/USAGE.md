@@ -775,11 +775,19 @@ python skills/vllm-kb/client.py code-versions --repo img        # 已提取镜�
 命中新版本后，用 GitHub commits API 按文件路径过滤找引入 commit → PR 编号 →
 再用 `graph fixes/chain` 确认落地 release 与 backport。
 
-> **符号索引升级**：`index.sqlite3` 是派生数据（zip 快照为事实源）。代码提取规则/schema 变更后
-> （如本次 ast 提取 + `--kind msg` 报错字面量索引）重建即可，无需迁移：
-> 先停检索 API → `python scripts/build_code_snapshots.py --index-only`（自动重建
-> index.sqlite3 + symbols.json + signal_words.json；旧索引缺 `kind` 列时自动补列，但需全量
-> 重建才有 kind 数据）→ 重启 API。耗时：7 版本约 2 分钟，41 版本约 11 分钟。
+> **符号索引升级**：各命名空间的 `index.sqlite3` 是派生数据（zip 快照为事实源）。代码提取规则/schema
+> 变更后（如本次 ast 提取 + `--kind msg` 报错字面量索引）重建即可，无需手工迁移：
+> 先停检索 API → 按命名空间跑对应 `--index-only`（自动重建 index.sqlite3 + 派生文件；旧索引缺
+> `kind` 列时自动补列，但需全量重建才有 kind 数据）→ 重启 API。耗时：7 版本约 2 分钟，41 版本约 11 分钟。
+>
+> | 命名空间 | 重建命令 |
+> |---|---|
+> | `vllm-ascend`（默认） | `python scripts/build_code_snapshots.py --index-only` |
+> | `vllm` | `python scripts/build_vllm_snapshots.py --index-only` |
+> | `fork:{model}` | `python scripts/build_fork_snapshots.py --index-only` |
+> | `img:{tag}` | `python scripts/build_image_snapshots.py --index-only` |
+>
+> 提示命令由服务端 503 详情自动给出（按请求的命名空间对应脚本）。
 
 ### 4.6 其他
 

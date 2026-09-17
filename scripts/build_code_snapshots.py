@@ -166,6 +166,9 @@ def main() -> None:
     repo = cfg.code.repo
 
     if args.index_only:
+        # 先无条件迁移 schema（即使可用版本列表为空，旧索引缺 kind 列也能补上）
+        conn = code._connect_index(write=True)
+        conn.close()
         for v in code.available_versions:
             index_version(code, v)
         build_symbol_table(cfg)

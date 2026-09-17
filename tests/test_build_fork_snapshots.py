@@ -219,8 +219,15 @@ class TestIndexAndMeta(unittest.TestCase):
         rows = conn.execute(
             "SELECT version, file FROM symbols WHERE symbol = ?",
             ("hy4_custom_kernel",)).fetchall()
-        conn.close()
         self.assertEqual(rows, [(SHA[:12], "vllm/hy4_ops.py")])
+        # 验证 kind 列存在且为 'def'
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)")]
+        self.assertIn("kind", cols)
+        self.assertEqual(
+            conn.execute("SELECT kind FROM symbols WHERE symbol=?",
+                         ("hy4_custom_kernel",)).fetchone(),
+            ("def",))
+        conn.close()
 
     def test_write_meta(self):
         row = {"vllm-ascend": "hy4", "vllm_repo": "voidvelocity/vllm",
@@ -231,6 +238,28 @@ class TestIndexAndMeta(unittest.TestCase):
         self.assertEqual(meta["repo"], "voidvelocity/vllm")
         self.assertEqual(meta["sha"], SHA)
         self.assertEqual(meta["base"], "0.23.0")
+
+    def test_open_index_migrates_old_schema(self):
+        """旧索引（缺 kind 列）经 _open_index 打开后自动 ALTER 补列（修复 503）。"""
+        import sqlite3
+
+        idx = self.root / "index.sqlite3"
+        idx.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(idx))
+        conn.execute(
+            "CREATE TABLE symbols (version TEXT, symbol TEXT, file TEXT, "
+            "line INTEGER, snippet TEXT)")
+        conn.execute("INSERT INTO symbols VALUES ('x','old_sym','f.py',1,'s')")
+        conn.commit()
+        conn.close()
+        # 旧库打开（迁移）后 kind 列存在，旧行 kind 为 NULL 但不报错
+        c2 = bfs._open_index(self.root)
+        cols = [r[1] for r in c2.execute("PRAGMA table_info(symbols)")]
+        self.assertIn("kind", cols)
+        self.assertEqual(
+            c2.execute("SELECT kind FROM symbols WHERE symbol='old_sym'").fetchone(),
+            (None,))
+        c2.close()
 
 
 if __name__ == "__main__":

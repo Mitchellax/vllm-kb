@@ -612,6 +612,12 @@ def main() -> None:
         if args.tag:
             wanted = set(args.tag)
             cands = [c for c in cands if c["tag"] in wanted or c["group"] in wanted]
+        # 先无条件迁移 schema（即使某镜像快照缺失会 skip，旧索引缺 kind 列也能补上）
+        from vllm_kb.code_index import VersionedCode  # noqa: E402
+
+        for c in cands:
+            ci = VersionedCode(cfg, repo=f"img:{c['tag']}")
+            ci._connect_index(write=True).close()
         for c in cands:
             extract_one(c, cfg, "", matrix, insecure=insecure, qbase=qbase, index_only=True)
         print(f"[img] 索引重建完成：{len(cands)} 个镜像", flush=True)

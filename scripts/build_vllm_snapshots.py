@@ -22,6 +22,7 @@
 import argparse
 import json
 import os
+import sqlite3
 import ssl
 import sys
 import urllib.request
@@ -100,24 +101,30 @@ def ensure_snapshot(root: Path, version: str) -> Path:
     return snap
 
 
-def build_index(root: Path, version: str) -> int:
-    """为 vllm 主仓版本构建符号索引（复用 vllm_kb.code_index 的提取器）。"""
-    from vllm_kb.code_index import VersionedCode  # noqa: E402
-
-    snap = ensure_snapshot(root, version)
+def _open_index(root: Path) -> sqlite3.Connection:
+    """打开索引库并确保 schema（含 kind 列；旧库缺 kind 时自动 ALTER 迁移）。"""
     index_path = root / "index.sqlite3"
-    import sqlite3
-
+    index_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(index_path))
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS symbols (
           version TEXT NOT NULL, symbol TEXT NOT NULL, file TEXT NOT NULL,
-          line INTEGER, snippet TEXT
+          line INTEGER, snippet TEXT, kind TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sym_ver ON symbols(symbol, version);
         """
     )
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(symbols)")]
+    if "kind" not in cols:
+        conn.execute("ALTER TABLE symbols ADD COLUMN kind TEXT")
+    return conn
+
+
+def build_index(root: Path, version: str) -> int:
+    """为 vllm 主仓版本构建符号索引（复用 vllm_kb.code_index 的提取器，独立库）。"""
+    snap = ensure_snapshot(root, version)
+    conn = _open_index(root)
     # 顶层目录兼容
     repo_root = snap
     subdirs = [d for d in snap.iterdir() if d.is_dir()]
@@ -147,8 +154,8 @@ def build_index(root: Path, version: str) -> int:
                 ln = text[: m.start()].count("\n") + 1
                 sn = lines[ln - 1].strip()[:120] if ln <= len(lines) else ""
                 conn.execute(
-                    "INSERT OR IGNORE INTO symbols VALUES (?,?,?,?,?)",
-                    (version, name.lower(), rel, ln, sn),
+                    "INSERT OR IGNORE INTO symbols VALUES (?,?,?,?,?,?)",
+                    (version, name.lower(), rel, ln, sn, "def"),
                 )
                 count += 1
     conn.commit()
@@ -195,6 +202,8 @@ def main() -> None:
         return
 
     if args.index_only:
+        # 先无条件迁移 schema（即使无 zip：旧索引缺 kind 列也能补上，修复 503）
+        _open_index(root).close()
         for v in versions:
             if (root / "zips" / f"{v}.zip").exists():
                 n = build_index(root, v)

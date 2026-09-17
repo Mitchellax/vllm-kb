@@ -118,10 +118,8 @@ class VersionedCode:
 
     @property
     def _built_hint(self) -> str:
-        """索引重建提示（同上，按命名空间给对应脚本）。"""
-        if self.repo.startswith(("img:", "fork:")):
-            return f"{self._preset_hint} --index-only"
-        return "scripts/build_code_snapshots.py --index-only"
+        """索引重建提示（按命名空间给对应脚本，与 _preset_hint 同源一处维护）。"""
+        return f"{self._preset_hint} --index-only"
 
     # ---------------- 版本与快照 ----------------
 
