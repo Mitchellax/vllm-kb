@@ -164,8 +164,10 @@ python scripts/maintain.py --insecure update
 > 3. Docker 场景**容器不重启**（重启会释放端口/GPU，窗口期可能被他人占用）——
 >    用 `docker exec` 在容器内 `pkill serve_api` 原地停/起，容器进程永远存活；
 > 4. **每条命令独立一条 `docker exec`**（业务环境实测 `bash -c "多条命令"` 不可靠）；
-> 5. **后台启动用 `setsid` 代替 `nohup`**（`docker exec` 内 nohup 实测有问题）；
->    日志由**定时脚本重定向 `>>` 落盘**，业务日志本身只打屏。
+> 5. **`docker exec` 是前台阻塞的**——常驻进程（serve_api）必须用 `docker exec -d`
+>    后台启动（立即返回，容器内进程由 docker daemon 接管；不要用 `setsid`/`nohup`）。
+>    `update` 是有限时间进程，可前台执行并用重定向 `>>` 落盘；serve_api 的日志由它
+>    自身 `setup_logging` 负责（config.json 的 logging 段配置落盘路径，不依赖 shell 重定向）。
 
 **场景 A：宿主机 systemd（root 权限，更规范）**
 
@@ -177,13 +179,14 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# 每条命令独立 docker exec（不嵌套 bash -c）；日志由 systemd 重定向落盘
+# 每条命令独立 docker exec（不嵌套 bash -c）；update 日志由 systemd 重定向落盘
 StandardOutput=append:<log_dir>/update.log
 StandardError=append:<log_dir>/update.log
 ExecStart=docker exec <container> pkill -TERM -f serve_api.py
 ExecStart=sleep 2
 ExecStart=docker exec <container> python <project_dir>/scripts/maintain.py update --insecure
-ExecStart=docker exec <container> setsid python <project_dir>/scripts/serve_api.py
+# 后台重启 API：-d 立即返回（serve_api 日志走自身 setup_logging 落盘）
+ExecStart=docker exec -d <container> python <project_dir>/scripts/serve_api.py
 ```
 
 ```ini
@@ -203,9 +206,6 @@ WantedBy=timers.target
 sudo systemctl daemon-reload && sudo systemctl enable --now vllm-kb-update.timer
 ```
 
-> serve_api 启动日志与更新日志同写 `<log_dir>/update.log`；如要分开，把
-> 最后一条 `ExecStart` 前加 `StandardOutput=append:<log_dir>/api.log` 覆盖（每条
-> ExecStart 可用各自的 StandardOutput/StandardError 前缀）。
 > 若 serve_api 本身由宿主机 systemd 管理（非容器），改用
 > `ExecStartPre=systemctl stop vllm-kb-api.service` / `ExecStart=<project_dir>/.venv/bin/python <project_dir>/scripts/maintain.py update --insecure`
 > / `ExecStartPost=systemctl start vllm-kb-api.service` 三行即可（无需 docker exec）。
@@ -214,8 +214,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now vllm-kb-update.timer
 
 ```
 # 每晚 3:00 停 API → 增量更新 → 后台重启 API（全程 docker exec，容器不重启）
-# 每条命令独立 docker exec，&& 顺序串联；日志 >> 落盘；setsid 代替 nohup
-0 3 * * * mkdir -p <log_dir> && docker exec <container> pkill -TERM -f serve_api.py && sleep 2 && docker exec <container> python <project_dir>/scripts/maintain.py update --insecure >> <log_dir>/update.log 2>&1 && docker exec <container> setsid python <project_dir>/scripts/serve_api.py >> <log_dir>/api.log 2>&1 &
+# 每条命令独立 docker exec，&& 顺序串联；update 日志 >> 落盘；serve_api 用 -d 后台启动
+0 3 * * * mkdir -p <log_dir> && docker exec <container> pkill -TERM -f serve_api.py && sleep 2 && docker exec <container> python <project_dir>/scripts/maintain.py update --insecure >> <log_dir>/update.log 2>&1 && docker exec -d <container> python <project_dir>/scripts/serve_api.py
 ```
 
 > 宿主机直接跑（非容器）时，把各 `docker exec <container> python <project_dir>/...`
