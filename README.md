@@ -149,14 +149,23 @@ python scripts/maintain.py --insecure update
 
 ### 定时自动更新（每晚停服务 → 增量更新 → 重启）
 
-需要每晚自动"停 API → `maintain.py update` → 重启 API"时，按运行环境选用以下范例
-（**范例需自适配**：容器名 `kb`、工程路径 `/app`、api 日志 `/var/log/api.log` 均按实际替换）。
+需要每晚自动"停 API → `maintain.py update` → 重启 API"时，按运行环境选用以下范例。
+**范例需自适配**，以下占位符按实际替换：
 
-> 三个注意点：
+| 占位符 | 含义 | 示例 |
+|---|---|---|
+| `<container>` | 容器名 | `kb` |
+| `<project_dir>` | 容器内工程路径 | `/app` |
+| `<log_dir>` | 宿主机日志目录（落盘） | `/var/log/vllm-kb` |
+
+> 五个注意点：
 > 1. **Kùzu 单写者**：`update` 含建图步骤，必须先在停 API 后再执行；
 > 2. **`update` 建图步骤非致命**：即使停 API 失败，入库仍成功、图失败告警，下一晚自动补；
 > 3. Docker 场景**容器不重启**（重启会释放端口/GPU，窗口期可能被他人占用）——
->    用 `docker exec` 在容器内 `pkill serve_api` 原地停/起，容器进程永远存活。
+>    用 `docker exec` 在容器内 `pkill serve_api` 原地停/起，容器进程永远存活；
+> 4. **每条命令独立一条 `docker exec`**（业务环境实测 `bash -c "多条命令"` 不可靠）；
+> 5. **后台启动用 `setsid` 代替 `nohup`**（`docker exec` 内 nohup 实测有问题）；
+>    日志由**定时脚本重定向 `>>` 落盘**，业务日志本身只打屏。
 
 **场景 A：宿主机 systemd（root 权限，更规范）**
 
@@ -168,10 +177,13 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# 停 API → 增量更新 → 后台重启 API（全程容器内，不重启容器）
-ExecStart=docker exec kb bash -c "pkill -TERM -f serve_api.py; sleep 2; \
-  cd /app && python scripts/maintain.py update --insecure; \
-  nohup python scripts/serve_api.py >>/var/log/api.log 2>&1 &"
+# 每条命令独立 docker exec（不嵌套 bash -c）；日志由 systemd 重定向落盘
+StandardOutput=append:<log_dir>/update.log
+StandardError=append:<log_dir>/update.log
+ExecStart=docker exec <container> pkill -TERM -f serve_api.py
+ExecStart=sleep 2
+ExecStart=docker exec <container> python <project_dir>/scripts/maintain.py update --insecure
+ExecStart=docker exec <container> setsid python <project_dir>/scripts/serve_api.py
 ```
 
 ```ini
@@ -191,20 +203,24 @@ WantedBy=timers.target
 sudo systemctl daemon-reload && sudo systemctl enable --now vllm-kb-update.timer
 ```
 
-> systemd 方式下如果 serve_api 本身由 systemd 管理（而非 docker exec），改用
-> `ExecStartPre=systemctl stop vllm-kb-api.service` / `ExecStart=/opt/vllm-kb/.venv/bin/python /opt/vllm-kb/scripts/maintain.py update`
+> serve_api 启动日志与更新日志同写 `<log_dir>/update.log`；如要分开，把
+> 最后一条 `ExecStart` 前加 `StandardOutput=append:<log_dir>/api.log` 覆盖（每条
+> ExecStart 可用各自的 StandardOutput/StandardError 前缀）。
+> 若 serve_api 本身由宿主机 systemd 管理（非容器），改用
+> `ExecStartPre=systemctl stop vllm-kb-api.service` / `ExecStart=<project_dir>/.venv/bin/python <project_dir>/scripts/maintain.py update --insecure`
 > / `ExecStartPost=systemctl start vllm-kb-api.service` 三行即可（无需 docker exec）。
 
 **场景 B：crontab（通用，无需 systemd）**
 
 ```
 # 每晚 3:00 停 API → 增量更新 → 后台重启 API（全程 docker exec，容器不重启）
-0 3 * * * docker exec kb bash -c "pkill -TERM -f serve_api.py; sleep 2; cd /app && python scripts/maintain.py update --insecure; nohup python scripts/serve_api.py >>/var/log/api.log 2>&1 &"
+# 每条命令独立 docker exec，&& 顺序串联；日志 >> 落盘；setsid 代替 nohup
+0 3 * * * mkdir -p <log_dir> && docker exec <container> pkill -TERM -f serve_api.py && sleep 2 && docker exec <container> python <project_dir>/scripts/maintain.py update --insecure >> <log_dir>/update.log 2>&1 && docker exec <container> setsid python <project_dir>/scripts/serve_api.py >> <log_dir>/api.log 2>&1 &
 ```
 
-> 宿主机直接跑（非容器）时，把 `docker exec kb bash -c "..."` 换成
-> `cd /path/to/vllm-kb && /path/to/.venv/bin/python scripts/maintain.py update --insecure`
-> 即可，停/起用各自进程管理方式（systemd `systemctl stop/start`、supervisorctl 等）。
+> 宿主机直接跑（非容器）时，把各 `docker exec <container> python <project_dir>/...`
+> 换成 `<project_dir>/.venv/bin/python <project_dir>/scripts/maintain.py update --insecure`，
+> 停/起用各自进程管理方式（systemd `systemctl stop/start`、supervisorctl 等）。
 
 ### 启动检索服务（部署后 / 更新后）
 
