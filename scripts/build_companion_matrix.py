@@ -138,7 +138,7 @@ def _quay_v2(qbase: str) -> str:
 
 
 def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io") -> str:
-    from vllm_kb.net import get_session
+    from vllm_kb.net import get_session, parse_json
 
     r = get_session(insecure).get(
         f"{qbase.rstrip('/')}/v2/auth",
@@ -146,7 +146,7 @@ def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io") -> st
         timeout=30,
     )
     r.raise_for_status()
-    return r.json()["token"]
+    return parse_json(r, "quay token 响应")["token"]
 
 
 def fetch_image_config(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,

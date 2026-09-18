@@ -36,7 +36,12 @@ from .vectorstore import build_vector_store
 
 def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
                  incremental: bool = False) -> list[KbDocument]:
-    """遍历生效数据源：pull（可选）+ canonicalize，合并所有来源的文档。"""
+    """遍历生效数据源：pull（可选）+ canonicalize，合并所有来源的文档。
+
+    每个来源独立 try/except：某个来源的网络故障（如 GitHub API 返回非 JSON
+    响应/代理错误/限流）不会影响其他来源（如本地 PDF/Markdown），日志中会警告但
+    不中断流水线。
+    """
     sources = build_sources(cfg)
     all_docs: list[KbDocument] = []
     for src in sources:
@@ -52,6 +57,9 @@ def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
             all_docs.extend(docs)
         except NotImplementedError as e:
             print(f"[warn] 来源 {src.id} ({src.type}) 未实现，跳过：{e}")
+        except Exception as e:
+            print(f"[warn] 来源 {src.id} ({src.type}) 异常跳过：{type(e).__name__}: {e}",
+                  flush=True)
     return all_docs
 
 

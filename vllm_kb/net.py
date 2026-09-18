@@ -68,6 +68,34 @@ def get_opener(insecure: bool):
     )
 
 
+def parse_json(r, what: str):
+    """解析 HTTP 响应 JSON，带防护：200 空响应 / HTML 错误页 / 网关页等非 JSON 体
+    统一转成带上下文（状态码 + body 前缀）的 RuntimeError，便于定位与降级处理。
+
+    requests 的 r.json() 对非 JSON 抛 requests.exceptions.JSONDecodeError
+    （ValueError 子类），裸调用会让业务方（增量更新等）直接崩在 json 解析上——
+    统一在这里捕获并给上下文。urllib 场景传入已读出的 bytes/str 亦可。
+    """
+    import json as _json
+
+    try:
+        if isinstance(r, (bytes, str)):
+            raw = r.decode("utf-8") if isinstance(r, bytes) else r
+            return _json.loads(raw)
+        return r.json()
+    except ValueError as e:
+        try:
+            text = r.text if not isinstance(r, (bytes, str)) else (r if isinstance(r, str) else r.decode("utf-8"))
+        except Exception:
+            text = "<unreadable>"
+        snippet = (text or "")[:200].replace("\n", " ")
+        status = getattr(r, "status_code", "?")
+        raise RuntimeError(
+            f"{what}：HTTP {status} 响应非 JSON（查询本身合法但被网关/代理/限流"
+            f"页或空体替代）；body 前缀: {snippet!r}"
+        ) from e
+
+
 def github_api_base(args_base: Optional[str]) -> str:
     """解析 GitHub API 前缀：命令行 > 环境变量 > 默认。"""
     return (args_base or os.environ.get("VLLM_KB_GITHUB_BASE") or DEFAULT_GITHUB_BASE).rstrip("/")

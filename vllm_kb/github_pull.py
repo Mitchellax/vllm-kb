@@ -31,7 +31,7 @@ import requests
 from .components import default_component_for_repo, extract_component_versions
 from .config import PROJECT_ROOT, SourceCfg
 from .models import KbDocument, VersionSpan
-from .net import github_api_base, get_session, insecure_from_env
+from .net import github_api_base, get_session, insecure_from_env, parse_json
 
 _LABEL_VERSION_RE = re.compile(r"v?(0\.\d+(?:\.\d+)?)")  # vLLM/vllm-ascend 均为 0.x.y 系，排除 3.5/26.1.0 等噪音
 _BODY_VERSION_RE = re.compile(r"(?i)vllm\s+version[^0-9]*(\d+\.\d+(?:\.\d+)?)")
@@ -214,7 +214,14 @@ class GithubPuller:
                 time.sleep(self.retry_backoff_seconds * (attempt + 1))
                 continue
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = parse_json(r, "GraphQL 响应")
+                except RuntimeError as e:
+                    last_exc = e
+                    print(f"[github:{self.id}] GraphQL 200 响应非 JSON（attempt {attempt}）："
+                          f"{e}")
+                    time.sleep(self.retry_backoff_seconds * (attempt + 1))
+                    continue
                 if data.get("errors"):
                     msgs = [e.get("message", "") for e in data["errors"]]
                     joined = " ".join(msgs).lower()
@@ -633,7 +640,7 @@ class GithubPuller:
         all_comments: list[dict] = []
         while True:
             r = self._get(url, params)
-            batch = r.json()
+            batch = parse_json(r, f"评论列表 #{number} 响应")
             if not batch:
                 break
             all_comments.extend(batch)
@@ -824,14 +831,16 @@ class GithubPuller:
             item: dict = {}
             kind = ""
             try:
-                data = self._get(f"{self.base}/repos/{self.repo}/pulls/{n}").json()
+                data = parse_json(self._get(f"{self.base}/repos/{self.repo}/pulls/{n}"),
+                                   f"#{n} pulls 响应")
                 item = self._item_from_rest(data, is_pr=True)
                 kind = "prs"
             except requests.HTTPError as e:
                 if e.response is not None and e.response.status_code != 404:
                     raise
                 try:
-                    data = self._get(f"{self.base}/repos/{self.repo}/issues/{n}").json()
+                    data = parse_json(self._get(f"{self.base}/repos/{self.repo}/issues/{n}"),
+                                       f"#{n} issues 响应")
                 except requests.HTTPError as e2:
                     if e2.response is not None and e2.response.status_code == 404:
                         print(f"[github:{self.id}] #{n} 不存在（pulls/issues 均 404），跳过")
@@ -840,7 +849,8 @@ class GithubPuller:
                 # issues 端点对 PR 也会返回（带 pull_request 字段）——补拉 pulls 拿 merged 信息
                 if data.get("pull_request"):
                     try:
-                        data = self._get(f"{self.base}/repos/{self.repo}/pulls/{n}").json()
+                        data = parse_json(self._get(f"{self.base}/repos/{self.repo}/pulls/{n}"),
+                                           f"#{n} pulls（补拉 merged）响应")
                         item = self._item_from_rest(data, is_pr=True)
                         kind = "prs"
                     except requests.HTTPError:

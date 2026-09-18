@@ -26,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from vllm_kb.net import parse_json
+
 API = "https://quay.io/api/v1/repository/ascend/vllm-ascend/tag/"
 
 # 排除：日构建 / 仓库分支 / 主干 / dev 构建（内容可能随构建变化，版本匹配会误导）
@@ -87,7 +89,7 @@ def fetch_tags(timeout: int = 30, max_retries: int = 3, insecure: bool = False,
                 continue
             r.raise_for_status()  # 其他 4xx：立即失败，不重试
 
-        data = r.json()
+        data = parse_json(r, f"quay page {page} 响应")
         batch = data.get("tags", []) or []
         tags.extend(batch)
         has_more = bool(data.get("has_additional", False))

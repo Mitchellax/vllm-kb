@@ -13,6 +13,7 @@ from typing import Optional
 import requests
 
 from .config import EmbeddingCfg
+from .net import parse_json
 
 
 class EmbeddingError(RuntimeError):
@@ -62,7 +63,10 @@ class EmbeddingClient:
                 time.sleep(2 ** attempt)
                 continue
             if r.status_code == 200:
-                data = r.json().get("data") or []
+                try:
+                    data = parse_json(r, "embedding API 响应").get("data") or []
+                except RuntimeError:
+                    raise EmbeddingError(f"embedding API 200 响应非 JSON: {r.text[:300]!r}")
                 data.sort(key=lambda d: d.get("index", 0))
                 return [d["embedding"] for d in data]
             if r.status_code in (429, 500, 502, 503):

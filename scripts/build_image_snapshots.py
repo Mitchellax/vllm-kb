@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_companion_matrix as bcm  # noqa: E402  （复用 quay/矩阵/tag→commit 工具）
 import fetch_quay_tags as fq  # noqa: E402
+from vllm_kb.net import parse_json  # noqa: E402
 
 # 插件源码在镜像里的位置（Dockerfile: COPY . /vllm-workspace/vllm-ascend/）
 _PLUGIN_PREFIX = "vllm-workspace/vllm-ascend/"
@@ -126,13 +127,15 @@ def fetch_image_layers(tag_info: dict, token: str, insecure: bool = False,
             print("[img]     匿名 token 失效（401/403），刷新后重试", flush=True)
             token = bcm.get_quay_token(insecure=insecure, qbase=qbase)
             r = _get(url, headers={"Authorization": "Bearer " + token})
-        return r.json()
+        return parse_json(r, f"blob {blob_digest} 响应")
 
-    md = json.loads(_get(f"{api}/manifest/{digest}").json()["manifest_data"])
+    md = parse_json(_get(f"{api}/manifest/{digest}"), f"manifest {digest[:16]} 响应")
+    md = json.loads(md["manifest_data"])
     if md.get("manifests"):
         arch = next((x for x in md["manifests"]
                      if x["platform"].get("architecture") == "amd64"), md["manifests"][0])
-        md = json.loads(_get(f"{api}/manifest/{arch['digest']}").json()["manifest_data"])
+        md = parse_json(_get(f"{api}/manifest/{arch['digest']}"), f"manifest {arch['digest'][:16]} 响应")
+        md = json.loads(md["manifest_data"])
     cfg = _blob_json(md["config"]["digest"])
     return {"layers": [str(l.get("digest") or "") for l in md.get("layers", []) or []],
             "layer_sizes": [int(l.get("size") or 0) for l in md.get("layers", []) or []],
