@@ -6,15 +6,17 @@
 否则服务器目录结构会随正文进检索库。`TestNoPathLeak` 就是这条约束的护栏。
 """
 import base64
+import contextlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 from vllm_kb.config import SourceCfg
 from vllm_kb.md_images import code_spans, find_image_refs, rewrite_images
-from vllm_kb.sources import MarkdownSource
+from vllm_kb.sources import MarkdownSource, _path_tag
 
 
 def png(path: Path, w=8, h=8, color="white") -> None:
@@ -23,10 +25,10 @@ def png(path: Path, w=8, h=8, color="white") -> None:
     Image.new("RGB", (w, h), color).save(path)
 
 
-def png_b64() -> str:
+def png_b64(color="red") -> str:
     buf = io.BytesIO()
     from PIL import Image
-    Image.new("RGB", (8, 8), "red").save(buf, format="PNG")
+    Image.new("RGB", (8, 8), color).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -330,6 +332,160 @@ class TestNoPathLeak(unittest.TestCase):
         for frag in self.FORBIDDEN:
             with self.subTest(fragment=frag):
                 self.assertNotIn(frag, blob)
+
+
+class _MdCase(unittest.TestCase):
+    """共用脚手架：临时项目根 + 一个 markdown source。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.md_dir = self.root / "data" / "imports" / "md"
+        self.md_dir.mkdir(parents=True)
+        self.cfg = SourceCfg(id="wiki", type="markdown", path="data/imports/md",
+                             title_pattern=r"^#\s+(.+)", enabled=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _src(self) -> MarkdownSource:
+        return MarkdownSource(self.cfg, project_root=self.root)
+
+    def _write(self, rel: str, body: str) -> Path:
+        p = self.md_dir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def _images(self) -> set[str]:
+        d = self.root / "data" / "assets" / "images"
+        return {p.name for p in d.glob("*")} if d.exists() else set()
+
+
+class TestFallbackMode(_MdCase):
+    """imports 缺失 → 回退 assets/md 扁平副本：图片按文件名尽力反查，正文仍不含路径。"""
+
+    def setUp(self):
+        super().setUp()
+        png(self.md_dir / "shot.png")
+        png(self.md_dir / "imgs" / "sub.png")
+        self._write("doc.md",
+                    "# T\n\n"
+                    "同目录 ![a](shot.png)\n"
+                    "子目录 ![b](imgs/sub.png)\n"
+                    "从未收集 ![c](never.png)\n")
+        self.src = self._src()
+        self.src.pull()                 # 填 assets/md
+        self.src.canonicalize()         # 首次（imports 在）→ 图片进 assets/images
+        self.assertTrue({"shot.png", "sub.png"} <= self._images())
+        shutil.rmtree(self.md_dir)      # 模拟 imports 被清空
+
+    def test_fallback_resolves_by_filename_and_warns(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            docs = self.src.canonicalize()
+        out = buf.getvalue()
+        self.assertIn("回退到资产层副本", out)          # 显式告警
+        self.assertEqual(len(docs), 1)
+        d = docs[0]
+        self.assertEqual(d.source_id, "md:doc")        # 唯一 stem → id 不漂移
+        self.assertEqual(d.extra["quality"]["source_mode"], "assets_fallback")
+        # 同目录图 + 扁平化后的子目录图（按文件名）都反查命中；从未收集的仍未命中
+        self.assertEqual([e["kind"] for e in d.extra["evidence"]],
+                         ["local", "local", "unresolved"])
+        self.assertEqual(d.extra["quality"]["images_unresolved"], 1)
+        self.assertIn("[图片:a]", d.body)
+        self.assertIn("[图片:b]", d.body)
+
+    def test_fallback_body_has_no_path(self):
+        """硬约束在回退模式下同样成立（否则相对路径会原样进库）。"""
+        d = self.src.canonicalize()[0]
+        for frag in ("shot.png", "sub.png", "never.png", "imgs/"):
+            with self.subTest(fragment=frag):
+                self.assertNotIn(frag, d.body)
+        self.assertNotIn("![", d.body)
+
+    def test_imports_mode_marked(self):
+        """imports 在时标记为 imports（对照组）。"""
+        png(self.md_dir / "shot.png")
+        self._write("doc.md", "# T\n\n![a](shot.png)\n")
+        d = self._src().canonicalize()[0]
+        self.assertEqual(d.extra["quality"]["source_mode"], "imports")
+        self.assertEqual(d.extra["quality"]["images_unresolved"], 0)
+
+
+class TestSameStemDisambiguation(_MdCase):
+    """同名 stem 不再互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）。"""
+
+    def setUp(self):
+        super().setUp()
+        self._write("sub_a/same.md", "# A\n\n甲\n")
+        self._write("sub_b/same.md", "# B\n\n乙\n")
+        self._write("uniq.md", "# U\n\n丙\n")
+
+    def test_distinct_ids_and_no_churn_for_unique(self):
+        docs = self._src().canonicalize()
+        ids = sorted(d.source_id for d in docs)
+        self.assertEqual(len(docs), 3)
+        self.assertEqual(len(set(ids)), 3, ids)         # 不再互相覆盖
+        self.assertIn("md:uniq", ids)                   # 唯一 stem 保持原 id（存量不漂移）
+        dup = [i for i in ids if i.startswith("md:same--")]
+        self.assertEqual(len(dup), 2, ids)
+        for i in dup:
+            self.assertRegex(i, r"^md:same--[0-9a-f]{8}$")
+
+    def test_fingerprint_hides_directory_names(self):
+        """source_id 会出现在 /search 的 doc_id 与遥测库里 → 不能含目录名。"""
+        docs = self._src().canonicalize()
+        for d in docs:
+            for frag in ("sub_a", "sub_b", "same.md", "/"):
+                self.assertNotIn(frag, d.source_id)
+
+    def test_warns_on_collision(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._src().canonicalize()
+        self.assertIn("同名 md", buf.getvalue())
+
+    def test_bodies_are_not_crossed(self):
+        """消歧后两篇内容各自独立（修复前 INSERT OR REPLACE 后者覆盖前者）。"""
+        bodies = {d.body for d in self._src().canonicalize()}
+        self.assertEqual(len(bodies), 3)
+        joined = "".join(bodies)
+        self.assertIn("甲", joined)
+        self.assertIn("乙", joined)
+
+    def test_path_tag_is_stable_and_normalized(self):
+        self.assertEqual(_path_tag("a/b.md"), _path_tag("a\\b.md"))   # 分隔符归一
+        self.assertEqual(len(_path_tag("x")), 8)
+        self.assertNotEqual(_path_tag("sub_a/same.md"), _path_tag("sub_b/same.md"))
+
+
+class TestBase64ContentAddressing(_MdCase):
+    """内嵌图按内容寻址：同图跨文档只落一份，命名不含 md 文件名。"""
+
+    def test_same_image_shared_across_docs(self):
+        b64 = png_b64()
+        for name in ("one.md", "two.md"):
+            self._write(name, f"# {name}\n\n![内嵌](data:image/png;base64,{b64})\n")
+        docs = self._src().canonicalize()
+        self.assertEqual(len(docs), 2)
+        shas = {d.extra["evidence"][0]["sha256"] for d in docs}
+        self.assertEqual(len(shas), 1)                  # 同一张图 → 同一个 sha
+        names = [n for n in self._images() if n.startswith("img_")]
+        self.assertEqual(len(names), 1, names)          # 只落一份（去重）
+        self.assertRegex(names[0], r"^img_[0-9a-f]{16}\.png$")
+        for d in docs:
+            self.assertNotIn("one", d.extra["evidence"][0].get("asset_id", ""))
+            self.assertIn("[图片:内嵌]", d.body)
+
+    def test_different_images_get_different_names(self):
+        a, b = png_b64(), png_b64("blue")
+        self._write("d.md", f"# T\n\n![a](data:image/png;base64,{a})\n"
+                            f"![b](data:image/png;base64,{b})\n")
+        d = self._src().canonicalize()[0]
+        self.assertEqual(len({e["sha256"] for e in d.extra["evidence"]}), 2)
+        self.assertEqual(len([n for n in self._images() if n.startswith("img_")]), 2)
 
 
 if __name__ == "__main__":

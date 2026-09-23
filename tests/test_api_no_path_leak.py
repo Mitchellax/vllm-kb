@@ -21,10 +21,17 @@ from vllm_kb.models import KbDocument
 from vllm_kb.vectorstore import PythonVectorStore
 
 # 服务器路径形态（GitHub URL 等社区链接是允许的，不属于服务器路径）
+# 注 1：早期只覆盖 `data/<子目录>/` 前缀，漏掉了裸相对路径 `parsed/pdf/x.tables.json`
+#      （extra.structure.tables 就是这么泄的）——补上裸形态。
+# 注 2：盘符需**非字母数字边界**，否则 `https:/`、`common:/usr` 里的 `s:/`、`n:/` 会误报
+#      （真实 PDF 正文里就有 `common:/usr/...`）。
 _PATH_PATTERNS = [
     re.compile(r"assets[/\\]"),
     re.compile(r"data[/\\](?:imports|parsed|raw|code|compatibility|assets)"),
-    re.compile(r"[A-Za-z]:[\\/]"),
+    re.compile(r"parsed[/\\]"),
+    re.compile(r"imports[/\\]"),
+    re.compile(r"\.tables\.json"),
+    re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]"),
     re.compile(r"\\assets\\"),
     re.compile(r"\\parsed\\"),
 ]
@@ -96,6 +103,8 @@ DIRTY_DOCS = [
                       "sha256": "abc123"},
             "evidence": [{"kind": "local", "path": "assets/images/topo.png",
                           "asset_id": "def456", "sha256": "def456"}],
+            # 历史残留：structure.tables 存的是服务器相对路径（真实库中确实如此）——出口只留数量
+            "structure": {"tables": ["parsed/pdf/guide.tables.json"], "pages": 12},
             "tag_candidates": [{"name": "命令参考", "tier": "purpose"}],
         },
     ),
@@ -203,6 +212,33 @@ class TestNoPathLeak(unittest.TestCase):
         self.assertEqual(d["tags"], ["HCCL", "超时排查"])
         self.assertEqual(d["extra"]["verification"], "expert")
         self.assertEqual(d["extra"]["kind"], "manual")
+
+    def test_structure_tables_path_stripped(self):
+        """structure.tables 内部存 `parsed/pdf/<asset_id>.tables.json`（服务器相对路径）。
+
+        表格已转 Markdown 拼进正文、且**没有任何端点能取该 JSON**，路径对 agent 无用却会
+        暴露目录结构 → 出口只保留数量；数值型结构指标放行，字符串一律丢弃（fail-closed）。
+        """
+        r = self.client.get("/doc/pdf:guide")
+        self.assertEqual(r.status_code, 200)
+        st = r.json()["extra"].get("structure")
+        self.assertEqual(st, {"tables": 1, "pages": 12})
+        self._assert_no_path(r.json(), "/doc/pdf:guide")
+
+    def test_sanitize_structure_unit(self):
+        """_sanitize_structure 直接单测：数量化 + 字符串 fail-closed。"""
+        from vllm_kb.api import _sanitize_structure
+
+        self.assertEqual(_sanitize_structure({"tables": ["a", "b", "c"]}), {"tables": 3})
+        self.assertEqual(_sanitize_structure({"tables": []}), {"tables": 0})
+        self.assertEqual(_sanitize_structure({"tables": "parsed/pdf/x.tables.json"}),
+                         {"tables": 1})                    # 非 list 真值 → 1（不保留字符串）
+        self.assertEqual(_sanitize_structure({"pages": 12, "ok": True, "ratio": 0.5}),
+                         {"pages": 12, "ok": True, "ratio": 0.5})
+        self.assertEqual(_sanitize_structure({"file": "parsed/pdf/x.tables.json"}), {})
+        self.assertEqual(_sanitize_structure({"path": "assets/pdf/a.pdf"}), {})
+        self.assertEqual(_sanitize_structure("nonsense"), {})
+        self.assertEqual(_sanitize_structure(None), {})
 
     def test_search_signature_results_no_path(self):
         """检索类端点（search/signature/title）响应无路径。"""

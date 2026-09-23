@@ -43,8 +43,15 @@ def gen_remote_config(cfg: AppConfig, out: Path) -> None:
     print(f"[deploy] 远程启动: VLLM_KB_DATA_ROOT=<数据目录> python scripts/serve_api.py --host 0.0.0.0")
 
 
-def pack_data(cfg: AppConfig, out: Path, include_raw: bool = False) -> None:
-    """打包数据（LanceDB/SQLite/code/compatibility，可选 raw）成 tar.gz。
+def pack_data(cfg: AppConfig, out: Path, include_raw: bool = False,
+              include_assets: bool = False, include_imports: bool = False) -> None:
+    """打包**只读服务**所需数据（LanceDB/SQLite/code/compatibility/graph）成 tar.gz。
+
+    默认**不含** assets/ imports/ parsed/：远程按"存算分离"只跑只读 API
+    （`serve_api.py`），不需要这些；重建（build_kb.py）与审核工作台才需要，见下方可选开关。
+    需要审核台图片预览 → `--include-assets`（含 assets/ + review.sqlite3）；
+    需要在远程重建（改了解析逻辑重跑）→ `--include-assets --include-imports`
+    （缺 imports 时 MarkdownSource 会回退 assets/md 扁平副本，图片只能按文件名尽力反查）。
 
     体积：干净向量库约 0.8GB（LanceDB 历史版本累积可达数十 GB——数据完整时可先
     cleanup_old_versions() 瘦身再打包）；打包/上传仍建议 rsync/scp -r 整目录拷贝，
@@ -58,6 +65,13 @@ def pack_data(cfg: AppConfig, out: Path, include_raw: bool = False) -> None:
     files = ["kb.sqlite3"]
     if include_raw:
         dirs.append("raw")
+    if include_assets:
+        # assets/ 是 md/pdf 图片的唯一副本；审核台 /assets 静态预览也依赖它
+        dirs.append("assets")
+        files.append("review.sqlite3")
+    if include_imports:
+        # 原始导入文件：远程重建（重新 canonicalize）的唯一来源
+        dirs.append("imports")
     out.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(out, "w:gz") as tar:
         for d in dirs:
@@ -70,6 +84,11 @@ def pack_data(cfg: AppConfig, out: Path, include_raw: bool = False) -> None:
                 tar.add(p, arcname=f"data/{f}")
     size = out.stat().st_size / 1e9
     print(f"[deploy] 数据包 -> {out}（{size:.2f} GB）")
+    print(f"[deploy] 已含: {', '.join(dirs + files)}")
+    missing = [x for x in ("assets", "imports") if not (root / x).exists()]
+    if missing:
+        print(f"[deploy] 注意: 包内不含 {', '.join(missing)}——"
+              f"该包只能跑只读 API，无法重建、审核台无图片预览")
     print(f"[deploy] 提示: 大目录打包/上传较慢，推荐 rsync/scp -r 整目录拷贝到远程")
 
 
@@ -99,6 +118,13 @@ def print_steps() -> None:
 【数据更新】
   数据更新仍在"拥有数据"的一端跑流水线（build_kb.py / build_*），
   更新后同步数据目录到远程即可（增量 rsync）。
+
+  注意 --pack-data 默认**只打只读 API 需要的部分**（LanceDB/SQLite/code/compatibility/graph），
+  不含 assets/ imports/ parsed/——这样的包在远程**无法重建**、审核台也没有图片预览。
+  需要审核台预览:  --pack-data --include-assets
+  需要远程重建:    --pack-data --include-assets --include-imports
+  （缺 imports 时 MarkdownSource 会回退 assets/md 扁平副本：图片相对路径失锚，
+    只能按文件名尽力反查，未命中的一律占位，正文仍不含路径）
 """)
 
 
@@ -107,6 +133,10 @@ def main() -> None:
     ap.add_argument("--gen-config", action="store_true", help="生成远程 server 最小 config")
     ap.add_argument("--pack-data", action="store_true", help="打包数据成 tar.gz")
     ap.add_argument("--include-raw", action="store_true", help="打包时包含 raw/ 原始数据")
+    ap.add_argument("--include-assets", action="store_true",
+                    help="打包时包含 assets/ + review.sqlite3（审核台图片预览需要）")
+    ap.add_argument("--include-imports", action="store_true",
+                    help="打包时包含 imports/（远程重建需要；缺它则 Markdown 图片失锚）")
     ap.add_argument("--out", default="deploy/", help="输出目录（默认 deploy/）")
     ap.add_argument("--print-steps", action="store_true", help="打印部署步骤")
     ap.add_argument("--config", default=None)
@@ -117,7 +147,8 @@ def main() -> None:
     if args.gen_config:
         gen_remote_config(cfg, out_dir / "config.remote.json")
     if args.pack_data:
-        pack_data(cfg, out_dir / "vllm-kb-data.tar.gz", include_raw=args.include_raw)
+        pack_data(cfg, out_dir / "vllm-kb-data.tar.gz", include_raw=args.include_raw,
+                  include_assets=args.include_assets, include_imports=args.include_imports)
     if args.print_steps:
         print_steps()
     if not (args.gen_config or args.pack_data or args.print_steps):

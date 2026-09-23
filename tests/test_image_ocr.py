@@ -79,7 +79,11 @@ class TestMarkdownImageCollection(unittest.TestCase):
         self.assertIn("local.png", names)
         self.assertIn("sub.png", names)
         self.assertIn("abs.png", names)
-        self.assertIn("doc_img1.png", names)
+        # base64 内嵌图按**内容寻址**命名（img_<sha16>.png）：不含 md 文件名 → 同名 md 不撞，
+        # 且不同文档内嵌同一张图自动去重
+        b64_names = [n for n in names if n.startswith("img_")]
+        self.assertEqual(len(b64_names), 1, names)
+        self.assertRegex(b64_names[0], r"^img_[0-9a-f]{16}\.png$")
 
     def test_evidence_records(self):
         self.src.pull()

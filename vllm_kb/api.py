@@ -49,19 +49,43 @@ def _readonly_sqlite(path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
 
+def _sanitize_structure(structure: Any) -> dict:
+    """structure 出口白名单：只放行**无路径形态**的结构指标。
+
+    `structure.tables` 内部存的是 `parsed/pdf/<asset_id>.tables.json` 这类服务器相对路径，
+    但表格已转 Markdown 拼进正文、且**没有任何端点能取该 JSON**——路径对 agent 无用，
+    只会暴露目录结构。故只保留**数量**。
+    其余字段按类型放行（数值/布尔），字符串一律丢弃（可能含路径，fail-closed）。
+    """
+    if not isinstance(structure, dict):
+        return {}
+    out: dict = {}
+    for k, v in structure.items():
+        if k == "tables":
+            out["tables"] = len(v) if isinstance(v, (list, tuple)) else (1 if v else 0)
+        elif v is None or isinstance(v, (int, float, bool)):
+            out[k] = v
+    return out
+
+
 def _sanitize_extra(extra: Any) -> dict:
     """出口白名单（纵深防御）：剥离 asset/evidence 中可能含服务器路径的字段。
 
     - 只保留 verification/quality/structure/kind/tag_candidates（知识性字段）；
+      structure 经 `_sanitize_structure` 二次收口（`tables` 只留数量）；
     - evidence 只保留无路径形态（kind/asset_id/sha256/source_ref 仅 http(s) URL）——
       即使存量库残留历史路径也不外泄（安全约束：skill 响应不含服务器路径）。
     """
     if not isinstance(extra, dict):
         return {}
     out: dict = {}
-    for k in ("verification", "quality", "structure", "kind"):
+    for k in ("verification", "quality", "kind"):
         if k in extra:
             out[k] = extra[k]
+    if "structure" in extra:
+        st = _sanitize_structure(extra["structure"])
+        if st:
+            out["structure"] = st
     if "tag_candidates" in extra and isinstance(extra["tag_candidates"], list):
         out["tag_candidates"] = [
             {"name": c.get("name"), "tier": c.get("tier")}

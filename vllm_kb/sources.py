@@ -53,6 +53,17 @@ def _sha256(p: Path) -> str:
     return h.hexdigest()
 
 
+def _path_tag(rel: str) -> str:
+    """相对路径指纹（8 hex），用于同名 md 消歧。
+
+    用**路径**而非内容的 sha：md 每次编辑内容都变，内容寻址会让 source_id 漂移
+    （旧文档变孤儿、审核状态/遥测丢失、检索重复）；路径指纹在内容改动下稳定，
+    且**不可读**——source_id 会出现在 /search 的 doc_id、/doc/{id} 与遥测库里，
+    不能暴露目录名（可能含客户/项目名）。
+    """
+    return hashlib.sha256(rel.replace("\\", "/").encode("utf-8")).hexdigest()[:8]
+
+
 def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
     """复制资产到 assets/{sub}/（不可变层）。同名同 sha 幂等跳过；同名异 sha 加 sha 前缀。
     返回 (assets 相对路径, sha256, 是否新增复制)。"""
@@ -308,6 +319,20 @@ class MarkdownSource(BaseSource):
             if assets.exists():
                 md_files = [(p, False) for p in sorted(assets.glob("*.md"))
                             + sorted(assets.glob("*.markdown"))]
+        if md_files and not any(fi for _, fi in md_files):
+            print(f"[sources:{self.id}] ⚠ 导入目录无 md（{self.import_dir}），已回退到资产层副本 "
+                  f"{self._assets_dir()}：图片相对路径**已失锚**（assets/md 是扁平副本），"
+                  f"只能按文件名到 assets/images 尽力反查，未命中的一律占位"
+                  f"（正文仍不含路径）；如需完整图片/OCR 请恢复 imports 目录", flush=True)
+        # 同名 stem 冲突检测：md:<stem> 会互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）
+        stem_counts: dict[str, int] = {}
+        for p, _fi in md_files:
+            stem_counts[p.stem] = stem_counts.get(p.stem, 0) + 1
+        dup_stems = {s for s, n in stem_counts.items() if n > 1}
+        if dup_stems:
+            shown = ", ".join(sorted(dup_stems)[:5]) + (" …" if len(dup_stems) > 5 else "")
+            print(f"[sources:{self.id}] ⚠ 检测到 {len(dup_stems)} 组同名 md（{shown}）："
+                  f"已用相对路径指纹消歧为 md:<stem>--<sha8>，避免互相覆盖", flush=True)
         total = len(md_files)
         start_ts = time.time()
         if total:
@@ -318,7 +343,7 @@ class MarkdownSource(BaseSource):
             except OSError as e:
                 print(f"[sources:{self.id}] 跳过 {p.name}: {e}")
                 continue
-            body, evidence = self._resolve_images(p, text) if from_imports else (text, [])
+            body, evidence = self._resolve_images(p, text, assets_only=not from_imports)
             if sanitize_on:
                 ips, paths = collect_sanitize_hits(body, keep_paths, keep_ips)
                 if ips:
@@ -329,11 +354,28 @@ class MarkdownSource(BaseSource):
             title = title_raw.group(1).strip() if title_raw else p.stem
             sha = _sha256(p)
             asset_id = sha[:16]
+            # 同名 stem：加相对路径指纹（默认不动 → 存量 source_id 不漂移）
+            if p.stem in dup_stems:
+                base_dir = self.import_dir if from_imports else self._assets_dir()
+                try:
+                    rel_key = p.relative_to(base_dir).as_posix()
+                except ValueError:
+                    rel_key = p.name
+                sid = f"md:{p.stem}--{_path_tag(rel_key)}"
+            else:
+                sid = f"md:{p.stem}"
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
             tags, cands = extract_tags(p.stem, headings_from_markdown(text), registry=registry)
             extra: dict[str, Any] = {
                 "asset": {"asset_id": asset_id, "sha256": sha, "format": "markdown"},
-                "quality": {"text_source": "text_layer", "parsed_with": "raw"},
+                "quality": {
+                    "text_source": "text_layer",
+                    "parsed_with": "raw",
+                    # 回退模式（imports 缺失）→ 图片只能按文件名尽力反查
+                    "source_mode": "imports" if from_imports else "assets_fallback",
+                    "images_unresolved": sum(1 for e in evidence
+                                             if e.get("kind") == "unresolved"),
+                },
                 "verification": "unverified",  # 质量参差：先入库，审核工作台补标
                 "structure": {},
                 # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
@@ -343,7 +385,7 @@ class MarkdownSource(BaseSource):
                 extra["evidence"] = evidence
             docs.append(KbDocument(
                 source_type="doc_markdown",
-                source_id=f"md:{p.stem}",
+                source_id=sid,
                 url="",
                 title=title,
                 body=body,
@@ -360,7 +402,8 @@ class MarkdownSource(BaseSource):
 
     # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
 
-    def _resolve_images(self, md_path: Path, text: str) -> tuple[str, list[dict]]:
+    def _resolve_images(self, md_path: Path, text: str, *,
+                        assets_only: bool = False) -> tuple[str, list[dict]]:
         """扫描正文图片引用：本地/base64 资产化（**不透明占位**替换引用，原引用只进 evidence）；
         URL 引用标记 remote（V1 不下载）；解析失败标记 unresolved。
         返回 (占位化后的 body, evidence 列表)。
@@ -368,6 +411,10 @@ class MarkdownSource(BaseSource):
         形态解析与代码感知在 `md_images.py`：行内（含空格/尖括号/括号/跨行）、引用式
         （含定义行去路径）、HTML `<img>` 均支持；**任何未识别或未闭合的图片语法也一律占位**，
         保证"正文与 canonical 不含服务器路径"对任意输入都成立。
+
+        assets_only=True（imports 缺失的回退模式）：相对路径基准 assets/md 是**扁平副本**，
+        原相对结构已丢失——先按 md 同目录找，未命中再按**文件名**到 assets/images 尽力反查；
+        仍未命中的照常占位（不记 source_ref），所以回退模式同样不泄漏路径。
 
         安全约束：正文与 canonical **不含任何服务器路径**——evidence 只记 asset_id/sha256
         （管理员侧经 asset_registry 映射回文件），unresolved 不保留原文引用（可能是路径形态）。
@@ -378,7 +425,7 @@ class MarkdownSource(BaseSource):
         from .md_images import rewrite_images
 
         evidence: list[dict] = []
-        counter: dict[str, int] = {}
+        images_dir = self.resolve("data/assets/images")
 
         def resolve(ref) -> str:
             alt = ref.alt or ""
@@ -403,12 +450,14 @@ class MarkdownSource(BaseSource):
                 except Exception:
                     evidence.append(ev)
                     return placeholder
-                counter[ext] = counter.get(ext, 0) + 1
-                name = f"{md_path.stem}_img{counter[ext]}.{ext}"
-                target = self.resolve("data/assets/images") / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-                sha = _sha256(target)
+                b64_sha = hashlib.sha256(data).hexdigest()
+                # 内容寻址命名：同图只落一份（跨文档自动去重），且不含 md 文件名 → 同名 md 也不撞
+                name = f"img_{b64_sha[:16]}.{ext}"
+                target = images_dir / name
+                if not target.is_file() or _sha256(target) != b64_sha:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                sha = b64_sha
                 ev.update({"kind": "base64", "asset_id": sha[:16], "sha256": sha})
                 ocr_ev, inject = self._ocr_artifact_for(target, sha, f"assets/images/{name}")
                 if ocr_ev is not None:
@@ -425,6 +474,11 @@ class MarkdownSource(BaseSource):
             except OSError:
                 evidence.append(ev)
                 return placeholder
+            if not p.is_file() and assets_only:
+                # 回退模式：相对结构已丢失，按文件名到资产层尽力反查（命中即视为该图）
+                cand = images_dir / Path(local).name
+                if cand.is_file():
+                    p = cand.resolve()
             if not p.is_file():   # 目录/不存在一律 unresolved（不记 source_ref，避免路径形态进库）
                 evidence.append(ev)
                 return placeholder

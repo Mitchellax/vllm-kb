@@ -45,7 +45,9 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   词典 `config.tags.registry` 驱动）——经 skill 的 `tags`/`context` 命令做**能力发现**
   （agent 先知道"知识库有哪些文档类别可提供知识"，如 HCCL 超时 → 命中 HCCL 领域 +
   超时排查/命令参考作用类，先读文档再下结论）；**资产路径不进库**（asset_id 标识 + API 出口白名单清理，
-  `evidence[].ocr` 只放行置信度/来源/异常/签名等知识字段，管理员侧路径仅存审核库）
+  `evidence[].ocr` 只放行置信度/来源/异常/签名等知识字段，`structure` 的表格字段只放行**数量**
+  （`tables: N`，内部存的是 `parsed/pdf/<id>.tables.json` 这类服务器相对路径），
+  管理员侧路径仅存审核库）
 - **内部数据脱敏（后置）**：库中存原文（原文检索）、serve_api 出口统一脱敏（内部 IP → `<IP>`、内部路径 → `<PATH>`，
   默认路径如 `/var/log/npu/` 保留）——改 `config.sanitize`（keep_paths/keep_ips/sources）**即时生效、无需重嵌**；
   被脱敏的原始 IP/路径落盘 `data/sanitize_log.json` 供维护白名单
@@ -554,7 +556,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分）；`OcrArtifact` 产物按 **sha256 + 引擎指纹**（provider/mode/model/提示词版本）幂等，阈值 `ocr_min_confidence` 不进指纹（调阈值只重判定不重跑 OCR） |
 | `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
-| `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册）/`api_image`（请求期图片 OCR，有 image source 时注册） |
+| `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；出口白名单 `_sanitize_extra`（`structure.tables` 只留数量、字符串字段 fail-closed 丢弃）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册）/`api_image`（请求期图片 OCR，有 image source 时注册） |
 
 ## 🗺️ 版本计划
 

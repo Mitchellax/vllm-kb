@@ -432,11 +432,24 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
   4 空格缩进代码块与列表续行无法可靠区分，故不识别（其中图片语法按正文处理）；
 - 图片的 OCR 由 image source 完成（见下）；**Markdown 正文引用的图片在 `canonicalize` 时同步 OCR**，
   高置信文本注入占位符之后（见"低置信度图片不进正文"）。
-  OCR 缓存按图片 sha256 幂等：多处引用同一张图只识别一次，但每处引用各自注入文本。
+  OCR 缓存按图片 sha256 幂等：多处引用同一张图只识别一次，但每处引用各自注入文本；
+- **内嵌 base64 图按内容寻址命名** `img_<sha16>.<ext>`：跨文档内嵌同一张图只落一份（自动去重），
+  且命名不含 md 文件名 → 同名 md 也不会互相覆盖；
+- **同名 md 自动消歧**：`md:<stem>` 会互相覆盖（入库用 `INSERT OR REPLACE`），所以检测到 stem 冲突时
+  冲突集合**整体**改用 `md:<stem>--<sha8>`——`sha8` 是**相对路径**的指纹（不是内容 sha：
+  内容每次编辑都变会让 id 漂移、旧文档变孤儿），且不可读（`source_id` 会出现在 `/search` 的
+  `doc_id`、`/doc/{id}` 与遥测库里，不能暴露目录名）。**唯一 stem 的文档 id 保持 `md:<stem>` 不变**，
+  所以存量库不需要重灌。冲突时构建日志会打印告警；
+- **回退模式**：`imports/md` 不存在或扫不到 md 时，回退到 `assets/md` 副本（`pull()` 的产物）。
+  此时相对路径**已失锚**（assets 是扁平副本），只能按**文件名**到 `assets/images` 尽力反查，
+  未命中的照常占位——所以**回退模式同样满足"正文不含路径"**。构建日志会打印显式告警，
+  且该篇 `extra.quality.source_mode = "assets_fallback"`（正常为 `"imports"`），
+  `extra.quality.images_unresolved` 记录未解析的图片数，可据此筛出需要人工看的文档。
 
 > **实践建议**：图片与 md 放同目录或相对子目录，文件名避免空格与括号（虽然已兼容，但最稳）；
 > alt 写有意义的内容（`[图片:alt]` 会进正文，对检索有帮助）；引用式定义行会被去掉目标，
-> 若同一标签还被普通链接 `[文字][label]` 使用，该链接会失去目标（正文文字保留）。
+> 若同一标签还被普通链接 `[文字][label]` 使用，该链接会失去目标（正文文字保留）；
+> **不要删除 `imports/`**——回退模式只能尽力而为，完整图片/OCR 需要 imports 在场。
 
 **图片 OCR（签名导向，provider 可插拔）**
 
@@ -1147,6 +1160,18 @@ python scripts/deploy_remote.py --gen-config    # 生成远程 config（已去 t
 python scripts/deploy_remote.py --pack-data     # 打包数据成 tar.gz（大数据推荐 rsync/scp -r）
 python scripts/deploy_remote.py --print-steps   # 部署步骤说明
 ```
+
+`--pack-data` 默认**只打只读 API 需要的部分**（`lancedb` / `code` / `compatibility` / `graph` /
+`kb.sqlite3`）——这样的包在远程**无法重建**（`build_kb.py` 跑不出 Markdown 文档），审核台也没有图片预览：
+
+| 需求 | 参数 |
+|---|---|
+| 只跑只读 API（默认） | `--pack-data` |
+| 审核台图片预览 | `--pack-data --include-assets`（含 `assets/` + `review.sqlite3`） |
+| 远程重建（改了解析逻辑重跑） | `--pack-data --include-assets --include-imports`（含 `imports/`） |
+| 需要 `raw/` 原始快照 | 追加 `--include-raw` |
+
+缺 `imports/` 时 `MarkdownSource` 会回退 `assets/md` **扁平副本**（见"Markdown 图片处理"）。
 
 数据更新在"拥有数据"的一端跑流水线，之后增量 rsync 到远程即可。
 
