@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -422,10 +423,10 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
     finally:
         conn.close()
     assets = list_assets(review_db) if review_db else {}
-    # 同 stem 重名统计（pdf:/md: 前缀后的部分）
+    # 同 stem 重名统计（pdf:/md: 前缀后的部分；`--<sha8>` 是自动消歧后缀，不算 stem）
     stems: dict[str, int] = {}
     for sid, *_ in rows:
-        stem = sid.split(":", 1)[1] if ":" in sid else sid
+        stem = _stem_of(sid)
         stems[stem] = stems.get(stem, 0) + 1
     out = []
     for sid, st, title, comp, url, extra in rows:
@@ -441,7 +442,7 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
         if not auto:
             auto = list(tags_by_id.get(sid, []))  # 旧库无快照：以最终标签近似
         final = merge_final(auto, ov.get("excluded", []), ov.get("manual", []))
-        stem = sid.split(":", 1)[1] if ":" in sid else sid
+        stem = _stem_of(sid)
         out.append({
             "source_id": sid,
             "source_type": st,
@@ -600,9 +601,66 @@ def _ensure_docs_tags_col(conn: sqlite3.Connection) -> None:
 # ---------------- 资产注册表（asset_registry，review.sqlite3，管理员侧） ----------------
 # 表结构见顶部 _ASSET_REGISTRY_DDL（ReviewStore._SCHEMA 与 register_asset 共用）。
 
+def _stem_of(source_id: str) -> str:
+    """`pdf:x` / `md:x` → `x`；并剥掉自动消歧后缀 `--<sha8>`（sources._path_tag 加的）。
+
+    消歧后 `md:same--d7878d1f` 的 stem 仍是 `same`，否则"同 stem 重名"提示会因
+    后缀不同而永不触发（消歧把原本能触发的告警抵消掉了）。
+    """
+    stem = source_id.split(":", 1)[1] if ":" in source_id else source_id
+    return re.sub(r"--[0-9a-f]{8}$", "", stem)
+
+
+def register_assets(db_path: str | Path, items: list[tuple]) -> int:
+    """批量注册资产映射（**单连接**，幂等 upsert），返回写入条数。
+
+    items: [(rel_path, sha256, source_type[, size])]，asset_id 取 sha256 前 16 位
+    （与 register_asset 一致）。逐条调 register_asset 会为每个资产开一次连接——
+    图片动辄数百张，故提供批量入口（md/pdf/excel/图片资产统一走这里）。
+    """
+    if not items:
+        return 0
+    conn = sqlite3.connect(str(db_path))
+    n = 0
+    try:
+        conn.executescript(_ASSET_REGISTRY_DDL)
+        for it in items:
+            rel, sha = it[0], (it[1] or "")
+            stype = it[2] if len(it) > 2 else ""
+            size = it[3] if len(it) > 3 else 0
+            asset_id = sha[:16]
+            if not asset_id or not rel:
+                continue
+            row = conn.execute(
+                "SELECT sha256, size, source_type FROM asset_registry WHERE asset_id=?",
+                (asset_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO asset_registry(asset_id, rel_path, sha256, size, source_type) "
+                    "VALUES(?,?,?,?,?)",
+                    (asset_id, rel, sha, int(size or 0), stype or ""),
+                )
+            else:
+                conn.execute(
+                    "UPDATE asset_registry SET rel_path=?, sha256=?, size=?, source_type=? "
+                    "WHERE asset_id=?",
+                    (rel, sha or row[0] or "", int(size or row[1] or 0),
+                     stype or row[2] or "", asset_id),
+                )
+            n += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
 def register_asset(db_path: str | Path, asset_id: str, rel_path: str,
                    sha256: str = "", size: int = 0, source_type: str = "") -> None:
-    """注册资产映射（幂等 upsert，已有记录保留未提供的字段）。db_path=review.sqlite3。"""
+    """注册单个资产映射（幂等 upsert，已有记录保留未提供的字段）。db_path=review.sqlite3。
+
+    批量场景请用 `register_assets`（单连接）；本函数保留给单条调用与测试。
+    """
     if not asset_id or not rel_path:
         return
     conn = sqlite3.connect(str(db_path))
@@ -1019,6 +1077,8 @@ def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
         return 0
+    # 图片资产反查（asset_id → rel_path，管理员侧）：让审核台能直接预览原图
+    assets = list_assets(cfg.resolve(cfg.storage.review_path))
     conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
     added = 0
     try:
@@ -1044,14 +1104,17 @@ def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
                     reason = "no_confidence"
                 else:
                     reason = "low"
+                aid = str(ev.get("asset_id", "") or "")
                 if store.add_item("low_confidence_ocr", ref, {
                     "source_id": source_id, "title": title, "url": url,
-                    "asset_id": ev.get("asset_id", ""), "sha256": sha,
+                    "asset_id": aid, "sha256": sha,
                     "kind": ev.get("kind", ""), "reason": reason,
                     "confidence": conf,
                     "confidence_source": ocr.get("confidence_source", ""),
                     "anomaly": anomaly,
                     "signatures": ocr.get("signatures") or [],
+                    # 审核侧路径（管理员可见）：assets 静态挂载在审核端口，可直接预览
+                    "asset_path": (assets.get(aid) or {}).get("rel_path", ""),
                 }):
                     added += 1
     finally:

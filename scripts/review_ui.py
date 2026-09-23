@@ -89,7 +89,9 @@ $('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 
 <p><b>item_ref:</b> <span class="mono">${esc(i.item_ref)}</span></p>
 ${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（提及文档 <b>${p.doc_count||1}</b> 篇：${esc((p.docs||[p]).map(d=>d.title||d.source_id||'').slice(0,5).join('、')||'')}${(p.doc_count||1)>5?' …':''}）</p>`:''}
 ${i.category==='low_confidence_ocr'?`<p><b>图片:</b> <span class="mono">${esc((p.sha256||'').slice(0,16)||p.asset_id||'')}</span>
- 原因: <b>${esc(p.reason||'')}</b>（置信度 ${p.confidence===null||p.confidence===undefined?'无':p.confidence}，来源 ${esc(p.confidence_source||'')}${p.anomaly?`，自报异常 ${esc(p.anomaly)}`:''}）
+  ${p.asset_path?`<span class="muted mono">· ${esc(p.asset_path)}</span>`:'<span class="muted">（未注册到 asset_registry，无预览）</span>'}
+  <br><img src="/${esc(p.asset_path||'')}" alt="原图" style="max-width:100%;max-height:320px;border:1px solid #d1d5db;border-radius:4px;margin:4px 0" onerror="this.style.display='none'">
+  原因: <b>${esc(p.reason||'')}</b>（置信度 ${p.confidence===null||p.confidence===undefined?'无':p.confidence}，来源 ${esc(p.confidence_source||'')}${p.anomaly?`，自报异常 ${esc(p.anomaly)}`:''}）
  ${(p.signatures||[]).length?`<br><b>OCR 签名线索:</b> ${esc((p.signatures||[]).map(s=>(s.kind||'')+':'+(s.text||'')).join('、'))}`:'<br><span class="muted">无签名线索</span>'}
  <br><span class="muted">该图 OCR 文本<b>未进正文</b>（低置信或自报异常），本项只是待核对清单：✓ 认证即忽略，存疑则重新排队。</span></p>`:''}
 <pre>${esc(JSON.stringify(p,null,2))}</pre>
@@ -118,7 +120,7 @@ const tagB=(sid,t,cls,act,mark)=>`<span class="tagb ${cls} ${tierOf(t)}" onclick
 const groupRow=(list,cls,act,mark,sid)=>list.length?`<div style="margin-top:4px"><span class="muted">${cls==='excluded'?'已排除':cls==='manual'?'人工':'自动'}:</span> ${list.map(t=>tagB(sid,t,cls,act,mark)).join('')}</div>`:'';
 $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
 <div class="card muted">删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>`+ds.map(d=>{const t=d.tags||{};
-return `<div class="card" style="border-left:3px solid ${d.duplicate?'#b45309':'#d1d5db'}"><div><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（人工处理，不自动消歧）</span>`:''}</div>
+return `<div class="card" style="border-left:3px solid ${d.duplicate?'#b45309':'#d1d5db'}"><div><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:''}</div>
 <div class="mono muted">${esc(d.source_id)}${d.asset_path?` · ${esc(d.asset_path)}`:''}</div>
 ${groupRow(t.auto||[],'auto','exclude','✕',d.source_id)}
 ${groupRow(t.excluded||[],'excluded','restore','↺',d.source_id)}

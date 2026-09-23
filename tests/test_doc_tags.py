@@ -18,6 +18,7 @@ from vllm_kb.review import (
     get_doc_tags_conn,
     list_assets,
     register_asset,
+    register_assets,
     set_doc_tags_conn,
     upsert_auto_snapshot_conn,
 )
@@ -160,6 +161,44 @@ class AssetRegistryTest(unittest.TestCase):
         # 空库 → 空
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(list_assets(Path(tmp) / "none.sqlite3"), {})
+
+    def test_register_assets_batch(self):
+        """批量注册（单连接）：asset_id 取 sha 前 16 位，幂等 upsert，脏条目跳过。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "review.sqlite3"
+            sha_a, sha_b = "a" * 64, "b" * 64
+            n = register_assets(db, [
+                (f"assets/images/{sha_a[:16]}.png", sha_a, "image", 111),
+                ("assets/images/b.png", sha_b, "image", 222),
+            ])
+            self.assertEqual(n, 2)
+            assets = list_assets(db)
+            self.assertEqual(assets[sha_a[:16]]["rel_path"], f"assets/images/{sha_a[:16]}.png")
+            self.assertEqual(assets[sha_a[:16]]["size"], 111)
+            self.assertEqual(assets[sha_a[:16]]["source_type"], "image")
+            # 重复注册 → 幂等（条数不变，字段更新）
+            register_assets(db, [("assets/images/moved.png", sha_a, "image", 333)])
+            assets = list_assets(db)
+            self.assertEqual(len(assets), 2)
+            self.assertEqual(assets[sha_a[:16]]["rel_path"], "assets/images/moved.png")
+            self.assertEqual(assets[sha_a[:16]]["size"], 333)
+            # 空 sha / 空路径跳过；空列表直接返回 0
+            self.assertEqual(register_assets(db, [("assets/x.png", "", "image"),
+                                                  ("", sha_b, "image")]), 0)
+            self.assertEqual(register_assets(db, []), 0)
+            self.assertEqual(len(list_assets(db)), 2)
+
+    def test_stem_of_strips_disambiguation_suffix(self):
+        """消歧后缀不算 stem，否则"同 stem 重名"提示会被消歧抵消掉。"""
+        from vllm_kb.review import _stem_of
+
+        self.assertEqual(_stem_of("md:same"), "same")
+        self.assertEqual(_stem_of("md:same--d7878d1f"), "same")
+        self.assertEqual(_stem_of("pdf:guide"), "guide")
+        self.assertEqual(_stem_of("same--d7878d1f"), "same")
+        # 只剥 8 位十六进制后缀（真名里带 `--` 的不误伤）
+        self.assertEqual(_stem_of("md:a--zzzzzzzz"), "a--zzzzzzzz")
+        self.assertEqual(_stem_of("md:a--d7878d1f9"), "a--d7878d1f9")
 
 
 class TagManagementTest(unittest.TestCase):

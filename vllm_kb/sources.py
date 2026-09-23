@@ -64,6 +64,15 @@ def _path_tag(rel: str) -> str:
     return hashlib.sha256(rel.replace("\\", "/").encode("utf-8")).hexdigest()[:8]
 
 
+def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
+    """asset_registry 注册条目 `(rel_path, sha256, source_type, size)`；size 取不到则 0。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return (rel, sha, stype, size)
+
+
 def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
     """复制资产到 assets/{sub}/（不可变层）。同名同 sha 幂等跳过；同名异 sha 加 sha 前缀。
     返回 (assets 相对路径, sha256, 是否新增复制)。"""
@@ -161,20 +170,19 @@ class BaseSource(ABC):
                                     f"{art.text.strip()}")
         return art.evidence(), ""
 
-    def _register_asset_mappings(self, items: list[tuple[str, str, str]]) -> None:
+    def _register_asset_mappings(self, items: list[tuple]) -> None:
         """注册资产到审核侧 asset_registry（管理员路径映射；不进 canonical/检索库）。
 
-        items: [(assets相对路径, sha256, source_type)]。app_cfg 缺失（纯解析测试）时跳过。
-        幂等 upsert；失败仅提示，不影响入库。
+        items: [(assets相对路径, sha256, source_type[, size])]。app_cfg 缺失（纯解析测试）时跳过。
+        幂等 upsert（批量单连接）；失败仅提示，不影响入库。
         """
         if self.app_cfg is None or not items:
             return
         try:
-            from .review import register_asset
+            from .review import register_assets
 
             db = self.app_cfg.resolve(self.app_cfg.storage.review_path)
-            for rel, sha, stype in items:
-                register_asset(db, sha[:16], rel, sha256=sha, source_type=stype)
+            register_assets(db, items)
         except Exception as e:
             print(f"[sources:{self.id}] asset_registry 注册失败（不影响入库）: {e}")
 
@@ -286,7 +294,7 @@ class MarkdownSource(BaseSource):
         registered: list[tuple[str, str, str]] = []
         for p in sorted(self.import_dir.rglob("*.md")) + sorted(self.import_dir.rglob("*.markdown")):
             rel, sha, copied = _copy_asset(p, self.resolve("data/assets"), "md")
-            registered.append((rel, sha, "doc_markdown"))
+            registered.append(_asset_entry(rel, sha, "doc_markdown", self.resolve(rel)))
             if copied:
                 added += 1
         self._register_asset_mappings(registered)
@@ -310,6 +318,7 @@ class MarkdownSource(BaseSource):
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
+        img_assets: list[tuple] = []  # 图片资产（末尾统一注册到 asset_registry）
         md_files: list[tuple[Path, bool]] = []
         if self.import_dir.exists():
             md_files = [(p, True) for p in sorted(self.import_dir.rglob("*.md"))
@@ -343,7 +352,9 @@ class MarkdownSource(BaseSource):
             except OSError as e:
                 print(f"[sources:{self.id}] 跳过 {p.name}: {e}")
                 continue
-            body, evidence = self._resolve_images(p, text, assets_only=not from_imports)
+            body, evidence, registered = self._resolve_images(
+                p, text, assets_only=not from_imports)
+            img_assets.extend(registered)
             if sanitize_on:
                 ips, paths = collect_sanitize_hits(body, keep_paths, keep_ips)
                 if ips:
@@ -397,16 +408,18 @@ class MarkdownSource(BaseSource):
         if total:
             print(f"[sources:{self.id}] 解析完成：{len(docs)}/{total} 篇（耗时 "
                   f"{time.time() - start_ts:.0f}s）", flush=True)
+        # 图片资产注册（审核侧经 asset_id 反查路径/预览）；与 md 文件同批注册
+        self._register_asset_mappings(img_assets)
         self.save_sanitize_log(collector)
         return docs
 
     # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
 
     def _resolve_images(self, md_path: Path, text: str, *,
-                        assets_only: bool = False) -> tuple[str, list[dict]]:
+                        assets_only: bool = False) -> tuple[str, list[dict], list[tuple]]:
         """扫描正文图片引用：本地/base64 资产化（**不透明占位**替换引用，原引用只进 evidence）；
         URL 引用标记 remote（V1 不下载）；解析失败标记 unresolved。
-        返回 (占位化后的 body, evidence 列表)。
+        返回 (占位化后的 body, evidence 列表, 新增资产 [(rel, sha, "image", size)])。
 
         形态解析与代码感知在 `md_images.py`：行内（含空格/尖括号/括号/跨行）、引用式
         （含定义行去路径）、HTML `<img>` 均支持；**任何未识别或未闭合的图片语法也一律占位**，
@@ -425,7 +438,12 @@ class MarkdownSource(BaseSource):
         from .md_images import rewrite_images
 
         evidence: list[dict] = []
+        registered: list[tuple] = []
         images_dir = self.resolve("data/assets/images")
+
+        def _reg(rel: str, sha: str, path: Path) -> None:
+            """登记图片资产（审核侧反查路径/预览；不进 canonical）。"""
+            registered.append(_asset_entry(rel, sha, "image", path))
 
         def resolve(ref) -> str:
             alt = ref.alt or ""
@@ -459,6 +477,7 @@ class MarkdownSource(BaseSource):
                     target.write_bytes(data)
                 sha = b64_sha
                 ev.update({"kind": "base64", "asset_id": sha[:16], "sha256": sha})
+                _reg(f"assets/images/{name}", sha, target)
                 ocr_ev, inject = self._ocr_artifact_for(target, sha, f"assets/images/{name}")
                 if ocr_ev is not None:
                     ev["ocr"] = ocr_ev
@@ -484,6 +503,7 @@ class MarkdownSource(BaseSource):
                 return placeholder
             rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
             ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
+            _reg(rel, sha, self.resolve(rel))
             ocr_ev, inject = self._ocr_artifact_for(self.resolve(rel), sha, rel)
             if ocr_ev is not None:
                 ev["ocr"] = ocr_ev
@@ -491,7 +511,7 @@ class MarkdownSource(BaseSource):
             return placeholder + inject
 
         body, _refs = rewrite_images(text, resolve)
-        return body, evidence
+        return body, evidence, registered
 
 
 class PdfSource(BaseSource):
@@ -532,7 +552,7 @@ class PdfSource(BaseSource):
         registered: list[tuple[str, str, str]] = []
         for p in sorted(self.import_dir.rglob("*.pdf")):
             rel, sha, copied = _copy_asset(p, self.resolve("data/assets"), "pdf")
-            registered.append((rel, sha, "doc_pdf"))
+            registered.append(_asset_entry(rel, sha, "doc_pdf", self.resolve(rel)))
             if copied:
                 added += 1
         self._register_asset_mappings(registered)
@@ -779,6 +799,14 @@ class ImageSource(BaseSource):
         images = self._images_dir()
         if not images.exists():
             return []
+        all_imgs = sorted(p for g in self._IMG_GLOBS for p in images.glob(g))
+        shas = {p: _sha256(p) for p in all_imgs}
+        # 图片资产注册（审核侧经 asset_id 反查路径/预览）：**与 OCR 是否启用无关**——
+        # 手工投放到 assets/images/ 的图也要可反查，故在 provider 决策之前注册。
+        # （md 引用到的图片由 MarkdownSource 注册；此处覆盖"无 md 引用"的图片，幂等 upsert）
+        self._register_asset_mappings([
+            _asset_entry(f"assets/images/{p.name}", shas[p], "image", p) for p in all_imgs
+        ])
         parsed_dir = self._parsed_dir()
         parsed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -799,10 +827,10 @@ class ImageSource(BaseSource):
 
         processed, skipped, failed, review = 0, 0, 0, 0
         asked = False  # API 失败后的本地询问只问一次
-        for img in sorted(p for g in self._IMG_GLOBS for p in images.glob(g)):
+        for img in all_imgs:
             if provider == "none":
                 break
-            sha = _sha256(img)
+            sha = shas[img]
             ocr_path = parsed_dir / f"{img.stem}.ocr.json"
             fp = engine_fingerprint(provider, api_mode, api_model)
             cached = load_ocr_artifact(ocr_path, sha, fp)
@@ -905,7 +933,7 @@ class ExcelSource(BaseSource):
         registered: list[tuple[str, str, str]] = []
         for f in files:
             rel, sha, copied = _copy_asset(f, self.resolve("data/assets"), "excel")
-            registered.append((rel, sha, "doc_excel"))
+            registered.append(_asset_entry(rel, sha, "doc_excel", self.resolve(rel)))
             if copied:
                 added += 1
         self._register_asset_mappings(registered)

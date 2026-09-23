@@ -552,7 +552,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布；`code_index` 承载四套命名空间：官方 / `fork:{model}` / `img:{tag}`（镜像插件层源码） |
 | `code_graph.py` | 代码图谱检索（gh-puller 接入）：MCP Streamable HTTP 客户端 + 熔断器，调用链/数据流/影响面/架构聚类/语义搜索——与 `code_index` 互补不重叠，不可达 503+引导不回退 |
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
-| `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 + 知识缺口展示 |
+| `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ **资产注册表 `asset_registry`**（`asset_id → rel_path`，md/pdf/excel/**图片**统一批量注册，审核台据此反查与预览）+ 本地密钥文件 + 知识缺口展示 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分）；`OcrArtifact` 产物按 **sha256 + 引擎指纹**（provider/mode/model/提示词版本）幂等，阈值 `ocr_min_confidence` 不进指纹（调阈值只重判定不重跑 OCR） |
 | `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |

@@ -9,6 +9,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -459,6 +460,104 @@ class TestSameStemDisambiguation(_MdCase):
         self.assertEqual(_path_tag("a/b.md"), _path_tag("a\\b.md"))   # 分隔符归一
         self.assertEqual(len(_path_tag("x")), 8)
         self.assertNotEqual(_path_tag("sub_a/same.md"), _path_tag("sub_b/same.md"))
+
+
+class TestImageAssetRegistration(_MdCase):
+    """图片资产注册到 asset_registry（审核侧反查路径/预览的唯一入口）。"""
+
+    def setUp(self):
+        super().setUp()
+        # app_cfg 必须在（_register_asset_mappings 缺 app_cfg 时跳过，纯解析测试不注册）；
+        # 且 app_cfg.resolve 走 VLLM_KB_DATA_ROOT（不看 project_root），故须显式重定向
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        self.cfg_path = self.root / "config.json"
+        self.cfg_path.write_text(json.dumps({
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "storage": {"vector_backend": "python",
+                        "review_path": "data/review.sqlite3"},
+        }), encoding="utf-8")
+
+    def tearDown(self):
+        os.environ.pop("VLLM_KB_DATA_ROOT", None)
+        super().tearDown()
+
+    def _app_cfg(self):
+        from vllm_kb.config import AppConfig
+        return AppConfig.load(str(self.cfg_path), require_keys=False)
+
+    def _src(self) -> MarkdownSource:
+        return MarkdownSource(self.cfg, project_root=self.root, app_cfg=self._app_cfg())
+
+    def _registry(self):
+        from vllm_kb.review import list_assets
+        return list_assets(self.root / "data" / "review.sqlite3")
+
+    def test_md_referenced_images_registered(self):
+        """md 引用到的本地图 + 内嵌图都注册，rel_path 可在审核台预览。"""
+        png(self.md_dir / "shot.png", 8, 8)
+        png(self.md_dir / "imgs" / "sub.png", 9, 9)   # 内容不同 → asset_id 不同
+        b64 = png_b64()
+        self._write("doc.md", "# T\n\n![a](shot.png)\n![b](imgs/sub.png)\n"
+                             f"![c](data:image/png;base64,{b64})\n"
+                             "![d](missing.png)\n")   # 未解析 → 不注册
+        docs = self._src().canonicalize()
+        self.assertEqual(len(docs), 1)
+        assets = self._registry()
+        self.assertEqual(len(assets), 3, assets)     # 未解析的不注册
+        for e in docs[0].extra["evidence"]:
+            if e["kind"] in ("local", "base64"):
+                reg = assets.get(e["asset_id"])
+                self.assertIsNotNone(reg, f"evidence {e['kind']} 未注册")
+                self.assertTrue(reg["rel_path"].startswith("assets/images/"))
+                self.assertEqual(reg["source_type"], "image")
+                self.assertGreater(reg["size"], 0)
+                # 反查到的路径与 sha 自洽（审核台据此预览原图）。
+                # rel_path 相对**数据根**（VLLM_KB_DATA_ROOT 指向 data/），审核台
+                # `StaticFiles(cfg.resolve("data/assets"))` 挂在 /assets，故 URL = /{rel_path}
+                self.assertTrue((self.root / "data" / reg["rel_path"]).is_file())
+
+    def test_registry_is_content_addressed(self):
+        """asset_id = 内容 sha → 同内容不同名的两个文件共用一个 registry 行。
+
+        这是设计使然（与 OCR 缓存同为内容寻址）：反查到的是"一份同内容的副本"，
+        预览结果一致，不影响审核。此处钉住该行为，避免误以为按路径 1:1。
+        """
+        png(self.md_dir / "a.png", 8, 8)
+        png(self.md_dir / "b.png", 8, 8)             # 与 a.png 内容完全相同
+        self._write("doc.md", "# T\n\n![x](a.png)\n![y](b.png)\n")
+        docs = self._src().canonicalize()
+        shas = {e["sha256"] for e in docs[0].extra["evidence"]}
+        self.assertEqual(len(shas), 1)               # 同一份内容
+        assets = self._registry()
+        self.assertEqual(len(assets), 1, assets)     # 只一行（内容寻址）
+        self.assertIn(assets[next(iter(assets))]["rel_path"],
+                      ("assets/images/a.png", "assets/images/b.png"))
+
+    def test_image_source_registers_all_including_unreferenced(self):
+        """ImageSource 注册资产层**全部**图片——手工投放的（无 md 引用）也要可反查。"""
+        from vllm_kb.sources import ImageSource
+        png(self.root / "data" / "assets" / "images" / "manual.png")
+        png(self.root / "data" / "assets" / "images" / "other.jpg")
+        src = ImageSource(SourceCfg(id="images", type="image", enabled=True,
+                                    ocr_provider="none"),
+                          project_root=self.root, app_cfg=self._app_cfg())
+        self.assertEqual(src.canonicalize(), [])     # OCR 关闭 → 不产出文档
+        assets = self._registry()
+        self.assertEqual(len(assets), 2, assets)     # 但资产仍注册（与 OCR 开关无关）
+        paths = {a["rel_path"] for a in assets.values()}
+        self.assertEqual(paths, {"assets/images/manual.png", "assets/images/other.jpg"})
+        for a in assets.values():
+            self.assertEqual(a["source_type"], "image")
+
+    def test_registration_is_idempotent(self):
+        """重复构建不产生重复行（upsert）。"""
+        png(self.md_dir / "shot.png", 8, 8)
+        self._write("doc.md", "# T\n\n![a](shot.png)\n")
+        self._src().canonicalize()
+        first = self._registry()
+        self._src().canonicalize()
+        self.assertEqual(self._registry(), first)
+        self.assertEqual(len(first), 1)
 
 
 class TestBase64ContentAddressing(_MdCase):

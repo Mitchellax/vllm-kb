@@ -444,7 +444,13 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
   此时相对路径**已失锚**（assets 是扁平副本），只能按**文件名**到 `assets/images` 尽力反查，
   未命中的照常占位——所以**回退模式同样满足"正文不含路径"**。构建日志会打印显式告警，
   且该篇 `extra.quality.source_mode = "assets_fallback"`（正常为 `"imports"`），
-  `extra.quality.images_unresolved` 记录未解析的图片数，可据此筛出需要人工看的文档。
+  `extra.quality.images_unresolved` 记录未解析的图片数，可据此筛出需要人工看的文档；
+- **图片资产注册**：每张落盘的图片都会注册到 `asset_registry`（`asset_id → rel_path`，
+  `source_type=image`）——`MarkdownSource` 注册它收集到的图，`ImageSource` 注册
+  `assets/images/` 下的**全部**图（含手工投放、含 `ocr_provider: none`）。审核工作台据此
+  反查路径并**直接预览原图**（`/assets` 静态挂载）。
+  注册是**内容寻址**的（`asset_id = sha256 前 16 位`），所以内容相同的多个副本只占一行，
+  反查到的是"一份同内容的副本"；未解析（`unresolved`）的引用不注册。
 
 > **实践建议**：图片与 md 放同目录或相对子目录，文件名避免空格与括号（虽然已兼容，但最稳）；
 > alt 写有意义的内容（`[图片:alt]` 会进正文，对检索有帮助）；引用式定义行会被去掉目标，
