@@ -73,6 +73,39 @@ def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
     return (rel, sha, stype, size)
 
 
+# 资产层"同名异内容"版本后缀（_copy_asset 写的 `stem.<sha12>.suffix`）
+_VER_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<sha>[0-9a-f]{12})$")
+
+
+def _latest_md_versions(paths: list[Path]) -> list[tuple[Path, str]]:
+    """资产层扁平副本按**版本族**收敛，返回 `[(最新版本的路径, 族名 stem)]`（按路径排序）。
+
+    `case.md` 与 `case.<sha12>.md` 是同一篇的不同版本，每族只保留最新（mtime 最大；
+    并列时取文件名字典序较大者，保证确定性）的一个。
+
+    `_copy_asset` 在"同名异内容"时写成 `stem.<sha12>.suffix`，所以 `assets/md/` 会累积历史版本
+    （原始 `case.md` 永久保留 + 每个不同内容一份）。回退模式若把它们都当文档，会把旧版本
+    **复活成独立文档**（源文件删掉后尤其明显，一篇变多篇）。
+
+    返回的**族名**（而非带 `.<sha12>` 的文件名）才是文档身份：否则收敛到 sha 副本时
+    `source_id` 会从 `md:case` 漂移成 `md:case.<sha12>`，等于换了篇文档（审核状态/标签丢失）。
+    """
+    fams: dict[tuple[str, str], tuple[float, str, Path, str]] = {}
+    for p in paths:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        m = _VER_SUFFIX_RE.match(p.stem)
+        base = m.group("base") if m else p.stem
+        key = (base, p.suffix.lower())
+        cand = (mtime, p.name, p, base)
+        cur = fams.get(key)
+        if cur is None or (cand[0], cand[1]) > (cur[0], cur[1]):
+            fams[key] = cand
+    return sorted(((v[2], v[3]) for v in fams.values()), key=lambda t: t[0])
+
+
 def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
     """复制资产到 assets/{sub}/（不可变层）。同名同 sha 幂等跳过；同名异 sha 加 sha 前缀。
     返回 (assets 相对路径, sha256, 是否新增复制)。"""
@@ -319,24 +352,26 @@ class MarkdownSource(BaseSource):
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
         img_assets: list[tuple] = []  # 图片资产（末尾统一注册到 asset_registry）
-        md_files: list[tuple[Path, bool]] = []
+        md_files: list[tuple[Path, bool, str]] = []   # (路径, 是否来自 imports, 逻辑 stem)
         if self.import_dir.exists():
-            md_files = [(p, True) for p in sorted(self.import_dir.rglob("*.md"))
+            md_files = [(p, True, p.stem) for p in sorted(self.import_dir.rglob("*.md"))
                         + sorted(self.import_dir.rglob("*.markdown"))]
         if not md_files:
             assets = self._assets_dir()
             if assets.exists():
-                md_files = [(p, False) for p in sorted(assets.glob("*.md"))
-                            + sorted(assets.glob("*.markdown"))]
-        if md_files and not any(fi for _, fi in md_files):
+                # 扁平副本按版本族收敛（否则历史版本会复活成独立文档）；
+                # 逻辑 stem 取**族名**而非带 `.<sha12>` 的文件名 → source_id 不漂移
+                cand = sorted(assets.glob("*.md")) + sorted(assets.glob("*.markdown"))
+                md_files = [(p, False, base) for p, base in _latest_md_versions(cand)]
+        if md_files and not any(fi for _, fi, _ in md_files):
             print(f"[sources:{self.id}] ⚠ 导入目录无 md（{self.import_dir}），已回退到资产层副本 "
                   f"{self._assets_dir()}：图片相对路径**已失锚**（assets/md 是扁平副本），"
                   f"只能按文件名到 assets/images 尽力反查，未命中的一律占位"
                   f"（正文仍不含路径）；如需完整图片/OCR 请恢复 imports 目录", flush=True)
         # 同名 stem 冲突检测：md:<stem> 会互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）
         stem_counts: dict[str, int] = {}
-        for p, _fi in md_files:
-            stem_counts[p.stem] = stem_counts.get(p.stem, 0) + 1
+        for _p, _fi, stem in md_files:
+            stem_counts[stem] = stem_counts.get(stem, 0) + 1
         dup_stems = {s for s, n in stem_counts.items() if n > 1}
         if dup_stems:
             shown = ", ".join(sorted(dup_stems)[:5]) + (" …" if len(dup_stems) > 5 else "")
@@ -346,7 +381,7 @@ class MarkdownSource(BaseSource):
         start_ts = time.time()
         if total:
             print(f"[sources:{self.id}] 解析 {total} 个 Markdown …", flush=True)
-        for p, from_imports in md_files:
+        for p, from_imports, stem in md_files:
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError as e:
@@ -362,21 +397,21 @@ class MarkdownSource(BaseSource):
                 if paths:
                     collector.setdefault("paths", set()).update(paths)
             title_raw = self._title_re.search(text)
-            title = title_raw.group(1).strip() if title_raw else p.stem
+            title = title_raw.group(1).strip() if title_raw else stem
             sha = _sha256(p)
             asset_id = sha[:16]
             # 同名 stem：加相对路径指纹（默认不动 → 存量 source_id 不漂移）
-            if p.stem in dup_stems:
+            if stem in dup_stems:
                 base_dir = self.import_dir if from_imports else self._assets_dir()
                 try:
                     rel_key = p.relative_to(base_dir).as_posix()
                 except ValueError:
                     rel_key = p.name
-                sid = f"md:{p.stem}--{_path_tag(rel_key)}"
+                sid = f"md:{stem}--{_path_tag(rel_key)}"
             else:
-                sid = f"md:{p.stem}"
+                sid = f"md:{stem}"
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
-            tags, cands = extract_tags(p.stem, headings_from_markdown(text), registry=registry)
+            tags, cands = extract_tags(stem, headings_from_markdown(text), registry=registry)
             extra: dict[str, Any] = {
                 "asset": {"asset_id": asset_id, "sha256": sha, "format": "markdown"},
                 "quality": {

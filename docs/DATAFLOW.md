@@ -75,7 +75,7 @@
 | 阶段 | 处理 | 产物 |
 |---|---|---|
 | 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
-| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md` 并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
+| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
 | 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 

@@ -445,6 +445,12 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
   未命中的照常占位——所以**回退模式同样满足"正文不含路径"**。构建日志会打印显式告警，
   且该篇 `extra.quality.source_mode = "assets_fallback"`（正常为 `"imports"`），
   `extra.quality.images_unresolved` 记录未解析的图片数，可据此筛出需要人工看的文档；
+  * **版本族收敛**：编辑过的 md 在资产层会留下多个版本（`case.md` 原始副本永久保留 +
+    每次内容变化一份 `case.<sha12>.md`）。回退模式按"版本族"收敛，**每族只取最新一份**
+    （mtime 最大），且 `source_id` 取**族名**（`md:case`）而非带 sha 的文件名——
+    否则收敛到副本时 id 会漂移成 `md:case.<sha12>`，等于换了篇文档（审核状态/标签丢失）；
+  * 因此**删掉 `imports/md/case.md` 后重跑，文档会按最新副本"复活"**（这是回退模式的语义）。
+    要彻底下线一篇文档，须同时清掉 `assets/md/` 里的同族副本，再到审核台"文档管理"删除记录。
 - **图片资产注册**：每张落盘的图片都会注册到 `asset_registry`（`asset_id → rel_path`，
   `source_type=image`）——`MarkdownSource` 注册它收集到的图，`ImageSource` 注册
   `assets/images/` 下的**全部**图（含手工投放、含 `ocr_provider: none`）。审核工作台据此

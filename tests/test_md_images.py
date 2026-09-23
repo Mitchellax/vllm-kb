@@ -415,6 +415,65 @@ class TestFallbackMode(_MdCase):
         self.assertEqual(d.extra["quality"]["images_unresolved"], 0)
 
 
+class TestFallbackVersionFamilies(_MdCase):
+    """回退模式按版本族收敛：`doc.md` 与 `doc.<sha12>.md` 是同一篇的不同版本。
+
+    `_copy_asset` 在"同名异内容"时另存 `stem.<sha12>.suffix`（原始 `doc.md` 永久保留），
+    所以编辑过的 md 在资产层会留下同族多版本。回退模式若逐个当文档，一篇会变成多篇
+    （源文件删掉后尤其明显）。
+    """
+
+    def _put(self, name: str, text: str, mtime: float) -> Path:
+        d = self.root / "data" / "assets" / "md"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / name
+        p.write_text(text, encoding="utf-8")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_collapses_to_latest_version(self):
+        self._put("doc.md", "# 旧版\n\n旧内容\n", 1000)
+        self._put("doc.abcdef123456.md", "# 新版\n\n新内容\n", 2000)
+        shutil.rmtree(self.md_dir)          # imports 缺失 → 回退
+
+        docs = self._src().canonicalize()
+        self.assertEqual(len(docs), 1, [d.source_id for d in docs])
+        self.assertEqual(docs[0].source_id, "md:doc")
+        self.assertIn("新内容", docs[0].body)     # 取最新版本（mtime 最大）
+        self.assertNotIn("旧内容", docs[0].body)
+
+    def test_keeps_distinct_stems(self):
+        """只收敛 `.<12位hex>` 后缀的族；其他 stem 照旧各自成篇。"""
+        self._put("a.md", "# A\n\n甲\n", 1000)
+        self._put("b.md", "# B\n\n乙\n", 1000)
+        self._put("c.zzzzzzzzzzzz.md", "# C\n\n丙\n", 1000)   # 非 hex → 独立文档
+        shutil.rmtree(self.md_dir)
+        ids = sorted(x.source_id for x in self._src().canonicalize())
+        self.assertEqual(ids, ["md:a", "md:b", "md:c.zzzzzzzzzzzz"])
+
+    def test_helper_directly(self):
+        """单测收敛规则：mtime 最大者胜；并列取文件名字典序较大者（确定性）；缺失文件跳过。
+
+        返回的族名（第二项）才是文档身份——收敛到 `.<sha12>` 副本时不能让它变成 id。
+        """
+        from vllm_kb.sources import _latest_md_versions
+
+        d = Path(self.tmp.name) / "v"
+        d.mkdir()
+        paths = []
+        for name, mt in [("x.md", 10), ("x.aaaaaaaaaaaa.md", 20),
+                         ("y.md", 30), ("y.bbbbbbbbbbbb.md", 30)]:
+            p = d / name
+            p.write_text(name, encoding="utf-8")
+            os.utime(p, (mt, mt))
+            paths.append(p)
+        kept = {p.name: base for p, base in _latest_md_versions(paths)}
+        # x 族：mtime 大的胜；y 族：mtime 并列 → 名字大的胜（"y.md" > "y.bbbb…"）
+        self.assertEqual(set(kept), {"x.aaaaaaaaaaaa.md", "y.md"})
+        self.assertEqual(set(kept.values()), {"x", "y"})          # 族名不带 sha 后缀
+        self.assertEqual(len(_latest_md_versions([d / "gone.md", paths[0]])), 1)
+
+
 class TestSameStemDisambiguation(_MdCase):
     """同名 stem 不再互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）。"""
 
