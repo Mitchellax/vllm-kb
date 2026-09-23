@@ -537,6 +537,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | 模块 | 职责 |
 |---|---|
 | `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量 + updatedAt 状态同步、`--numbers`/`--force-numbers` 单条） |
+| `md_images.py` | Markdown 图片引用扫描/重写：行内（含空格、尖括号、目标含括号、跨行）、引用式（含定义行去路径）、HTML `<img>` 全支持；```/`code` 代码区跳过；**任何未识别或未闭合的图片语法也一律占位**——保证"正文不含服务器路径"对任意输入成立 |
 | `models.py` / `config.py` | Canonical 统一中间格式 + 唯一配置入口（旧版单源折叠兼容；secrets 自动加载） |
 | `chunking.py` / `embed.py` | 讨论线按段切块 + 批量嵌入（攒批降 API 调用） |
 | `ingest.py` / `vectorstore.py` / `pipeline.py` | 幂等入库流水线：SQLite+FTS5、LanceDB 批量写入、`build_kb.py` 入口 |

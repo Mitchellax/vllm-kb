@@ -39,8 +39,8 @@ from .tagging import (
 if TYPE_CHECKING:  # 仅类型标注用，避免循环导入
     from .config import AppConfig
 
-# Markdown 图片引用：![alt](url "title")——url 取到空白/右括号前
-_IMG_REF_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+# Markdown 图片引用解析（形态支持 + 代码感知 + 兜底占位）见 md_images.py；
+# 这里只保留资产落盘需要的常量
 _BASE64_IMG_RE = re.compile(r"data:image/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)", re.I)
 _IMG_EXT = {"png": "png", "jpeg": "jpg", "jpg": "jpg", "webp": "webp", "gif": "gif"}
 
@@ -365,25 +365,35 @@ class MarkdownSource(BaseSource):
         URL 引用标记 remote（V1 不下载）；解析失败标记 unresolved。
         返回 (占位化后的 body, evidence 列表)。
 
+        形态解析与代码感知在 `md_images.py`：行内（含空格/尖括号/括号/跨行）、引用式
+        （含定义行去路径）、HTML `<img>` 均支持；**任何未识别或未闭合的图片语法也一律占位**，
+        保证"正文与 canonical 不含服务器路径"对任意输入都成立。
+
         安全约束：正文与 canonical **不含任何服务器路径**——evidence 只记 asset_id/sha256
         （管理员侧经 asset_registry 映射回文件），unresolved 不保留原文引用（可能是路径形态）。
 
         **图片 OCR 文本注入**：本地/base64 图片资产化后立即走 OCR（ocr.json 幂等缓存）；
         高置信文本追加在占位符之后随正文进 FTS + 向量，低置信/自报异常不注入（只留签名线索）。
         """
+        from .md_images import rewrite_images
+
         evidence: list[dict] = []
         counter: dict[str, int] = {}
 
-        def repl(m: re.Match) -> str:
-            alt, ref = m.group(1), m.group(2)
+        def resolve(ref) -> str:
+            alt = ref.alt or ""
             placeholder = f"[图片:{alt}]" if alt.strip() else "[图片]"
+            dest = (ref.dest or "").strip()
             ev: dict = {"kind": "unresolved", "ocr": None}
-            if ref.startswith(("http://", "https://")):
-                ev = {"kind": "remote", "source_ref": ref, "ocr": None}
+            if not dest:
                 evidence.append(ev)
-                return placeholder  # URL 引用不下载，正文占位
-            if ref.startswith("data:"):
-                bm = _BASE64_IMG_RE.match(ref)
+                return placeholder
+            if dest.startswith(("http://", "https://")):
+                ev = {"kind": "remote", "source_ref": dest, "ocr": None}
+                evidence.append(ev)
+                return placeholder
+            if dest.startswith("data:"):
+                bm = _BASE64_IMG_RE.match(dest)
                 if not bm:
                     evidence.append(ev)
                     return placeholder
@@ -406,13 +416,17 @@ class MarkdownSource(BaseSource):
                 evidence.append(ev)
                 return placeholder + inject
             # 本地路径（file:// 剥前缀；相对路径以 md 目录为基准）
-            local = ref[len("file://"):] if ref.startswith("file://") else ref
+            local = dest[len("file://"):] if dest.startswith("file://") else dest
             p = Path(local)
             if not p.is_absolute():
                 p = md_path.parent / p
-            p = p.resolve()
-            if not p.exists():
-                evidence.append(ev)  # unresolved（不记 source_ref，避免路径形态进库）
+            try:
+                p = p.resolve()
+            except OSError:
+                evidence.append(ev)
+                return placeholder
+            if not p.is_file():   # 目录/不存在一律 unresolved（不记 source_ref，避免路径形态进库）
+                evidence.append(ev)
                 return placeholder
             rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
             ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
@@ -422,7 +436,7 @@ class MarkdownSource(BaseSource):
             evidence.append(ev)
             return placeholder + inject
 
-        body = _IMG_REF_RE.sub(repl, text)
+        body, _refs = rewrite_images(text, resolve)
         return body, evidence
 
 

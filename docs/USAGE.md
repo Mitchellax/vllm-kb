@@ -406,13 +406,37 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 
 **Markdown 图片处理（随 md 一起入库）**
 
-- md 正文里的图片引用自动收集：相对路径（以 md 所在目录为基准）、绝对路径、base64 内嵌 → 复制到
-  `data/assets/images/`，**正文引用改为不透明占位 `[图片]`**（不暴露路径），`extra.evidence`
-  记录 asset_id/sha256（管理员侧经 asset_registry 找回原图）；
-- 网络 URL 图片：标记 `remote` 不阻塞导入（业务环境网络可达时可后续补抓）；
-- 引用不存在的本地图片：标记 `unresolved`（不保留路径形态引用）；
+- md 正文里的图片引用自动收集到 `data/assets/images/`，**正文引用改为不透明占位**（不暴露路径），
+  `extra.evidence` 记录 asset_id/sha256（管理员侧经 asset_registry 找回原图）。
+  解析规则在 `vllm_kb/md_images.py`，**支持的形态**：
+
+  | 形态 | 示例 | 结果 |
+  |---|---|---|
+  | 相对路径（以 md 所在目录为基准） | `![a](shot.png)`、`![a](imgs/sub.png)`、`![a](../up/x.png)` | 收集（`local`） |
+  | 绝对路径 / `file://` | `![a](D:/x/shot.png)`、`![a](file:///D:/x/shot.png)` | 收集（`local`） |
+  | 目标含空格（非标准但常见） | `![a](my file.png)` | 收集（`local`） |
+  | 尖括号包裹 | `![a](<my file.png>)` | 收集（`local`） |
+  | 目标含括号 | `![a](img(1).png)` | 收集（`local`） |
+  | 带 title / 跨行目标 | `![a](shot.png "标题")`、`![a](\n shot.png\n)` | 收集（`local`） |
+  | 引用式 | `![a][r1]` + `[r1]: shot.png`；`![a][]`；`![a]`（有同名定义时） | 收集（`local`），定义行目标同时去路径 |
+  | HTML | `<img src="shot.png" alt="x" width="200">`（单/双/无引号） | 收集（`local`） |
+  | base64 内嵌 | `![a](data:image/png;base64,…)` | 落盘后收集（`base64`） |
+  | 网络 URL | `![a](https://…)` | 标记 `remote`，**不下载**，只占位 |
+  | 文件不存在 / 目录 / 坏 base64 / 未闭合 | — | 标记 `unresolved`，只占位 |
+
+- **硬约束（对任意输入成立）**：正文与 canonical **绝不留存图片引用里的原始目标**——
+  上述未识别或未闭合的写法也一律占位，避免服务器目录结构随正文进检索库
+  （回归护栏：`tests/test_md_images.py::TestNoPathLeak`）；
+- **代码区不处理**：``` / ~~~ 围栏块与行内 `` `code` `` 内的图片语法**原样保留**
+  （否则会破坏代码示例并产生虚假 `unresolved` 记录）；未闭合的围栏块按 CommonMark 吞到文末；
+  4 空格缩进代码块与列表续行无法可靠区分，故不识别（其中图片语法按正文处理）；
 - 图片的 OCR 由 image source 完成（见下）；**Markdown 正文引用的图片在 `canonicalize` 时同步 OCR**，
   高置信文本注入占位符之后（见"低置信度图片不进正文"）。
+  OCR 缓存按图片 sha256 幂等：多处引用同一张图只识别一次，但每处引用各自注入文本。
+
+> **实践建议**：图片与 md 放同目录或相对子目录，文件名避免空格与括号（虽然已兼容，但最稳）；
+> alt 写有意义的内容（`[图片:alt]` 会进正文，对检索有帮助）；引用式定义行会被去掉目标，
+> 若同一标签还被普通链接 `[文字][label]` 使用，该链接会失去目标（正文文字保留）。
 
 **图片 OCR（签名导向，provider 可插拔）**
 

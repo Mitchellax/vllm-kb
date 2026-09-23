@@ -6,7 +6,7 @@
 2. **查询**：agent 的请求从哪个 API 接口进来？后端查询哪些数据库？
 
 配套代码：`vllm_kb/pipeline.py`（入库入口）、`vllm_kb/ingest.py`（落库）、`vllm_kb/api.py`（查询服务组装）、
-`skills/vllm-kb/client.py`（agent 侧客户端）。查询端点按检索域拆分在
+`vllm_kb/md_images.py`（Markdown 图片引用扫描/重写）、`skills/vllm-kb/client.py`（agent 侧客户端）。查询端点按检索域拆分在
 `vllm_kb/api_meta.py`（辅助）/ `api_community.py`（社区+文档）/ `api_code.py`（本地代码仓）/
 `vllm_kb/api_code_graph.py`（gh-puller 代码图谱，可选启用）/ `api_image.py`（请求期图片 OCR，
 有 image source 时启用），`api.py` 只负责组装与出口脱敏。
@@ -75,7 +75,7 @@
 | 阶段 | 处理 | 产物 |
 |---|---|---|
 | 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
-| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（**引用的本地/base64 图片即时 OCR**）；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
+| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR）；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
 | 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 
