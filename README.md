@@ -38,6 +38,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
   Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）；
+   **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
+   把用户截图转成文本 + 报错签名再检索；置信度取 OCR 模型自报单一来源，自报异常标记待人工复核）；
   入库自动打**文档级两级标签**（主题/领域类 + 具体作用类，确定性提取自文件名+内部标题，
   词典 `config.tags.registry` 驱动）——经 skill 的 `tags`/`context` 命令做**能力发现**
   （agent 先知道"知识库有哪些文档类别可提供知识"，如 HCCL 超时 → 命中 HCCL 领域 +
@@ -303,6 +305,9 @@ python skills/vllm-kb/client.py diff v0.22.1rc1 v0.23.0rc1 vllm_ascend/worker/mo
 python skills/vllm-kb/client.py graph chain vllm-ascend#10700
 python skills/vllm-kb/client.py graph fixes vllm-ascend#12885
 python skills/vllm-kb/client.py graph sig dispatch_ffn_combine
+
+# 图片 OCR：截图 → 文本 + 报错签名（模型无图像输入能力时的通路；需服务端已配置 OCR）
+python skills/vllm-kb/client.py ocr ./screenshot.png
 ```
 
 完整用法见 [使用指南](docs/USAGE.md)。
@@ -516,10 +521,11 @@ Agent 只调用 skill（`skills/vllm-kb/client.py`，标准库零依赖）→ HT
 | `diff` | `GET /code/diff` | 两个快照同一文件的 unified diff；版本参数可带命名空间前缀（`img:` / `fork:` / `vllm-ascend:` / `vllm:`）跨仓对比 |
 | `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单；`repo=img` 列出**已提取镜像**（agent 发现 `img:` 前缀的入口） |
 | `doc` | `GET /doc/{source_id}` | kb.sqlite3 `docs` + `chunks_meta` + `chunks_fts` 按序拼装全文 |
-| `components` / `stats` / `health` | `GET` | kb.sqlite3 聚合 / 向量库 count（`/health` 含 embedding 状态） |
+| `components` / `stats` / `health` | `GET` | kb.sqlite3 聚合 / 向量库 count（`/health` 含 embedding 状态 + `ocr` 配置状态，不主动探测 OCR 服务） |
 | `companion` / `matrix` | `GET /companion` `/matrix` | `data/compatibility/vllm-ascend.json` 配套矩阵 |
 | `graph chain/fixes/sig/doc/tags/evidence/stats` | `GET /graph/*` | Kùzu `data/graph`（只读查询，未构建返回引导提示） |
 | `tags list` / `tags docs` / `context` | `GET /tags` `/tags/{tag}/docs` `POST /tags/match` | kb.sqlite3 `docs.tags`（最终标签）+ `config.tags.registry` 词典 |
+| `ocr` | `POST /ocr` | 无（请求期只读计算）：图片 base64 → 外接 OCR 服务 → 文本 + 签名；**不落盘、不审计** |
 
 所有出口统一后置脱敏（`sanitize.py`：内部 IP/路径 → 占位，白名单见 config `sanitize`）；
 embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（快速失败客户端 + 熔断器）。
@@ -542,10 +548,10 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `code_graph.py` | 代码图谱检索（gh-puller 接入）：MCP Streamable HTTP 客户端 + 熔断器，调用链/数据流/影响面/架构聚类/语义搜索——与 `code_index` 互补不重叠，不可达 503+引导不回退 |
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 + 知识缺口展示 |
-| `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔 |
+| `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分） |
 | `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
-| `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册） |
+| `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册）/`api_image`（请求期图片 OCR，有 image source 时注册） |
 
 ## 🗺️ 版本计划
 

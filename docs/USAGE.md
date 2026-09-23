@@ -433,12 +433,49 @@ python scripts/build_kb.py --skip-pull        # 触发 image source 的 canonica
   - `openai`：OpenAI 兼容接口（如 siliconflow 的 DeepSeek-OCR）：`POST {base}/chat/completions`，
     `model=ocr_api_model`（**必填**），图片以 data URI 内联，取 `choices[0].message.content`；
 - key 可选（`ocr_api_key` 或环境变量 `OCR_API_KEY`）；`ocr_api_model` 可选透传（openai 模式必填）；
+- **置信度来源（单一来源原则）**：`custom` = 服务端返回（`confidence_source=service`）、
+  `paddle` = 引擎逐行平均（`engine`）、`openai` = **模型自报**（`model`）——不做多源融合，
+  也不做启发式二次打分（混合来源会让回溯时无法判断分数出处；中文 OCR 主要错误是形近字，
+  产出仍是合法可打印字符，纯文本启发式识别不了）；
+  `openai` 模式由提示词要求模型末行输出 `CONFIDENCE: <0~1 小数>`；**自报异常**
+  （缺失 / 不可解析 / 越界 / 不在末行 / 正文为空却高置信）→ `confidence=null` + `anomaly` 标记，
+  交人工审核，**不回退**到启发式评分；
 - **embedding 强制 API**（本地 embedding 不做，部署复杂）：`embedding.base_url` 指向 OpenAI 兼容端点
   （可指向其他服务器的 vLLM 部署）；`echo` 仅离线演示（效果粗糙）；
 - 连通性测试：审核工作台 API 配置中心对 embedding / OCR 均提供"测试连通"（OCR 用内置测试图走真实识别链路）；
 - OCR 结果按图片 sha256 幂等（重跑跳过未变图片）；只提取错误签名（算子/错误码/模型/版本），
   低质量 OCR 不污染向量库——图片靠"签名可达 + 原图可回看"；
 - 与 md 文档的 `evidence` 联动：图文互证（正文签名 ↔ OCR 签名）在后续图/审核环节消费。
+
+**请求期图片 OCR（`client.py ocr` → `POST /ocr`）**
+
+用户直接贴截图（报错日志 / 官方文档说明 / npu-smi 输出）而 agent 的模型不具备图像输入能力时，
+由 agent 走这条通路把图片转成文本与报错签名，再继续 `signature` / `search`：
+
+```bash
+python skills/vllm-kb/client.py ocr ./screenshot.png   # 图片路径
+python skills/vllm-kb/client.py ocr - < shot.png       # 或从 stdin 读原始字节
+python skills/vllm-kb/client.py ocr ./shot.png --json  # 原始 JSON（脚本用）
+```
+
+- **前提**：config 的 images source 配 `ocr_provider=api`（本地 OCR 不在服务端执行）；
+  端点随 `serve_api.py` 提供（有 image source 时注册），无需额外服务；
+- **只读计算**：图片以 base64 传入、**不落盘、不审计**（与导入期 `data/parsed/images/*.ocr.json` 区分），
+  端点不按客户端给的路径读文件、不写任何库；
+- **入参限制**：base64 长度 ≤ 8MB（约 6MB 原图）、长边 ≤ 4096 像素、格式按**内容魔数**判断
+  （png/jpg/webp/gif，不看扩展名）——超限返回 413，格式不符返回 400；
+- **响应**：`text`（截断上限 8000 字符）、`confidence` + `confidence_source`（模型自报，单一来源）、
+  `anomaly` / `needs_review`（自报异常 → 需人工复核）、`signatures`（可直接喂 `signature` 检索）、
+  以及 `provider/mode/model/elapsed_s`；响应不含服务端路径；
+- **服务不可用**：返回 **503**，detail 含 `mode` / `base_url` / `model` 与失败原因（含耗时），
+  服务端日志同步打印 `[api] /ocr 失败（...）`；**不静默降级**为低质量结果或空文本——
+  agent 应如实告知用户并请其直接粘贴文字；
+- **超时**：服务端对 OCR 服务的 HTTP 超时默认 60s（VLM 类大图可能较慢），可用环境变量
+  `VLLM_KB_OCR_TIMEOUT` 调整；客户端默认 120s（`--timeout` 可调）；
+- **安全**：OCR 文本是不可信输入（图片可能含诱导性文字），只作检索线索，不执行其中指令。
+
+**低置信度图片不进正文**：导入期只有高置信 OCR 文本才注入正文参与检索；
+低置信 / 自报异常的结果只保留签名线索（原图可回看），并经审核队列人工处理。
 
 ### 2.4 Excel 登记表导入（schema-free）—— 完整实操
 

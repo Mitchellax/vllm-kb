@@ -17,6 +17,33 @@ def register(app, ctx) -> None:
     engine = ctx.engine
     cfg = ctx.cfg
 
+    def _ocr_state() -> dict:
+        """OCR 配置状态（**不主动探测服务**——连通性由审核工作台「测试连通」显式触发）。
+
+        如实反映配置，便于排查「端点 404 / 400 / 503」时先区分"没配 OCR"、"配了但不能
+        用于请求期"还是"配好了但服务挂了"。
+        """
+        from .ocr import ocr_config_from_cfg
+
+        try:
+            oc = ocr_config_from_cfg(cfg)
+        except Exception as e:
+            return {"state": "unknown", "note": str(e)}
+        if oc is None:
+            return {"state": "unconfigured", "note": "未启用 image source"}
+        note = f"provider={oc.provider} mode={oc.mode}"
+        if oc.model:
+            note += f" model={oc.model}"
+        if oc.provider == "none":
+            return {"state": "disabled", "note": "ocr_provider=none（明确跳过 OCR）"}
+        if oc.provider == "api" and not oc.api_base:
+            return {"state": "unconfigured", "note": "ocr_provider=api 但未配置 ocr_api_base"}
+        if oc.provider == "ask" and not oc.api_base:
+            return {"state": "unconfigured",
+                    "note": "ocr_provider=ask 且无 ocr_api_base（导入时询问本地/跳过）"}
+        return {"state": "configured", "endpoint": "/ocr" if oc.provider == "api" else None,
+                "note": note}
+
     @app.get("/health")
     def health():
         embed_state = "ok"
@@ -28,6 +55,7 @@ def register(app, ctx) -> None:
             "chunks": engine.vector_store.count(),
             "embedding": embed_state,
             "embedding_note": engine._embed_error or None,
+            "ocr": _ocr_state(),
         }
 
     @app.get("/components")

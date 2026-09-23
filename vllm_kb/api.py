@@ -12,6 +12,7 @@
                   /doc /graph/* /tags/*（共用 SearchEngine，存储合一）
 - api_code.py      版本化代码仓符号索引：/code/* /code-versions（本地快照，存储独立）
 - api_code_graph.py 代码图谱检索（gh-puller 接入）：/code-graph/*（见该模块）
+- api_image.py      请求期图片 OCR：/ocr（只读计算，不落盘/不审计，见该模块）
 
 启动（需先 pip install fastapi uvicorn）：
     python scripts/serve_api.py [--port 8000]
@@ -128,6 +129,16 @@ def create_app(config_path: Optional[str] = None):
         from . import api_code_graph
 
         api_code_graph.register(app, ctx)
+
+    # 请求期图片 OCR：存在 image source 时注册（未配置则端点不存在 = 404）。
+    # provider 不当时由端点返回 400 并说明原因（比 404 更好诊断：区分"没配 OCR"与"配了但不能用于请求期"）。
+    # 此处**不主动探测** OCR 服务可用性——/health 只报配置状态。
+    from .ocr import ocr_config_from_cfg
+
+    if ocr_config_from_cfg(cfg) is not None:
+        from . import api_image
+
+        api_image.register(app, ctx)
 
     # 行为遥测中间件：feedback_enabled 时挂载，全量记查询行为到独立 telemetry 库
     # （不碰只读 kb.sqlite3；中间件只记原始行为，推断在离线脚本）

@@ -352,5 +352,101 @@ class TestOcrOpenAiMode(unittest.TestCase):
                           model="m", mode="openai")
 
 
+class TestSelfConfidenceParsing(unittest.TestCase):
+    """OpenAI 兼容模式：模型自报置信度的解析与异常判定（单一来源，无启发式评分）。"""
+
+    def test_parsed_from_last_line(self):
+        from vllm_kb.ocr import parse_self_confidence
+
+        text, conf, anomaly, raw = parse_self_confidence(
+            "error code 107020, dispatch_ffn_combine failed\nCONFIDENCE: 0.92")
+        self.assertEqual(text, "error code 107020, dispatch_ffn_combine failed")
+        self.assertEqual(conf, 0.92)
+        self.assertEqual(anomaly, "")
+        self.assertEqual(raw, "CONFIDENCE: 0.92")
+
+    def test_missing_marker_is_anomaly(self):
+        from vllm_kb.ocr import ANOMALY_MISSING, parse_self_confidence
+
+        text, conf, anomaly, _ = parse_self_confidence("识别出的文字")
+        self.assertEqual(text, "识别出的文字")
+        self.assertIsNone(conf)
+        self.assertEqual(anomaly, ANOMALY_MISSING)
+
+    def test_marker_not_at_end_is_misplaced(self):
+        from vllm_kb.ocr import ANOMALY_MISPLACED, parse_self_confidence
+
+        text, conf, anomaly, _ = parse_self_confidence(
+            "CONFIDENCE: 0.9\nhalMemCreate failed drvRetCode=6")
+        self.assertIsNone(conf)
+        self.assertEqual(anomaly, ANOMALY_MISPLACED)
+        self.assertIn("drvRetCode", text)  # 正文未被截断
+
+    def test_duplicate_marker_is_misplaced(self):
+        from vllm_kb.ocr import ANOMALY_MISPLACED, parse_self_confidence
+
+        _, conf, anomaly, _ = parse_self_confidence("text\nCONFIDENCE: 0.9\nCONFIDENCE: 0.8")
+        self.assertIsNone(conf)
+        self.assertEqual(anomaly, ANOMALY_MISPLACED)
+
+    def test_unparsable_and_out_of_range(self):
+        from vllm_kb.ocr import (ANOMALY_OUT_OF_RANGE, ANOMALY_UNPARSABLE,
+                                 parse_self_confidence)
+
+        _, conf, anomaly, _ = parse_self_confidence("text\nCONFIDENCE: abc")
+        self.assertIsNone(conf)
+        self.assertEqual(anomaly, ANOMALY_UNPARSABLE)
+        _, conf, anomaly, _ = parse_self_confidence("text\nCONFIDENCE: 1.7")
+        self.assertIsNone(conf)
+        self.assertEqual(anomaly, ANOMALY_OUT_OF_RANGE)
+
+    def test_empty_text_with_high_confidence_is_contradictory(self):
+        from vllm_kb.ocr import ANOMALY_CONTRADICTORY, parse_self_confidence
+
+        text, conf, anomaly, _ = parse_self_confidence("CONFIDENCE: 0.9")
+        self.assertEqual(text, "")
+        self.assertIsNone(conf)
+        self.assertEqual(anomaly, ANOMALY_CONTRADICTORY)
+
+    def test_inline_marker_at_end(self):
+        from vllm_kb.ocr import parse_self_confidence
+
+        text, conf, anomaly, _ = parse_self_confidence("报错 dispatch_ffn_combine failed CONFIDENCE: 0.88")
+        self.assertEqual(text, "报错 dispatch_ffn_combine failed")
+        self.assertEqual(conf, 0.88)
+        self.assertEqual(anomaly, "")
+
+    def test_confidence_source_is_model_in_openai_mode(self):
+        """openai 模式置信度来源 = model（单一来源，可回溯）。"""
+        from vllm_kb.ocr import ocr_image_detail
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {
+                    "content": "halMemCreate failed\nCONFIDENCE: 0.77"}}]}).encode()
+
+        def fake(req, timeout=60):
+            return FakeResp()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                   model="m", mode="openai")
+        self.assertEqual(res.confidence, 0.77)
+        self.assertEqual(res.confidence_source, "model")
+        self.assertEqual(res.anomaly, "")
+        self.assertFalse(res.needs_review)
+
+
 if __name__ == "__main__":
     unittest.main()

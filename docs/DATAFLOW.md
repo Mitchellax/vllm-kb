@@ -8,7 +8,8 @@
 配套代码：`vllm_kb/pipeline.py`（入库入口）、`vllm_kb/ingest.py`（落库）、`vllm_kb/api.py`（查询服务组装）、
 `skills/vllm-kb/client.py`（agent 侧客户端）。查询端点按检索域拆分在
 `vllm_kb/api_meta.py`（辅助）/ `api_community.py`（社区+文档）/ `api_code.py`（本地代码仓）/
-`api_code_graph.py`（gh-puller 代码图谱，可选启用），`api.py` 只负责组装与出口脱敏。
+`vllm_kb/api_code_graph.py`（gh-puller 代码图谱，可选启用）/ `api_image.py`（请求期图片 OCR，
+有 image source 时启用），`api.py` 只负责组装与出口脱敏。
 
 ## 1. 总览
 
@@ -34,6 +35,7 @@
 │  ├─ /graph/*           ──▶ data/graph（Kùzu）                   │
 │  ├─ /tags/*            ──▶ kb.sqlite3(docs.tags) + 词典         │
 │  ├─ /code-graph/*      ──▶ gh-puller 代码图谱（可选，外部服务） │
+│  ├─ /ocr               ──▶ 外接 OCR 服务（请求期，无本地存储） │
 │  └─ 出口统一脱敏（sanitize）→ 返回 agent                        │
 │                                                                │
 │  行为遥测（feedback_enabled 时）：中间件记查询行为              │
@@ -76,6 +78,25 @@
 | 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 结果 `*.ocr.json`，可重跑） |
 | 3. 规范化 | `canonicalize()`：正文拼装 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
+
+> **OCR 置信度单一来源**：`custom`=服务端返回 / `paddle`=引擎逐行平均 / `openai`=**模型自报**
+> （提示词要求末行 `CONFIDENCE: <0~1 小数>`）。自报异常（缺失/不可解析/越界/不在末行/正文空却高置信）
+> → `confidence=null` + `anomaly`，交人工审核，**不回退**启发式评分。**只有高置信文本进正文**
+> 参与向量/全文检索；低置信与异常结果只留签名线索（原图可回看），不污染检索库。
+
+### 2.2b 请求期图片 OCR（`POST /ocr`，不经 canonical）
+
+Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POST /ocr` → `ocr.py`（`provider=api`，
+外接 OpenAI 兼容 OCR 服务）→ 文本 + 报错签名，回到 `signature` / `search` 检索链路。
+
+| 特性 | 说明 |
+|---|---|
+| 存储 | **无**——不落盘、不审计、不写任何库（与 2.2 导入期 `data/parsed/images/*.ocr.json` 区分） |
+| 入参 | 图片 base64（≤8MB base64 / 约 6MB 原图、长边 ≤4096、魔数判格式）；**不接受路径**，端点不读客户端文件 |
+| 出参 | `text` + `confidence`/`confidence_source`（模型自报单一来源）+ `anomaly`/`needs_review` + `signatures` + `provider/mode/model/elapsed_s`；不含服务端路径 |
+| 注册 | 有 image source 时随 `serve_api.py` 注册；provider 非 `api` → 400 说明原因（本地 OCR 不在服务端执行） |
+| 不可用 | OCR 服务不可达/超时 → **503** + detail（`mode`/`base_url`/`model`/原因/耗时）+ 服务端日志；**不静默降级** |
+| 健康 | `GET /health` 的 `ocr` 字段只报**配置状态**（unconfigured/disabled/configured + endpoint），**不主动探测**服务 |
 
 ### 2.3 版本化代码仓（code 检索的数据源）
 
@@ -156,6 +177,7 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 - 服务端结构性只读：SQLite URI `mode=ro`、向量库经只读包装（写操作抛错）、无写端点、不导入可写模块；
 - 路由按检索域拆分注册（`api.py` 只做组装）：`api_meta` / `api_community` / `api_code` 恒注册，
   `api_code_graph` 仅 `config.code_graph.enabled=true` 时注册（未启用则端点不存在）；
+  `api_image` 仅存在 image source 时注册（未配置 OCR 则 `/ocr` 不存在）；
   `feedback_enabled=true` 时额外挂遥测中间件（见 3.6）。
 
 ### 3.2 端点 → 存储映射
@@ -173,12 +195,13 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | `diff <v1> <v2> <路径>` | `GET /code/diff` | 两个快照同一文件的 unified diff（difflib），**两侧可属不同命名空间** | 版本参数带前缀：`img:{tag}` / `fork:{model}@{sha12}` / `vllm-ascend:{版本}` / `vllm:{版本}`；`--keyword` 只留相关差异行 |
 | `code-versions` | `GET /code/versions` | `data/code` 可用预存版本清单；`repo=img` 返回 `images[]`（tag/digest/镜像时间/vllm commit/是否有索引） | 管理员调试；`repo=img` 是 agent 发现 `img:` 前缀的入口 |
 | `doc <source_id>` | `GET /doc/{source_id}` | `kb.sqlite3`：docs 行 + chunks_meta 排序 + chunks_fts 原文拼装 | extra 出口白名单清理（不返回服务器路径） |
-| `components` / `stats` / `health` | `GET` | `kb.sqlite3` 聚合 / 向量库 count | `/health` 含 embedding 状态 |
+| `components` / `stats` / `health` | `GET` | `kb.sqlite3` 聚合 / 向量库 count | `/health` 含 embedding 状态 + `ocr` 配置状态（不主动探测 OCR 服务） |
 | `companion` / `matrix` | `GET /companion` `/matrix` | `data/compatibility/vllm-ascend.json` | 配套反向展开 / 全量矩阵 |
 | `graph chain/fixes/sig/doc/tags/evidence/stats` | `GET /graph/*` | Kùzu `data/graph`（只读查询） | 图未构建时返回引导提示（503→client 展示） |
 | `tags list` / `tags docs <标签>` / `context "问题"` | `GET /tags` `/tags/{tag}/docs` `POST /tags/match` | `kb.sqlite3` `docs.tags`（最终标签）+ `config.tags.registry` 词典 | 能力发现：先知道知识库有哪些文档类别 |
 | `code-graph search/code-search/trace/query/architecture/changes` | `POST /code-graph/*` | **外部 gh-puller 代码图谱服务**（`config.code_graph.base_url` + `path`），本库不落数据 | 可选能力：`enabled=false` 时端点不注册；不可达 → 503 + 引导用 `code` 查本地索引（**不回退**） |
 | `code-graph health` | `GET /code-graph/health` | gh-puller 可达性探测 | 不触发熔断计数，仅展示 |
+| `ocr <图片路径>` | `POST /ocr` | **无存储**（请求期只读计算）：图片 base64 → 外接 OCR 服务（`ocr.py`，provider=api）→ 文本 + 签名 | 不落盘/不审计；provider 非 `api` → 400；服务不可用 → 503 + 原因（不回退） |
 
 ### 3.3 关键路径举例（search）
 
@@ -252,6 +275,7 @@ serve_api（只读）                            离线周期
 ```
 
 - 采集范围（`_TRACKED_PREFIXES`）：`/search`、`/signature-search`、`/title`、`/doc/`、`/code/search`、`/code/diff`；
+  **`/ocr` 刻意不在采集范围**（请求期图片 OCR 不审计：图片内容与 OCR 文本不落任何库）；
   会话归属经 `VLLM_KB_SESSION` → `X-Session-Id` header（缺失回退 ip+时间窗）；
 - 探索/测试行为打标 `probe`（`client.py --probe` / `VLLM_KB_PROBE=1` 显式 + 占位词启发式兜底），
   推断层排除 `probe≠0` 事件但保留原始行；

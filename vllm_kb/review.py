@@ -1097,16 +1097,13 @@ def probe_ocr_connectivity(cfg: "AppConfig") -> dict:
     """
     import tempfile
 
-    from .ocr import OcrApiError, OcrUnavailable, ocr_image
+    from .ocr import OcrApiError, OcrUnavailable, ocr_config_from_cfg, ocr_image
 
-    sc = next((s for s in cfg.effective_sources() if s.type == "image"), None)
-    if sc is None:
+    oc = ocr_config_from_cfg(cfg)  # 与请求期 /ocr 端点同源，避免两处解析漂移
+    if oc is None:
         raise ValueError("未启用 image source（config.json sources 中配置 images 条目）")
-    provider = str(sc.get("ocr_provider", "ask") or "ask").lower()
-    api_base = str(sc.get("ocr_api_base", "") or "")
-    api_key = str(sc.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
-    model = str(sc.get("ocr_api_model", "") or "")
-    mode = str(sc.get("ocr_api_mode", "custom") or "custom")
+    provider, api_base, api_key, model, mode = (
+        oc.provider, oc.api_base, oc.api_key, oc.model, oc.mode)
     if provider == "none":
         raise ValueError("ocr_provider=none（明确跳过 OCR），无需测试")
     if provider == "ask" and not api_base:
