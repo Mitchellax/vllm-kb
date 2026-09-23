@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from vllm_kb.config import SourceCfg
-from vllm_kb.ocr import OcrApiError
+from vllm_kb.ocr import OcrApiError, OcrResult
 from vllm_kb.sources import ImageSource, MarkdownSource
 
 
@@ -135,8 +135,9 @@ class TestImageSource(unittest.TestCase):
         self.make_src(ocr_provider="none").canonicalize()
         self.assertFalse(self.ocr_path().exists())
 
-    @mock.patch("vllm_kb.ocr.ocr_image", return_value=(
-        "error code 107020, dispatch_ffn_combine failed, GLM-5.1", 0.92))
+    @mock.patch("vllm_kb.ocr.ocr_image_detail", return_value=OcrResult(
+        text="error code 107020, dispatch_ffn_combine failed, GLM-5.1",
+        confidence=0.92, confidence_source="engine", provider="paddle"))
     def test_ocr_paddle_mode(self, _mock):
         """provider=paddle（明确本地）：不询问，直接 OCR + 签名提取。"""
         self.make_src(ocr_provider="paddle").canonicalize()
@@ -146,8 +147,12 @@ class TestImageSource(unittest.TestCase):
         self.assertIn("op", kinds)
         self.assertIn("model", kinds)
         self.assertEqual(meta["confidence"], 0.92)
+        self.assertEqual(meta["confidence_source"], "engine")
+        self.assertTrue(meta["text_included"])  # 0.92 ≥ 阈值 0.6 → 允许进正文
+        self.assertTrue(meta["engine_fingerprint"])
 
-    @mock.patch("vllm_kb.ocr.ocr_image", return_value=("", 0.0))
+    @mock.patch("vllm_kb.ocr.ocr_image_detail", return_value=OcrResult(
+        text="", confidence=0.0, confidence_source="engine", provider="paddle"))
     @mock.patch("builtins.input", return_value="y")
     @mock.patch("sys.stdin.isatty", return_value=True)
     def test_ask_no_api_yes_local(self, _tty, _in, _ocr):
@@ -168,7 +173,7 @@ class TestImageSource(unittest.TestCase):
         self.make_src(ocr_provider="ask").canonicalize()
         self.assertFalse(self.ocr_path().exists())
 
-    @mock.patch("vllm_kb.ocr.ocr_image",
+    @mock.patch("vllm_kb.ocr.ocr_image_detail",
                 side_effect=OcrApiError("connection refused"))
     @mock.patch("builtins.input", return_value="n")
     @mock.patch("sys.stdin.isatty", return_value=True)
@@ -177,8 +182,10 @@ class TestImageSource(unittest.TestCase):
         self.make_src(ocr_provider="api", ocr_api_base="http://127.0.0.1:9999").canonicalize()
         self.assertFalse(self.ocr_path().exists())
 
-    @mock.patch("vllm_kb.ocr.ocr_image",
-                side_effect=[OcrApiError("down"), ("halMemCreate failed", 0.8)])
+    @mock.patch("vllm_kb.ocr.ocr_image_detail",
+                side_effect=[OcrApiError("down"),
+                             OcrResult(text="halMemCreate failed", confidence=0.8,
+                                       confidence_source="engine", provider="paddle")])
     @mock.patch("builtins.input", return_value="y")
     @mock.patch("sys.stdin.isatty", return_value=True)
     def test_api_failure_ask_yes_local_retry(self, _tty, _in, _ocr):
@@ -191,12 +198,46 @@ class TestImageSource(unittest.TestCase):
     def test_ocr_idempotent(self):
         self.make_src(ocr_provider="none").canonicalize()  # 无产物
         # 用 paddle mock 生成产物后，重跑应跳过（sha 一致）
-        with mock.patch("vllm_kb.ocr.ocr_image", return_value=("x", 0.5)):
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="x", confidence=0.5, provider="paddle")):
             self.make_src(ocr_provider="paddle").canonicalize()
         mtime1 = self.ocr_path().stat().st_mtime_ns
-        with mock.patch("vllm_kb.ocr.ocr_image", return_value=("x2", 0.6)):
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="x2", confidence=0.6, provider="paddle")):
             self.make_src(ocr_provider="paddle").canonicalize()
         self.assertEqual(self.ocr_path().stat().st_mtime_ns, mtime1)
+
+    def test_engine_fingerprint_invalidates_cache(self):
+        """换 OCR 模型 → 引擎指纹变化 → 缓存失效并重算（图片 sha 未变）。"""
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="old", confidence=0.9, provider="api")) as m:
+            self.make_src(ocr_provider="api", ocr_api_base="http://ocr:8000",
+                          ocr_api_mode="openai", ocr_api_model="model-a").canonicalize()
+            self.assertEqual(m.call_count, 1)
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="new", confidence=0.9, provider="api")) as m:
+            self.make_src(ocr_provider="api", ocr_api_base="http://ocr:8000",
+                          ocr_api_mode="openai", ocr_api_model="model-b").canonicalize()
+            self.assertEqual(m.call_count, 1, "换模型应重算（指纹不同）")
+        meta = json.loads(self.ocr_path().read_text(encoding="utf-8"))
+        self.assertEqual(meta["text"], "new")
+        self.assertEqual(meta["model"], "model-b")
+
+    def test_threshold_change_does_not_reocr(self):
+        """调阈值只重判定，不重跑 OCR（阈值不进引擎指纹）。"""
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="halMemCreate failed", confidence=0.7,
+                                               provider="paddle")) as m:
+            self.make_src(ocr_provider="paddle", ocr_min_confidence=0.6).canonicalize()
+            self.assertEqual(m.call_count, 1)
+        self.assertTrue(json.loads(self.ocr_path().read_text(encoding="utf-8"))["text_included"])
+        # 提高阈值到 0.9：缓存命中（不重跑），但 text_included 重判为 false
+        with mock.patch("vllm_kb.ocr.ocr_image_detail") as m:
+            self.make_src(ocr_provider="paddle", ocr_min_confidence=0.9).canonicalize()
+            self.assertEqual(m.call_count, 0, "阈值变化不应重跑 OCR")
+        meta = json.loads(self.ocr_path().read_text(encoding="utf-8"))
+        self.assertFalse(meta["text_included"])
+        self.assertEqual(meta["confidence"], 0.7)
 
 
 class TestOcrApiModel(unittest.TestCase):
@@ -254,7 +295,8 @@ class TestOcrApiModel(unittest.TestCase):
         images.mkdir(parents=True)
         make_png(images / "x.png")
         src = ImageSource(cfg, project_root=self.root)
-        with mock.patch("vllm_kb.ocr.ocr_image", return_value=("", 0.0)) as m:
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="", confidence=None)) as m:
             src.canonicalize()
             kwargs = m.call_args.kwargs
             self.assertEqual(kwargs.get("model"), "log")
@@ -270,7 +312,8 @@ class TestOcrApiModel(unittest.TestCase):
         images.mkdir(parents=True)
         make_png(images / "x.png")
         src = ImageSource(cfg, project_root=self.root)
-        with mock.patch("vllm_kb.ocr.ocr_image", return_value=("", 0.0)) as m:
+        with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                        return_value=OcrResult(text="", confidence=None)) as m:
             src.canonicalize()
             self.assertEqual(m.call_args.kwargs.get("mode"), "openai")
             self.assertEqual(m.call_args.kwargs.get("model"), "deepseek-ai/DeepSeek-OCR")

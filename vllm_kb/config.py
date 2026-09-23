@@ -384,6 +384,16 @@ class AppConfig(BaseModel):
                 base = src.get("ocr_api_base", "")
                 if base:
                     src.ocr_api_base = ensure_url_scheme(base, f"来源 {src.id} 的 ocr_api_base")
+                mc = src.get("ocr_min_confidence", "")
+                if mc not in ("", None):
+                    try:
+                        f = float(mc)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"来源 {src.id} 的 ocr_min_confidence 不合法: {mc!r}（应为 0~1 小数）")
+                    if not 0.0 <= f <= 1.0:
+                        raise ValueError(
+                            f"来源 {src.id} 的 ocr_min_confidence 应在 [0,1]: {f}")
         if self.storage.vector_backend not in ("lancedb", "python"):
             raise ValueError(f"storage.vector_backend 不合法: {self.storage.vector_backend}")
         if not (0 < self.confidence.alpha + self.confidence.beta <= 1.0 + 1e-9):

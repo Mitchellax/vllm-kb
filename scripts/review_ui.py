@@ -88,6 +88,10 @@ async function showItem(id){const i=await j('/api/item/'+id);const p=i.payload||
 $('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 返回队列</button><h3>#${i.id} ${esc(i.category)} <span class="badge ${i.status}">${i.status}</span></h3>
 <p><b>item_ref:</b> <span class="mono">${esc(i.item_ref)}</span></p>
 ${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（提及文档 <b>${p.doc_count||1}</b> 篇：${esc((p.docs||[p]).map(d=>d.title||d.source_id||'').slice(0,5).join('、')||'')}${(p.doc_count||1)>5?' …':''}）</p>`:''}
+${i.category==='low_confidence_ocr'?`<p><b>图片:</b> <span class="mono">${esc((p.sha256||'').slice(0,16)||p.asset_id||'')}</span>
+ 原因: <b>${esc(p.reason||'')}</b>（置信度 ${p.confidence===null||p.confidence===undefined?'无':p.confidence}，来源 ${esc(p.confidence_source||'')}${p.anomaly?`，自报异常 ${esc(p.anomaly)}`:''}）
+ ${(p.signatures||[]).length?`<br><b>OCR 签名线索:</b> ${esc((p.signatures||[]).map(s=>(s.kind||'')+':'+(s.text||'')).join('、'))}`:'<br><span class="muted">无签名线索</span>'}
+ <br><span class="muted">该图 OCR 文本<b>未进正文</b>（低置信或自报异常），本项只是待核对清单：✓ 认证即忽略，存疑则重新排队。</span></p>`:''}
 <pre>${esc(JSON.stringify(p,null,2))}</pre>
 <h4>审核（只做判定，不修改原始内容）</h4><input id="rev" placeholder="审核人（必填）" style="width:180px" oninput="saveReviewer(this.value)">
 <textarea id="rvnote" rows="2" style="width:100%" placeholder="备注（可选）"></textarea><br><br>
@@ -95,8 +99,8 @@ ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">�
 <button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button><br><br>`:''}
 <button class="ok" onclick="review(${i.id},'approved')">✓ 认证</button>
 <button onclick="review(${i.id},'suspected')">？ 存疑（重新排队靠后）</button>
-<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除（只删数据库记录，原始文件手动删）</button>
-<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条），忽略/采纳后不再出现</span></div>`
+${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除（只删数据库记录，原始文件手动删）</button>`}
+<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条）、low_confidence_ocr 按图片 sha256 聚合，两者 item_ref 不是文档 id，故不提供删除按钮（忽略请用 ✓ 认证）</span></div>`
 $('#rev').value=loadReviewer()}
 async function adoptCandidate(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
@@ -159,10 +163,10 @@ $('#view-configs').innerHTML=`<h3>API 配置中心（key 脱敏；可编辑）</
 <div><button onclick="editConfig('${esc(c.name)}')">编辑配置</button> ${c.name==='embedding'?`<button onclick="testApi('embedding','etest')">测试连通</button><span id="etest" class="muted"></span>`:''}${c.name==='ocr'?`<button onclick="testApi('ocr','otest')">测试连通</button><span id="otest" class="muted"></span>`:''}${c.name==='code_graph'?`<button onclick="testApi('code_graph','gtest')">测试连通</button><span id="gtest" class="muted"></span>`:''}</div></div>`).join('')}
 const CFG_FIELDS={
  embedding:[['provider','select',['openai_compatible','echo']],['base_url','text'],['model','text'],['api_key','password']],
- ocr:[['ocr_provider','select',['ask','api','paddle','none']],['ocr_api_mode','select',['custom','openai']],['ocr_api_base','text'],['ocr_api_model','text'],['ocr_api_key','password']],
+ ocr:[['ocr_provider','select',['ask','api','paddle','none']],['ocr_api_mode','select',['custom','openai']],['ocr_api_base','text'],['ocr_api_model','text'],['ocr_api_key','password'],['ocr_min_confidence','text']],
  github:[['token','password']],
  code_graph:[['enabled','select',['true','false']],['base_url','text'],['path','text']]};
-function fillCache(cs){window._cfgCache={};cs.forEach(c=>window._cfgCache[c.name]={provider:c.provider,base_url:c.base_url,model:c.model||'',mode:c.mode||'custom',ocr_provider:c.provider,ocr_api_base:c.base_url,ocr_api_model:c.model||'',ocr_api_mode:c.mode||'custom',enabled:c.enabled===true?'true':'false',path:c.path||'/gh-puller/graph'})}
+function fillCache(cs){window._cfgCache={};cs.forEach(c=>window._cfgCache[c.name]={provider:c.provider,base_url:c.base_url,model:c.model||'',mode:c.mode||'custom',ocr_provider:c.provider,ocr_api_base:c.base_url,ocr_api_model:c.model||'',ocr_api_mode:c.mode||'custom',ocr_min_confidence:c.min_confidence||'',enabled:c.enabled===true?'true':'false',path:c.path||'/gh-puller/graph'})}
 async function editConfig(name){const old=document.getElementById('form-'+name);if(old)old.remove();
 try{fillCache(await j('/api/configs'))}catch(e){} // 打开时拉最新配置，避免缓存/时序回填旧值
 const c=CFG_FIELDS[name];const cur=window._cfgCache[name]||{};const html=c.map(([k,t,opts])=>`<div style="margin:4px 0"><label>${esc(k)}: </label>${t==='select'?`<select id="f-${k}">${opts.map(o=>`<option ${(cur[k]||'')===o?'selected':''}>${esc(o)}</option>`).join('')}</select>`:`<input id="f-${k}" type="${t}" placeholder="${t==='password'?'(留空不改)':'...'}" style="width:340px" ${cur[k]&&t!=='password'?`value="${esc(cur[k])}"`:''}>`}</div>`).join('');
@@ -466,7 +470,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             elif name == "ocr":
                 update_config_json(cfg, "ocr",
                                    {k: fields[k] for k in ("ocr_provider", "ocr_api_base",
-                                                           "ocr_api_model", "ocr_api_mode")
+                                                           "ocr_api_model", "ocr_api_mode",
+                                                           "ocr_min_confidence")
                                     if k in fields},
                                    config_path=_config_path)
                 if "ocr_api_key" in fields:

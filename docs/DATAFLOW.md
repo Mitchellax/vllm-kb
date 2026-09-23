@@ -75,14 +75,23 @@
 | 阶段 | 处理 | 产物 |
 |---|---|---|
 | 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
-| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 结果 `*.ocr.json`，可重跑） |
-| 3. 规范化 | `canonicalize()`：正文拼装 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
+| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（**引用的本地/base64 图片即时 OCR**）；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
+| 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 
 > **OCR 置信度单一来源**：`custom`=服务端返回 / `paddle`=引擎逐行平均 / `openai`=**模型自报**
 > （提示词要求末行 `CONFIDENCE: <0~1 小数>`）。自报异常（缺失/不可解析/越界/不在末行/正文空却高置信）
 > → `confidence=null` + `anomaly`，交人工审核，**不回退**启发式评分。**只有高置信文本进正文**
 > 参与向量/全文检索；低置信与异常结果只留签名线索（原图可回看），不污染检索库。
+>
+> **进正文判定**：`confidence 非空` ∧ `anomaly 为空` ∧ `confidence ≥ ocr_min_confidence`（默认 0.6）。
+> 注入形态：占位符 `[图片:alt]` 之后追加 `图片文字（OCR 置信度 x.xx）:` + 文本（正文仍不含路径）。
+> 低置信/异常项由 `review.seed_low_confidence_ocr` 按图片 sha256 聚合进 `low_confidence_ocr` 审核队列。
+>
+> **幂等**：`*.ocr.json` 的缓存键 = 图片 `sha256` + **引擎指纹**（`provider|mode|model|提示词版本`）。
+> 换模型/换模式/改提示词 → 自动重算；**阈值不进指纹** → 调 `ocr_min_confidence` 只重判定
+> `text_included`，不重跑 OCR。旧版无指纹的产物视为未命中，升级后首次全量重算一次。
+> 由于 `MarkdownSource` 在 `canonicalize` 时**即时 OCR 并按需写缓存**，注入不依赖 source 执行顺序。
 
 ### 2.2b 请求期图片 OCR（`POST /ocr`，不经 canonical）
 
@@ -228,7 +237,8 @@ POST /search {query:"vllm-ascend:0.23.0rc1 GLM5.1 PD分离P节点挂死"}
   `scripts/check_readonly.py` 可在运行前验证；
 - 出口统一脱敏：正文/标题/图结果递归脱敏（`config.sanitize` 白名单，改配置即时生效、无需重嵌）；
   被脱敏原始值落 `data/sanitize_log.json`；
-- `extra`/`evidence` 走字段白名单清理，`source_ref` 仅保留 http(s) URL——检索响应不含服务器路径。
+- `extra`/`evidence` 走字段白名单清理，`source_ref` 仅保留 http(s) URL——检索响应不含服务器路径；
+  `evidence[].ocr` 只放行 `confidence/confidence_source/anomaly/text_included/signatures`（纯知识字段）。
 
 ### 3.5 代码图谱检索（可选，gh-puller 接入）
 

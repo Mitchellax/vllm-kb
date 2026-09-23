@@ -1005,11 +1005,66 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
             "docs_count": len(docs)}
 
 
+def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
+    """扫描 kb.sqlite3 的 `extra.evidence[].ocr` → 低置信/自报异常图片审核项（幂等）。
+
+    只针对**未进正文**的图片 OCR（`text_included=false`）——即置信度低于
+    `ocr_min_confidence`，或模型自报置信度异常（缺失/不可解析/越界/格式污染）。
+    **按图片 sha256 聚合**（item_ref = `ocr:{sha256前16位}`）：同一张图被多篇文档引用只生成
+    一条审核项，人工核对一次即可。reason 区分 low（分低）/ anomaly（自报异常）/
+    no_confidence（无置信度）。
+
+    已认证/存疑/删除过的项因 item_ref 已存在（任意状态）不再重复打扰。
+    """
+    kb = cfg.resolve(cfg.storage.sqlite_path)
+    if not kb.exists():
+        return 0
+    conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
+    added = 0
+    try:
+        rows = conn.execute("SELECT source_id, title, url, extra FROM docs").fetchall()
+        for source_id, title, url, extra in rows:
+            try:
+                ex = json.loads(extra or "{}")
+            except Exception:
+                continue
+            for ev in (ex.get("evidence") or []):
+                if not isinstance(ev, dict):
+                    continue
+                ocr = ev.get("ocr")
+                if not isinstance(ocr, dict) or ocr.get("text_included"):
+                    continue
+                sha = str(ev.get("sha256", "") or "")
+                ref = f"ocr:{sha[:16]}" if sha else f"ocr:{source_id}"
+                conf = ocr.get("confidence")
+                anomaly = str(ocr.get("anomaly", "") or "")
+                if anomaly:
+                    reason = "anomaly"
+                elif conf is None:
+                    reason = "no_confidence"
+                else:
+                    reason = "low"
+                if store.add_item("low_confidence_ocr", ref, {
+                    "source_id": source_id, "title": title, "url": url,
+                    "asset_id": ev.get("asset_id", ""), "sha256": sha,
+                    "kind": ev.get("kind", ""), "reason": reason,
+                    "confidence": conf,
+                    "confidence_source": ocr.get("confidence_source", ""),
+                    "anomaly": anomaly,
+                    "signatures": ocr.get("signatures") or [],
+                }):
+                    added += 1
+    finally:
+        conn.close()
+    return added
+
+
 def seed_all(cfg: "AppConfig", store: ReviewStore) -> dict[str, int]:
     """运行全部 seed（幂等），返回各 seed 新增数。"""
     return {
         "verification_pending": seed_verification_pending(cfg, store),
         "case_title_flag": seed_case_title_flags(cfg, store),
+        "low_confidence_ocr": seed_low_confidence_ocr(cfg, store),
         "tag_candidate": seed_tag_candidates(cfg, store),
     }
 
@@ -1041,10 +1096,12 @@ def api_configs(cfg: "AppConfig") -> list[dict]:
                 "base_url": api_base,
                 "model": str(sc.get("ocr_api_model", "") or ""),
                 "mode": str(sc.get("ocr_api_mode", "custom") or "custom"),
+                "min_confidence": str(sc.get("ocr_min_confidence", "") or ""),
                 "key_configured": bool(key),
                 "status": "configured" if (api_base or sc.get("ocr_provider") == "paddle") else "ask",
                 "note": "ask=无 API 时询问本地/跳过；api 需 ocr_api_base；mode: custom=自研/ocr 协议, "
-                        "openai=OpenAI 兼容（如 DeepSeek-OCR，需 ocr_api_model）",
+                        "openai=OpenAI 兼容（如 DeepSeek-OCR，需 ocr_api_model）；"
+                        "min_confidence=进正文阈值（默认 0.6，低于则只留签名并进审核队列）",
             })
             break
     else:

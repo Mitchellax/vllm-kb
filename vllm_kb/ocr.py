@@ -58,6 +58,16 @@ ANOMALY_OUT_OF_RANGE = "out_of_range"    # 数值不在 [0,1]
 ANOMALY_MISPLACED = "misplaced"          # 不在末尾 / 出现多次（格式污染正文）
 ANOMALY_CONTRADICTORY = "contradictory"  # 正文为空却自报高置信
 
+# 提示词版本：改动 _CONFIDENCE_PROMPT / 解析规则时必须 +1——引擎指纹随之变化，
+# 已有 ocr.json 缓存全部失效并自动重算（避免"图片没变、提示词变了，结果还是旧的"）。
+_OCR_PROMPT_VERSION = 1
+
+# 高置信阈值默认值（source 级 ocr_min_confidence 可覆盖）：只有 ≥ 阈值才注入正文进检索库
+DEFAULT_MIN_CONFIDENCE = 0.6
+
+# 签名导向：只保留"可判错"的签名类型（能定位问题的算子/错误码/模型/版本）
+JUDGABLE_KINDS = ("kernel", "op", "errcode", "model", "version")
+
 
 class OcrUnavailable(RuntimeError):
     """OCR 引擎不可用（未安装 / 初始化失败）。调用方应降级处理，不中断导入。"""
@@ -95,12 +105,22 @@ class OcrConfig:
     api_key: str = ""
     model: str = ""
     mode: str = "custom"
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE
     extra: dict = field(default_factory=dict)
 
     @property
     def usable_for_request(self) -> bool:
         """请求期（服务端）可用：仅 api 模式（本地 OCR 不在服务端执行）。"""
         return self.provider == "api" and bool(self.api_base)
+
+
+def as_confidence_threshold(v) -> float:
+    """解析 ocr_min_confidence（非法/缺失回默认值，钳制到 [0,1]）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_CONFIDENCE
+    return min(max(f, 0.0), 1.0)
 
 
 def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
@@ -119,6 +139,7 @@ def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
         api_key=str(sc.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", "")),
         model=str(sc.get("ocr_api_model", "") or ""),
         mode=str(sc.get("ocr_api_mode", "custom") or "custom").lower(),
+        min_confidence=as_confidence_threshold(sc.get("ocr_min_confidence")),
     )
 
 
@@ -178,6 +199,149 @@ def parse_self_confidence(content: str) -> tuple[str, Optional[float], str, str]
             return body, None, ANOMALY_CONTRADICTORY, m.group(0)
         return body, value, "", m.group(0)
     return raw.strip(), None, ANOMALY_MISSING, ""
+
+
+def engine_fingerprint(provider: str, mode: str, model: str) -> str:
+    """OCR 引擎指纹 = provider | mode | model | 提示词版本。
+
+    ocr.json 的幂等键 = **sha256 + 指纹**：换模型 / 换调用模式 / 改提示词后自动重算，
+    避免"图片没变、引擎变了，结果还是旧的"。阈值（ocr_min_confidence）**不进指纹**——
+    调阈值只需重新判定，无需重跑 OCR。
+    """
+    import hashlib
+
+    raw = f"{provider}|{mode}|{model}|p{_OCR_PROMPT_VERSION}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def extract_judgable_signatures(text: str) -> list[dict]:
+    """签名导向：只提取"可判错"的签名（算子/错误码/模型/版本），返回 [{"text","kind"}]。"""
+    from .signature import extract_signatures
+
+    return [{"text": s.text, "kind": s.kind}
+            for s in extract_signatures(text or "") if s.kind in JUDGABLE_KINDS]
+
+
+@dataclass
+class OcrArtifact:
+    """单张图片的 OCR 产物（`data/parsed/images/<stem>.ocr.json` 的内容）。
+
+    既是幂等缓存，也是"能否进正文"的判定依据：只有 `high_confidence` 才注入正文
+    （进 FTS + 向量）；低置信 / 自报异常只留签名线索并进审核队列。
+    """
+    sha256: str
+    provider: str = ""
+    mode: str = ""
+    model: str = ""
+    fingerprint: str = ""
+    text: str = ""
+    confidence: Optional[float] = None
+    confidence_source: str = "none"
+    anomaly: str = ""
+    signatures: list = field(default_factory=list)
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE
+
+    @property
+    def high_confidence(self) -> bool:
+        """高置信 = 有置信度 **且** 无自报异常 **且** ≥ 阈值。"""
+        return (self.confidence is not None and not self.anomaly
+                and self.confidence >= self.min_confidence)
+
+    @property
+    def review_reason(self) -> str:
+        """需人工复核的原因（空串表示无需复核）：anomaly 优先于 low。"""
+        if self.anomaly:
+            return "anomaly"
+        if self.confidence is None:
+            return "no_confidence"
+        if self.confidence < self.min_confidence:
+            return "low"
+        return ""
+
+    def to_json(self, image_ref: str = "") -> dict:
+        return {
+            "image": image_ref,
+            "sha256": self.sha256,
+            "provider": self.provider,
+            "mode": self.mode,
+            "model": self.model,
+            "engine_fingerprint": self.fingerprint,
+            "text": self.text,
+            "confidence": (round(self.confidence, 4)
+                           if self.confidence is not None else None),
+            "confidence_source": self.confidence_source,
+            "anomaly": self.anomaly,
+            "min_confidence": self.min_confidence,
+            "text_included": self.high_confidence,
+            "signatures": self.signatures,
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "OcrArtifact":
+        conf = d.get("confidence")
+        return cls(
+            sha256=str(d.get("sha256", "") or ""),
+            provider=str(d.get("provider", "") or ""),
+            mode=str(d.get("mode", "") or ""),
+            model=str(d.get("model", "") or ""),
+            fingerprint=str(d.get("engine_fingerprint", "") or ""),
+            text=str(d.get("text", "") or ""),
+            confidence=(float(conf) if isinstance(conf, (int, float)) else None),
+            confidence_source=str(d.get("confidence_source", "none") or "none"),
+            anomaly=str(d.get("anomaly", "") or ""),
+            signatures=list(d.get("signatures") or []),
+            min_confidence=as_confidence_threshold(d.get("min_confidence")),
+        )
+
+    def evidence(self) -> dict:
+        """进 `extra.evidence[].ocr` 的摘要（**不含任何路径**；出口白名单会再过一遍）。"""
+        return {
+            "confidence": (round(self.confidence, 4)
+                           if self.confidence is not None else None),
+            "confidence_source": self.confidence_source,
+            "anomaly": self.anomaly,
+            "text_included": self.high_confidence,
+            "signatures": self.signatures,
+        }
+
+
+def build_ocr_artifact(src: "str | Path | bytes", sha256: str, result: OcrResult,
+                       provider: str, mode: str, model: str,
+                       min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> OcrArtifact:
+    """由一次 OCR 调用结果构造产物（含签名提取与引擎指纹）。"""
+    return OcrArtifact(
+        sha256=sha256, provider=provider, mode=mode, model=model,
+        fingerprint=engine_fingerprint(provider, mode, model),
+        text=result.text or "", confidence=result.confidence,
+        confidence_source=result.confidence_source, anomaly=result.anomaly,
+        signatures=extract_judgable_signatures(result.text or ""),
+        min_confidence=min_confidence,
+    )
+
+
+def load_ocr_artifact(cache_path, sha256: str, fingerprint: str) -> Optional[OcrArtifact]:
+    """读 ocr.json 缓存：**sha256 与引擎指纹都一致**才算命中，否则返回 None（需重算）。
+
+    旧版产物没有 engine_fingerprint → 视为未命中（升级后首次全量重算一次，
+    因为提示词/置信度语义已变）。
+    """
+    try:
+        d = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("sha256") != sha256:
+        return None
+    if fingerprint and d.get("engine_fingerprint") != fingerprint:
+        return None
+    return OcrArtifact.from_json(d)
+
+
+def save_ocr_artifact(cache_path, artifact: OcrArtifact, image_ref: str = "") -> None:
+    """写 ocr.json（幂等缓存 + 入库判定依据）。"""
+    p = Path(cache_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(artifact.to_json(image_ref), ensure_ascii=False, indent=1),
+                 encoding="utf-8")
 
 
 _paddle_ocr = None  # 全局单例（模型加载一次）

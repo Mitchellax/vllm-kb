@@ -76,6 +76,19 @@ def _sanitize_extra(extra: Any) -> dict:
             sr = e.get("source_ref", "")
             if isinstance(sr, str) and sr.startswith(("http://", "https://")):
                 item["source_ref"] = sr
+            # OCR 摘要：置信度来源/自报异常/是否进正文 + 可判错签名（纯知识字段，无路径）
+            ocr = e.get("ocr")
+            if isinstance(ocr, dict):
+                item["ocr"] = {
+                    "confidence": ocr.get("confidence"),
+                    "confidence_source": ocr.get("confidence_source"),
+                    "anomaly": ocr.get("anomaly"),
+                    "text_included": ocr.get("text_included"),
+                    "signatures": [
+                        {"text": s.get("text"), "kind": s.get("kind")}
+                        for s in (ocr.get("signatures") or []) if isinstance(s, dict)
+                    ],
+                }
             safe.append(item)
         if safe:
             out["evidence"] = safe

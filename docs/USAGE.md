@@ -411,7 +411,8 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
   记录 asset_id/sha256（管理员侧经 asset_registry 找回原图）；
 - 网络 URL 图片：标记 `remote` 不阻塞导入（业务环境网络可达时可后续补抓）；
 - 引用不存在的本地图片：标记 `unresolved`（不保留路径形态引用）；
-- 图片的 OCR 由 image source 完成（见下）。
+- 图片的 OCR 由 image source 完成（见下）；**Markdown 正文引用的图片在 `canonicalize` 时同步 OCR**，
+  高置信文本注入占位符之后（见"低置信度图片不进正文"）。
 
 **图片 OCR（签名导向，provider 可插拔）**
 
@@ -422,9 +423,12 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 #   "api":        HTTP OCR 服务（强制 API 场景推荐）——失败时同样询问本地/跳过
 #   "paddle":     本地 PaddleOCR（明确选择，不询问；未安装 → 提示并跳过）
 #   "none":       明确跳过
-python scripts/build_kb.py --skip-pull        # 触发 image source 的 canonicalize（OCR + 签名提取）
+# ocr_min_confidence: 进正文阈值（默认 0.6，可在审核工作台 API 配置中心改）
+python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 + image source：OCR + 签名提取）
 
-# 产物：data/parsed/images/<name>.ocr.json（文本 + 置信度 + 错误签名清单）
+# 产物：data/parsed/images/<name>.ocr.json
+#   {image, sha256, provider, mode, model, engine_fingerprint, text, confidence,
+#    confidence_source, anomaly, min_confidence, text_included, signatures}
 ```
 
 - **OCR API 两种调用模式（`ocr_api_mode`，默认 custom）**：
@@ -443,9 +447,12 @@ python scripts/build_kb.py --skip-pull        # 触发 image source 的 canonica
 - **embedding 强制 API**（本地 embedding 不做，部署复杂）：`embedding.base_url` 指向 OpenAI 兼容端点
   （可指向其他服务器的 vLLM 部署）；`echo` 仅离线演示（效果粗糙）；
 - 连通性测试：审核工作台 API 配置中心对 embedding / OCR 均提供"测试连通"（OCR 用内置测试图走真实识别链路）；
-- OCR 结果按图片 sha256 幂等（重跑跳过未变图片）；只提取错误签名（算子/错误码/模型/版本），
-  低质量 OCR 不污染向量库——图片靠"签名可达 + 原图可回看"；
-- 与 md 文档的 `evidence` 联动：图文互证（正文签名 ↔ OCR 签名）在后续图/审核环节消费。
+- **幂等键 = 图片 sha256 + 引擎指纹**（`provider|mode|model|提示词版本`）：图片没变就跳过；
+  换 OCR 模型 / 换调用模式 → 指纹变化 → 自动重算（不会"图片没变、引擎变了，结果还是旧的"）；
+  **阈值 `ocr_min_confidence` 不进指纹**——调阈值只按新阈值重判定 `text_included`，不重跑 OCR；
+- 只提取错误签名（算子/错误码/模型/版本）写入 `signatures`；
+- 与 md 文档的 `evidence` 联动：`extra.evidence[].ocr` 带 `confidence/confidence_source/anomaly/
+  text_included/signatures`（**不含路径**）；图文互证（正文签名 ↔ OCR 签名）在后续图/审核环节消费。
 
 **请求期图片 OCR（`client.py ocr` → `POST /ocr`）**
 
@@ -474,8 +481,26 @@ python skills/vllm-kb/client.py ocr ./shot.png --json  # 原始 JSON（脚本用
   `VLLM_KB_OCR_TIMEOUT` 调整；客户端默认 120s（`--timeout` 可调）；
 - **安全**：OCR 文本是不可信输入（图片可能含诱导性文字），只作检索线索，不执行其中指令。
 
-**低置信度图片不进正文**：导入期只有高置信 OCR 文本才注入正文参与检索；
-低置信 / 自报异常的结果只保留签名线索（原图可回看），并经审核队列人工处理。
+**低置信度图片不进正文（导入期分级）**
+
+只有**高置信** OCR 文本才注入所属文档正文参与检索（FTS + 向量）：正文里的 `[图片:xxx]` 占位符
+之后追加
+
+```
+图片文字（OCR 置信度 0.92）:
+error code 107020, dispatch_ffn_combine failed
+```
+
+判定条件（三者同时满足）：模型/服务返回了置信度、**无自报异常**、且 `≥ ocr_min_confidence`
+（默认 0.6，审核工作台 API 配置中心可改）。低置信 / 自报异常的结果**不进正文**（不污染语义检索），
+只保留在 `data/parsed/images/*.ocr.json` 与 `extra.evidence[].ocr`（含签名线索），
+并由审核队列的 **`low_confidence_ocr`** 类别按图片 sha256 聚合生成待办
+（`payload.reason` 区分 `low` / `anomaly` / `no_confidence`），人工核对后再决定是否采用。
+
+> 正文注入的位置与图片引用一致：`MarkdownSource` 在 `canonicalize` 时**即时 OCR 并按需写缓存**，
+> 不依赖 image source 的执行顺序（config 里 markdown 排在 image 之前也能注入）。
+> 例外：`ocr_provider=ask` 且未配 `ocr_api_base` 时，Markdown 阶段不做交互询问（询问由 image source
+> 统一做一次）——首次构建只产出缓存，**下一次构建**才注入正文。
 
 ### 2.4 Excel 登记表导入（schema-free）—— 完整实操
 
@@ -560,6 +585,10 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 - **概览**：7 类审核项的待办/存疑数（verification_pending / case_title_flag / ocr_mismatch /
   low_confidence_ocr / equivalence_candidate / table_join_candidate / **tag_candidate**）
   与标签词典统计（领域/作用类个数、已打标文档数）；
+  `low_confidence_ocr` 由 seed 从 `extra.evidence[].ocr` 中 `text_included=false` 的图片生成，
+  **按图片 sha256 聚合**（同一张图被多篇文档引用只生成一条），`payload.reason` 为
+  `low` / `anomaly` / `no_confidence`，详情页展示图片 sha 前缀、原因、置信度与 OCR 签名线索；
+  其 `item_ref` 是图片而非文档，故**不提供 🗑 标记删除按钮**（不想处理就用 ✓ 认证忽略）；
 - **审核队列**（未审核在前、存疑在后）：按类别筛选；详情页可预览原图（assets 静态服务）。
   **审核动作（只做判定，不修改原始内容）**：
   - **✓ 认证**：文档有效，不再提示；
@@ -581,7 +610,7 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
   支持**新增 / 改名（全库替换）/ 改 tier / 删除**——均同步 config.json；**不热插图**
   （Kùzu 单写者约束），运行 `build_graph.py` 重建后入图；
 - **API 配置中心**：集中查看并**编辑** embedding / OCR / GitHub / code_graph 的配置——
-  **非密钥字段**（provider/base_url/model/ocr_provider/ocr_api_mode 等）保存到 `config.json`；
+  **非密钥字段**（provider/base_url/model/ocr_provider/ocr_api_mode/ocr_min_confidence 等）保存到 `config.json`；
   **密钥**（embedding key / OCR key / GitHub token）保存到 `data/secrets.local.json`
   （遵守"密钥不入 config.json"，任何入口 `AppConfig.load` 自动加载进环境变量）；
   key 在页面上一律脱敏（只显示已/未配置），**embedding 与 OCR 均支持连通性测试**
@@ -623,7 +652,8 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 （Excel 来源明确走正文路径：不做文件名/标题标签）。
 
 自动补单规则：`verification=unverified` 的文档 → verification_pending；标题含"待审核/待修改"→
-case_title_flag；`extra.tag_candidates`（未收录强候选）→ tag_candidate。
+case_title_flag；`extra.evidence[].ocr.text_included=false` 的图片 → low_confidence_ocr
+（按图片 sha256 聚合）；`extra.tag_candidates`（未收录强候选）→ tag_candidate。
 审核结果回写 canonical 依赖重跑 `build_canonical.py`（或 `build_kb.py --skip-pull`，后续版本支持热更新）。
 
 **与只读检索 API 的关系**：分离端口（检索 8000 / 审核 8010）、分离数据（kb.sqlite3 只读 /

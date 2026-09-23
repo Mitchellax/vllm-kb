@@ -94,6 +94,62 @@ class BaseSource(ABC):
         """该来源原始数据的独立目录（默认 data/raw/{source_id}）。"""
         return self.resolve(self.cfg.get("raw_dir", f"data/raw/{self.id}"))
 
+    def _ocr_settings(self):
+        """OCR 配置（取自 image source 的 ocr_* 字段，与审核工作台/请求期端点同源）。
+
+        无 app_cfg（纯解析测试）或无 image source → None。
+        """
+        if self.app_cfg is None:
+            return None
+        from .ocr import ocr_config_from_cfg
+
+        return ocr_config_from_cfg(self.app_cfg)
+
+    def _ocr_artifact_for(self, asset_path: Path, sha: str,
+                          image_ref: str) -> tuple[Optional[dict], str]:
+        """对已资产化的图片做 OCR（ocr.json 为幂等缓存），返回 (evidence.ocr 摘要, 正文注入后缀)。
+
+        - **高置信**（无自报异常且 ≥ `ocr_min_confidence`）→ 返回注入后缀，调用方拼到占位符后
+          （文本随正文进 FTS + 向量）；
+        - 低置信 / 自报异常 → 返回摘要但**注入后缀为空**（只留签名线索 + 审核队列）；
+        - OCR 不可用 / 未配置 / `ask` 且无 API → (None, "")，导入不受阻。
+
+        provider=ask 且无 ocr_api_base 时**不在此交互询问**（询问由 ImageSource 统一做一次），
+        此时本次构建不注入正文——本地 OCR 产出缓存后，下次构建即生效。
+        """
+        from .ocr import (OcrApiError, OcrUnavailable, build_ocr_artifact,
+                          engine_fingerprint, load_ocr_artifact, ocr_image_detail,
+                          save_ocr_artifact)
+
+        oc = self._ocr_settings()
+        if oc is None or oc.provider == "none":
+            return None, ""
+        provider = oc.provider
+        if provider == "ask":
+            if not oc.api_base:
+                return None, ""
+            provider = "api"
+        cache = self.resolve("data/parsed/images") / f"{asset_path.stem}.ocr.json"
+        fp = engine_fingerprint(provider, oc.mode, oc.model)
+        art = load_ocr_artifact(cache, sha, fp)
+        if art is None:
+            try:
+                res = ocr_image_detail(asset_path, provider, api_base=oc.api_base,
+                                       api_key=oc.api_key, model=oc.model, mode=oc.mode)
+            except (OcrApiError, OcrUnavailable) as e:
+                print(f"[sources:{self.id}] 图片 OCR 失败（{asset_path.name}）：{e}", flush=True)
+                return None, ""
+            art = build_ocr_artifact(asset_path, sha, res, provider, oc.mode, oc.model,
+                                     oc.min_confidence)
+            save_ocr_artifact(cache, art, image_ref=image_ref)
+        else:
+            # 阈值即时生效（不进引擎指纹：调阈值只重判定，不重跑 OCR）
+            art.min_confidence = oc.min_confidence
+        if art.high_confidence and art.text.strip():
+            return art.evidence(), (f"\n图片文字（OCR 置信度 {art.confidence:.2f}）:\n"
+                                    f"{art.text.strip()}")
+        return art.evidence(), ""
+
     def _register_asset_mappings(self, items: list[tuple[str, str, str]]) -> None:
         """注册资产到审核侧 asset_registry（管理员路径映射；不进 canonical/检索库）。
 
@@ -311,6 +367,9 @@ class MarkdownSource(BaseSource):
 
         安全约束：正文与 canonical **不含任何服务器路径**——evidence 只记 asset_id/sha256
         （管理员侧经 asset_registry 映射回文件），unresolved 不保留原文引用（可能是路径形态）。
+
+        **图片 OCR 文本注入**：本地/base64 图片资产化后立即走 OCR（ocr.json 幂等缓存）；
+        高置信文本追加在占位符之后随正文进 FTS + 向量，低置信/自报异常不注入（只留签名线索）。
         """
         evidence: list[dict] = []
         counter: dict[str, int] = {}
@@ -341,8 +400,11 @@ class MarkdownSource(BaseSource):
                 target.write_bytes(data)
                 sha = _sha256(target)
                 ev.update({"kind": "base64", "asset_id": sha[:16], "sha256": sha})
+                ocr_ev, inject = self._ocr_artifact_for(target, sha, f"assets/images/{name}")
+                if ocr_ev is not None:
+                    ev["ocr"] = ocr_ev
                 evidence.append(ev)
-                return placeholder
+                return placeholder + inject
             # 本地路径（file:// 剥前缀；相对路径以 md 目录为基准）
             local = ref[len("file://"):] if ref.startswith("file://") else ref
             p = Path(local)
@@ -352,10 +414,13 @@ class MarkdownSource(BaseSource):
             if not p.exists():
                 evidence.append(ev)  # unresolved（不记 source_ref，避免路径形态进库）
                 return placeholder
-            asset_path, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
+            rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
             ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
+            ocr_ev, inject = self._ocr_artifact_for(self.resolve(rel), sha, rel)
+            if ocr_ev is not None:
+                ev["ocr"] = ocr_ev
             evidence.append(ev)
-            return placeholder
+            return placeholder + inject
 
         body = _IMG_REF_RE.sub(repl, text)
         return body, evidence
@@ -637,10 +702,11 @@ class ImageSource(BaseSource):
         return ans in ("y", "yes")
 
     def canonicalize(self) -> list[KbDocument]:
-        import json
         import os
 
-        from .ocr import OcrApiError, OcrUnavailable, ocr_image
+        from .ocr import (OcrApiError, OcrUnavailable, as_confidence_threshold,
+                          build_ocr_artifact, engine_fingerprint, load_ocr_artifact,
+                          ocr_image_detail, save_ocr_artifact)
 
         images = self._images_dir()
         if not images.exists():
@@ -649,6 +715,8 @@ class ImageSource(BaseSource):
         parsed_dir.mkdir(parents=True, exist_ok=True)
 
         # ---- OCR 引擎决策 ----
+        # 阈值与其他 ocr_* 字段一样直接读本来源配置（本来源即 image source）
+        min_conf = as_confidence_threshold(self.cfg.get("ocr_min_confidence"))
         provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
         api_base = str(self.cfg.get("ocr_api_base", "") or "")
         api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
@@ -661,62 +729,60 @@ class ImageSource(BaseSource):
                   f"api + ocr_api_base 服务，或安装 paddleocr）")
             return []
 
-        processed, skipped, failed = 0, 0, 0
+        processed, skipped, failed, review = 0, 0, 0, 0
         asked = False  # API 失败后的本地询问只问一次
         for img in sorted(p for g in self._IMG_GLOBS for p in images.glob(g)):
             if provider == "none":
                 break
             sha = _sha256(img)
             ocr_path = parsed_dir / f"{img.stem}.ocr.json"
-            if ocr_path.exists():
-                try:
-                    meta = json.loads(ocr_path.read_text(encoding="utf-8"))
-                    if meta.get("sha256") == sha:
-                        skipped += 1
-                        continue
-                except Exception:
-                    pass
+            fp = engine_fingerprint(provider, api_mode, api_model)
+            cached = load_ocr_artifact(ocr_path, sha, fp)
+            if cached is not None:
+                skipped += 1
+                # 阈值改了但图片/引擎未变：不重跑 OCR，只按新阈值刷新判定字段
+                if cached.min_confidence != min_conf:
+                    cached.min_confidence = min_conf
+                    save_ocr_artifact(ocr_path, cached, image_ref=f"assets/images/{img.name}")
+                continue
+            result = None
             while True:
                 try:
-                    text, conf = ocr_image(img, provider, api_base=api_base, api_key=api_key,
-                                           model=api_model, mode=api_mode)
+                    result = ocr_image_detail(img, provider, api_base=api_base,
+                                              api_key=api_key, model=api_model, mode=api_mode)
                     break
                 except OcrApiError as e:
-                    print(f"[sources:{self.id}] OCR API 失败: {e}")
+                    print(f"[sources:{self.id}] OCR API 失败: {e}", flush=True)
                     if not asked:
                         asked = True
                         if self._ask_local_ocr():
                             provider = "paddle"
+                            fp = engine_fingerprint(provider, api_mode, api_model)
                             continue  # 换本地重试当前图
                     provider = "none"
                     break
                 except OcrUnavailable as e:
-                    print(f"[sources:{self.id}] OCR 不可用（{e}）——跳过 OCR")
+                    print(f"[sources:{self.id}] OCR 不可用（{e}）——跳过 OCR", flush=True)
                     provider = "none"
                     break
             if provider == "none":
                 print(f"[sources:{self.id}] 跳过 OCR（图片 {len(list(images.iterdir()))} 张，"
                       f"已处理 {processed}）。可配置 ocr_provider: paddle 或 api + ocr_api_base")
                 break
-            # 签名导向：只提取可判错的签名（算子/错误码/模型/版本）
-            from .signature import extract_signatures
-
-            sigs = extract_signatures(text)
-            matched = [
-                {"text": s.text, "kind": s.kind}
-                for s in sigs if s.kind in ("kernel", "op", "errcode", "model", "version")
-            ]
-            ocr_path.write_text(
-                json.dumps({
-                    "image": f"assets/images/{img.name}", "sha256": sha,
-                    "provider": provider, "text": text,
-                    "confidence": round(conf, 4),
-                    "signatures": matched,
-                }, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
+            if result is None:
+                failed += 1
+                continue
+            art = build_ocr_artifact(img, sha, result, provider, api_mode, api_model, min_conf)
+            save_ocr_artifact(ocr_path, art, image_ref=f"assets/images/{img.name}")
+            if art.review_reason:
+                review += 1
+                print(f"[sources:{self.id}] 图片 {img.name} OCR 需人工复核"
+                      f"（reason={art.review_reason} conf={art.confidence}）——不进正文", flush=True)
             processed += 1
-        print(f"[sources:{self.id}] OCR 完成：新增 {processed}，跳过（幂等）{skipped}（图片 {len(list(images.iterdir()))} 张）")
+        total = len(list(images.iterdir()))
+        print(f"[sources:{self.id}] OCR 完成：新增 {processed}，跳过（幂等）{skipped}，"
+              f"失败 {failed}，待人工复核 {review}（图片 {total} 张；"
+              f"高置信文本已随所属文档正文入库）")
         return []
 
 

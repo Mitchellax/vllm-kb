@@ -37,14 +37,15 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   API 请求为 0，不受未认证限流约束；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
   Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
-  截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问）；
+  截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；
+   **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列）；
    **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
    把用户截图转成文本 + 报错签名再检索；置信度取 OCR 模型自报单一来源，自报异常标记待人工复核）；
   入库自动打**文档级两级标签**（主题/领域类 + 具体作用类，确定性提取自文件名+内部标题，
   词典 `config.tags.registry` 驱动）——经 skill 的 `tags`/`context` 命令做**能力发现**
   （agent 先知道"知识库有哪些文档类别可提供知识"，如 HCCL 超时 → 命中 HCCL 领域 +
   超时排查/命令参考作用类，先读文档再下结论）；**资产路径不进库**（asset_id 标识 + API 出口白名单清理，
-  管理员侧路径仅存审核库）
+  `evidence[].ocr` 只放行置信度/来源/异常/签名等知识字段，管理员侧路径仅存审核库）
 - **内部数据脱敏（后置）**：库中存原文（原文检索）、serve_api 出口统一脱敏（内部 IP → `<IP>`、内部路径 → `<PATH>`，
   默认路径如 `/var/log/npu/` 保留）——改 `config.sanitize`（keep_paths/keep_ips/sources）**即时生效、无需重嵌**；
   被脱敏的原始 IP/路径落盘 `data/sanitize_log.json` 供维护白名单
@@ -254,7 +255,7 @@ python scripts/build_graph.py
 python scripts/review_ui.py            # http://127.0.0.1:8010（自动补单，幂等）
 ```
 
-- **审核**：未验证文档补标、案例标题待审核、OCR 图文不一致、低置信度签名、跨来源合并候选等
+- **审核**：未验证文档补标、案例标题待审核、OCR 图文不一致、低置信度/自报异常 OCR、跨来源合并候选等
   7 类待办，逐条 **✓ 认证 / ？存疑 / 🗑 标记删除 / ↩ 撤回**（删除只动数据库记录、原始文件保留）；
 - **API 配置中心**：集中编辑 embedding / OCR / GitHub 配置（非密钥进 config.json，
   密钥脱敏存 `data/secrets.local.json`），embedding / OCR 均支持连通性测试；
@@ -411,6 +412,7 @@ data/
 ├── graph/                  # Kùzu 图（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）
 ├── assets/                 # 业务来源原始资产（pdf/md/images，不可变，sha256）
 ├── parsed/                 # 解析产物（PDF 表格 JSON、OCR 结果，可重跑；建图时提取表格→错误码）
+│                           # OCR 结果按 sha256 + 引擎指纹幂等，含置信度/来源/异常/可判错签名
 ├── imports/                # 业务数据放置目录（pdf/md/xlsx）
 ├── cache/                  # 跨运行缓存（fork 层 SHA / GitHub releases / requirements 兜底；不可变对象复用，防限流与重复下载）
 ├── review.sqlite3          # 审核工作台队列（认证/存疑/删除）
@@ -429,7 +431,7 @@ data/
 采集/导入层
    ├─ GitHub REST + GraphQL（issues/PRs/comments/releases）
    ├─ PdfSource / MarkdownSource / ExcelSource（业务来源：资产层 + 解析层；Excel schema-free）
-   └─ ImageSource（签名导向 OCR，provider 可插拔）
+   └─ ImageSource（签名导向 OCR，provider 可插拔；高置信文本注入所属文档正文，低置信进审核队列）
    ▼
 Canonical 规范化（统一中间格式，可重放可重嵌）
    ▼
@@ -548,7 +550,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `code_graph.py` | 代码图谱检索（gh-puller 接入）：MCP Streamable HTTP 客户端 + 熔断器，调用链/数据流/影响面/架构聚类/语义搜索——与 `code_index` 互补不重叠，不可达 503+引导不回退 |
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ 本地密钥文件 + 知识缺口展示 |
-| `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分） |
+| `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分）；`OcrArtifact` 产物按 **sha256 + 引擎指纹**（provider/mode/model/提示词版本）幂等，阈值 `ocr_min_confidence` 不进指纹（调阈值只重判定不重跑 OCR） |
 | `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
 | `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册）/`api_image`（请求期图片 OCR，有 image source 时注册） |
