@@ -150,9 +150,15 @@ def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
     return f"assets/{sub}/{target.name}", sha, True
 
 
+# 解析中间产物（`parsed/*/<asset_id>.extract.json`）的 schema 位：**每次改提取逻辑都要 +1**。
+# 只校验 sha256 是不够的——提取逻辑升级后旧缓存的 sha256 仍然匹配，会**静默沿用旧解析结果**
+# （Word 加内嵌图片时踩过：图片永远不生效且不报错）。改这个常量即让旧缓存整体失效并重解析。
+_PDF_EXTRACT_SCHEMA = 1
+_WORD_EXTRACT_SCHEMA = 2      # 1=纯文本/表格；2=+内嵌图片清单（占位 + 资产）
+
+
 class BaseSource(ABC):
     type: str = "base"
-
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
         self.cfg = cfg
@@ -678,7 +684,10 @@ class PdfSource(BaseSource):
         if cache.exists():
             try:
                 data = json.loads(cache.read_text(encoding="utf-8"))
-                if data.get("sha256") == sha:
+                # schema 位必须校验：`_extract_pdf` 升级后旧缓存的 sha256 仍然匹配，
+                # 不校验就会**静默沿用旧解析结果**（例如新增的表格提取永远不生效）
+                if (data.get("sha256") == sha
+                        and data.get("schema") == _PDF_EXTRACT_SCHEMA):
                     return self._doc_from_extract(p, sha, asset_id, data, registry), True
             except (OSError, ValueError):
                 pass  # 缓存损坏 → 重新解析
@@ -692,7 +701,7 @@ class PdfSource(BaseSource):
     def _extract_pdf(self, p: Path):
         """PyMuPDF 逐页提取（慢，结果可缓存）：文字层 → Markdown 正文 + 结构化表格。
 
-        返回 {"sha256", "asset_id", "pages", "first_text", "body", "tables"}；
+        返回 {"schema", "sha256", "asset_id", "pages", "first_text", "body", "tables"}；
         加密/无文字层返回 None（调用方跳过）。
         """
         import pymupdf
@@ -727,6 +736,7 @@ class PdfSource(BaseSource):
                 print(f"[sources:{self.id}] 跳过无文字层 PDF（可能为扫描件，待 OCR）: {p.name}")
                 return None
             return {
+                "schema": _PDF_EXTRACT_SCHEMA,
                 "sha256": _sha256(p),
                 "asset_id": _sha256(p)[:16],
                 "pages": pdf.page_count,
@@ -797,16 +807,101 @@ def _table_to_markdown(rows: list[list]) -> str:
 
 # ---------------- Word（.docx）解析辅助 ----------------
 
+# WordprocessingML 主命名空间：直接比 URI 而不是每次调 qn()（这些比较在逐段落热路径上）
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+# "透明"容器：本身不产出文字，但里面的 run 是正文（内容控件/修订插入/智能标记）
+_WORD_TRANSPARENT = frozenset({_W + "ins", _W + "smartTag", _W + "sdt", _W + "sdtContent"})
+# OLE2/CFB 容器魔数：**旧版 .doc 与加密/受 IRM 保护的 docx 是同一个格式**，靠它区分
+_CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+# 绝对路径（盘符 + UNC）：仅用于日志脱敏
+_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)[^\s'\"]+")
+
 # 标题样式名：英文 "Heading 1" / 中文 "标题 1" / 繁体 "標題 1"；style_id 通常恒为 "Heading1"
 _WORD_HEADING_RE = re.compile(r"^(?:heading|标题|標題)\s*([1-6])$", re.IGNORECASE)
-_WORD_TITLE_STYLES = {"title", "标题", "標題"}
+# 表驱动兜底：这些样式名里没有"数字"可正则提取，且各语言界面写法不同
+_WORD_HEADING_NAMES = {
+    "title": 1, "标题": 1, "標題": 1,
+    "subtitle": 2, "副标题": 2, "副標題": 2,
+}
+
+
+def _word_hyperlink_url(par, rid: str) -> str:
+    """超链接 rId → 目标 URL；**只认 http/https**。
+
+    内部书签（`w:anchor`）没有 URL；`file://` / UNC（`\\\\server\\share`）等目标是**内部路径**，
+    正是"正文不含服务器路径"要挡的东西，一律返回空（只留链接文字）。
+    """
+    if not rid:
+        return ""
+    try:
+        rel = par.part.rels.get(rid)
+    except Exception:
+        return ""
+    if rel is None or not getattr(rel, "is_external", False):
+        return ""
+    target = str(getattr(rel, "target_ref", "") or "")
+    return target if target.startswith(("http://", "https://")) else ""
+
+
+def _word_inline_text(el, par, *, link: bool = True) -> str:
+    """元素内联文字：run 取文字，超链接渲染成 `[text](url)`，透明容器递归。
+
+    `Paragraph.text` 会把 `w:hyperlink` 里的文字并进来但**丢掉链接地址**——业务文档里
+    「见 XX 手册」这类链接是重要线索，丢了就只剩一个裸标题。
+    只下潜到透明容器，**不进 `w:drawing`/`w:pict`**——文本框文字仍不提取（见类文档边界）。
+    """
+    from docx.text.run import Run
+
+    out: list[str] = []
+    for child in el.iterchildren():
+        if not isinstance(child.tag, str):     # 注释/PI
+            continue
+        tag = child.tag
+        if tag == _W + "r":
+            out.append(Run(child, par).text)
+        elif tag == _W + "hyperlink":
+            text = _word_inline_text(child, par, link=False)
+            url = _word_hyperlink_url(par, child.get(_R + "id")) if link else ""
+            out.append(f"[{text}]({url})" if (link and url and text) else text)
+        elif tag in _WORD_TRANSPARENT:
+            out.append(_word_inline_text(child, par, link=link))
+    return "".join(out)
+
+
+def _word_paragraph_text(par) -> str:
+    """段落文字（含超链接 URL）：`[text](url)` / 内部书签只留文字。"""
+    return _word_inline_text(par._p, par)
+
+
+def _word_outline_level(par) -> int:
+    """`w:outlineLvl` → 标题层级（0-5 → 1-6；其余 → 0）。
+
+    **自定义/本地化标题样式的兜底**：样式名可以任意（"我的章节"），但大纲级别存在
+    `w:outlineLvl`（0 基）里——Word 的导航窗格与自动目录就是靠它。先看段落直接格式，
+    再看样式定义（内置 Heading N 的级别写在样式里，段落元素上没有）。
+    """
+    holders = (getattr(par, "_p", None),
+               getattr(getattr(par, "style", None), "element", None))
+    for holder in holders:
+        pPr = getattr(holder, "pPr", None) if holder is not None else None
+        lvl = getattr(getattr(pPr, "outlineLvl", None), "val", None) if pPr is not None else None
+        if lvl is None:
+            continue
+        try:
+            n = int(lvl)
+        except (TypeError, ValueError):
+            continue
+        return n + 1 if 0 <= n <= 5 else 0
+    return 0
 
 
 def _word_heading_level(par) -> int:
-    """段落标题层级：Heading 1-6 / "标题 1" → 1-6；Title / "标题" → 1；非标题 → 0。
+    """段落标题层级：Heading 1-6 / "标题 1" → 1-6；Title/Subtitle → 1/2；非标题 → 0。
 
-    中英界面下样式名不同（"Heading 1" vs "标题 1"），但 `style_id` 一般不受界面语言影响，
-    两者都匹配、任一命中即可。
+    三重信号（依次退化）：① 样式名/style_id 里的 `heading|标题|標題` + 数字（最精确）；
+    ② 名字表（Title/Subtitle 这类没有数字的）；③ `w:outlineLvl`（覆盖用户自定义的
+    标题样式名，如"我的章节"）。
     """
     st = getattr(par, "style", None)
     name = (getattr(st, "name", "") or "").strip()
@@ -815,7 +910,34 @@ def _word_heading_level(par) -> int:
         m = _WORD_HEADING_RE.match(cand)
         if m:
             return int(m.group(1))
-    return 1 if name.lower() in _WORD_TITLE_STYLES else 0
+    lvl = _WORD_HEADING_NAMES.get(name.lower())
+    if lvl:
+        return lvl
+    return _word_outline_level(par)
+
+
+def _redact_paths(text: str) -> str:
+    """日志里不出现服务器绝对路径。
+
+    异常文本常常自带绝对路径（`Package not found at 'C:\\...\\加密案例.docx'`），而日志会被
+    贴进工单/群里——与"正文不含服务器路径"同一条约束。文件名本身保留（其余日志也这么打）。
+    """
+    return _PATH_RE.sub("<路径>", text)
+
+
+def _word_bad_file_reason(p: Path) -> str:
+    """打不开的 Word 文件的**可操作**原因（只说"解析失败"用户不知道下一步做什么）。"""
+    try:
+        with p.open("rb") as f:
+            head = f.read(8)
+    except OSError:
+        return "文件无法读取（可能被占用/权限不足）"
+    if head.startswith(_CFB_MAGIC):
+        return ("这是 OLE2/CFB 容器——**旧版 .doc 或加密/受保护的 docx**（同一格式，无法区分）；"
+                "请在 Word 里另存为未加密的 .docx")
+    if not head.startswith(b"PK"):
+        return "不是 OOXML 包（.docx 本质是 zip）；请确认文件类型"
+    return "OOXML 结构损坏或缺少必要部件（zip 可打开但 Word 部件不全）"
 
 
 def _word_list_prefix(par) -> str:
@@ -838,16 +960,24 @@ def _iter_docx_blocks(document):
 
     python-docx 的 `.paragraphs` 与 `.tables` 是两个互不相干的列表，各自都不保留混排顺序——
     直接用会把表格全挪到正文末尾，章节归属也就错了（表格落在错误的 section 下）。
+    块级内容控件（`w:sdt`，模板/目录常用）会包住整段甚至整表，也要下潜，否则内容整块丢失。
     """
     from docx.oxml.ns import qn
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
-    for child in document.element.body.iterchildren():
-        if child.tag == qn("w:p"):
-            yield Paragraph(child, document)
-        elif child.tag == qn("w:tbl"):
-            yield Table(child, document)
+    def _walk(parent):
+        for child in parent.iterchildren():
+            if child.tag == qn("w:p"):
+                yield Paragraph(child, document)
+            elif child.tag == qn("w:tbl"):
+                yield Table(child, document)
+            elif child.tag == qn("w:sdt"):
+                content = child.find(qn("w:sdtContent"))
+                if content is not None:
+                    yield from _walk(content)
+
+    yield from _walk(document.element.body)
 
 
 # ---------------- Word 内嵌图片（OOXML 包内 media part） ----------------
@@ -866,10 +996,6 @@ _CT_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/g
            "image/webp": "webp", "image/bmp": "bmp", "image/x-ms-bmp": "bmp",
            "image/tiff": "tiff", "image/x-emf": "emf", "image/emf": "emf",
            "image/x-wmf": "wmf", "image/wmf": "wmf", "image/svg+xml": "svg"}
-# 解析中间产物 schema 位：1=纯文本/表格；2=+内嵌图片清单（占位 + 资产）。
-# **必须校验**——`_extract_docx` 升级后旧缓存仍带旧 sha256，不校验的话图片永远不会生效，
-# 而且现象是"静默无图"（比报错难查得多）。
-_WORD_EXTRACT_SCHEMA = 2
 
 
 def _word_walk(el):
@@ -1258,6 +1384,8 @@ class WordSource(BaseSource):
 
     type = "word"
     _SUFFIXES = ("*.docx", "*.docm")
+    # 本来源**不支持**、但用户很可能放进来的格式：只用于给出指向性提示
+    _LEGACY_SUFFIXES = ("*.doc", "*.rtf", "*.wps", "*.odt", "*.pages", "*.pdf")
 
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
@@ -1283,6 +1411,23 @@ class WordSource(BaseSource):
         if p.is_file() and p.suffix.lower() in (".docx", ".docm"):
             return [p]
         return []
+
+    def _legacy_hint(self) -> str:
+        """目录里只有本来源不支持的格式时给出**指向性**提示。
+
+        否则只报"无 Word 文件"，用户不知道该改什么（最常见就是丢了一堆 .doc 进来）。
+        """
+        if not self.import_dir.is_dir():
+            return ""
+        found: list[str] = []
+        for pat in self._LEGACY_SUFFIXES:
+            found.extend(sorted(p.name for p in self.import_dir.rglob(pat)))
+        if not found:
+            return ""
+        shown = ", ".join(found[:5]) + (" …" if len(found) > 5 else "")
+        return (f"；另检测到 {len(found)} 个**非 OOXML** 文件（{shown}）——本来源只认 "
+                f".docx/.docm，旧版 .doc / RTF / WPS / ODT 请先在 Word 里另存为 .docx"
+                f"（.pdf 请改用 pdf 来源）")
 
     # ---------- 采集 ----------
 
@@ -1329,6 +1474,9 @@ class WordSource(BaseSource):
                   f"副本 {self._assets_dir()}（按版本族收敛，每族只取最新一份）；"
                   f"如需按目录树消歧/保留原始组织方式，请恢复 imports 目录", flush=True)
         if not files:
+            # 提示只在 canonicalize 打一次（pull 也会打"无 Word 文件"，两处都带上就重复了）
+            print(f"[sources:{self.id}] 导入路径无 Word 文件: {self.import_dir}"
+                  f"{self._legacy_hint()}", flush=True)
             return docs
         # 同名 stem 冲突检测：word:<stem> 会互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）
         stem_counts: dict[str, int] = {}
@@ -1437,8 +1585,9 @@ class WordSource(BaseSource):
         try:
             document = docx.Document(str(p))
         except Exception as e:
-            print(f"[sources:{self.id}] 跳过无法解析的 Word 文件 {p.name}: {e}"
-                  f"（仅支持 OOXML 的 .docx/.docm；旧版 .doc 请先另存为 .docx）")
+            print(f"[sources:{self.id}] 跳过无法解析的 Word 文件 {p.name}："
+                  f"{_word_bad_file_reason(p)}"
+                  f"（{type(e).__name__}: {_redact_paths(str(e))}）")
             return None
         parts: list[str] = []
         tables_data: list[dict] = []
@@ -1457,7 +1606,8 @@ class WordSource(BaseSource):
 
         for block in _iter_docx_blocks(document):
             if hasattr(block, "rows"):  # Table
-                rows = [[c.text.strip() for c in row.cells] for row in block.rows]
+                rows = [["\n".join(_word_paragraph_text(par) for par in c.paragraphs).strip()
+                         for c in row.cells] for row in block.rows]
                 rows = [r for r in rows if any(r)]      # 全空行丢掉（合并单元格常见）
                 if rows:
                     tables_data.append({"index": len(tables_data), "rows": rows})
@@ -1468,7 +1618,7 @@ class WordSource(BaseSource):
                 # 扫表格 XML（而非逐 cell.paragraphs）——合并单元格会让同一段落被重复枚举。
                 _add_images(_word_images_in(block._tbl))
                 continue
-            text = (block.text or "").strip()
+            text = _word_paragraph_text(block).strip()
             refs = _word_images_in(block._p)
             if not text and not refs:
                 continue

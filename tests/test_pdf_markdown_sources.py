@@ -260,6 +260,34 @@ class TestPdfSource(unittest.TestCase):
         # 缓存已重建为合法 JSON
         self.assertIn("body", json.loads(cache.read_text(encoding="utf-8")))
 
+    def test_parse_cache_stale_schema_reparses(self):
+        """缓存 schema 位不符 → 重新解析。
+
+        只校验 sha256 是不够的：`_extract_pdf` 升级（例如新增表格提取）后旧缓存的 sha256
+        仍然匹配，会**静默沿用旧解析结果**。测试手段：把缓存里的 schema 改掉，
+        再断言 pymupdf.open 被重新调用（缓存命中时不会）。
+        """
+        import unittest.mock as mock
+
+        import pymupdf
+
+        from vllm_kb.sources import _PDF_EXTRACT_SCHEMA
+
+        self.src.pull()
+        self.src.canonicalize()
+        cache = list((self.root / "data" / "parsed" / "pdf").glob("*.extract.json"))[0]
+        stale = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual(stale.get("schema"), _PDF_EXTRACT_SCHEMA, "缓存未写 schema 位")
+        stale["schema"] = _PDF_EXTRACT_SCHEMA - 1        # 冒充上一代提取逻辑的缓存
+        cache.write_text(json.dumps(stale, ensure_ascii=False), encoding="utf-8")
+        with mock.patch("pymupdf.open", wraps=pymupdf.open) as m:
+            docs = self.src.canonicalize()
+        self.assertEqual(m.call_count, 1, "schema 不符应重新解析")
+        self.assertEqual(len(docs), 1)
+        # 重解析后缓存写回当前 schema（下次才能真正命中）
+        self.assertEqual(json.loads(cache.read_text(encoding="utf-8"))["schema"],
+                         _PDF_EXTRACT_SCHEMA)
+
     def test_tables_json_written(self):
         self.src.pull()
         self.src.canonicalize()

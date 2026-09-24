@@ -810,5 +810,269 @@ class TestWordExtractCacheSchema(_WordCase):
         self.assertIn("[图片]", docs[0].body)
 
 
+def _add_hyperlink(par, text: str, url: str = "", *, anchor: str = "") -> None:
+    """给段落加超链接（python-docx 没有 add_hyperlink，手搓）。
+
+    url 非空 → 建**外部关系**（`w:hyperlink/@r:id`）；anchor 非空 → 内部书签（`w:anchor`，无 URL）。
+    """
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    h = OxmlElement("w:hyperlink")
+    if anchor:
+        h.set(qn("w:anchor"), anchor)
+    else:
+        h.set(qn("r:id"), par.part.relate_to(url, RT.HYPERLINK, is_external=True))
+    r = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = text
+    r.append(t)
+    h.append(r)
+    par._p.append(h)
+
+
+def _add_style_with_level(d, name: str, level: int, *, style_id: str = "") -> object:
+    """建一个带 `w:outlineLvl` 的段落样式（模拟用户自定义/本地化的标题样式）。
+
+    `style_id` 可覆盖——用来隔离"靠样式名匹配"与"靠大纲级别匹配"两条路径。
+    """
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls, qn
+
+    st = d.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+    if style_id:
+        st.element.set(qn("w:styleId"), style_id)
+    st.element.append(parse_xml(
+        f'<w:pPr {nsdecls("w")}><w:outlineLvl w:val="{level - 1}"/></w:pPr>'))
+    return st
+
+
+class TestWordHyperlinks(_WordCase):
+    """超链接 → `[text](url)`：`Paragraph.text` 会并进链接文字但**丢掉地址**。"""
+
+    def _doc_with(self, build) -> Path:
+        import docx
+
+        p = self.import_dir / "链接.docx"
+        d = docx.Document()
+        d.add_heading("链接案例", level=1)
+        build(d)
+        d.save(str(p))
+        return p
+
+    def test_external_hyperlink_rendered_with_url(self):
+        def build(d):
+            par = d.add_paragraph("见 ")
+            _add_hyperlink(par, "昇腾社区文档", "https://www.hiascend.com/document")
+            par.add_run(" 的说明")
+
+        self._doc_with(build)
+        body = self._docs()[0].body
+        self.assertIn("[昇腾社区文档](https://www.hiascend.com/document)", body)
+        self.assertIn("见 ", body)
+        self.assertIn(" 的说明", body)
+
+    def test_internal_anchor_text_only(self):
+        """内部书签（`w:anchor`）没有 URL → 只留文字，不能渲染成空链接 `[x]()`。"""
+        self._doc_with(lambda d: _add_hyperlink(d.add_paragraph("跳转："), "见第 3 章",
+                                                anchor="chap3"))
+        body = self._docs()[0].body
+        self.assertIn("见第 3 章", body)
+        self.assertNotIn("见第 3 章]", body)
+        self.assertNotIn("]()", body)
+
+    def test_non_http_target_not_written_to_body(self):
+        """**路径安全**：file:// / UNC 等非 http(s) 目标只留链接文字，地址不写进正文。"""
+        self._doc_with(lambda d: _add_hyperlink(
+            d.add_paragraph("附件："), "内部附件", "file:///D:/internal/secret/plan.docx"))
+        body = self._docs()[0].body
+        self.assertIn("内部附件", body)
+        self.assertNotIn("secret", body)
+        self.assertNotIn("file://", body)
+        self.assertNotIn("D:/", body)
+
+    def test_hyperlink_in_table_cell(self):
+        """表格单元格里的超链接也要渲染（否则表内链接地址同样丢失）。"""
+        def build(d):
+            t = d.add_table(rows=1, cols=2)
+            t.cell(0, 0).text = "参考"
+            _add_hyperlink(t.cell(0, 1).paragraphs[0], "手册", "https://example.com/manual")
+
+        self._doc_with(build)
+        body = self._docs()[0].body
+        self.assertIn("[手册](https://example.com/manual)", body)
+
+    def test_hyperlink_inside_inserted_run(self):
+        """`w:ins`（修订插入）是透明容器：里面的文字（含超链接）也是正文。"""
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+
+        def build(d):
+            par = d.add_paragraph("开始 ")
+            par._p.append(parse_xml(
+                f'<w:ins {nsdecls("w")} w:id="1" w:author="a" w:date="2026-01-01T00:00:00Z">'
+                '<w:r><w:t>插入的正文</w:t></w:r></w:ins>'))
+
+        self._doc_with(build)
+        self.assertIn("插入的正文", self._docs()[0].body)
+
+
+class TestWordHeadingStyles(unittest.TestCase):
+    """标题识别三重信号：样式名/ID 正则 → 名字表 → `w:outlineLvl`。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_chinese_style_name_matched_by_name(self):
+        """中文界面样式名「标题 3」——**故意把 styleId 改成中性值**，隔离出"靠名字匹配"。"""
+        import docx
+
+        from vllm_kb.sources import _word_heading_level
+
+        d = docx.Document()
+        st = d.styles.add_style("标题 3", 1)          # 1 = PARAGRAPH
+        st.element.set(__import__("docx").oxml.ns.qn("w:styleId"), "Neutral3")
+        par = d.add_paragraph("三级标题", style="标题 3")
+        self.assertEqual(par.style.style_id, "Neutral3")
+        self.assertEqual(_word_heading_level(par), 3)
+
+    def test_custom_style_name_falls_back_to_outline_level(self):
+        """自定义样式名（"我的章节"）靠 `w:outlineLvl` 识别——名字正则救不了。"""
+        import docx
+
+        from vllm_kb.sources import _word_heading_level
+
+        d = docx.Document()
+        _add_style_with_level(d, "我的章节", 2)
+        par = d.add_paragraph("自定义章节", style="我的章节")
+        self.assertEqual(_word_heading_level(par), 2)
+
+    def test_paragraph_direct_outline_level(self):
+        """段落直接格式上的 `w:outlineLvl`（样式名完全中性）也要认。"""
+        import docx
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+
+        from vllm_kb.sources import _word_heading_level
+
+        d = docx.Document()
+        par = d.add_paragraph("直接格式标题")
+        par._p.get_or_add_pPr().append(
+            parse_xml(f'<w:outlineLvl {nsdecls("w")} w:val="0"/>'))
+        self.assertEqual(_word_heading_level(par), 1)
+
+    def test_outline_level_body_text_not_heading(self):
+        """`w:outlineLvl val=9`（正文级）不是标题。"""
+        import docx
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+
+        from vllm_kb.sources import _word_heading_level
+
+        d = docx.Document()
+        par = d.add_paragraph("正文")
+        par._p.get_or_add_pPr().append(
+            parse_xml(f'<w:outlineLvl {nsdecls("w")} w:val="9"/>'))
+        self.assertEqual(_word_heading_level(par), 0)
+
+    def test_subtitle_is_level_2(self):
+        import docx
+
+        from vllm_kb.sources import _word_heading_level
+
+        d = docx.Document()
+        # 默认模板自带 Subtitle 样式（add_style 会报"已存在"）
+        self.assertEqual(_word_heading_level(d.add_paragraph("副标题", style="Subtitle")), 2)
+
+    def test_list_style_not_mistaken_for_heading(self):
+        """列表样式不能被大纲级别兜底误判成标题（否则列表项会变成章节）。"""
+        import docx
+
+        from vllm_kb.sources import _word_heading_level, _word_list_prefix
+
+        d = docx.Document()
+        par = d.add_paragraph("列表项", style="List Bullet")
+        self.assertEqual(_word_heading_level(par), 0)
+        self.assertEqual(_word_list_prefix(par), "- ")
+
+    def test_block_level_sdt_unwrapped(self):
+        """块级内容控件（`w:sdt`）包住的段落/表格要下潜取出，否则整块内容丢失。"""
+        import docx
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+
+        from vllm_kb.sources import _iter_docx_blocks
+
+        d = docx.Document()
+        d.add_paragraph("前")
+        # 必须插在 w:sectPr 之前：body.append 会落到节属性之后，顺序断言就失去意义
+        d.element.body.sectPr.addprevious(parse_xml(
+            f'<w:sdt {nsdecls("w")}><w:sdtContent>'
+            '<w:p><w:r><w:t>控件里的段落</w:t></w:r></w:p>'
+            '</w:sdtContent></w:sdt>'))
+        d.add_paragraph("后")
+        texts = [b.text if not hasattr(b, "rows") else "table" for b in _iter_docx_blocks(d)]
+        self.assertEqual(texts, ["前", "控件里的段落", "后"])
+
+
+class TestWordBadFiles(_WordCase):
+    """旧格式/加密/损坏文件：跳过原因要**可操作**（否则用户不知道下一步做什么）。"""
+
+    def test_legacy_files_get_targeted_hint(self):
+        """目录里只有 .doc → 明确提示另存为 .docx，而不是干巴巴一句"无 Word 文件"。"""
+        from vllm_kb.sources import _CFB_MAGIC
+
+        (self.import_dir / "旧案例.doc").write_bytes(_CFB_MAGIC + b"\x00" * 64)
+        (self.import_dir / "说明.rtf").write_text("{\\rtf1}", encoding="utf-8")
+        src = self._src()
+        hint = src._legacy_hint()
+        self.assertIn("旧案例.doc", hint)
+        self.assertIn("说明.rtf", hint)
+        self.assertIn("另存为 .docx", hint)
+        # 直接调 canonicalize：`_docs()` 会自动补一个默认 docx，掩盖"无 Word 文件"的场景
+        src.pull()
+        self.assertEqual(src.canonicalize(), [])
+
+    def test_no_legacy_hint_when_dir_empty(self):
+        self.assertEqual(self._src()._legacy_hint(), "")
+
+    def test_cfb_docx_reports_encrypted_or_legacy(self):
+        """CFB 容器伪装成 .docx（= 加密/受保护 docx，或改了扩展名的 .doc）要说明白。"""
+        from vllm_kb.sources import _CFB_MAGIC, _word_bad_file_reason
+
+        p = self.import_dir / "加密.docx"
+        p.write_bytes(_CFB_MAGIC + b"\x00" * 64)
+        reason = _word_bad_file_reason(p)
+        self.assertIn("加密", reason)
+        self.assertIn("另存为", reason)
+        self.assertIsNone(self._src()._extract_docx(p))
+
+    def test_non_zip_reports_not_ooxml(self):
+        from vllm_kb.sources import _word_bad_file_reason
+
+        p = self.import_dir / "伪装.docx"
+        p.write_bytes(b"just plain text, not a zip")
+        self.assertIn("不是 OOXML", _word_bad_file_reason(p))
+
+    def test_broken_zip_reports_structure_damage(self):
+        from vllm_kb.sources import _word_bad_file_reason
+
+        p = self.import_dir / "损坏.docx"
+        p.write_bytes(b"PK\x03\x04" + b"\x00" * 64)     # zip 魔数但内容无效
+        self.assertIn("OOXML 结构损坏", _word_bad_file_reason(p))
+        self.assertIsNone(self._src()._extract_docx(p))
+
+    def test_unreadable_file_reports_io(self):
+        from vllm_kb.sources import _word_bad_file_reason
+
+        self.assertIn("无法读取", _word_bad_file_reason(self.import_dir / "不存在.docx"))
+
+
 if __name__ == "__main__":
     unittest.main()

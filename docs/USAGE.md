@@ -394,6 +394,9 @@ data/raw/canonical.jsonl                 # canonical 追加（verification/tags 
 （241 页手册约 7s/篇），解析中间产物（文字层 + 表格 + 页数）按资产 sha256 缓存到
 `data/parsed/pdf/<asset_id>.extract.json`——**资产未变时直接复用缓存**（进度行标注
 "缓存命中"，毫秒级），仅标签/元数据提取每次重算（词典/提取规则升级**无需清缓存**即生效）。
+缓存里带 **schema 位**（`sources._PDF_EXTRACT_SCHEMA`）：`_extract_pdf` 的**提取逻辑**升级
+（例如新增表格提取）时把这个常量 +1，旧缓存即整体失效并自动重解析——否则旧缓存的 sha256
+仍然匹配，会**静默沿用旧解析结果**。
 **强制重新解析**（如 PyMuPDF 升级后想重新提取文字层）：删除 `data/parsed/pdf/` 目录即可，
 资产层（`data/assets/`）与 kb 数据不受影响。
 
@@ -609,6 +612,9 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
   正文出现过的图片走 OCR（`data/parsed/images/<asset>.ocr.json` 幂等缓存）——
   **高置信文本注入占位符之后**随正文进 FTS + 向量，低置信/自报异常只留签名线索并进
   「低置信 OCR」审核队列（与 markdown 图片、`ImageSource` **同一套 OCR 缓存与通路**，同图不重复调用）；
+- **超链接**：渲染成 `[文字](url)`（`Paragraph.text` 会把链接文字并进来但**丢掉地址**，
+  业务文档里「见 XX 手册」的链接是重要线索）。**只认 http/https**：内部书签（`w:anchor`）
+  只留文字；`file://`/UNC 等目标是内部路径，**一律不写进正文**（只留链接文字）；
 - **解析缓存**：`data/parsed/word/{asset_id}.extract.json`（内容寻址）——文件未变时复用提取结果，
   标签/元数据/**OCR 注入**每轮重算（升级提取规则或调 `ocr_min_confidence` 都**无需清缓存**；
   缓存带 schema 位，提取逻辑升级会自动失效旧缓存）；删该目录即强制重解析；
@@ -619,20 +625,28 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - **verification=unverified**：与 markdown/excel **统一路径**——先入库，审核工作台「补标」队列
   人工确认（`verification_pending`）；
 - **脱敏**：默认启用（`config.sanitize.sources` 默认含 `word`），正文原文入库、出口统一脱敏，
-  被脱敏的 IP/路径落 `data/sanitize_log.json`。
+  被脱敏的 IP/路径落 `data/sanitize_log.json`；
+- **标题识别三重信号**：① 样式名/`style_id` 里的 `heading|标题|標題` + 数字（`Heading 1`、
+  「标题 1」、繁体「標題 1」）；② 名字表（`Title`→1、`Subtitle`→2）；③ `w:outlineLvl`
+  （**自定义标题样式名**如「我的章节」只能靠它——Word 导航窗格/自动目录用的就是这个）。
+  块级内容控件（`w:sdt`）会下潜，否则整块内容丢失。
 
 **本版边界**（因此正文不含任何路径）：
 
 - 页眉/页脚/脚注/尾注是**独立部件**（`/word/header1.xml` 等），不在正文遍历范围内 →
   其文字与图片都不提取；
 - 文本框：其**图片**在正文 XML 内（`w:txbxContent`）会被遍历到并产占位，但其**文字**
-  不在 `Paragraph.text` 里（python-docx 只取直接 run）→ 文字不提取（两者不对称，已知）；
+  不在遍历范围内（只下潜"透明"容器：`w:ins`/`w:sdt`/`w:smartTag`，不进 `w:drawing`/
+  `w:pict`）→ 文字不提取（两者不对称，已知）；
 - 表格内图片的占位符统一排在表格之后（塞进单元格会破 Markdown 表格）；
 - 嵌套表格只取外层单元格文本；合并单元格重复文本；
 - **矢量/多页图片**（emf/wmf/svg/tiff）注册资产但**不送 OCR**（引擎不收，白花一次调用）；
 - 孤儿图片（包内有关系、正文未引用）注册资产但不插占位、不 OCR（没有正文落点）；
 - 外链图片（`r:link`，内容不在包里）只留占位，不登记资产（也**不记链接**，避免路径进库）；
-- `.doc`（旧二进制格式）与加密 docx 不支持 → 跳过并提示先另存为 `.docx`。
+- 超链接只渲染 http/https；修订**删除**的文本（`w:del`）不提取（不是可见内容）；
+- `.doc`（旧二进制）/加密 docx / RTF / WPS / ODT 不支持 → 跳过并给出**可操作**原因
+  （CFB 容器会说明"旧版 .doc 或加密 docx，请另存为未加密 .docx"；目录里只有旧格式时
+  会列出文件名并提示转换）。
 
 **验证**：`python -m unittest tests.test_word_source -v`
 
@@ -1317,7 +1331,8 @@ A: Kùzu 图库路径**不能含非 ASCII 字符**（中文、emoji 等）——
 
 A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.extract.json`），
 资产未变时自动复用（进度行标注"缓存命中"）；想强制重新解析（如 PyMuPDF 升级），
-删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。
+删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。缓存带 schema 位——
+**升级提取逻辑**（不只是升 PyMuPDF）时把 `_PDF_EXTRACT_SCHEMA` +1，旧缓存会自动失效重解析。
 
 **Q: 想加自己的故障记录（excel/markdown/word）？**
 
