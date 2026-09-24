@@ -71,10 +71,10 @@ def chunk_doc(
     if not text:
         return []
 
-    # PDF 手册：带章节结构切分；Markdown：按 # 标题切分；其他来源保持原逻辑（section 为空）
+    # PDF 手册：带章节结构切分；Markdown / Word：按 # 标题切分；其他来源保持原逻辑（section 为空）
     if doc.source_type == "doc_pdf":
         return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, _split_sections)
-    if doc.source_type == "doc_markdown":
+    if doc.source_type in ("doc_markdown", "doc_word"):
         return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, _split_markdown_sections)
 
     if len(text) <= max_chunk_chars:

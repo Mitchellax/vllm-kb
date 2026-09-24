@@ -117,6 +117,22 @@ DIRTY_DOCS = [
         tags=["超时排查"],
         extra={"verification": "unverified"},
     ),
+    KbDocument(
+        source_type="doc_word",
+        source_id="word:案例",
+        url="",
+        title="HCCL 超时复盘",
+        body="现场：10.0.0.9 卡住，日志 /home/user/case.log。",
+        tags=["HCCL"],
+        extra={
+            "verification": "unverified",
+            "asset": {"asset_id": "w0rd", "sha256": "w0rd", "format": "word",
+                      "paragraphs": 12, "tables": 2},
+            "quality": {"text_source": "text_layer", "parsed_with": "python-docx"},
+            # 表格 JSON 是服务器相对路径——出口只留数量
+            "structure": {"tables": ["parsed/word/w0rd.tables.json"]},
+        },
+    ),
 ]
 
 
@@ -260,7 +276,7 @@ class TestNoPathLeak(unittest.TestCase):
         self.assertNotIn("doc_id", json.dumps(r))
         # 标签检索只返回该标签的文档
         r2 = self.client.get("/tags/HCCL/docs").json()
-        self.assertEqual({d["doc_id"] for d in r2["docs"]}, {"pdf:guide"})
+        self.assertEqual({d["doc_id"] for d in r2["docs"]}, {"pdf:guide", "word:案例"})
         r3 = self.client.get("/tags/超时排查/docs").json()
         self.assertEqual({d["doc_id"] for d in r3["docs"]}, {"pdf:guide", "md:wiki"})
         for d in r2["docs"] + r3["docs"]:

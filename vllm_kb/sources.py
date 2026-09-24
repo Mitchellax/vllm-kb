@@ -77,18 +77,20 @@ def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
 _VER_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<sha>[0-9a-f]{12})$")
 
 
-def _latest_md_versions(paths: list[Path]) -> list[tuple[Path, str]]:
+def _latest_versions(paths: list[Path]) -> list[tuple[Path, str]]:
     """资产层扁平副本按**版本族**收敛，返回 `[(最新版本的路径, 族名 stem)]`（按路径排序）。
 
     `case.md` 与 `case.<sha12>.md` 是同一篇的不同版本，每族只保留最新（mtime 最大；
     并列时取文件名字典序较大者，保证确定性）的一个。
 
-    `_copy_asset` 在"同名异内容"时写成 `stem.<sha12>.suffix`，所以 `assets/md/` 会累积历史版本
+    `_copy_asset` 在"同名异内容"时写成 `stem.<sha12>.suffix`，所以资产层会累积历史版本
     （原始 `case.md` 永久保留 + 每个不同内容一份）。回退模式若把它们都当文档，会把旧版本
     **复活成独立文档**（源文件删掉后尤其明显，一篇变多篇）。
 
     返回的**族名**（而非带 `.<sha12>` 的文件名）才是文档身份：否则收敛到 sha 副本时
     `source_id` 会从 `md:case` 漂移成 `md:case.<sha12>`，等于换了篇文档（审核状态/标签丢失）。
+
+    后缀无关（按 `(族名, 后缀)` 分组），md/word 等扁平副本层共用。
     """
     fams: dict[tuple[str, str], tuple[float, str, Path, str]] = {}
     for p in paths:
@@ -104,6 +106,32 @@ def _latest_md_versions(paths: list[Path]) -> list[tuple[Path, str]]:
         if cur is None or (cand[0], cand[1]) > (cur[0], cur[1]):
             fams[key] = cand
     return sorted(((v[2], v[3]) for v in fams.values()), key=lambda t: t[0])
+
+
+def _discover_source_files(src: "BaseSource", patterns: tuple[str, ...],
+                           import_dir: Path, assets_dir: Path,
+                           ) -> tuple[list[tuple[Path, bool, str]], bool]:
+    """业务文本来源的文件发现（md / word 共用），返回 `([(路径, 是否来自导入目录, 逻辑 stem)], 是否回退)`。
+
+    - **优先导入目录**：`rglob` 保留操作者的目录树 → 同名不同目录的文件能按相对路径指纹
+      消歧，且编辑源文件不会因资产层累积副本而变成多篇；
+    - 导入目录不存在/扫不到文件 → **回退资产层扁平副本**（`pull()` 的产物），并按版本族
+      收敛（见 `_latest_versions`），逻辑 stem 取族名以防 `source_id` 漂移。
+
+    回退的代价由调用方负责提示（图片相对路径失锚等），本函数只做发现与收敛。
+    """
+    files: list[tuple[Path, bool, str]] = []
+    if import_dir.exists():
+        for pat in patterns:
+            files.extend((p, True, p.stem) for p in sorted(import_dir.rglob(pat)))
+    if files:
+        return files, False
+    if not assets_dir.exists():
+        return [], False
+    cand: list[Path] = []
+    for pat in patterns:
+        cand.extend(sorted(assets_dir.glob(pat)))
+    return [(p, False, base) for p, base in _latest_versions(cand)], True
 
 
 def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
@@ -222,7 +250,7 @@ class BaseSource(ABC):
     # ---------------- 内部数据脱敏（config.sanitize 控制启用范围） ----------------
 
     # 默认启用脱敏的业务来源（github 公开数据不脱敏；PDF 手册默认不启用，config 加 "pdf" 即开）
-    DEFAULT_SANITIZE_SOURCES = ("excel", "markdown")
+    DEFAULT_SANITIZE_SOURCES = ("excel", "markdown", "word")
 
     def sanitize_enabled(self) -> bool:
         """该来源是否启用脱敏（config.sanitize.sources 控制；None=默认业务来源，[]=全关）。"""
@@ -352,18 +380,9 @@ class MarkdownSource(BaseSource):
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
         img_assets: list[tuple] = []  # 图片资产（末尾统一注册到 asset_registry）
-        md_files: list[tuple[Path, bool, str]] = []   # (路径, 是否来自 imports, 逻辑 stem)
-        if self.import_dir.exists():
-            md_files = [(p, True, p.stem) for p in sorted(self.import_dir.rglob("*.md"))
-                        + sorted(self.import_dir.rglob("*.markdown"))]
-        if not md_files:
-            assets = self._assets_dir()
-            if assets.exists():
-                # 扁平副本按版本族收敛（否则历史版本会复活成独立文档）；
-                # 逻辑 stem 取**族名**而非带 `.<sha12>` 的文件名 → source_id 不漂移
-                cand = sorted(assets.glob("*.md")) + sorted(assets.glob("*.markdown"))
-                md_files = [(p, False, base) for p, base in _latest_md_versions(cand)]
-        if md_files and not any(fi for _, fi, _ in md_files):
+        md_files, fallback = _discover_source_files(
+            self, ("*.md", "*.markdown"), self.import_dir, self._assets_dir())
+        if fallback:
             print(f"[sources:{self.id}] ⚠ 导入目录无 md（{self.import_dir}），已回退到资产层副本 "
                   f"{self._assets_dir()}：图片相对路径**已失锚**（assets/md 是扁平副本），"
                   f"只能按文件名到 assets/images 尽力反查，未命中的一律占位"
@@ -776,6 +795,61 @@ def _table_to_markdown(rows: list[list]) -> str:
     return "\n".join(lines)
 
 
+# ---------------- Word（.docx）解析辅助 ----------------
+
+# 标题样式名：英文 "Heading 1" / 中文 "标题 1" / 繁体 "標題 1"；style_id 通常恒为 "Heading1"
+_WORD_HEADING_RE = re.compile(r"^(?:heading|标题|標題)\s*([1-6])$", re.IGNORECASE)
+_WORD_TITLE_STYLES = {"title", "标题", "標題"}
+
+
+def _word_heading_level(par) -> int:
+    """段落标题层级：Heading 1-6 / "标题 1" → 1-6；Title / "标题" → 1；非标题 → 0。
+
+    中英界面下样式名不同（"Heading 1" vs "标题 1"），但 `style_id` 一般不受界面语言影响，
+    两者都匹配、任一命中即可。
+    """
+    st = getattr(par, "style", None)
+    name = (getattr(st, "name", "") or "").strip()
+    sid = (getattr(st, "style_id", "") or "").replace(" ", "").strip()
+    for cand in (name, sid):
+        m = _WORD_HEADING_RE.match(cand)
+        if m:
+            return int(m.group(1))
+    return 1 if name.lower() in _WORD_TITLE_STYLES else 0
+
+
+def _word_list_prefix(par) -> str:
+    """列表项前缀：无序 → `- `；有序 → `1. `（Markdown 自动编号）；非列表 → ``。
+
+    列表可能来自直接编号格式（`pPr/numPr`）或样式名（List Bullet / List Number），两者都看
+    （Word 里用样式而非直接格式建的列表很常见，只看 numPr 会漏）。
+    """
+    name = (getattr(getattr(par, "style", None), "name", "") or "").strip().lower()
+    pPr = getattr(getattr(par, "_p", None), "pPr", None)
+    if not name.startswith("list") and (pPr is None or pPr.numPr is None):
+        return ""
+    if "number" in name or "编号" in name or "数字" in name:
+        return "1. "
+    return "- "
+
+
+def _iter_docx_blocks(document):
+    """按**文档顺序**产出 Paragraph / Table。
+
+    python-docx 的 `.paragraphs` 与 `.tables` 是两个互不相干的列表，各自都不保留混排顺序——
+    直接用会把表格全挪到正文末尾，章节归属也就错了（表格落在错误的 section 下）。
+    """
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    for child in document.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, document)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, document)
+
+
 class ImageSource(BaseSource):
     """图片证据 OCR 来源：对 data/assets/images/ 未 OCR 的图片做**签名导向 OCR**。
 
@@ -1047,12 +1121,297 @@ class ExcelSource(BaseSource):
         return docs
 
 
+class WordSource(BaseSource):
+    """Word 文档来源（案例 / 故障复盘 / 操作记录，`.docx` / `.docm`）。
+
+    配置示例：
+        {"id": "cases", "type": "word", "path": "data/imports/word", "enabled": true}
+
+    - pull()：扫描配置 path（文件或目录）下 `*.docx`/`*.docm`，复制到 `data/assets/word/`
+      （不可变层，sha256）；
+    - canonicalize()：python-docx 按**文档顺序**单遍解析 → Markdown 全文：
+      * 标题样式（Heading 1-6 / 中文"标题 1" / Title）→ `#`~`######`。这是相对 PDF 的实质增益：
+        分块直接复用 `_split_markdown_sections`，chunk 带 `section`（命中正文能看到所属章节）；
+      * 列表样式（List Bullet / List Number，或直接编号格式）→ `- ` / `1. `，避免条目粘成一段
+        （粘成一段会让 FTS 命中粒度变差）；
+      * 表格 → Markdown 表格拼入正文（表内错误码/命令可被 FTS 检索），另存
+        `data/parsed/word/{asset_id}.tables.json` 供结构化消费（图/查询）；
+    - 解析中间产物按 asset_id（内容寻址）缓存到 `parsed/word/{asset_id}.extract.json`，与 PDF 同构：
+      耗时提取复用缓存，标签/元数据每次重算（升级提取规则**无需清缓存**）；
+    - verification=unverified（与 markdown/excel **统一路径**：人工文档先入库，审核工作台补标）；
+    - 与 markdown 同构：**优先读导入目录**（保留目录树 → 同名不同目录可消歧、编辑源文件不会
+      因资产层累积副本而变成多篇），导入目录扫不到时回退资产层扁平副本并按版本族收敛。
+
+    **本版边界**（因此正文不含任何路径）：页眉/页脚/脚注/尾注/文本框不提取（python-docx
+    无原生 API，需手撸 XML）；嵌套表格只取外层单元格文本；内嵌图片留待后续版本；
+    `.doc`（旧二进制格式）与加密 docx 不支持 → 明确跳过并提示另存为 `.docx`。
+    """
+
+    type = "word"
+    _SUFFIXES = ("*.docx", "*.docm")
+
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        super().__init__(cfg, project_root, app_cfg=app_cfg)
+        self.import_dir = self.resolve(self.cfg.get("path", f"data/imports/{self.id}"))
+
+    # ---------- 布局 ----------
+
+    def _assets_dir(self) -> Path:
+        return self.resolve("data/assets/word")
+
+    def _parsed_dir(self) -> Path:
+        return self.resolve("data/parsed/word")
+
+    def _word_files(self) -> list[Path]:
+        """导入路径下的 Word 文件（path 可为文件或目录）。"""
+        p = self.import_dir
+        if p.is_dir():
+            out: list[Path] = []
+            for pat in self._SUFFIXES:
+                out.extend(sorted(p.rglob(pat)))
+            return out
+        if p.is_file() and p.suffix.lower() in (".docx", ".docm"):
+            return [p]
+        return []
+
+    # ---------- 采集 ----------
+
+    def pull(self, max_issues: Optional[int] = None) -> int:
+        """扫描导入路径，把 Word 文件复制到资产层（幂等）。返回新增条数。"""
+        files = self._word_files()
+        if not files:
+            print(f"[sources:{self.id}] 导入路径无 Word 文件: {self.import_dir}")
+            return 0
+        added = 0
+        registered: list[tuple] = []
+        for f in files:
+            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"), "word")
+            registered.append(_asset_entry(rel, sha, "doc_word", self.resolve(rel)))
+            if copied:
+                added += 1
+        self._register_asset_mappings(registered)
+        print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 word）")
+        return added
+
+    # ---------- 解析（可重跑：优先读导入目录） ----------
+
+    def canonicalize(self) -> list[KbDocument]:
+        """解析 Word → KbDocument（每篇一个，body=Markdown 全文，标题层级保留为 `#`）。
+
+        **后置脱敏**：body 以**原文入库**（原文检索）；仅按 config.sanitize 扫描会被脱敏的
+        IP/路径落盘 sanitize_log.json 供维护白名单（出口脱敏由 serve_api 返回时统一做）。
+        """
+        try:
+            import docx  # noqa: F401  （仅探测可用性，实际解析在 _extract_docx）
+        except ImportError as e:
+            print(f"[sources:{self.id}] 未安装 python-docx：pip install python-docx（{e}）")
+            return []
+        from .sanitize import collect_sanitize_hits
+
+        docs: list[KbDocument] = []
+        registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
+        sanitize_on, keep_paths, keep_ips = self.sanitize_params()
+        collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
+        files, fallback = _discover_source_files(
+            self, self._SUFFIXES, self.import_dir, self._assets_dir())
+        if fallback:
+            print(f"[sources:{self.id}] ⚠ 导入目录无 Word 文件（{self.import_dir}），已回退到资产层"
+                  f"副本 {self._assets_dir()}（按版本族收敛，每族只取最新一份）；"
+                  f"如需按目录树消歧/保留原始组织方式，请恢复 imports 目录", flush=True)
+        if not files:
+            return docs
+        # 同名 stem 冲突检测：word:<stem> 会互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）
+        stem_counts: dict[str, int] = {}
+        for _p, _fi, stem in files:
+            stem_counts[stem] = stem_counts.get(stem, 0) + 1
+        dup_stems = {s for s, n in stem_counts.items() if n > 1}
+        if dup_stems:
+            shown = ", ".join(sorted(dup_stems)[:5]) + (" …" if len(dup_stems) > 5 else "")
+            print(f"[sources:{self.id}] ⚠ 检测到 {len(dup_stems)} 组同名 Word（{shown}）："
+                  f"已用相对路径指纹消歧为 word:<stem>--<sha8>，避免互相覆盖", flush=True)
+        parsed_dir = self._parsed_dir()
+        parsed_dir.mkdir(parents=True, exist_ok=True)
+        total = len(files)
+        start_ts = time.time()
+        print(f"[sources:{self.id}] 解析 {total} 个 Word …", flush=True)
+        for i, (p, from_imports, stem) in enumerate(files, 1):
+            t0 = time.time()
+            try:
+                parsed, cached = self._parse_docx(p, parsed_dir)
+            except Exception as e:
+                print(f"[sources:{self.id}] [{i}/{total}] 解析失败 {p.name}: {e}（跳过）", flush=True)
+                continue
+            if parsed is None:
+                continue
+            sha = _sha256(p)
+            doc = self._doc_from_extract(
+                p, sha, sha[:16], parsed, registry,
+                sid=self._sid_for(p, stem, dup_stems, from_imports))
+            if sanitize_on:
+                ips, paths = collect_sanitize_hits(doc.body, keep_paths, keep_ips)
+                if ips:
+                    collector.setdefault("ips", set()).update(ips)
+                if paths:
+                    collector.setdefault("paths", set()).update(paths)
+            docs.append(doc)
+            cache_tag = "，缓存命中" if cached else ""
+            print(f"[sources:{self.id}] [{i}/{total}] 解析完成 {p.name}"
+                  f"（{parsed.get('paragraphs', '?')} 段 / {parsed.get('tables', 0)} 表，"
+                  f"{time.time() - t0:.1f}s{cache_tag}）", flush=True)
+        print(f"[sources:{self.id}] 解析完成：成功 {len(docs)}/{total}（耗时 "
+              f"{time.time() - start_ts:.0f}s）", flush=True)
+        self.save_sanitize_log(collector)
+        return docs
+
+    def _sid_for(self, p: Path, stem: str, dup_stems: set[str], from_imports: bool) -> str:
+        """文档身份 `word:<stem>`；同名 stem 加相对路径指纹消歧（默认不动 → 存量 id 不漂移）。"""
+        if stem not in dup_stems:
+            return f"word:{stem}"
+        base_dir = self.import_dir if from_imports else self._assets_dir()
+        try:
+            rel_key = p.relative_to(base_dir).as_posix()
+        except ValueError:
+            rel_key = p.name
+        return f"word:{stem}--{_path_tag(rel_key)}"
+
+    def _parse_docx(self, p: Path, parsed_dir: Path):
+        """解析单篇 Word，返回 (parsed | None, 是否缓存命中)。
+
+        **缓存优先**：`parsed/word/<asset_id>.extract.json`（asset_id = sha256 前缀，内容寻址）——
+        文件未变时直接复用提取结果，仅重跑确定性提取（标签/元数据，毫秒级）；
+        删除 `parsed/word/` 目录即强制全量重解析。
+        """
+        sha = _sha256(p)
+        asset_id = sha[:16]
+        cache = parsed_dir / f"{asset_id}.extract.json"
+        if cache.exists():
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+                if data.get("sha256") == sha:
+                    return data, True
+            except (OSError, ValueError):
+                pass  # 缓存损坏 → 重新解析
+        parsed = self._extract_docx(p)
+        if parsed is None:
+            return None, False
+        cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
+        self._write_tables(parsed_dir, asset_id, parsed.get("tables_data") or [])
+        return parsed, False
+
+    def _extract_docx(self, p: Path):
+        """python-docx 按文档顺序单遍解析（可缓存）：正文 → Markdown + 结构化表格。
+
+        返回 {"sha256", "asset_id", "paragraphs", "tables", "first_heading", "first_text",
+              "body", "tables_data"}；无法解析（非 OOXML / 加密 / 空正文）返回 None。
+        """
+        import docx
+
+        try:
+            document = docx.Document(str(p))
+        except Exception as e:
+            print(f"[sources:{self.id}] 跳过无法解析的 Word 文件 {p.name}: {e}"
+                  f"（仅支持 OOXML 的 .docx/.docm；旧版 .doc 请先另存为 .docx）")
+            return None
+        parts: list[str] = []
+        tables_data: list[dict] = []
+        first_heading = ""
+        first_text = ""
+        n_par = 0
+        for block in _iter_docx_blocks(document):
+            if hasattr(block, "rows"):  # Table
+                rows = [[c.text.strip() for c in row.cells] for row in block.rows]
+                rows = [r for r in rows if any(r)]      # 全空行丢掉（合并单元格常见）
+                if not rows:
+                    continue
+                tables_data.append({"index": len(tables_data), "rows": rows})
+                md = _table_to_markdown(rows)
+                if md:
+                    parts.append(md)
+                continue
+            text = (block.text or "").strip()
+            if not text:
+                continue
+            n_par += 1
+            if not first_text:
+                first_text = text[:120]
+            level = _word_heading_level(block)
+            if level:
+                if not first_heading:
+                    first_heading = text[:120]
+                parts.append("#" * level + " " + text)
+                continue
+            prefix = _word_list_prefix(block)
+            parts.append(f"{prefix}{text}" if prefix else text)
+        body = "\n\n".join(parts).strip()
+        if not body:
+            print(f"[sources:{self.id}] 跳过无正文 Word 文件（可能只含图片/文本框）: {p.name}")
+            return None
+        sha = _sha256(p)
+        return {
+            "sha256": sha,
+            "asset_id": sha[:16],
+            "paragraphs": n_par,
+            "tables": len(tables_data),
+            "first_heading": first_heading,
+            "first_text": first_text,
+            "body": body,
+            "tables_data": tables_data,
+        }
+
+    def _write_tables(self, parsed_dir: Path, asset_id: str, tables: list[dict]) -> list[str]:
+        """结构化表格落盘（可重跑产物，以 asset_id 命名——不暴露文件名/路径）。"""
+        if not tables:
+            return []
+        tpath = parsed_dir / f"{asset_id}.tables.json"
+        tpath.write_text(
+            json.dumps({"source": f"word:{asset_id}", "tables": tables},
+                       ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        return [f"parsed/word/{tpath.name}"]
+
+    def _doc_from_extract(self, p: Path, sha: str, asset_id: str, parsed: dict,
+                          registry: TagRegistry, *, sid: str) -> KbDocument:
+        """用解析中间产物构造 KbDocument（确定性提取，毫秒级，每次运行重算）。
+
+        缓存命中与首次解析共用本函数——标签/元数据始终以最新规则执行，解析器升级不影响一致性。
+        """
+        body = str(parsed.get("body") or "")
+        title = (str(parsed.get("first_heading") or "").strip()
+                 or str(parsed.get("first_text") or "").strip() or p.stem)
+        # 正文标题已渲染为 Markdown `#`，标题结构与标签提取与 markdown 同源
+        tags, cands = extract_tags(p.stem, headings_from_markdown(body), registry=registry)
+        tables_rel = [f"parsed/word/{asset_id}.tables.json"] if parsed.get("tables_data") else []
+        return KbDocument(
+            source_type="doc_word",
+            source_id=sid,
+            url="",
+            title=title,
+            body=body,
+            created_at=None,
+            component="",
+            tags=[t.name for t in tags],
+            extra={
+                "asset": {"asset_id": asset_id, "sha256": sha, "format": "word",
+                          "paragraphs": int(parsed.get("paragraphs") or 0),
+                          "tables": int(parsed.get("tables") or 0)},
+                "quality": {"text_source": "text_layer", "parsed_with": "python-docx"},
+                "verification": "unverified",  # 与 markdown/excel 统一：先入库，审核台补标
+                "structure": {"tables": tables_rel},
+                # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+                "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
+            },
+        )
+
+
 _REGISTRY: dict[str, type[BaseSource]] = {
     "github": GithubSource,
     "markdown": MarkdownSource,
     "pdf": PdfSource,
     "image": ImageSource,
     "excel": ExcelSource,
+    "word": WordSource,
 }
 
 

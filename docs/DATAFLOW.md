@@ -67,15 +67,15 @@
 > canonical.jsonl，不 ingest——提取逻辑（版本/kind/组件/标签规则）升级后先跑它再 `build_graph.py`
 > 建图，无需重嵌向量；`build_kb.py` 内部复用同一 canonical 处理（`pipeline.upsert_unified_canonical`）。
 
-### 2.2 业务来源（PDF 手册 / Markdown / Excel 登记表 / 截图 OCR）
+### 2.2 业务来源（PDF 手册 / Markdown / Word 文档 / Excel 登记表 / 截图 OCR）
 
 文件放 `data/imports/{pdf,md,xlsx}/`（截图走 images source），config 启用对应 source 后跑
 `python scripts/build_kb.py`（注意：本地文件导入**不要**用 `--skip-pull`，会跳过资产复制，见使用指南 §2.3）。
 
 | 阶段 | 处理 | 产物 |
 |---|---|---|
-| 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
-| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
+| 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,word,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
+| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；**Word**（`python-docx` 按文档顺序单遍解析：标题样式 `Heading 1-6`/「标题 1」/`Title` → Markdown `#` 层级（分块复用 markdown 章节切分，chunk 带 `section`）、列表样式 → `- `/`1. `、表格 → Markdown 拼入正文；与 markdown 同构：优先读 `imports/word`（保留目录树、可消歧），扫不到时回退 `assets/word` 并按版本族收敛；`.doc`/加密 docx 跳过）；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF/Word 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
 | 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 
@@ -145,7 +145,7 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
   ├─ 两哈希均未变      → 跳过（不重嵌，崩溃续传按此粒度恢复）
   ├─ 仅元数据变化      → 刷新 docs 行 + 向量 meta（不重嵌）
   └─ 内容变化/新文档    → 全量路径：
-       chunking（按段切块，max_chunk_chars=4000 / overlap=200；PDF/MD 带章节结构，
+       chunking（按段切块，max_chunk_chars=4000 / overlap=200；PDF/MD/Word 带章节结构，
                  标题注入 chunk 文本并记 section）→ embed（OpenAI 兼容 /embeddings，
                  攒批 64 chunk/批）→ 写 LanceDB（攒批 200 条 flush）+ kb.sqlite3
 ```
@@ -298,7 +298,7 @@ serve_api（只读）                            离线周期
 |---|---|---|
 | `docs` | source_id（PK）/ source_type / url / title / created_at / resolved_at / status / labels / version_span_min / version_span_max / reliability / component / content_hash / embed_hash / extra / tags | 文档元数据 + 增量哈希 + 最终标签 |
 | `chunks_fts` | chunk_id（UNINDEXED）/ doc_id（UNINDEXED）/ indexed_text / text（UNINDEXED） | FTS5 虚拟表；indexed_text 存 jieba 分词、text 存原文 |
-| `chunks_meta` | chunk_id（PK）/ doc_id / seq / section | 分块序号与章节（PDF/MD 手册） |
+| `chunks_meta` | chunk_id（PK）/ doc_id / seq / section | 分块序号与章节（PDF/MD/Word 手册） |
 | `doc_tags` | source_id（PK）/ auto_snapshot / excluded / manual / updated_at / reviewer | 人工标签覆盖层（审核工作台维护） |
 
 ### 4.1 旁路存储（不参与检索）

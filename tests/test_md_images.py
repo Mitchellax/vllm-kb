@@ -456,7 +456,7 @@ class TestFallbackVersionFamilies(_MdCase):
 
         返回的族名（第二项）才是文档身份——收敛到 `.<sha12>` 副本时不能让它变成 id。
         """
-        from vllm_kb.sources import _latest_md_versions
+        from vllm_kb.sources import _latest_versions
 
         d = Path(self.tmp.name) / "v"
         d.mkdir()
@@ -467,11 +467,11 @@ class TestFallbackVersionFamilies(_MdCase):
             p.write_text(name, encoding="utf-8")
             os.utime(p, (mt, mt))
             paths.append(p)
-        kept = {p.name: base for p, base in _latest_md_versions(paths)}
+        kept = {p.name: base for p, base in _latest_versions(paths)}
         # x 族：mtime 大的胜；y 族：mtime 并列 → 名字大的胜（"y.md" > "y.bbbb…"）
         self.assertEqual(set(kept), {"x.aaaaaaaaaaaa.md", "y.md"})
         self.assertEqual(set(kept.values()), {"x", "y"})          # 族名不带 sha 后缀
-        self.assertEqual(len(_latest_md_versions([d / "gone.md", paths[0]])), 1)
+        self.assertEqual(len(_latest_versions([d / "gone.md", paths[0]])), 1)
 
 
 class TestSameStemDisambiguation(_MdCase):

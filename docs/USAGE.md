@@ -9,7 +9,8 @@
 - [2. 数据采集与构建](#2-数据采集与构建) —— [2.0 快速运维（单指令）](#20-快速运维单指令) /
   [2.1 增量与重建](#21-增量与重建) /
   [2.2 辅助数据构建](#22-辅助数据构建) / [2.3 业务来源导入（PDF / Markdown）](#23-业务来源导入pdf-手册--markdown-文档--完整实操) /
-  [2.4 Excel 登记表导入](#24-excel-登记表导入schema-free--完整实操)
+  [2.4 Excel 登记表导入](#24-excel-登记表导入schema-free--完整实操) /
+  [2.5 Word 文档导入](#25-word-文档导入docxdocm--完整实操)
 - [3. 启动检索服务](#3-启动检索服务) —— [3.1 日志与降级](#31-总日志接口打屏--可选落盘分卷) /
   [3.2 审核工作台](#32-审核工作台人工确认统一入口--api-配置中心) /
   [3.3 图更新流程](#33-图更新流程kùzu-单写者约束)
@@ -52,7 +53,7 @@ export EMBEDDING_API_KEY=sk-xxx
 
 | 段 | 作用 |
 |---|---|
-| `sources` | 数据源（默认 vllm-ascend + vllm 两个 GitHub 仓库；可加 `type: pdf/markdown/excel/image` 业务来源，见 §2.3 / §2.4） |
+| `sources` | 数据源（默认 vllm-ascend + vllm 两个 GitHub 仓库；可加 `type: pdf/markdown/word/excel/image` 业务来源，见 §2.3 / §2.4 / §2.5） |
 | `embedding` | 嵌入端点（OpenAI 兼容 `/embeddings`；`echo` 仅离线演示） |
 | `storage` | 数据目录（含 `code_root`：版本化代码仓根） |
 | `code` | 代码仓快照来源与预存版本列表 |
@@ -580,12 +581,50 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - `config.sanitize` 三个字段：
   - `keep_paths`：保留的默认路径前缀；
   - `keep_ips`：保留的 IP（默认回环/通配）；
-  - `sources`：入库时扫描维护日志的源（默认 `["excel","markdown"]`）。
+  - `sources`：入库时扫描维护日志的源（默认 `["excel","markdown","word"]`）。
   `None` = 用默认，显式 `[]` = 全部脱敏 / 全部关闭；
 - **被脱敏的原始 IP/路径落盘 `data/sanitize_log.json`**（维护文件，不进库、不返回给 agent）——
   据此调整白名单；审核页（管理员）显示原文。
 
-> Word/HTML 适配在业务环境阶段开发。
+### 2.5 Word 文档导入（.docx/.docm）—— 完整实操
+
+```jsonc
+{"id": "cases", "type": "word", "path": "data/imports/word", "enabled": true}
+```
+
+`path` 可为目录（递归）或单个文件。流程与 §2.3 同构：
+
+- **pull**：`*.docx`/`*.docm` → `data/assets/word/`（sha256 不可变层），并注册 `asset_registry`
+  （审核台「文档管理」据此反查路径 / 取回原件）；
+- **标题样式即章节**：`Heading 1-6` / 中文「标题 1」/ `Title` → Markdown `#`~`######`。
+  这是相对 PDF 的实质增益——PDF 只能靠正则猜编号标题，Word 的结构是**显式声明**的。
+  分块因此直接复用 markdown 的章节切分：每个 chunk 带 `section`，检索命中就能看到所属章节；
+- **列表**：`List Bullet` / `List Number`（或直接编号格式）→ `- ` / `1. `，避免条目粘成一段
+  （粘成一段会让 FTS 命中粒度变差）；
+- **表格**：转 Markdown 表格**拼入正文**（表内错误码/命令可被 FTS 检索），同时落
+  `data/parsed/word/{asset_id}.tables.json` 供结构化消费（建图时提取表格 → 错误码/命令的
+  `DOCUMENTS` 边）；
+- **解析缓存**：`data/parsed/word/{asset_id}.extract.json`（内容寻址）——文件未变时复用提取结果，
+  标签/元数据每次重算，**升级提取规则无需清缓存**；删该目录即强制重解析；
+- **身份**：`word:<文件名去后缀>`（同名不同目录用相对路径指纹消歧为 `word:<stem>--<sha8>`）。
+  与 markdown 同构：**优先读 `imports/word`**（保留目录树 → 可消歧、编辑源文件不会因资产层累积
+  副本而变成多篇），扫不到时回退 `assets/word` 扁平副本并按版本族收敛（每族只取最新一份、
+  `source_id` 取族名）；
+- **verification=unverified**：与 markdown/excel **统一路径**——先入库，审核工作台「补标」队列
+  人工确认（`verification_pending`）；
+- **脱敏**：默认启用（`config.sanitize.sources` 默认含 `word`），正文原文入库、出口统一脱敏，
+  被脱敏的 IP/路径落 `data/sanitize_log.json`。
+
+**本版边界（不提取，因此正文不含任何路径）**：
+
+- 页眉/页脚/脚注/尾注/文本框：python-docx 无原生 API（需手撸 XML），留待后续；
+- 嵌套表格只取外层单元格文本；合并单元格会重复文本；
+- **内嵌图片**：留待后续版本（提取 + 资产注册 + OCR 复用）；
+- `.doc`（旧二进制格式）与加密 docx 不支持 → 跳过并提示先另存为 `.docx`。
+
+**验证**：`python -m unittest tests.test_word_source -v`
+
+> HTML 适配在业务环境阶段开发（Word 已接入，见 §2.5）。
 
 ## 3. 启动检索服务
 
@@ -1268,9 +1307,10 @@ A: 解析中间产物已按资产 sha256 缓存（`data/parsed/pdf/<asset_id>.ex
 资产未变时自动复用（进度行标注"缓存命中"）；想强制重新解析（如 PyMuPDF 升级），
 删除 `data/parsed/pdf/` 目录即可，资产层与 kb 数据不受影响。
 
-**Q: 想加自己的故障记录（excel/markdown）？**
+**Q: 想加自己的故障记录（excel/markdown/word）？**
 
 A: config.json 的 `sources` 加条目即可：`{"id":"engineer-troubleshooting","type":"excel",
-"path":"data/imports/...xlsx","enabled":true}`（schema-free 导入，见 §2.4）或
-`{"id":"mynotes","type":"markdown","path":"data/mynotes","enabled":true}`；GitHub 源的
+"path":"data/imports/...xlsx","enabled":true}`（schema-free 导入，见 §2.4）、
+`{"id":"mynotes","type":"markdown","path":"data/mynotes","enabled":true}` 或
+`{"id":"cases","type":"word","path":"data/imports/word","enabled":true}`（见 §2.5）；GitHub 源的
 增量拉取见 §2.1（`--incremental` / `--pull-missing` / `--numbers` / `--numbers … --force-numbers`）。

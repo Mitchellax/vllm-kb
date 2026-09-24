@@ -390,8 +390,8 @@ def default_review_path(cfg: Optional["AppConfig"] = None) -> Path:
 
 # ---------------- 外源文档管理（审核工作台"文档管理"页签） ----------------
 
-# 外源文档 = 非 GitHub 采集来源（导入的 PDF / Markdown / 表格 / OCR 等）
-_EXTERNAL_SOURCE_TYPES = ("doc_pdf", "doc_markdown", "doc_excel", "doc_other")
+# 外源文档 = 非 GitHub 采集来源（导入的 PDF / Markdown / Word / 表格 / OCR 等）
+_EXTERNAL_SOURCE_TYPES = ("doc_pdf", "doc_markdown", "doc_word", "doc_excel", "doc_other")
 
 
 def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = None,

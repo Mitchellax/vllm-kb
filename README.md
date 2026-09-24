@@ -37,6 +37,7 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   API 请求为 0，不受未认证限流约束；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
   Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
+  Word 文档（标题样式→章节、列表、表格→结构化 JSON；复用同一套分块/标签/图/审核链路）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；
    **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列）；
    **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
@@ -391,10 +392,11 @@ python scripts/build_tag_candidates.py
 | `scripts/pack_migrate.py` | 迁移打包：业务环境重新嵌入的最小集（canonical + 业务数据，不传向量库） |
 | `scripts/seed_demo.py` | 离线演示：写入模拟 GitHub 原始数据（配 `config.offline.json` 跑通全链路） |
 
-**业务来源导入**（PDF 手册 / Markdown / Excel 登记表 / 截图 OCR）：文件放 `data/imports/{pdf,md,xlsx}/`，
+**业务来源导入**（PDF 手册 / Markdown / Word 文档 / Excel 登记表 / 截图 OCR）：文件放 `data/imports/{pdf,md,word,xlsx}/`，
 启用 config 对应 source 后跑 `python scripts/build_kb.py`；详见
 [使用指南 §2.3](docs/USAGE.md#23-业务来源导入pdf-手册--markdown-文档--完整实操) /
-[§2.4 Excel 导入](docs/USAGE.md#24-excel-登记表导入schema-free--完整实操)。
+[§2.4 Excel 导入](docs/USAGE.md#24-excel-登记表导入schema-free--完整实操) /
+[§2.5 Word 导入](docs/USAGE.md#25-word-文档导入docxdocm--完整实操)。
 
 ## 🧠 知识库结构
 
@@ -412,8 +414,8 @@ data/
 │   ├── symbols.json        # 三层签名提取的符号表
 │   └── signal_words.json   # 社区高频信号词（build_signal_words.py 生成，供 agent 判断）
 ├── graph/                  # Kùzu 图（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）
-├── assets/                 # 业务来源原始资产（pdf/md/images，不可变，sha256）
-├── parsed/                 # 解析产物（PDF 表格 JSON、OCR 结果，可重跑；建图时提取表格→错误码）
+├── assets/                 # 业务来源原始资产（pdf/md/word/images，不可变，sha256）
+├── parsed/                 # 解析产物（PDF/Word 表格 JSON、OCR 结果，可重跑；建图时提取表格→错误码）
 │                           # OCR 结果按 sha256 + 引擎指纹幂等，含置信度/来源/异常/可判错签名
 ├── imports/                # 业务数据放置目录（pdf/md/xlsx）
 ├── cache/                  # 跨运行缓存（fork 层 SHA / GitHub releases / requirements 兜底；不可变对象复用，防限流与重复下载）
@@ -432,7 +434,8 @@ data/
 ```
 采集/导入层
    ├─ GitHub REST + GraphQL（issues/PRs/comments/releases）
-   ├─ PdfSource / MarkdownSource / ExcelSource（业务来源：资产层 + 解析层；Excel schema-free）
+   ├─ PdfSource / MarkdownSource / ExcelSource / WordSource（业务来源：资产层 + 解析层；
+   │  Excel schema-free；Word 标题样式→章节、表格→JSON）
    └─ ImageSource（签名导向 OCR，provider 可插拔；高置信文本注入所属文档正文，低置信进审核队列）
    ▼
 Canonical 规范化（统一中间格式，可重放可重嵌）
@@ -469,7 +472,7 @@ GitHub 社区（vllm / vllm-ascend issues/PRs/comments）
    ▼
 data/raw/{source_id}/（原始 JSON 快照，事实源，可重放）── canonicalize() ──▶ 统一 canonical.jsonl
                                                                               （中间格式，可重放可重嵌）
-业务来源（PDF/MD/Excel/截图，放 data/imports/）
+业务来源（PDF/MD/Word/Excel/截图，放 data/imports/）
    │  build_kb.py ── 资产层复制（data/assets/，sha256 不可变）＋ 解析（data/parsed/：表格 JSON / OCR 结果）
    ▼
    canonicalize()（文档级标签 tagging）──────────────▶ 同上 canonical.jsonl
@@ -538,7 +541,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 
 | 模块 | 职责 |
 |---|---|
-| `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量 + updatedAt 状态同步、`--numbers`/`--force-numbers` 单条） |
+| `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/word/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量 + updatedAt 状态同步、`--numbers`/`--force-numbers` 单条） |
 | `md_images.py` | Markdown 图片引用扫描/重写：行内（含空格、尖括号、目标含括号、跨行）、引用式（含定义行去路径）、HTML `<img>` 全支持；```/`code` 代码区跳过；**任何未识别或未闭合的图片语法也一律占位**——保证"正文不含服务器路径"对任意输入成立 |
 | `models.py` / `config.py` | Canonical 统一中间格式 + 唯一配置入口（旧版单源折叠兼容；secrets 自动加载） |
 | `chunking.py` / `embed.py` | 讨论线按段切块 + 批量嵌入（攒批降 API 调用） |
@@ -552,7 +555,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `code_index.py` / `companion.py` / `components.py` | 版本化代码仓符号索引（grep path/per-version）、配套矩阵、组件分布；`code_index` 承载四套命名空间：官方 / `fork:{model}` / `img:{tag}`（镜像插件层源码） |
 | `code_graph.py` | 代码图谱检索（gh-puller 接入）：MCP Streamable HTTP 客户端 + 熔断器，调用链/数据流/影响面/架构聚类/语义搜索——与 `code_index` 互补不重叠，不可达 503+引导不回退 |
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
-| `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ **资产注册表 `asset_registry`**（`asset_id → rel_path`，md/pdf/excel/**图片**统一批量注册，审核台据此反查与预览）+ 本地密钥文件 + 知识缺口展示 |
+| `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ **资产注册表 `asset_registry`**（`asset_id → rel_path`，md/pdf/word/excel/**图片**统一批量注册，审核台据此反查与预览）+ 本地密钥文件 + 知识缺口展示 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分）；`OcrArtifact` 产物按 **sha256 + 引擎指纹**（provider/mode/model/提示词版本）幂等，阈值 `ocr_min_confidence` 不进指纹（调阈值只重判定不重跑 OCR） |
 | `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
@@ -564,9 +567,9 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 |---|---|---|
 | 0 | 最小链路（拉取→规范化→嵌入→检索→置信度） | ✅ 完成 |
 | 1 | 全量采集 + 版本日历 | ✅ 完成 |
-| 2 | 图 + 向量双存储（Kùzu，修复链路/手册定义） | ✅ 核心完成（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）；多来源（PDF/MD/Excel/OCR/审核工作台）✅；Evidence 互证 ✅；等价合并 🔲 |
+| 2 | 图 + 向量双存储（Kùzu，修复链路/手册定义） | ✅ 核心完成（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）；多来源（PDF/MD/Word/Excel/OCR/审核工作台）✅；Evidence 互证 ✅；等价合并 🔲 |
 | 3 | MCP Server 封装（任意 MCP 客户端接入） | 🔲 规划 |
-| 4 | wiki/文档通用 adapter（word/html 等） | 🔲 规划（excel 已提前完成：schema-free 导入 ✅） |
+| 4 | wiki/文档通用 adapter（word/html 等） | 🚧 部分完成（**word 已接入**：标题样式→章节、列表、表格→JSON；excel 已提前完成：schema-free 导入 ✅；html 🔲） |
 | 5 | 评估集 + 置信度参数调优（真实故障案例） | 🔲 规划 |
 
 ## 🧪 测试
