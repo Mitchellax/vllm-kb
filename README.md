@@ -16,6 +16,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
 - **三层签名提取**：源码符号表（算子/特性自动生成）+ 结构化解析（Python 堆栈/键值对/ACL 错误码）+ 社区信号词，替代手写正则——新增算子只需重新索引代码仓
 - **混合检索 + 置信度动态计算**：向量（LanceDB）+ 全文（FTS5）+ 标题精确匹配，置信度按时间衰退 / 版本区间 / 来源可靠度在查询时实时计算；
   **验证状态因子**（expert 官方手册 0.95 / tested 0.85 / unverified 0.5）并入可靠度
+  `w_rel`（取 `max` 下限提升）；人工补标经审核工作台认证后**立即生效**（`doc_verification`
+  覆盖层，不被重新入库冲掉，`--rebuild` 亦保留）
 - **图存储（Kùzu）**：Issue/PR/Release/Operator/ErrorCode/Model/Version/**Doc/Interface** 节点 +
   FIXES/MERGED_IN/MENTIONS/DOCUMENTS 边——**修复链路追溯**（`graph chain`：issue→修复 PR→落地 release，
   "这个修复是否已进入我的部署版本"）、**手册定义查询**（错误码/命令在哪个手册定义）
@@ -406,7 +408,7 @@ data/
 ├── raw/                    # 采集原始快照（JSON，事实源，可重放，按来源分目录）
 │   └── canonical.jsonl     # 统一 Canonical 中间格式（全量构建 66k+ 条；本仓库样例 16k+ 条）
 ├── lancedb/                # 向量库（bge-m3，全量 122k+ chunks；样例 31k+）
-├── kb.sqlite3              # SQLite：docs 元数据 + chunks_meta 分块 + chunks_fts 全文（jieba 分词）+ doc_tags 标签覆盖层
+├── kb.sqlite3              # SQLite：docs 元数据 + chunks_meta 分块 + chunks_fts 全文（jieba 分词）+ doc_tags/doc_verification 人工治理覆盖层
 ├── code/                   # 版本化代码仓
 │   ├── zips/               # vllm-ascend 各版本源码 zip
 │   ├── snapshots/          # 解压后的源码快照（按需读取 / diff，版本子目录）
@@ -480,7 +482,7 @@ data/raw/{source_id}/（原始 JSON 快照，事实源，可重放）── cano
    ▼
 ingest_docs()（幂等双哈希增量 + 断点续传）
    ├─ chunking 分段切块 ──▶ embed（OpenAI 兼容 /embeddings）──▶ LanceDB 向量库（data/lancedb）
-   └─ 写 SQLite（data/kb.sqlite3）：docs 元数据 + chunks_fts 全文（jieba 分词）+ chunks_meta + doc_tags 标签覆盖层
+   └─ 写 SQLite（data/kb.sqlite3）：docs 元数据 + chunks_fts 全文（jieba 分词）+ chunks_meta + doc_tags/doc_verification 人工治理覆盖层
 
 版本化代码仓：build_code_snapshots.py / build_vllm_snapshots.py
    ──▶ data/code/{zips,snapshots}/ 源码快照 + index.sqlite3 符号索引 + symbols.json / signal_words.json
@@ -504,7 +506,7 @@ ingest_docs()（幂等双哈希增量 + 断点续传）
 | `data/raw/{source_id}/` | `build_kb.py` 拉取阶段 | GitHub 原始 JSON 快照（按来源分目录；checkpoints 断点续传） |
 | `data/raw/canonical.jsonl` | `build_kb.py` canonicalize | 多来源统一中间格式（按 source_id upsert，幂等） |
 | `data/lancedb` | `ingest.py`（批量攒批写入） | chunk 向量 + 原文 + meta（title/组件/版本区间/标签/section…） |
-| `data/kb.sqlite3` | `ingest.py` | `docs`（文档元数据+哈希）、`chunks_fts`（jieba 分词全文）、`chunks_meta`（分块序号/章节）、`doc_tags`（人工标签覆盖层） |
+| `data/kb.sqlite3` | `ingest.py` | `docs`（文档元数据+哈希）、`chunks_fts`（jieba 分词全文）、`chunks_meta`（分块序号/章节）、`doc_tags`（人工标签覆盖层）、`doc_verification`（人工补标覆盖层） |
 | `data/code/*` | `build_code_snapshots.py` / `build_vllm_snapshots.py` | 各版本源码 zip + 解压快照 + 符号/报错字面量索引 + 符号表/信号词 |
 | `data/code/forks/{model}/` | `build_fork_snapshots.py` | 0day fork 仓 vllm 代码（按镜像锁定 SHA）+ 独立符号索引 + meta（SHA↔镜像/分支/基线） |
 | `data/code/images/{tag}/` | `build_image_snapshots.py` | 0day 镜像内插件源码（插件层解包）+ 独立索引 + meta（image_digest/镜像时间/vllm commit/插件层 digest） |

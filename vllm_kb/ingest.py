@@ -70,6 +70,18 @@ CREATE TABLE IF NOT EXISTS doc_tags (
   updated_at TEXT,
   reviewer TEXT
 );
+-- 文档级验证状态覆盖层（人工补标，kb.sqlite3）：
+--   verification = 人工补标结果（tested/expert）；**无行 = 沿用 canonical 自带值**。
+--   为什么必须独立存：本函数是 INSERT OR REPLACE，直接改 docs.extra 会被下次构建
+--   用 canonical（verification=unverified）覆盖回去，人工认证就白做了。
+--   ingest 读本表并把结果并进 docs.extra.verification 与 w_rel（见 _effective_doc）。
+CREATE TABLE IF NOT EXISTS doc_verification (
+  source_id TEXT PRIMARY KEY,
+  verification TEXT NOT NULL,
+  canonical_verification TEXT,
+  reviewer TEXT,
+  updated_at TEXT
+);
 """
 
 
@@ -231,6 +243,23 @@ def _upsert_docs_row(conn: sqlite3.Connection, doc: KbDocument, rel: float,
     )
 
 
+def _effective_doc(doc: KbDocument, verification: Optional[str]) -> KbDocument:
+    """把人工补标结果并进 `extra.verification`（**不改原对象**）。
+
+    两件事都要靠它：
+    1. `docs.extra.verification` 是**查询期**取验证状态的唯一来源
+       （`search._doc_meta_from_fts`，向量路径也用它补全 meta）→ 必须写进 docs 行；
+    2. `meta_hash` 由 `doc_to_json(doc)` 算出，含 extra → 覆盖层变了 meta_hash 就变，
+       ingest 才会走"仅刷新元数据"路径把新值写进 docs。否则会被判"内容未变"而跳过刷新，
+       人工补标永远落不到库上。embed_hash 只覆盖 source_id+title+body → 不受影响，不重嵌。
+    """
+    if not verification:
+        return doc
+    if verification == doc.extra.get("verification", ""):
+        return doc
+    return doc.model_copy(update={"extra": {**doc.extra, "verification": verification}})
+
+
 def ingest_docs(
     cfg: AppConfig,
     docs: list[KbDocument],
@@ -244,9 +273,11 @@ def ingest_docs(
     # 标签词典词注册进 jieba（复合标签如"超时排查"不被拆散；jieba 未装时无副作用）
     register_words([e.name for e in TagRegistry.load(cfg).entries])
     # 人工标签覆盖层（doc_tags：excluded/manual）——最终标签 = (auto − excluded) ∪ manual
-    from .review import load_doc_tags_conn, upsert_auto_snapshot_conn
+    from .review import load_doc_tags_conn, load_doc_verification_conn, upsert_auto_snapshot_conn
 
     overlay = load_doc_tags_conn(conn)
+    # 人工补标覆盖层（doc_verification）：**优先于 canonical 自带值**
+    verif_overlay = load_doc_verification_conn(conn)
     stats = {"docs": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0, "meta_refresh": 0, "skipped_empty": 0}
 
     total = len(docs)
@@ -289,6 +320,9 @@ def ingest_docs(
             rel = reliability_score(
                 doc.source_type, doc.status, doc.resolved_at, doc.reliability, cfg.confidence,
                 kind=doc.extra.get("kind", ""),
+                # 人工补标（覆盖层）也参与 w_rel：docs.reliability 虽不用于查询期打分，
+                # 但保持一致可避免"库里存的分和检索算的分对不上"的困惑
+                verification=doc.extra.get("verification") or None,
             )
             # 最终标签 = (自动 − 排除) ∪ 人工（覆盖层见 doc_tags 表）
             ov = overlay.get(doc.source_id, {})
@@ -332,7 +366,7 @@ def ingest_docs(
         existing[sid] = (mh, eh)
     plan = {"embed": 0, "skip": 0, "refresh": 0}
     for doc in docs:
-        eh, mh = _hashes(doc)
+        eh, mh = _hashes(_effective_doc(doc, verif_overlay.get(doc.source_id)))
         stored = existing.get(doc.source_id)
         if stored:
             sm, se = stored
@@ -355,6 +389,8 @@ def ingest_docs(
     for doc in docs:
         processed += 1
         try:
+            # 人工补标优先：后续 hashes/rel/写库全部用合并后的对象（不改调用方的 canonical）
+            doc = _effective_doc(doc, verif_overlay.get(doc.source_id))
             eh, mh = _hashes(doc)
             stored = existing.get(doc.source_id)
             if stored:
@@ -369,6 +405,7 @@ def ingest_docs(
                     rel = reliability_score(
                         doc.source_type, doc.status, doc.resolved_at, doc.reliability,
                         cfg.confidence, kind=doc.extra.get("kind", ""),
+                        verification=doc.extra.get("verification") or None,
                     )
                     ov = overlay.get(doc.source_id, {})
                     final_tags = merge_final(doc.tags or [], ov.get("excluded", []),
@@ -383,6 +420,9 @@ def ingest_docs(
             rel = reliability_score(
                 doc.source_type, doc.status, doc.resolved_at, doc.reliability, cfg.confidence,
                 kind=doc.extra.get("kind", ""),
+                # 人工补标（覆盖层）也参与 w_rel：docs.reliability 虽不用于查询期打分，
+                # 但保持一致可避免"库里存的分和检索算的分对不上"的困惑
+                verification=doc.extra.get("verification") or None,
             )
             chunks = chunk_doc(doc, cfg.chunking.max_chunk_chars, cfg.chunking.overlap_chars)
             if not chunks:
@@ -408,23 +448,77 @@ def ingest_docs(
     return stats
 
 
+def _snapshot_overlays(sqlite_path: Path) -> dict[str, list[tuple]]:
+    """备份人工治理覆盖层（doc_tags / doc_verification）——rebuild 会删库，先捞出来。
+
+    这两张表是**人工成果**（标签治理 + 补标认证），canonical 里没有，删库即永久丢失。
+    """
+    out: dict[str, list[tuple]] = {}
+    if not sqlite_path.exists():
+        return out
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        for table in ("doc_tags", "doc_verification"):
+            try:
+                out[table] = conn.execute(f"SELECT * FROM {table}").fetchall()
+            except sqlite3.OperationalError:
+                out[table] = []      # 老库可能还没有该表
+    finally:
+        conn.close()
+    return out
+
+
+def _restore_overlays(sqlite_path: Path, snapshot: dict[str, list[tuple]]) -> int:
+    """把覆盖层写回新库（在 ingest 之前，让本轮合并就用上）。返回恢复行数。"""
+    n = 0
+    if not snapshot:
+        return n
+    conn = _connect(sqlite_path)      # 建表（含覆盖层两张表）
+    try:
+        for table, rows in snapshot.items():
+            if not rows:
+                continue
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            if not cols:
+                continue
+            placeholders = ",".join("?" * len(cols))
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {table}({','.join(cols)}) VALUES({placeholders})",
+                rows,
+            )
+            n += len(rows)
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
 def rebuild(cfg: AppConfig) -> dict:
-    """全量重建：清空向量库与 SQLite，从统一 canonical.jsonl 重新入库（换 embedding 模型后使用）。"""
+    """全量重建：清空向量库与 SQLite，从统一 canonical.jsonl 重新入库（换 embedding 模型后使用）。
+
+    **人工治理覆盖层（doc_tags/doc_verification）先备份后恢复**：它们只存在于 kb.sqlite3，
+    canonical 里没有，不备份就会被删库抹掉（标签治理与补标认证是人工成果）。
+    """
     from .embed import EmbeddingClient
     from .github_pull import load_canonical
     from .vectorstore import build_vector_store
 
+    sqlite_path = cfg.resolve(cfg.storage.sqlite_path)
+    snapshot = _snapshot_overlays(sqlite_path)
     print("[rebuild] 清空向量库 ...", flush=True)
     vector_store = build_vector_store(cfg)
     vector_store.clear()
-    sqlite_path = cfg.resolve(cfg.storage.sqlite_path)
     if sqlite_path.exists():
         sqlite_path.unlink()
+    n_ov = _restore_overlays(sqlite_path, snapshot)
+    if n_ov:
+        print(f"[rebuild] 已保留人工治理覆盖层 {n_ov} 行（标签/补标），重建后仍然生效", flush=True)
     print("[rebuild] 加载统一 canonical ...", flush=True)
     docs = load_canonical(cfg.resolve(cfg.storage.canonical_file))
     print(f"[rebuild] canonical {len(docs)} 条，开始入库（嵌入为最慢步骤，见 [ingest] 进度）", flush=True)
     embed_client = EmbeddingClient(cfg.embedding)
     stats = ingest_docs(cfg, docs, embed_client, vector_store, sqlite_path)
     stats["total_docs"] = len(docs)
+    stats["overlays_kept"] = n_ov
     print(f"[rebuild] 完成: {stats}", flush=True)
     return stats

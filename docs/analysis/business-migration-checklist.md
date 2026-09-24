@@ -113,7 +113,10 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 
 - [ ] 初始知识库迁入业务环境：`client.py health/stats` + `graph stats` 正常，图链路复验通过（D3）
 - [ ] A1-A3：案例/表格/wiki 从业务环境导入并检索命中（验证状态默认规则生效）
-- [ ] A5：审核工作台可用，至少 1 条补标闭环回写 canonical
+- [x] A5：审核工作台可用，至少 1 条补标闭环**生效**（认证 → `doc_verification` 覆盖层 +
+  `docs.extra.verification`/`reliability` 即时刷新，检索 `w_rel` 0.5→0.85 当场可见；
+  **不回写 canonical**——canonical 由 adapter 再生，人工结果存覆盖层才不会被下次构建冲掉；
+  已端到端实测，含 `--rebuild` 后仍生效）
 - [ ] A2/A6：截图签名入库，图文互证不一致进入审核队列
 - [ ] B2-B5：embedding 可用（或明确降级）、服务由管理脚本拉起、更新窗口流程可用
 - [ ] D1/D2：OCR 阈值与置信度参数经业务数据标定，写入 config

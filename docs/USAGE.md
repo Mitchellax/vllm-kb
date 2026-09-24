@@ -384,7 +384,8 @@ data/raw/canonical.jsonl                 # canonical 追加（verification/tags 
   如 `npu-smi`/`Atlas`，= 这是什么领域的知识）与**具体作用类**（purpose，如 `命令参考`/`错误码表`，
   = 文档能帮我做什么），与 `config.json` 的 `tags.registry` 词典子串命中为准；
   未收录强候选进审核队列 `tag_candidate`，采纳后入词典并即时打标；
-- 验证状态默认：**PDF 手册 = `expert`**、**Markdown = `unverified`**（审核工作台补标）；
+- 验证状态默认：**PDF 手册 = `expert`**、**Markdown = `unverified`**（审核工作台补标，
+  认证后立即生效——见 §3.2 补标回写）；
 - 检索结果显示 `验证=expert/unverified`；embedding key 有效时语义检索（向量）生效，
   无效时自动降级全文检索（`search` 仍可用）；
 - **路径不进库（安全约束）**：canonical / 检索库不含服务器路径（资产以 asset_id 标识），
@@ -754,6 +755,7 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 | 目标 | 采纳后何时可见 | 需要做什么 |
 |---|---|---|
 | 检索 API：`tags` 目录 / `tags docs` / `context` / search 的 **FTS 命中**过滤 | **立即**（读 `docs.tags`，采纳时已同步） | 无 |
+| **补标认证的 `w_rel`**（verification_pending → tested/expert） | **立即**（覆盖层 + `docs.extra.verification` 同步刷新） | 无 |
 | search 的**向量命中**过滤（chunk 向量 meta.tags 是入库时快照） | 下次入库 | 重跑 `build_kb.py --skip-pull` |
 | Kùzu 图（TAGGED_WITH 边 / `graph tags`） | 重建图后 | `build_graph.py`（先停检索服务） |
 | 词典对新文档生效（文件名/标题含该词自动打标） | 下次入库 | 无（词典已写入 config.json） |
@@ -768,7 +770,22 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 自动补单规则：`verification=unverified` 的文档 → verification_pending；标题含"待审核/待修改"→
 case_title_flag；`extra.evidence[].ocr.text_included=false` 的图片 → low_confidence_ocr
 （按图片 sha256 聚合）；`extra.tag_candidates`（未收录强候选）→ tag_candidate。
-审核结果回写 canonical 依赖重跑 `build_canonical.py`（或 `build_kb.py --skip-pull`，后续版本支持热更新）。
+
+**补标回写（verification_pending）——认证立即生效**：
+
+- 「认证」→ 覆盖层 `doc_verification` 写 `tested`（`result.verification="expert"` 可升为专家认证），
+  并**立即**刷新 `docs.extra.verification` 与 `reliability`——**不需要重建**，
+  检索算出的 `w_rel` 当场从 0.5 提到 0.85（0.95）；「存疑」→ 清除覆盖层，
+  回到**覆盖前**的 canonical 值（不是写死 `unverified`：PDF 手册 canonical 就是 `expert`）；
+- **为什么必须有覆盖层**：`docs` 行是 `INSERT OR REPLACE` 写的，直接改 `docs.extra` 会被下次
+  构建用 canonical（`unverified`）覆盖回去，人工认证就白做了。所以人工结果存独立表，
+  由 `ingest` 每轮合并（与 `doc_tags` 标签覆盖层同构）；
+- 认证过的文档不会再进补标队列（`seed` 读的是**生效值**）；覆盖层变化会让 `meta_hash` 改变，
+  下次入库走"仅刷新元数据"路径（`embed_hash` 未变 → **不重新嵌入**）；
+- `--rebuild` 会删 `kb.sqlite3`，因此**先备份后恢复** `doc_tags` / `doc_verification`——
+  人工标签治理与补标认证不会被重建抹掉。
+
+审核结果（标签类）回写 canonical 依赖重跑 `build_canonical.py`（或 `build_kb.py --skip-pull`）。
 
 **与只读检索 API 的关系**：分离端口（检索 8000 / 审核 8010）、分离数据（kb.sqlite3 只读 /
 review.sqlite3 可写）；审核库检索 API 不碰。权限（谁能标注专家认证）由部署方加 nginx basic auth 等。

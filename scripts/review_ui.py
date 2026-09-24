@@ -376,12 +376,26 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
 
     @app.post("/api/item/{item_id}/review")
     def review(item_id: int, body: dict):
-        """标注（不改原始内容）：approved 认证 | suspected 存疑（重新排队靠后）。"""
+        """标注（不改原始内容）：approved 认证 | suspected 存疑（重新排队靠后）。
+
+        **补标项（verification_pending）特殊**：认证要真的改可靠度——写覆盖层
+        （doc_verification）+ 立即刷新 docs.extra.verification，否则点了认证 w_rel 仍停在
+        unverified 的 0.5（见 vllm_kb.review.review_verification）。
+        """
         action = body.get("action", "")
         reviewer = (body.get("reviewer") or "").strip()
         if not reviewer:
             raise HTTPException(400, "reviewer 必填")
         try:
+            it = store.get_item(item_id)
+            if it is None:
+                raise HTTPException(404, "审核项不存在")
+            if it["category"] == "verification_pending":
+                from vllm_kb.review import review_verification
+
+                r = review_verification(cfg, store, item_id, action, reviewer,
+                                        result=body.get("result"))
+                return {"ok": True, **r}
             ok = store.review(item_id, action, reviewer, result=body.get("result"))
         except ValueError as e:
             raise HTTPException(400, str(e))

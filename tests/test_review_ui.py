@@ -7,6 +7,7 @@ stats / queue / item / review / configs / configs-save / configs-test / 页面 H
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,28 @@ def make_env(tmp: Path) -> tuple[Path, Path]:
         "storage": {"sqlite_path": "data/kb.sqlite3", "canonical_file": "data/raw/canonical.jsonl"},
     }), encoding="utf-8")
     return data_root, cfg_path
+
+
+def seed_kb_doc(cfg_path: Path, source_id: str = "md:doc1", *,
+                source_type: str = "doc_markdown", verification: str = "unverified") -> None:
+    """在 kb.sqlite3 里造一条外源文档。
+
+    补标回写需要真实的 docs 行（要写覆盖层并刷新 extra/reliability），
+    只往审核库塞队列项是不够的。
+    """
+    from vllm_kb.config import AppConfig
+    from vllm_kb.ingest import _connect
+
+    cfg = AppConfig.load(str(cfg_path), require_keys=False)
+    conn = _connect(cfg.resolve(cfg.storage.sqlite_path))
+    conn.execute(
+        "INSERT OR REPLACE INTO docs (source_id, source_type, title, status, reliability, extra) "
+        "VALUES (?,?,?,?,?,?)",
+        (source_id, source_type, "待审核文档", "open", 0.5,
+         json.dumps({"verification": verification}, ensure_ascii=False)),
+    )
+    conn.commit()
+    conn.close()
 
 
 class ReviewUiApiTest(unittest.TestCase):
@@ -176,6 +199,7 @@ class ReviewUiApiTest(unittest.TestCase):
         store = ReviewStore(default_review_path(cfg))
         store.add_item("verification_pending", "md:doc1", {"title": "待审核文档"})
         store.close()
+        seed_kb_doc(self.cfg_path)      # 补标要写回 docs，得有真实文档
         # stats
         st = self.client.get("/api/stats").json()
         self.assertEqual(st["verification_pending"]["pending"], 1)
@@ -189,11 +213,21 @@ class ReviewUiApiTest(unittest.TestCase):
         # review 提交（缺 reviewer → 400）
         r = self.client.post("/api/item/1/review", json={"action": "approved"})
         self.assertEqual(r.status_code, 400)
-        # 认证
+        # 认证：**补标项要真的改可靠度**（覆盖层 + docs.extra 立即刷新）
         r = self.client.post("/api/item/1/review",
                              json={"action": "approved", "reviewer": "tester",
                                    "result": {"note": "ok"}})
         self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["verification"], "tested")
+        self.assertEqual(r.json()["reliability"], 0.85)
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        try:
+            extra, rel = conn.execute(
+                "SELECT extra, reliability FROM docs WHERE source_id='md:doc1'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(extra)["verification"], "tested")
+        self.assertEqual(rel, 0.85)
         it = self.client.get("/api/item/1").json()
         self.assertEqual(it["status"], "approved")
         self.assertEqual(it["reviewer"], "tester")

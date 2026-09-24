@@ -413,6 +413,12 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
             (int(limit), int(offset)),
         ).fetchall()
         overlay = load_doc_tags_conn(conn)
+        # 人工补标覆盖层：verification 本身已在 extra（ingest 合并后的生效值），
+        # 这里额外给出**是否人工所加 + 谁加的**，供审计/排查"这文档为什么是 tested"
+        verif_overlay = {sid: (v, rev) for sid, v, rev in
+                         conn.execute("SELECT source_id, verification, reviewer "
+                                      "FROM doc_verification").fetchall()} \
+            if _has_table(conn, "doc_verification") else {}
         try:
             tags_by_id = {
                 sid: json.loads(raw) if raw else []
@@ -450,6 +456,8 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
             "component": comp or "",
             "url": url or "",
             "verification": ex.get("verification", ""),
+            "verification_manual": (verif_overlay.get(sid) or (None, None))[0],
+            "verification_reviewer": (verif_overlay.get(sid) or (None, None))[1],
             "asset_id": asset_id,
             "asset_path": rel_path,
             "tags": {"auto": auto, "excluded": ov.get("excluded", []),
@@ -596,6 +604,188 @@ def _ensure_docs_tags_col(conn: sqlite3.Connection) -> None:
         return
     if "tags" not in cols:
         conn.execute("ALTER TABLE docs ADD COLUMN tags TEXT")
+
+
+# ---------------- 文档级验证状态覆盖层（doc_verification 表，kb.sqlite3，ingest 建表） ----------------
+# 人工补标（unverified → tested/expert）**必须存在独立表里，不能直接改 docs.extra**：
+# ingest 是 INSERT OR REPLACE，下次构建会用 canonical（verification=unverified）覆盖回去，
+# 人工认证就白做了（这正是"认证了但 w_rel 一直 0.5"的根因）。
+# ingest 读本表并把结果并进 docs.extra.verification 与 w_rel；无行 = 沿用 canonical 自带值。
+# 与 doc_tags 同构（覆盖层 + 入库合并）。
+
+# 合法验证级别（与 config.confidence.verification_weights 的键一致）
+VERIFICATION_LEVELS = ("unverified", "tested", "expert")
+
+
+def _ensure_doc_verification(conn: sqlite3.Connection) -> None:
+    """幂等建表（老库 / 审核页自建连接时）。"""
+    try:
+        conn.execute("SELECT 1 FROM doc_verification LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS doc_verification (
+                 source_id TEXT PRIMARY KEY,
+                 verification TEXT NOT NULL,
+                 canonical_verification TEXT,
+                 reviewer TEXT,
+                 updated_at TEXT
+               )"""
+        )
+    else:
+        # 老行可能没有 canonical_verification 列（记下覆盖前的 canonical 值，
+        # 撤销时要回退到它——否则撤销会读到"上次写入的覆盖值"而撤不掉）
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(doc_verification)")]
+        if "canonical_verification" not in cols:
+            conn.execute("ALTER TABLE doc_verification ADD COLUMN canonical_verification TEXT")
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    """表是否存在（旧库可能还没建覆盖层表）。"""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def load_doc_verification_conn(conn: sqlite3.Connection) -> dict[str, str]:
+    """批量读取覆盖层：{source_id: verification}（ingest 预读合并用）。"""
+    out: dict[str, str] = {}
+    _ensure_doc_verification(conn)
+    try:
+        rows = conn.execute("SELECT source_id, verification FROM doc_verification").fetchall()
+    except sqlite3.OperationalError:
+        return out  # 旧库尚无该表
+    for sid, v in rows:
+        if v in VERIFICATION_LEVELS:
+            out[sid] = v
+    return out
+
+
+def get_doc_verification_conn(conn: sqlite3.Connection, source_id: str) -> dict:
+    """单篇覆盖层（审核页展示"人工补标为 X"用）。"""
+    _ensure_doc_verification(conn)
+    row = conn.execute(
+        "SELECT verification, canonical_verification, reviewer, updated_at "
+        "FROM doc_verification WHERE source_id=?",
+        (source_id,),
+    ).fetchone()
+    if row is None:
+        return {"source_id": source_id, "verification": None, "canonical_verification": None,
+                "reviewer": None, "updated_at": None}
+    return {"source_id": source_id, "verification": row[0], "canonical_verification": row[1],
+            "reviewer": row[2], "updated_at": row[3]}
+
+
+def set_doc_verification_conn(conn: sqlite3.Connection, source_id: str, verification: str,
+                              reviewer: Optional[str] = None,
+                              canonical: Optional[str] = None) -> None:
+    """写覆盖层（整体替换）。verification 必须是合法级别。
+
+    `canonical` 只在**首次**覆盖时记录（覆盖前的 canonical 值），供撤销回退；
+    已有覆盖行时不覆盖它——否则连续两次认证会把第一次的覆盖值当成 canonical 存下来。
+    """
+    if verification not in VERIFICATION_LEVELS:
+        raise ValueError(f"非法验证级别: {verification}（支持 {VERIFICATION_LEVELS}）")
+    _ensure_doc_verification(conn)
+    row = conn.execute("SELECT canonical_verification FROM doc_verification WHERE source_id=?",
+                       (source_id,)).fetchone()
+    canon = row[0] if row is not None else canonical
+    conn.execute(
+        "INSERT OR REPLACE INTO doc_verification"
+        "(source_id, verification, canonical_verification, reviewer, updated_at) "
+        "VALUES(?,?,?,?,?)",
+        (source_id, verification, canon, reviewer or "", _now()),
+    )
+
+
+def clear_doc_verification_conn(conn: sqlite3.Connection, source_id: str) -> Optional[str]:
+    """撤销人工补标，返回**覆盖前的 canonical 值**（无覆盖行 → None，调用方保持原值）。"""
+    _ensure_doc_verification(conn)
+    row = conn.execute("SELECT canonical_verification FROM doc_verification WHERE source_id=?",
+                       (source_id,)).fetchone()
+    if row is None:
+        return None
+    conn.execute("DELETE FROM doc_verification WHERE source_id=?", (source_id,))
+    return row[0]
+
+
+def apply_verification(cfg: "AppConfig", source_id: str, verification: Optional[str],
+                       reviewer: str = "", *, clear: bool = False) -> dict:
+    """人工补标落库：写覆盖层 + **立即刷新 docs 行**（不必等下次构建）。
+
+    刷新是必要的：查询期 `search._doc_meta_from_fts` 从 `docs.extra.verification` 取该值
+    （向量路径也会用它补全 meta），不刷的话人工认证要等到下次 build_kb 才影响排序——
+    正是"点了认证但 w_rel 还是 0.5"的观感。
+
+    `docs.reliability` 按**查询期口径**重算（`compute_confidence` 不传 explicit_reliability，
+    会现场按字段+kind+verification 重算），因此这里也用 explicit=None，与检索实际得分一致。
+    **不动 content_hash**：下次 ingest 会因 meta_hash 不符走"仅刷新元数据"路径
+    （embed_hash 未变 → 不重嵌），结果一致且自愈。
+    """
+    from .confidence import reliability_score
+
+    kb = cfg.resolve(cfg.storage.sqlite_path)
+    if not kb.exists():
+        raise ValueError(f"kb.sqlite3 不存在：{kb}（先跑 build_kb.py 入库）")
+    conn = sqlite3.connect(str(kb))
+    try:
+        row = conn.execute(
+            "SELECT source_type, status, resolved_at, extra FROM docs WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"kb.sqlite3 中不存在文档 {source_id}")
+        source_type, status, resolved_at, extra_raw = row
+        extra = json.loads(extra_raw or "{}")
+        if clear:
+            # 撤销：回到**覆盖前**的 canonical 值（存在覆盖层里；无覆盖行则保持原值）
+            prev = clear_doc_verification_conn(conn, source_id)
+            effective = prev if prev is not None else extra.get("verification", "")
+        else:
+            # 首次覆盖时把当前（canonical）值记进覆盖层，供撤销回退
+            set_doc_verification_conn(conn, source_id, verification or "", reviewer,
+                                      canonical=extra.get("verification", ""))
+            effective = verification or ""
+        extra["verification"] = effective
+        rel = reliability_score(source_type, status, resolved_at, None, cfg.confidence,
+                                kind=extra.get("kind", ""), verification=effective or None)
+        conn.execute("UPDATE docs SET extra=?, reliability=? WHERE source_id=?",
+                     (json.dumps(extra, ensure_ascii=False), rel, source_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"source_id": source_id, "verification": effective, "reliability": rel}
+
+
+def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, action: str,
+                        reviewer: str, result: Optional[dict] = None) -> dict:
+    """补标审核动作（verification_pending 专用）：写覆盖层 + 刷新 docs + 记录审核项。
+
+    action=approved → 覆盖层写 `tested`（`result.verification="expert"` 可升级为专家认证）；
+    action=suspected → **清除覆盖层**（回到 unverified，可反悔；不是写 unverified，
+    因为 canonical 可能自带更高值如 PDF 的 expert）。
+    """
+    it = store.get_item(item_id)
+    if it is None:
+        raise ValueError(f"审核项不存在: {item_id}")
+    if it["category"] != "verification_pending":
+        raise ValueError(f"审核项 {item_id} 类别为 {it['category']}，不是补标项")
+    source_id = it["item_ref"]
+    if action == "approved":
+        want = (result or {}).get("verification") or "tested"
+        if want not in ("tested", "expert"):
+            raise ValueError(f"approved 的 verification 只能是 tested/expert，收到 {want!r}")
+        r = apply_verification(cfg, source_id, want, reviewer)
+    elif action == "suspected":
+        r = apply_verification(cfg, source_id, None, reviewer, clear=True)
+    else:
+        raise ValueError(f"非法标注动作: {action}（支持 approved | suspected）")
+    store.review(item_id, action, reviewer,
+                 result={"action": "verification", "verification": r["verification"],
+                         "reliability": r["reliability"], **(result or {})})
+    return {"ok": True, "source_id": source_id, **r}
 
 
 # ---------------- 资产注册表（asset_registry，review.sqlite3，管理员侧） ----------------
@@ -915,7 +1105,12 @@ def delete_tag(cfg: "AppConfig", name: str,
 # ---------------- 审核项生成（seed，幂等） ----------------
 
 def seed_verification_pending(cfg: "AppConfig", store: ReviewStore) -> int:
-    """扫描 kb.sqlite3 中 verification=unverified 的文档，生成补标审核项（幂等）。"""
+    """扫描 kb.sqlite3 中**生效** verification=unverified 的文档，生成补标审核项（幂等）。
+
+    读的是生效值（`docs.extra.verification`，ingest 已把人工补标覆盖层合并进去），
+    所以补标过的文档不会再进队列。LIKE 只作**预筛**（键名不受 json 分隔符影响），
+    真正判定用 JSON 精确比对——否则 json.dumps 的格式一变，这里会静默地什么都捞不到。
+    """
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
         return 0
@@ -923,9 +1118,14 @@ def seed_verification_pending(cfg: "AppConfig", store: ReviewStore) -> int:
     added = 0
     try:
         rows = conn.execute(
-            "SELECT source_id, title, url, extra FROM docs WHERE extra LIKE '%\"verification\": \"unverified\"%'"
+            'SELECT source_id, title, url, extra FROM docs WHERE extra LIKE \'%"verification"%\''
         ).fetchall()
         for source_id, title, url, extra in rows:
+            try:
+                if json.loads(extra or "{}").get("verification") != "unverified":
+                    continue
+            except ValueError:
+                continue
             if store.add_item("verification_pending", source_id,
                               {"source_id": source_id, "title": title, "url": url}):
                 added += 1

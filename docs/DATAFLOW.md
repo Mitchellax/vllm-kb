@@ -20,7 +20,8 @@
 │                                                           │    │
 │  canonical.jsonl ──chunk──▶ embed ──▶ LanceDB 向量库            │
 │                └──────────▶ SQLite（docs / chunks_fts /         │
-│                             chunks_meta / doc_tags）            │
+│                             chunks_meta / doc_tags /            │
+│                             doc_verification）                  │
 │  代码快照 ──▶ data/code/{zips,snapshots}/ + index.sqlite3       │
 │  版本日历/配套矩阵 ──▶ data/compatibility/*.json                │
 │  canonical+parsed+kb.sqlite3 ──build_graph──▶ data/graph（Kùzu）│
@@ -163,6 +164,7 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | `data/kb.sqlite3` 的 `chunks_fts` | FTS5：`indexed_text` 存 jieba 分词结果（中文可独立命中）、`text` 存原文（snippet 展示用） |
 | `data/kb.sqlite3` 的 `chunks_meta` | chunk_id → doc_id / seq / section |
 | `data/kb.sqlite3` 的 `doc_tags` | 人工标签覆盖层（auto_snapshot / excluded / manual），最终标签 = (auto − excluded) ∪ manual |
+| `data/kb.sqlite3` 的 `doc_verification` | 人工补标覆盖层（verification / canonical_verification / reviewer），**优先于 canonical 的 verification**——`docs` 行是 INSERT OR REPLACE，人工认证只能存独立表再由 ingest 合并；查询期从 `docs.extra.verification` 取该值 |
 
 > FTS 分词只影响索引列，向量库（原文嵌入）不受影响——`build_fts.py` 重建全文索引**无需重嵌向量**。
 
@@ -171,7 +173,7 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | 命令 / 组件 | 产物 | 说明 |
 |---|---|---|
 | `python scripts/build_fts.py` | 重建 `kb.sqlite3` 的 `chunks_fts`（读现有 chunk 原文重新 jieba 分词，chunk_id 与向量库严格一致） | 升级分词规则/旧库升级后使用；**不重新分块、不重嵌向量**，普通增量入库自动分词无需运行 |
-| `python scripts/review_ui.py` | `data/review.sqlite3`（`review_items` 审核队列 / `asset_registry` 资产路径注册 / `doc_tags` 标签覆盖层） | 审核工作台独立端口，**只读检索 API 全程不碰该库**；资产路径只存 `asset_id → rel_path`，不进 canonical/检索库。图片资产由 `ImageSource`/`MarkdownSource`/`WordSource` 批量注册（内容寻址：同内容多副本共用一行），审核台按 `rel_path` 经 `/assets` 静态挂载预览原图 |
+| `python scripts/review_ui.py` | `data/review.sqlite3`（`review_items` 审核队列 / `asset_registry` 资产路径注册 / `doc_tags` 标签覆盖层） | 审核工作台独立端口，**只读检索 API 全程不碰该库**；资产路径只存 `asset_id → rel_path`，不进 canonical/检索库。图片资产由 `ImageSource`/`MarkdownSource`/`WordSource` 批量注册（内容寻址：同内容多副本共用一行），审核台按 `rel_path` 经 `/assets` 静态挂载预览原图。**补标认证**（verification_pending）写 `kb.sqlite3.doc_verification` 覆盖层并立即刷新 `docs.extra.verification`/`reliability`（w_rel 0.5→0.85 当场生效，无需重建） |
 
 > 审核队列的 7 类人工确认项、API 配置中心、知识缺口展示见
 > [使用指南 §3.2](USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)。
@@ -300,12 +302,13 @@ serve_api（只读）                            离线周期
 | `chunks_fts` | chunk_id（UNINDEXED）/ doc_id（UNINDEXED）/ indexed_text / text（UNINDEXED） | FTS5 虚拟表；indexed_text 存 jieba 分词、text 存原文 |
 | `chunks_meta` | chunk_id（PK）/ doc_id / seq / section | 分块序号与章节（PDF/MD/Word 手册） |
 | `doc_tags` | source_id（PK）/ auto_snapshot / excluded / manual / updated_at / reviewer | 人工标签覆盖层（审核工作台维护） |
+| `doc_verification` | source_id（PK）/ verification / canonical_verification / reviewer / updated_at | 人工补标覆盖层（审核工作台认证/存疑维护）；`canonical_verification` 记覆盖前的值，供撤销回退 |
 
 ### 4.1 旁路存储（不参与检索）
 
 | 库 | 表 | 说明 |
 |---|---|---|
-| `data/review.sqlite3` | `review_items`（id/category/item_ref/payload/status/created_at/reviewed_at/reviewer/result）、`asset_registry`（asset_id/rel_path/sha256/size/source_type）、`doc_tags` | 审核队列 + 资产路径注册 + 标签覆盖层；只读检索 API 全程不碰；资产路径不进 canonical/检索库 |
+| `data/review.sqlite3` | `review_items`（id/category/item_ref/payload/status/created_at/reviewed_at/reviewer/result）、`asset_registry`（asset_id/rel_path/sha256/size/source_type） | 审核队列 + 资产路径注册；只读检索 API 全程不碰；资产路径不进 canonical/检索库（人工治理覆盖层 `doc_tags`/`doc_verification` 在 **kb.sqlite3**，见 4.0） |
 | `data/telemetry.sqlite3` | `query_events`（session_id/client_ip/ts/endpoint/method/query_hash/query_normalized/signature_hash/signature_entities/signature_text/result_doc_ids/result_count/component/target_version/repo/probe） | 行为遥测原始事件（`feedback_enabled` 时写入）；离线推断产出 `data/confidence_feedback.json`（见 3.6） |
 
 ## 5. 关键设计点
@@ -315,6 +318,11 @@ serve_api（只读）                            离线周期
 - **断点续传**：拉取断点存 `data/checkpoints/`；canonical 按 source_id upsert；重跑同一命令即续传；
 - **canonical 是唯一事实源**：`--rebuild` 从 `canonical.jsonl` 全量重建（清空向量库 + 删 kb.sqlite3，需 TTY 确认或 `--yes`）；
   修改过的业务文件必须回写 canonical（upsert 覆盖），否则全量重建会回退旧内容；
+  **例外：人工治理覆盖层**（`doc_tags`/`doc_verification`）只存在于 kb.sqlite3、canonical 里没有，
+  删库前先备份后恢复，否则标签治理与补标认证会被重建抹掉；
+- **人工治理覆盖层优先于 canonical**：`doc_tags`（标签）与 `doc_verification`（验证状态）在 ingest 时
+  合并进 `docs` 行；`doc_verification` 参与 `meta_hash`，所以补标后下一轮入库走"仅刷新元数据"
+  路径（不重嵌），且覆盖层变化不会被 canonical 冲回；
   若 kb 与 canonical 漂移（kb 有、canonical 无 → 图/rebuild 丢文档），用
   `scripts/backfill_canonical.py` 从 kb.sqlite3 回填缺失文档（默认 dry-run，`--write` 回填）；
 - **Kùzu 单写者**：更新图前必须先停检索服务，更新完重启；

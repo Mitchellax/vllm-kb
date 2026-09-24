@@ -337,7 +337,8 @@ class MarkdownSource(BaseSource):
 
     - pull(): 扫描配置 path 下 *.md / *.markdown，复制到 data/assets/md/（不可变层）；
     - canonicalize(): 每个文件一个 KbDocument（title=首个 # 标题或文件名，body=全文）；
-    - verification=unverified（质量参差，后续经审核工作台补标为 tested/expert）。
+    - verification=unverified（质量参差；审核工作台「补标」认证后写 doc_verification 覆盖层，
+      ingest 每轮合并进 extra/reliability —— 见 review.review_verification）。
     """
 
     type = "markdown"
