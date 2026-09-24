@@ -67,7 +67,7 @@ class TestSplitterDerivation(unittest.TestCase):
         self.assertEqual(dk.section_splitter_for("doc_pdf"), dk.SPLITTER_PDF)
         self.assertEqual(dk.section_splitter_for("doc_markdown"), dk.SPLITTER_MARKDOWN)
         self.assertEqual(dk.section_splitter_for("doc_word"), dk.SPLITTER_MARKDOWN)
-        self.assertEqual(dk.section_splitter_for("doc_excel"), dk.SPLITTER_MARKDOWN)
+        self.assertEqual(dk.section_splitter_for("doc_excel"), dk.SPLITTER_LINES)
         self.assertEqual(dk.section_splitter_for("github_issue"), "")
         self.assertEqual(dk.section_splitter_for("不存在的类型"), "")
 

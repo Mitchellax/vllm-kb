@@ -75,8 +75,8 @@
 
 | 阶段 | 处理 | 产物 |
 |---|---|---|
-| 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,word,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
-| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；**Word**（`python-docx` 按文档顺序单遍解析：标题样式 `Heading 1-6`/「标题 1」/`Title`/`Subtitle` → Markdown `#` 层级，**自定义标题样式名靠 `w:outlineLvl` 兜底**（分块复用 markdown 章节切分，chunk 带 `section`）、列表样式 → `- `/`1. `、表格 → Markdown 拼入正文、超链接 → `[文字](url)`（**只认 http/https**，`file://`/UNC 只留文字以免内部路径进正文）；**内嵌图片** → `[图片]`/`[图片:alt]` 不透明占位（DrawingML `a:blip` 与 VML `v:imagedata` 都扫、`mc:AlternateContent` 只认 Choice 以免一张图数成两张）+ `assets/images/img_{sha16}.{ext}` 内容寻址资产 + 复用同一套 OCR 幂等缓存（高置信注入占位符之后，低置信进审核队列）；与 markdown 同构：优先读 `imports/word`（保留目录树、可消歧），扫不到时回退 `assets/word` 并按版本族收敛；`.doc`/加密 docx（CFB 容器）/RTF 跳过并给出可操作原因）；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF/Word 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`（**带 schema 位**，提取逻辑升级即整体失效重解析）、OCR 产物 `*.ocr.json`，可重跑） |
+| 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层；**`canonicalize()` 也会落原件**（§1.6：`--skip-pull` / `build_canonical.py` 只跑 canonicalize，不落盘就断了 `asset_id → asset_registry.rel_path` 预览链） | `data/assets/{pdf,md,word,excel,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
+| 2. 解析 | PDF 文字层 + 表格提取（**文档集由 `imports/pdf` 决定**，资产层只作回退；历史版本升级后资产层独有的族会打 stray 告警）；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel **一个文件一篇**（body = `## <sheet 名>` + 每个非空行按列序拼接；分块按行，见 §2.2a）；**Word**（`python-docx` 按文档顺序单遍解析：标题样式 `Heading 1-6`/「标题 1」/`Title`/`Subtitle` → Markdown `#` 层级，**自定义标题样式名靠 `w:outlineLvl` 兜底**（分块复用 markdown 章节切分，chunk 带 `section`）、列表样式 → `- `/`1. `、表格 → Markdown 拼入正文、超链接 → `[文字](url)`（**只认 http/https**，`file://`/UNC 只留文字以免内部路径进正文）；**内嵌图片** → `[图片]`/`[图片:alt]` 不透明占位（DrawingML `a:blip` 与 VML `v:imagedata` 都扫、`mc:AlternateContent` 只认 Choice 以免一张图数成两张）+ `assets/images/img_{sha16}.{ext}` 内容寻址资产 + 复用同一套 OCR 幂等缓存（高置信注入占位符之后，低置信进审核队列）；与 markdown 同构：优先读 `imports/word`（保留目录树、可消歧），扫不到时回退 `assets/word` 并按版本族收敛；`.doc`/加密 docx（CFB 容器）/RTF 跳过并给出可操作原因）；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF/Word 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`（**带 schema 位**，提取逻辑升级即整体失效重解析）、OCR 产物 `*.ocr.json`，可重跑） |
 | 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 
@@ -92,12 +92,19 @@ PDF / Markdown / Word / Excel 都是"一个文件一篇文档"，原先各自实
 | **身份** | `source_id = <前缀>:<族名>`；族名在**内容改动下稳定**（不含 `_copy_asset` 写的 `.<sha12>`）；同族名多份才追加**相对路径**指纹 `--<sha8>` | `SourceFile.sid()` / `source_files.path_tag` |
 | **版本族收敛** | 回退模式按 `(族名, 后缀)` 分组，每族只取 mtime 最大者（并列取文件名字典序较大者），并取**族名**作 stem | `source_files.latest_versions` |
 | **偏离诊断** | 导入路径非空时，资产层"有、导入路径没有"的族 → 打告警（这些文档**已不再纳入 canonical**） | `Discovery.stray` |
-| **章节切分** | 由 `DocKind.section_splitter` 决定（`pdf`=编号标题 / `markdown`= `#` 标题 / `""`=不切），实现表在 `chunking._SPLITTERS` | `chunking.chunk_doc` |
+| **章节切分** | 由 `DocKind.section_splitter` 决定（`pdf`=编号标题 / `markdown`= `#` 标题且同标题正文合成一段 / `lines`= `##` 标题分组但**每行各自成块** / `""`=不切），实现表在 `chunking._SPLITTERS` | `chunking.chunk_doc` |
 | **外源文档范围** | 审核台「文档管理」收录哪些 `source_type`，由声明表派生 | `review._EXTERNAL_SOURCE_TYPES = doc_kinds.EXTERNAL_DOC_TYPES` |
+| **文档粒度** | 一个文件一篇（PDF/Markdown/Word/Excel 一致）；Excel 的分块仍按**行**（`lines` 策略）——聚合粒度与检索粒度解耦 | `sources.ExcelSource.canonicalize` + `chunking._split_lines_with_headings` |
 
 > **为什么"偏离诊断"必须有**：`ingest` 不删文档、`pipeline.upsert_unified_canonical` 也不删行，
 > 所以"某文件不再被刷新"是**静默偏离**（文档还在库里、还能被检索到，只是永远停在旧内容），
 > 比直接丢掉更难发现。发现层因此把"资产层有、导入路径没有"的族显式打出来。
+> 历史版本升级（原先 PDF 只 pull、不建 `imports/pdf`）时必然触发这条告警，处理办法见使用指南 §2.3。
+>
+> **为什么 Excel 按文件聚合**：逐行的 `source_id` 只能靠**位置**（`文件:sheet:行`），
+> 中间插一行就会让其后的行身份整体平移，人工治理（标签/补标）会**串到别的行**上；
+> 按文件聚合后身份 = `excel:<文件名>`，与其余来源同构。**检索粒度不损失**：
+> 每个非空行仍是独立 chunk（`lines` 策略不合并行），且 `## sheet 名` 让 chunk 带 `section`。
 >
 > **刻意不纳入本表**：`confidence.py` 的来源可靠度基线与 `graph.py` 的节点类型映射——
 > 那是**评分语义**与**图语义**，不是"文件型来源"的属性，硬塞进来会让声明表退化成万能配置表。

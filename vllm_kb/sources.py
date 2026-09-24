@@ -87,12 +87,13 @@ def _discover_for(src: "BaseSource", kind: DocKind, import_path: Path) -> Discov
     ))
 
 
-def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
+def _copy_asset(src: Path, assets_dir: Path, sub: str,
+                sha: Optional[str] = None) -> tuple[str, str, bool]:
     """复制资产到 assets/{sub}/（不可变层）。同名同 sha 幂等跳过；同名异 sha 加 sha 前缀。
-    返回 (assets 相对路径, sha256, 是否新增复制)。"""
+    返回 (assets 相对路径, sha256, 是否新增复制)。`sha` 已知时传入可省一次整文件读取。"""
     target_dir = assets_dir / sub
     target_dir.mkdir(parents=True, exist_ok=True)
-    sha = _sha256(src)
+    sha = sha or _sha256(src)
     target = target_dir / src.name
     if target.exists() and _sha256(target) == sha:
         return f"assets/{sub}/{target.name}", sha, False
@@ -194,6 +195,19 @@ class BaseSource(ABC):
             return art.evidence(), (f"\n图片文字（OCR 置信度 {art.confidence:.2f}）:\n"
                                     f"{art.text.strip()}")
         return art.evidence(), ""
+
+    def _materialize_doc_asset(self, p: Path, sha: Optional[str] = None) -> tuple:
+        """把**文档原件**复制进资产层并返回 asset_registry 条目。
+
+        `canonicalize()` 也落资产层：`scripts/build_canonical.py` 与 `--skip-pull` 只跑
+        canonicalize，不落盘就会断掉 `asset_id → asset_registry.rel_path` 这条链
+        （审核台「文档管理」拿不到原件、无法预览/下载，只能看到一个 sha）。这与
+        "canonicalize 已把内嵌图片落资产层"是同一套约定，不引入新的副作用——
+        `_copy_asset` 幂等，与 `pull()` 重复执行不会多出副本。
+        """
+        rel, sha_out, _copied = _copy_asset(p, self.resolve("data/assets"),
+                                            self.kind.asset_sub, sha)
+        return _asset_entry(rel, sha_out, self.kind.source_type, self.resolve(rel))
 
     def _register_asset_mappings(self, items: list[tuple]) -> None:
         """注册资产到审核侧 asset_registry（管理员路径映射；不进 canonical/检索库）。
@@ -351,6 +365,7 @@ class MarkdownSource(BaseSource):
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
+        doc_assets: list[tuple] = []   # md 原件资产（§1.6：canonicalize 也落资产层）
         img_assets: list[tuple] = []  # 图片资产（末尾统一注册到 asset_registry）
         # 发现 + 回退告警 + 同名消歧告警统一由 source_files.discover 负责
         found = _discover_for(self, self.kind, self.import_dir)
@@ -380,6 +395,7 @@ class MarkdownSource(BaseSource):
             sha = _sha256(p)
             asset_id = sha[:16]
             sid = f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir())
+            doc_assets.append(self._materialize_doc_asset(p, sha))
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
             tags, cands = extract_tags(stem, headings_from_markdown(text), registry=registry)
             extra: dict[str, Any] = {
@@ -413,8 +429,8 @@ class MarkdownSource(BaseSource):
         if total:
             print(f"[sources:{self.id}] 解析完成：{len(docs)}/{total} 篇（耗时 "
                   f"{time.time() - start_ts:.0f}s）", flush=True)
-        # 图片资产注册（审核侧经 asset_id 反查路径/预览）；与 md 文件同批注册
-        self._register_asset_mappings(img_assets)
+        # 图片资产注册（审核侧经 asset_id 反查路径/预览）；与 md 原件、图片同批注册
+        self._register_asset_mappings(doc_assets + img_assets)
         self.save_sanitize_log(collector)
         return docs
 
@@ -568,10 +584,13 @@ class PdfSource(BaseSource):
         print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 pdf）")
         return added
 
-    # ---------- 解析（可重跑：只读资产层） ----------
+    # ---------- 解析（可重跑：优先读导入目录） ----------
 
     def canonicalize(self) -> list[KbDocument]:
-        """从资产层 PDF 解析出 KbDocument（每篇一个，body=Markdown 全文）。
+        """从导入目录（缺失时回退资产层）的 PDF 解析出 KbDocument（每篇一个，body=Markdown 全文）。
+
+        **导入路径权威**：与 md/word 同构——`path` 下扫到的 PDF 就是文档集，资产层只作为
+        回退与诊断（`stray` 告警会点出"资产层有、导入路径没有"的族，因为那些文档会**静默停更**）。
 
         表格策略：页面表格转 Markdown 表格拼入正文（错误码/命令可被 FTS 检索），
         同时写入 parsed/pdf/{asset_id}.tables.json 供结构化消费（图/查询）。
@@ -585,22 +604,24 @@ class PdfSource(BaseSource):
             print(f"[sources:{self.id}] 未安装 pymupdf：pip install pymupdf（{e}）")
             return []
         docs: list[KbDocument] = []
-        assets = self._assets_dir()
-        if not assets.exists():
+        doc_assets: list[tuple] = []   # PDF 原件资产（§1.6：canonicalize 也落资产层）
+        found = _discover_for(self, self.kind, self.import_dir)
+        if not found.files:
             return docs
         parsed_dir = self._parsed_dir()
         parsed_dir.mkdir(parents=True, exist_ok=True)
-        pdfs = sorted(assets.glob("*.pdf"))
-        if not pdfs:
-            return docs
-        total = len(pdfs)
+        total = len(found.files)
         start_ts = time.time()
         print(f"[sources:{self.id}] 解析 {total} 个 PDF（PyMuPDF 逐页提取，大手册耗时较长）…",
               flush=True)
-        for i, p in enumerate(pdfs, 1):
+        for i, f in enumerate(found.files, 1):
+            p = f.path
             t0 = time.time()
+            sid = f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir())
+            doc_assets.append(self._materialize_doc_asset(p))
             try:
-                result = self._parse_pdf(p, parsed_dir)
+                result = self._parse_pdf(p, parsed_dir, sid=sid, stem=f.stem,
+                                         from_imports=f.from_imports)
             except Exception as e:
                 print(f"[sources:{self.id}] [{i}/{total}] 解析失败 {p.name}: {e}（跳过）",
                       flush=True)
@@ -615,10 +636,17 @@ class PdfSource(BaseSource):
                   f"{time.time() - t0:.1f}s{cache_tag}）", flush=True)
         print(f"[sources:{self.id}] 解析完成：成功 {len(docs)}/{total}（耗时 "
               f"{time.time() - start_ts:.0f}s）", flush=True)
+        # 原件资产注册（§1.6：--skip-pull / build_canonical.py 也留下完整预览链）
+        self._register_asset_mappings(doc_assets)
         return docs
 
-    def _parse_pdf(self, p: Path, parsed_dir: Path):
+    def _parse_pdf(self, p: Path, parsed_dir: Path, *, sid: str, stem: str,
+                   from_imports: bool):
         """解析单篇 PDF，返回 (KbDocument | None, 是否缓存命中)。
+
+        `sid` / `stem` / `from_imports` 由发现层给出（`stem` 是**族名**，不是可能带
+        `.<sha12>` 的文件名）——文档身份必须与"哪一份文件"解耦，否则收敛到历史版本
+        副本时 id 会漂移。
 
         **缓存优先**：耗时大头是 PyMuPDF 逐页提取（大手册 200+ 页约数秒~数十秒）；
         解析中间产物（文字层 body + 表格 + 首行/页数）按 asset_id（sha256 前缀，内容寻址）
@@ -637,7 +665,9 @@ class PdfSource(BaseSource):
                 # 不校验就会**静默沿用旧解析结果**（例如新增的表格提取永远不生效）
                 if (data.get("sha256") == sha
                         and data.get("schema") == _PDF_EXTRACT_SCHEMA):
-                    return self._doc_from_extract(p, sha, asset_id, data, registry), True
+                    return self._doc_from_extract(p, sha, asset_id, data, registry,
+                                                  sid=sid, stem=stem,
+                                                  from_imports=from_imports), True
             except (OSError, ValueError):
                 pass  # 缓存损坏 → 重新解析
         parsed = self._extract_pdf(p)
@@ -645,7 +675,9 @@ class PdfSource(BaseSource):
             return None, False
         cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
         self._write_tables(parsed_dir, asset_id, parsed.get("tables") or [])
-        return self._doc_from_extract(p, sha, asset_id, parsed, registry), False
+        return self._doc_from_extract(p, sha, asset_id, parsed, registry,
+                                      sid=sid, stem=stem,
+                                      from_imports=from_imports), False
 
     def _extract_pdf(self, p: Path):
         """PyMuPDF 逐页提取（慢，结果可缓存）：文字层 → Markdown 正文 + 结构化表格。
@@ -709,20 +741,24 @@ class PdfSource(BaseSource):
         return [f"parsed/pdf/{tpath.name}"]
 
     def _doc_from_extract(self, p: Path, sha: str, asset_id: str, parsed: dict,
-                          registry: TagRegistry) -> KbDocument:
+                          registry: TagRegistry, *, sid: str, stem: str,
+                          from_imports: bool) -> KbDocument:
         """用解析中间产物构造 KbDocument（确定性提取，毫秒级，每次运行重算）。
 
         缓存命中与首次解析共用本函数——标签/元数据提取始终以最新规则执行，
         解析器升级（pymupdf 版本/提取逻辑）不影响提取结果的一致性。
+
+        `stem` 是发现层给出的**族名**（文档身份来源）；`p.stem` 只在回退模式收敛到
+        `.<sha12>` 历史副本时会不同，直接用它会造出"新文档"。
         """
         body = str(parsed.get("body") or "")
-        title = str(parsed.get("first_text") or "").strip() or p.stem
-        tags, cands = extract_tags(p.stem, headings_from_pdf(body), registry=registry)
+        title = str(parsed.get("first_text") or "").strip() or stem
+        tags, cands = extract_tags(stem, headings_from_pdf(body), registry=registry)
         # tables.json 由 _parse_pdf 首次解析时写入；缓存命中时文件已存在，rel 引用直接构造
         tables_rel = [f"parsed/pdf/{asset_id}.tables.json"] if parsed.get("tables") else []
         return KbDocument(
-            source_type="doc_pdf",
-            source_id=f"pdf:{p.stem}",
+            source_type=self.kind.source_type,
+            source_id=sid,
             url="",
             title=title,
             body=body,
@@ -732,8 +768,10 @@ class PdfSource(BaseSource):
             extra={
                 "asset": {"asset_id": asset_id, "sha256": sha,
                           "format": "pdf", "pages": int(parsed.get("pages") or 0)},
-                "quality": {"text_source": "text_layer", "parsed_with": "pymupdf"},
-                "verification": "expert",  # 官方操作手册默认专家验证
+                "quality": {"text_source": "text_layer", "parsed_with": "pymupdf",
+                            # 回退模式（imports 缺失）→ 资产层扁平副本，无目录树
+                            "source_mode": "imports" if from_imports else "assets_fallback"},
+                "verification": self.kind.default_verification,  # 官方手册默认专家验证
                 "structure": {"tables": tables_rel},
                 # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
                 "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
@@ -1173,14 +1211,18 @@ class ExcelSource(BaseSource):
 
     **schema-free 设计（不写死任何列名/sheet 名/行号）**：
     - pull：把配置 path（文件或目录）下的 .xlsx/.xlsm 复制到资产层；
-    - canonicalize：遍历**所有 sheet、所有行**，把每行的非空 cell **按列序拼接成一段
-      自由文本**作为 body——不依赖表头/列语义；每行一条 KbDocument（source_id 用
-      `excel:{stem}:{sheet序号}:{行号}` 保证唯一，行号仅作标识、非解析依赖）；
+    - canonicalize：**一个文件一篇文档**（`source_id = excel:<文件名>`，与 md/word/pdf 同构）——
+      body 为 `## <sheet 名>` + 各非空行的 cell **按列序拼接**（不依赖表头/列语义）；
+      分块仍以"行"为单位（每个非空行是独立段落 → 独立 chunk，带 sheet 作 section），
+      所以按文件聚合**不损失检索粒度**；
+    - **为什么不再逐行一篇**：逐行的 `source_id` 只能靠位置（`文件:sheet:行`），中间插一行会让
+      其后所有行身份平移，人工治理（标签/补标）**串到别的行**上；按文件聚合后身份稳定，
+      且标签/验证状态是**整体评估**（登记表整体入库、整体补标，不做逐行判断）；
     - **实体提取复用现有线路**：body 进入 canonical 后，错误码/算子/模型/版本由
       signature 三层提取自动入图（scheme-free：图构建只依赖 canonical）；
     - **脱敏**：cell 值经 sanitize_text（内部 IP → &lt;IP&gt;、内部路径 → &lt;PATH&gt;，
       默认路径/日志路径白名单保留），防止内部数据经检索外泄；
-    - 验证状态：登记表默认 `unverified`、status=open（低优先级，按未解决 issue 处理）。
+    - 验证状态：登记表默认 `unverified`（低优先级），审核台整体补标。
     """
 
     type = "excel"
@@ -1224,10 +1266,26 @@ class ExcelSource(BaseSource):
         return added
 
     def canonicalize(self) -> list[KbDocument]:
-        """遍历所有 sheet/行，行 cell 拼接为 body（schema-free）。
+        """**一个文件一篇文档**（与 md/word/pdf 同构）：body = 各 sheet 的 Markdown 段落。
 
-        **后置脱敏**：body 以**原文入库**（原文检索）；仅按 config.sanitize 扫描会被脱敏的
-        IP/路径，落盘 sanitize_log.json 供维护白名单（出口脱敏由 serve_api 返回时统一做）。
+        体例（schema-free，不假设列语义）：
+
+            ## <sheet 名>
+
+            行1单元格1 行1单元格2 …
+            行2单元格1 …
+
+        - **为什么按文件聚合**：逐行一篇时 `source_id` 只能靠**位置**（`excel:文件:sheet:行`），
+          在中间插一行就会让其后所有行的身份整体平移——人工治理（标签/补标）会**串到别的行**上。
+          按文件聚合后身份 = `excel:<文件名>`，与 md/word/pdf 完全一致，插行/改行都不影响；
+        - **检索粒度不损失**：分块仍以"行"为单位（每个非空行是独立段落 → 独立 chunk），
+          且 `## sheet 名` 让每个 chunk 带 `section`，命中时能看出属于哪张表；
+        - **标签/置信度是整体评估**：`tags` 由文件名 + sheet 名走同一套 `extract_tags`
+          （与 md/word 同构），`verification` 按文件给一个默认值——登记表整体入库、整体补标，
+          不做逐行判断；
+        - 每个非空行仍做**后置脱敏**扫描（命中落 sanitize_log.json，不阻断入库）。
+
+        **后置脱敏**：body 以**原文入库**（原文检索）；出口脱敏由 serve_api 返回时统一做。
         """
         from .sanitize import collect_sanitize_hits
 
@@ -1240,58 +1298,85 @@ class ExcelSource(BaseSource):
             print(f"[sources:{self.id}] 未安装 openpyxl：pip install openpyxl（{e}）")
             return []
         docs: list[KbDocument] = []
-        assets = self._assets_dir()
-        if not assets.exists():
+        registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
+        doc_assets: list[tuple] = []   # excel 原件资产（§1.6：canonicalize 也落资产层）
+        found = _discover_for(self, self.kind, self.import_path)
+        if not found.files:
             return docs
-        n_files = 0
-        for pat in self.kind.patterns:
-            for p in sorted(assets.glob(pat)):
-                n_files += 1
-                sha = _sha256(p)
-                asset_id = sha[:16]
-                try:
-                    wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
-                except Exception as e:
-                    print(f"[sources:{self.id}] 读取失败 {p.name}: {e}（跳过）")
-                    continue
-                try:
-                    for sheet_idx, ws in enumerate(wb.worksheets, 1):
-                        for row_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
-                            cells = [str(c).strip() for c in row
-                                     if c is not None and str(c).strip()]
-                            if not cells:
-                                continue  # 空行跳过（不依赖行号语义）
-                            body = " ".join(cells)
-                            if sanitize_on:
-                                ips, paths = collect_sanitize_hits(body, keep_paths, keep_ips)
-                                if ips:
-                                    collector.setdefault("ips", set()).update(ips)
-                                if paths:
-                                    collector.setdefault("paths", set()).update(paths)
-                            if not body.strip():
-                                continue
-                            title = cells[0][:80]
-                            docs.append(KbDocument(
-                                source_type=self.kind.source_type,
-                                source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",
-                                url="",
-                                title=title or f"{p.stem} {sheet_idx} 行 {row_idx}",
-                                body=body,
-                                created_at=None,
-                                component="",
-                                tags=[],  # Excel 不做文件名/标题标签（正文候选走 build_tag_candidates）
-                                extra={
-                                    "asset": {"asset_id": asset_id, "sha256": sha,
-                                              "format": "excel"},
-                                    "quality": {"text_source": "table", "parsed_with": "openpyxl"},
-                                    "verification": self.kind.default_verification,
-                                },
-                            ))
-                finally:
-                    wb.close()
+        total = len(found.files)
+        start_ts = time.time()
+        print(f"[sources:{self.id}] 解析 {total} 个 Excel …", flush=True)
+        for f in found.files:
+            p, stem = f.path, f.stem
+            sha = _sha256(p)
+            asset_id = sha[:16]
+            doc_assets.append(self._materialize_doc_asset(p, sha))
+            try:
+                wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+            except Exception as e:
+                print(f"[sources:{self.id}] 读取失败 {p.name}: {e}（跳过）", flush=True)
+                continue
+            parts: list[str] = []
+            sheet_names: list[str] = []
+            n_rows = 0
+            try:
+                for ws in wb.worksheets:
+                    sheet = str(ws.title or "").strip() or "Sheet"
+                    sheet_names.append(sheet)
+                    rows: list[str] = []
+                    for row in ws.iter_rows(values_only=True):
+                        cells = [str(c).strip() for c in row
+                                 if c is not None and str(c).strip()]
+                        if not cells:
+                            continue  # 空行跳过（不依赖行号语义）
+                        line = " ".join(cells)
+                        rows.append(line)
+                        if sanitize_on:
+                            ips, paths = collect_sanitize_hits(line, keep_paths, keep_ips)
+                            if ips:
+                                collector.setdefault("ips", set()).update(ips)
+                            if paths:
+                                collector.setdefault("paths", set()).update(paths)
+                    if rows:
+                        n_rows += len(rows)
+                        parts.append(f"## {sheet}\n\n" + "\n".join(rows))
+            finally:
+                wb.close()
+            body = "\n\n".join(parts).strip()
+            if not body:
+                print(f"[sources:{self.id}] 跳过 {p.name}：所有 sheet 均为空", flush=True)
+                continue
+            # 标签与 md/word 同构：文件名 + sheet 名（两级分类，见 tagging.py）
+            tags, cands = extract_tags(stem, sheet_names, registry=registry)
+            docs.append(KbDocument(
+                source_type=self.kind.source_type,
+                source_id=f.sid(self.kind.sid_prefix, self.import_path, self._assets_dir()),
+                url="",
+                title=stem,
+                body=body,
+                created_at=None,
+                component="",
+                tags=[t.name for t in tags],
+                extra={
+                    "asset": {"asset_id": asset_id, "sha256": sha, "format": "excel"},
+                    "quality": {"text_source": "table", "parsed_with": "openpyxl",
+                                "sheets": len(sheet_names), "rows": n_rows,
+                                # 回退模式（imports 缺失）→ 资产层扁平副本，无目录树
+                                "source_mode": "imports" if f.from_imports
+                                               else "assets_fallback"},
+                    "verification": self.kind.default_verification,
+                    # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+                    "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
+                },
+            ))
+            print(f"[sources:{self.id}] 解析完成 {p.name}"
+                  f"（{len(sheet_names)} sheet / {n_rows} 行）", flush=True)
+        print(f"[sources:{self.id}] 解析完成：{len(docs)}/{total} 篇（耗时 "
+              f"{time.time() - start_ts:.0f}s）", flush=True)
+        # 原件资产注册（§1.6：--skip-pull / build_canonical.py 也留下完整预览链）
+        self._register_asset_mappings(doc_assets)
         # 被脱敏命中的 IP/路径落盘维护文件（data/sanitize_log.json，幂等合并；app_cfg 缺失时跳过）
         self.save_sanitize_log(collector)
-        print(f"[sources:{self.id}] canonical {len(docs)} 条（{n_files} 个 excel）")
         return docs
 
 
@@ -1431,6 +1516,7 @@ class WordSource(BaseSource):
         total = len(files)
         start_ts = time.time()
         img_assets: list[tuple] = []   # 内嵌图片资产（末尾与 word 原件同批注册）
+        doc_assets: list[tuple] = []   # word 原件资产（§1.6：canonicalize 也落资产层）
         print(f"[sources:{self.id}] 解析 {total} 个 Word …", flush=True)
         for i, f in enumerate(files, 1):
             p, from_imports, stem = f.path, f.from_imports, f.stem
@@ -1443,6 +1529,7 @@ class WordSource(BaseSource):
             if parsed is None:
                 continue
             sha = _sha256(p)
+            doc_assets.append(self._materialize_doc_asset(p, sha))
             evidence, injects, registered = self._materialize_images(p, parsed)
             img_assets.extend(registered)
             doc = self._doc_from_extract(
@@ -1463,8 +1550,8 @@ class WordSource(BaseSource):
                   f" / {n_img} 图，{time.time() - t0:.1f}s{cache_tag}）", flush=True)
         print(f"[sources:{self.id}] 解析完成：成功 {len(docs)}/{total}（耗时 "
               f"{time.time() - start_ts:.0f}s）", flush=True)
-        # 内嵌图片资产注册（审核侧经 asset_id 反查路径/预览；低置信 OCR 项由 review 扫描入队）
-        self._register_asset_mappings(img_assets)
+        # 内嵌图片与 word 原件资产注册（审核侧经 asset_id 反查路径/预览）
+        self._register_asset_mappings(doc_assets + img_assets)
         self.save_sanitize_log(collector)
         return docs
 

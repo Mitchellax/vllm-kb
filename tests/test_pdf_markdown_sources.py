@@ -1,6 +1,7 @@
 """PDF / Markdown 来源导入测试：pull 幂等、canonicalize 解析、验证状态默认规则、表格结构化、
 文档级标签提取（两级分类）、资产路径脱敏（asset_id + 正文图片占位）。"""
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -213,6 +214,72 @@ class TestPdfSource(unittest.TestCase):
         self.assertIn("npu", cands)
         self.assertIn("hccn", cands)
         self.assertIn("cmd format", cands)
+
+    def test_imports_authority_ignores_assets_only_family(self):
+        """**严格 imports 权威**：导入目录扫到 PDF 后，资产层独有的 PDF 不再产出文档。
+
+        这是"与 md/word 同构"的核心行为。代价是那些文档会**静默停更**（ingest 不删文档），
+        所以必须打 stray 告警——见下一个测试。
+        """
+        self.src.pull()                       # 资产层有 npu_hccn_tool_guide.pdf
+        # 再放一篇只存在于资产层的 PDF（模拟"以前 pull 过、后来从 imports 删了"）
+        stray = self.root / "data" / "assets" / "pdf" / "老手册.pdf"
+        make_pdf(stray)
+        docs = self.src.canonicalize()
+        self.assertEqual([d.source_id for d in docs], ["pdf:npu_hccn_tool_guide"])
+
+    def test_stray_family_warning(self):
+        """资产层有、导入路径没有的族 → 显式告警（否则"停更"不可见）。"""
+        import contextlib
+        import io
+
+        self.src.pull()
+        make_pdf(self.root / "data" / "assets" / "pdf" / "老手册.pdf")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.src.canonicalize()
+        out = buf.getvalue()
+        self.assertIn("不在导入路径中", out)
+        self.assertIn("老手册.pdf", out)
+
+    def test_fallback_to_assets_when_imports_missing(self):
+        """导入目录清空 → 回退资产层副本（按版本族收敛，身份取族名）。"""
+        self.src.pull()
+        shutil.rmtree(self.root / "data" / "imports" / "pdf")
+        docs = self.src.canonicalize()
+        self.assertEqual([d.source_id for d in docs], ["pdf:npu_hccn_tool_guide"])
+        self.assertEqual(docs[0].extra["quality"]["source_mode"], "assets_fallback")
+
+    def test_fallback_converges_version_copies(self):
+        """资产层同名异内容会累积 `.<sha12>` 副本 → 回退时收敛为一篇（族名作身份）。"""
+        self.src.pull()
+        p = self.root / "data" / "assets" / "pdf" / "npu_hccn_tool_guide.pdf"
+        # 造一份"历史版本"副本（sha 后缀必须 12 位 hex）
+        shutil.copy2(p, p.with_name("npu_hccn_tool_guide.0123456789ab.pdf"))
+        shutil.rmtree(self.root / "data" / "imports" / "pdf")
+        docs = self.src.canonicalize()
+        self.assertEqual([d.source_id for d in docs], ["pdf:npu_hccn_tool_guide"])
+
+    def test_doc_asset_registered_without_pull(self):
+        """§1.6：只跑 canonicalize（`--skip-pull` / build_canonical.py）也留下原件预览链。"""
+        import os
+
+        from vllm_kb.review import list_assets
+
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        try:
+            cfg = AppConfig.model_validate({})
+            src = PdfSource(self.cfg, project_root=self.root, app_cfg=cfg)
+            docs = src.canonicalize()          # 注意：**不调 pull()**
+            self.assertEqual(len(docs), 1)
+            assets = list_assets(self.root / "data" / "review.sqlite3")
+            reg = assets.get(docs[0].extra["asset"]["asset_id"])
+            self.assertIsNotNone(reg, assets)
+            self.assertEqual(reg["source_type"], "doc_pdf")
+            self.assertEqual(reg["rel_path"], "assets/pdf/npu_hccn_tool_guide.pdf")
+            self.assertTrue((self.root / "data" / reg["rel_path"]).is_file())
+        finally:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
 
     def test_pdf_tags_from_registry(self):
         """词典命中 → 自动标签（两级 tier）。"""

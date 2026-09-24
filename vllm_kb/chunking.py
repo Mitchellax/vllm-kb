@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import re
 
-from .doc_kinds import SPLITTER_MARKDOWN, SPLITTER_PDF, section_splitter_for
+from .doc_kinds import (
+    SPLITTER_LINES,
+    SPLITTER_MARKDOWN,
+    SPLITTER_PDF,
+    section_splitter_for,
+)
 from .models import KbChunk, KbDocument
 
 _PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
@@ -69,6 +74,7 @@ def _split_sections(text: str) -> list[tuple[str, str]]:
 _SPLITTERS = {
     SPLITTER_PDF: lambda text: _split_sections(text),
     SPLITTER_MARKDOWN: lambda text: _split_markdown_sections(text),
+    SPLITTER_LINES: lambda text: _split_lines_with_headings(text),
 }
 
 
@@ -144,6 +150,29 @@ def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
     if cur_lines:
         sections.append((cur_title, "\n".join(cur_lines)))
     return sections
+
+
+def _split_lines_with_headings(text: str) -> list[tuple[str, str]]:
+    """`## 标题` 分组、**每个非空行各自成节**（不合并）。
+
+    与 `_split_markdown_sections` 的区别：后者把同一标题下的正文当**一段**（按空行分块、
+    攒到 `max_chunk_chars` 才切），适合长文档；本策略**绝不合并行**，适合"一行一条记录"的
+    结构化文本——Excel 登记表每个非空行是独立条目，若与相邻行合并成一大块，检索精度会被
+    稀释（查一条问题却把整张表塞进上下文）。
+
+    本函数不知道"Excel"：它只认 `## 标题` 与行。哪种来源用它由 `doc_kinds` 声明。
+    """
+    out: list[tuple[str, str]] = []
+    title = ""
+    for line in (text or "").splitlines():
+        m = _MD_HEADING_LINE_RE.match(line)
+        if m:
+            title = m.group(1).strip()
+            continue
+        s = line.strip()
+        if s:
+            out.append((title, s))
+    return out
 
 
 def _chunk_sections(

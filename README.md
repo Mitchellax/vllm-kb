@@ -38,7 +38,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   磁盘缓存，跨运行零重复下载）；GitHub releases/requirements/tag→commit 跨运行缓存——全命中时
   API 请求为 0，不受未认证限流约束；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
-  Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
+  Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，**一个文件一篇**——分块仍按行，
+  每行独立 chunk 且带 sheet 作 section）、
   Word 文档（标题样式/大纲级别→章节、列表、表格→结构化 JSON、内嵌图片→内容寻址资产 + OCR、
   超链接→`[文字](url)`；复用同一套分块/标签/图/审核链路）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；

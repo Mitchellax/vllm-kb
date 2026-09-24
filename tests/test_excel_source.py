@@ -49,27 +49,113 @@ class TestExcelSource(unittest.TestCase):
         # 幂等
         self.assertEqual(self.src.pull(), 0)
 
-    def test_canonicalize_schema_free(self):
-        """多 sheet/变列/空行：每行一条，body 按列序拼接（不依赖列名/sheet名/行号）。"""
+    def test_canonicalize_one_doc_per_file(self):
+        """**一个文件一篇**：多 sheet/变列/空行都进同一篇 body，sheet 名作 Markdown 标题。
+
+        身份 = `excel:<文件名>`（不再是位置性的 `文件:sheet:行`）——插行/改行不会让身份平移。
+        """
         self.src.pull()
         docs = self.src.canonicalize()
-        # 4 个有效行（Sheet1 3 行 + Sheet2 1 行；空行跳过）
-        self.assertEqual(len(docs), 4)
-        by_id = {d.source_id: d for d in docs}
-        # source_id: excel:{stem}:{sheet序号}:{行号}
-        self.assertTrue(any("问题定位记录:1:1" in k for k in by_id))
-        self.assertTrue(any("问题定位记录:2:1" in k for k in by_id))
-        # body 按列序拼接（自由文本）
-        row1 = next(d for d in docs if ":1:1" in d.source_id)
-        self.assertIn("HCCL 超时", row1.body)
-        self.assertIn("节点", row1.body)
-        # 变列（Sheet2 2 列）也解析
-        row_sheet2 = next(d for d in docs if ":2:1" in d.source_id)
-        self.assertIn("561000", row_sheet2.body)
-        self.assertIn("aclnn", row_sheet2.body)
-        # 验证状态/类型
-        self.assertTrue(all(d.source_type == "doc_excel" for d in docs))
-        self.assertTrue(all(d.extra["verification"] == "unverified" for d in docs))
+        self.assertEqual(len(docs), 1)
+        doc = docs[0]
+        self.assertEqual(doc.source_id, "excel:问题定位记录")
+        self.assertEqual(doc.title, "问题定位记录")
+        self.assertEqual(doc.source_type, "doc_excel")
+        self.assertEqual(doc.extra["verification"], "unverified")
+        # 每个 sheet 一个小节标题 + 行内容按列序拼接（自由文本）
+        self.assertIn("## Sheet1", doc.body)
+        self.assertIn("## 任意名", doc.body)
+        self.assertIn("HCCL 超时", doc.body)
+        self.assertIn("节点 10.0.0.5 通信超时", doc.body)
+        self.assertIn("561000", doc.body)      # 变列（Sheet2 2 列）也解析
+        self.assertIn("aclnn", doc.body)
+        # 空行不进正文（Sheet1 第 3 行）
+        self.assertEqual(doc.body.count("\n\n## "), 1)   # 两个 sheet 之间只有一个分隔
+        # 计数元数据（整体评估用；quality 出口整包透传）
+        self.assertEqual(doc.extra["quality"]["sheets"], 2)
+        self.assertEqual(doc.extra["quality"]["rows"], 4)   # 3 + 1 个有效行
+        self.assertEqual(doc.extra["quality"]["source_mode"], "imports")
+
+    def test_chunks_are_still_per_row_with_sheet_section(self):
+        """按文件聚合**不损失检索粒度**：每个非空行仍是独立 chunk，且带 sheet 作 section。"""
+        from vllm_kb.chunking import chunk_doc
+
+        self.src.pull()
+        doc = self.src.canonicalize()[0]
+        chunks = chunk_doc(doc)
+        texts = [c.text for c in chunks]
+        self.assertEqual(len(chunks), 4, texts)
+        self.assertEqual({c.section for c in chunks}, {"Sheet1", "任意名"})
+        hit = next(c for c in chunks if "HCCL 超时" in c.text)
+        self.assertEqual(hit.section, "Sheet1")
+        self.assertTrue(hit.text.startswith("【Sheet1】"), hit.text)   # 标题注入正文
+        # 每行一个 chunk（不跨行合并成一大块）
+        self.assertTrue(all("561000" not in c.text or c.section == "任意名" for c in chunks))
+
+    def test_file_identity_survives_row_insert(self):
+        """**核心动机**：中间插一行不会改变文档身份（逐行方案下会整体平移）。"""
+        import openpyxl
+
+        self.src.pull()
+        before = self.src.canonicalize()[0].source_id
+        p = self.root / "data" / "imports" / "engineer" / "问题定位记录.xlsx"
+        wb = openpyxl.load_workbook(str(p))
+        wb["Sheet1"].insert_rows(2)          # 在表头与第二行之间插一行
+        wb["Sheet1"].cell(row=2, column=1, value="新增问题")
+        wb.save(str(p))
+        after = self.src.canonicalize()[0].source_id
+        self.assertEqual(before, after)
+        self.assertEqual(after, "excel:问题定位记录")
+
+    def test_tags_from_filename_and_sheets(self):
+        """标签是**整体评估**：文件名 + sheet 名走与 md/word 同一套 extract_tags。"""
+        from vllm_kb.tagging import TagRegistry
+
+        self.src.pull()
+        doc = self.src.canonicalize()[0]
+        self.assertIsInstance(doc.tags, list)          # 无词典命中时为空列表
+        self.assertIn("tag_candidates", doc.extra)     # 候选走审核队列
+        self.assertEqual(TagRegistry().entries, [])
+
+    def test_doc_asset_registered(self):
+        """§1.6：canonicalize 也把 excel 原件落资产层并注册（--skip-pull 也要有预览链）。"""
+        import os
+
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import list_assets
+
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        try:
+            cfg = AppConfig.model_validate({})
+            src = ExcelSource(self.cfg, project_root=self.root, app_cfg=cfg)
+            docs = src.canonicalize()          # 注意：**不调 pull()**
+            self.assertEqual(len(docs), 1)
+            assets = list_assets(self.root / "data" / "review.sqlite3")
+            reg = assets.get(docs[0].extra["asset"]["asset_id"])
+            self.assertIsNotNone(reg, assets)
+            self.assertEqual(reg["source_type"], "doc_excel")
+            self.assertEqual(reg["rel_path"], "assets/excel/问题定位记录.xlsx")
+            self.assertTrue((self.root / "data" / reg["rel_path"]).is_file())
+        finally:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
+    def test_empty_file_skipped(self):
+        """所有 sheet 都为空 → 不产文档（但原件照常落资产层）。"""
+        import openpyxl
+
+        p = self.root / "data" / "imports" / "engineer" / "空表.xlsx"
+        wb = openpyxl.Workbook()
+        wb.save(str(p))
+        cfg = SourceCfg(id="e2", type="excel", path=str(p), enabled=True)
+        self.assertEqual(ExcelSource(cfg, project_root=self.root).canonicalize(), [])
+
+    def test_fallback_to_assets_when_imports_missing(self):
+        """imports 缺失 → 回退资产层副本，身份取族名，quality 标记来源模式。"""
+        self.src.pull()
+        (self.root / "data" / "imports" / "engineer" / "问题定位记录.xlsx").unlink()
+        docs = self.src.canonicalize()
+        self.assertEqual([d.source_id for d in docs], ["excel:问题定位记录"])
+        self.assertEqual(docs[0].extra["quality"]["source_mode"], "assets_fallback")
 
     def test_raw_text_stored_sanitize_log_collected(self):
         """后置脱敏：body 原文入库（原文检索）；会被脱敏的 IP/路径落盘维护日志。"""
@@ -88,7 +174,7 @@ class TestExcelSource(unittest.TestCase):
 
         self.src.pull()
         docs = self.src.canonicalize()
-        doc = next(d for d in docs if ":2:1" in d.source_id)
+        doc = docs[0]
         ex = extract_doc_relations(doc.source_id, "", 0, doc.source_type, doc.body)
         self.assertIn("561000", ex.mentions.get("error_code", set()))
         # 有 body 的文档都能被 canonical/ingest 接受

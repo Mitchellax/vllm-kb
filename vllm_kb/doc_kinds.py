@@ -33,7 +33,7 @@ class DocKind:
     - `suffixes`：**裸后缀**（`.pdf`），glob 由 `patterns` 派生——原先 word 存 `*.docx`、
       excel 存 `.xlsx`，两种写法混用，这里统一成裸后缀；
     - `section_splitter`：分块时按什么切章节（`""` = 不切，`"pdf"` = 编号标题，
-      `"markdown"` = `#` 标题）；
+      `"markdown"` = `#` 标题且同标题正文合成一段，`"lines"` = `##` 标题分组但**每行各自成块**）；
     - `external_doc`：是否算"外源文档"（审核台「文档管理」页收录）；
     - `default_verification`：该来源入库时的默认验证状态（人工可经审核台补标覆盖，
       见 `review.review_verification`）。
@@ -66,7 +66,7 @@ KINDS: tuple[DocKind, ...] = (
             sid_prefix="word", suffixes=(".docx", ".docm"), section_splitter="markdown",
             external_doc=True, default_verification="unverified"),
     DocKind(source_type="doc_excel", source="excel", label="Excel", asset_sub="excel",
-            sid_prefix="excel", suffixes=(".xlsx", ".xlsm"), section_splitter="markdown",
+            sid_prefix="excel", suffixes=(".xlsx", ".xlsm"), section_splitter="lines",
             external_doc=True, default_verification="unverified"),
 )
 
@@ -85,6 +85,7 @@ EXTERNAL_DOC_TYPES: tuple[str, ...] = (
 # 分块策略名 → 实现函数由 chunking 注册（本模块不 import chunking，避免环）
 SPLITTER_PDF = "pdf"
 SPLITTER_MARKDOWN = "markdown"
+SPLITTER_LINES = "lines"
 
 
 def section_splitter_for(source_type: str) -> str:

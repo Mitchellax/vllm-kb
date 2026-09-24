@@ -355,13 +355,28 @@ data/imports/md/     ← 放 Markdown（案例/架构说明/经验总结）
 # 直接跑（pull 幂等：pdf/md 复制到资产层 + 解析 + 入库 + 嵌入）
 python scripts/build_kb.py
 
-# 注意：不要用 --skip-pull 导入本地文件——它同样会跳过 pdf/md 的 pull（资产层复制），
-# 导致 canonicalize 无文件。--skip-pull 只用于"仅重跑入库、文件已在资产层"的场景。
+# --skip-pull 也可用（仅重跑入库）：canonicalize 自己也会把原件落资产层并注册
+# （见"文件型来源的统一约定"），所以不会出现"资产层空 → canonicalize 无文件"。
 ```
 
 - 无 `GITHUB_TOKEN` 时 GitHub source 拉取会报错——**临时把 config 里 github source 的
   `enabled` 改为 `false`** 跑导入（只处理本地来源），完事恢复 `true`（保留标记注意改回）；
 - 断点续传：中途 Ctrl-C 后重跑同一命令即可。
+
+> **PDF 的文档集由 `imports/pdf` 决定**（与 md/word 同构）：`imports/pdf` 里扫到的 PDF 就是
+> 全部文档，资产层只作回退与诊断。若资产层还有"导入路径里没有"的 PDF，构建日志会打印
+> `⚠ 资产层有 N 个族不在导入路径中，已不再纳入 canonical`——**必须处理**（复制回
+> `imports/pdf`，或到审核台「文档管理」删除），否则那几篇会**静默停在旧内容**
+> （`ingest` 不删文档）。历史版本从"只 pull 不建 imports"升级过来时尤其容易碰到：
+>
+> ```powershell
+> Get-ChildItem data\assets\pdf\*.pdf |
+>   Where-Object { -not (Test-Path "data\imports\pdf\$($_.Name)") } |
+>   Copy-Item -Destination data\imports\pdf\
+> ```
+>
+> 文件名不变 ⇒ `source_id`（`pdf:<文件名去扩展名>`）不变 ⇒ 原地更新，**不会产生重复文档、
+> 不丢标签与补标**。
 
 **步骤 5：验证**
 
@@ -582,14 +597,22 @@ error code 107020, dispatch_ffn_combine failed
 
 ```bash
 pip install openpyxl          # 依赖（可选组，离线 wheel 可装）
-python scripts/build_kb.py    # 导入：每行一条文档入库 + 嵌入
+python scripts/build_kb.py    # 导入：一个文件一篇文档入库 + 嵌入
 python scripts/build_graph.py # 建图：错误码/算子等实体自动入图（先停 serve_api）
 python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 ```
 
-- **schema-free**：不写死任何列名 / sheet 名 / 行号——遍历所有 sheet/行，每行**非空 cell 按列序拼接为自由文本**入库（每行一条文档，`excel:{文件名}:{sheet序号}:{行号}`）；空行跳过；
+- **schema-free**：不写死任何列名 / sheet 名 / 行号——遍历所有 sheet，每个非空行的
+  **非空 cell 按列序拼接为自由文本**，正文体例是 `## <sheet 名>` + 若干行；
+- **一个文件一篇文档**：`source_id = excel:<文件名>`（与 PDF/Markdown/Word 同构），
+  标签与验证状态都是**整体评估**（登记表整体入库、审核台整体补标），不做逐行判断；
+  * **为什么不再逐行一篇**：逐行的身份只能靠**位置**（`文件:sheet:行`），在中间插一行就会让
+    其后所有行的身份整体平移——人工治理（标签/补标）会**串到别的行**上。按文件聚合后
+    插行/改行都不影响身份；
+  * **检索粒度不损失**：分块仍以**行**为单位（每个非空行是独立 chunk），且 `## sheet 名`
+    让每个 chunk 带 `section`——命中时能看出属于哪张表；
 - 错误码/算子/模型/版本由 signature 三层提取**自动入图**（建图只依赖 canonical，无需图侧适配）；
-- 验证状态 `unverified`（登记表低优先级，按未解决 issue 处理）。
+- 验证状态 `unverified`（登记表低优先级），审核台补标认证后按 `tested` 参与 `w_rel`。
 
 **内部数据脱敏（后置，Excel/Markdown 源生效）**
 

@@ -564,7 +564,13 @@ class TestImageAssetRegistration(_MdCase):
         docs = self._src().canonicalize()
         self.assertEqual(len(docs), 1)
         assets = self._registry()
-        self.assertEqual(len(assets), 3, assets)     # 未解析的不注册
+        # 3 张可解析的图 + **md 原件自身**（§1.6：canonicalize 也落资产层并注册）；
+        # 未解析的 missing.png 不注册
+        self.assertEqual(len(assets), 4, assets)
+        doc_asset = assets.get(docs[0].extra["asset"]["asset_id"])
+        self.assertIsNotNone(doc_asset, "md 原件必须注册（--skip-pull 也要留下预览链）")
+        self.assertEqual(doc_asset["source_type"], "doc_markdown")
+        self.assertEqual(doc_asset["rel_path"], "assets/md/doc.md")
         for e in docs[0].extra["evidence"]:
             if e["kind"] in ("local", "base64"):
                 reg = assets.get(e["asset_id"])
@@ -589,9 +595,10 @@ class TestImageAssetRegistration(_MdCase):
         docs = self._src().canonicalize()
         shas = {e["sha256"] for e in docs[0].extra["evidence"]}
         self.assertEqual(len(shas), 1)               # 同一份内容
-        assets = self._registry()
-        self.assertEqual(len(assets), 1, assets)     # 只一行（内容寻址）
-        self.assertIn(assets[next(iter(assets))]["rel_path"],
+        images = {k: v for k, v in self._registry().items()
+                  if v["source_type"] == "image"}
+        self.assertEqual(len(images), 1, images)     # 只一行（内容寻址）
+        self.assertIn(images[next(iter(images))]["rel_path"],
                       ("assets/images/a.png", "assets/images/b.png"))
 
     def test_image_source_registers_all_including_unreferenced(self):
@@ -618,7 +625,9 @@ class TestImageAssetRegistration(_MdCase):
         first = self._registry()
         self._src().canonicalize()
         self.assertEqual(self._registry(), first)
-        self.assertEqual(len(first), 1)
+        self.assertEqual(len(first), 2)   # 1 张图 + 1 份 md 原件（§1.6）
+        self.assertEqual({v["source_type"] for v in first.values()},
+                         {"image", "doc_markdown"})
 
 
 class TestBase64ContentAddressing(_MdCase):
