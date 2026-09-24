@@ -17,7 +17,8 @@ from pathlib import Path
 
 from vllm_kb.config import SourceCfg
 from vllm_kb.md_images import code_spans, find_image_refs, rewrite_images
-from vllm_kb.sources import MarkdownSource, _path_tag
+from vllm_kb.source_files import path_tag as _path_tag
+from vllm_kb.sources import MarkdownSource
 
 
 def png(path: Path, w=8, h=8, color="white") -> None:
@@ -456,7 +457,7 @@ class TestFallbackVersionFamilies(_MdCase):
 
         返回的族名（第二项）才是文档身份——收敛到 `.<sha12>` 副本时不能让它变成 id。
         """
-        from vllm_kb.sources import _latest_versions
+        from vllm_kb.source_files import latest_versions as _latest_versions
 
         d = Path(self.tmp.name) / "v"
         d.mkdir()
@@ -505,7 +506,8 @@ class TestSameStemDisambiguation(_MdCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self._src().canonicalize()
-        self.assertIn("同名 md", buf.getvalue())
+        # 文案由 source_files.discover 统一产出（按 DocKind.label 命名）
+        self.assertIn("同名 Markdown", buf.getvalue())
 
     def test_bodies_are_not_crossed(self):
         """消歧后两篇内容各自独立（修复前 INSERT OR REPLACE 后者覆盖前者）。"""

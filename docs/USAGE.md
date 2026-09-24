@@ -409,6 +409,21 @@ python scripts/serve_api.py          # http://127.0.0.1:8000
 python skills/vllm-kb/client.py health   # chunks 数与预期一致
 ```
 
+**文件型来源的统一约定（PDF / Markdown / Word / Excel）**
+
+四种来源都是"一个文件一篇文档"，共用同一套发现/身份/分块规则（实现在
+`vllm_kb/doc_kinds.py` + `vllm_kb/source_files.py`，说明见数据流 §2.2a）：
+
+| 规则 | 说明 |
+|---|---|
+| **放文件的位置** | config 里该 source 的 `path`（`data/imports/<你的目录>`），**目录树会被保留**——同名文件放不同子目录不会互相覆盖；`path` 也可以直接指向**单个文件**（Excel 登记表常用） |
+| **导入路径优先** | 只要 `path` 下扫到匹配文件，就**不再看**资产层副本。想下线一篇文档 → 从 `path` 删掉并清掉 `assets/<种类>/` 同族副本，再到审核台「文档管理」删记录 |
+| **回退资产层** | `path` 不存在/扫不到文件时，回退 `data/assets/<种类>/` 扁平副本，并按**版本族**收敛（`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取 mtime 最新一份） |
+| **文档身份** | `source_id = <前缀>:<文件名去后缀>`（`pdf:` / `md:` / `word:` / `excel:`）。**改内容不改身份**（标签/补标/遥测都跟着走）；只有同名冲突时才追加**相对路径**指纹 `--<sha8>`，唯一文件名**不会**被加后缀 → 存量库不需要重灌 |
+| **章节切分** | PDF 按编号标题（`2.34 xxx`）、Markdown/Word/Excel 按 `#` 标题切分，chunk 带 `section` 字段；新增来源时在声明表里填策略名即可，`chunking.py` 不用改 |
+| **偏离告警** | 导入路径非空、但资产层还有"导入路径里没有"的族时，构建日志会打印 `⚠ 资产层有 N 个族不在导入路径中，已不再纳入 canonical`。**看到这条就要处理**：这些文档不会消失也不会报错，只是**永远停在旧内容**（`ingest` 不删文档，属于静默偏离） |
+| **新增一种文件型来源** | ① 在 `doc_kinds.KINDS` 加一条 `DocKind`；② 来源类挂 `kind = BY_SOURCE["..."]`；③ 文件发现改走 `_discover_for(self, self.kind, self.import_dir)`。分块章节切分与审核台「文档管理」收录范围会自动跟上（护栏测试：`tests/test_doc_kinds.py`） |
+
 **Markdown 图片处理（随 md 一起入库）**
 
 - md 正文里的图片引用自动收集到 `data/assets/images/`，**正文引用改为不透明占位**（不暴露路径），

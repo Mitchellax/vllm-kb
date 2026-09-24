@@ -13,6 +13,12 @@
 
 新增来源类型：继承 BaseSource + 注册到 _REGISTRY，即可接入全链路
 （canonical 合并 -> 分块 -> 嵌入 -> 图/向量 -> 置信度 -> 检索），无需改动其他模块。
+
+**文件型来源**（pdf / markdown / word / excel 这类"一个文件一篇文档"的来源）另有一层接缝：
+- 文档种类的知识（`source_type` / 资产子目录 / source_id 前缀 / 后缀 / 分块策略）统一声明在
+  `doc_kinds.py`，**不要在各来源类里再散落一份**；
+- 文件发现 / 版本族收敛 / 同名消歧 / 身份构造统一走 `source_files.discover`
+  （经 `_discover_for` 装配），**不要在来源类里自己 glob**。
 """
 from __future__ import annotations
 
@@ -27,7 +33,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from .config import PROJECT_ROOT, SourceCfg
+from .doc_kinds import BY_SOURCE, DocKind
 from .models import KbDocument
+from .source_files import DiscoverSpec, Discovery, discover
 from .tagging import (
     TagEntry,
     TagRegistry,
@@ -53,17 +61,6 @@ def _sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def _path_tag(rel: str) -> str:
-    """相对路径指纹（8 hex），用于同名 md 消歧。
-
-    用**路径**而非内容的 sha：md 每次编辑内容都变，内容寻址会让 source_id 漂移
-    （旧文档变孤儿、审核状态/遥测丢失、检索重复）；路径指纹在内容改动下稳定，
-    且**不可读**——source_id 会出现在 /search 的 doc_id、/doc/{id} 与遥测库里，
-    不能暴露目录名（可能含客户/项目名）。
-    """
-    return hashlib.sha256(rel.replace("\\", "/").encode("utf-8")).hexdigest()[:8]
-
-
 def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
     """asset_registry 注册条目 `(rel_path, sha256, source_type, size)`；size 取不到则 0。"""
     try:
@@ -73,65 +70,21 @@ def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
     return (rel, sha, stype, size)
 
 
-# 资产层"同名异内容"版本后缀（_copy_asset 写的 `stem.<sha12>.suffix`）
-_VER_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<sha>[0-9a-f]{12})$")
+def _discover_for(src: "BaseSource", kind: DocKind, import_path: Path) -> Discovery:
+    """按**文档种类声明**做文件发现——文件型来源的唯一入口。
 
-
-def _latest_versions(paths: list[Path]) -> list[tuple[Path, str]]:
-    """资产层扁平副本按**版本族**收敛，返回 `[(最新版本的路径, 族名 stem)]`（按路径排序）。
-
-    `case.md` 与 `case.<sha12>.md` 是同一篇的不同版本，每族只保留最新（mtime 最大；
-    并列时取文件名字典序较大者，保证确定性）的一个。
-
-    `_copy_asset` 在"同名异内容"时写成 `stem.<sha12>.suffix`，所以资产层会累积历史版本
-    （原始 `case.md` 永久保留 + 每个不同内容一份）。回退模式若把它们都当文档，会把旧版本
-    **复活成独立文档**（源文件删掉后尤其明显，一篇变多篇）。
-
-    返回的**族名**（而非带 `.<sha12>` 的文件名）才是文档身份：否则收敛到 sha 副本时
-    `source_id` 会从 `md:case` 漂移成 `md:case.<sha12>`，等于换了篇文档（审核状态/标签丢失）。
-
-    后缀无关（按 `(族名, 后缀)` 分组），md/word 等扁平副本层共用。
+    这里只做"声明 → 输入"的装配；发现逻辑本身在 `source_files.discover`
+    （与格式/来源无关，不 import 解析库、不知道 source_type 字符串）。
     """
-    fams: dict[tuple[str, str], tuple[float, str, Path, str]] = {}
-    for p in paths:
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            continue
-        m = _VER_SUFFIX_RE.match(p.stem)
-        base = m.group("base") if m else p.stem
-        key = (base, p.suffix.lower())
-        cand = (mtime, p.name, p, base)
-        cur = fams.get(key)
-        if cur is None or (cand[0], cand[1]) > (cur[0], cur[1]):
-            fams[key] = cand
-    return sorted(((v[2], v[3]) for v in fams.values()), key=lambda t: t[0])
-
-
-def _discover_source_files(src: "BaseSource", patterns: tuple[str, ...],
-                           import_dir: Path, assets_dir: Path,
-                           ) -> tuple[list[tuple[Path, bool, str]], bool]:
-    """业务文本来源的文件发现（md / word 共用），返回 `([(路径, 是否来自导入目录, 逻辑 stem)], 是否回退)`。
-
-    - **优先导入目录**：`rglob` 保留操作者的目录树 → 同名不同目录的文件能按相对路径指纹
-      消歧，且编辑源文件不会因资产层累积副本而变成多篇；
-    - 导入目录不存在/扫不到文件 → **回退资产层扁平副本**（`pull()` 的产物），并按版本族
-      收敛（见 `_latest_versions`），逻辑 stem 取族名以防 `source_id` 漂移。
-
-    回退的代价由调用方负责提示（图片相对路径失锚等），本函数只做发现与收敛。
-    """
-    files: list[tuple[Path, bool, str]] = []
-    if import_dir.exists():
-        for pat in patterns:
-            files.extend((p, True, p.stem) for p in sorted(import_dir.rglob(pat)))
-    if files:
-        return files, False
-    if not assets_dir.exists():
-        return [], False
-    cand: list[Path] = []
-    for pat in patterns:
-        cand.extend(sorted(assets_dir.glob(pat)))
-    return [(p, False, base) for p, base in _latest_versions(cand)], True
+    return discover(DiscoverSpec(
+        patterns=kind.patterns,
+        import_path=import_path,
+        assets_dir=src.resolve(f"data/assets/{kind.asset_sub}"),
+        sid_prefix=kind.sid_prefix,
+        label=kind.label,
+        log_prefix=f"[sources:{src.id}]",
+        fallback_note=src.FALLBACK_NOTE,
+    ))
 
 
 def _copy_asset(src: Path, assets_dir: Path, sub: str) -> tuple[str, str, bool]:
@@ -159,6 +112,11 @@ _WORD_EXTRACT_SCHEMA = 2      # 1=纯文本/表格；2=+内嵌图片清单（占
 
 class BaseSource(ABC):
     type: str = "base"
+    # 文件型来源的文档种类声明（见 doc_kinds.py）；非文件型来源为 None
+    kind: Optional[DocKind] = None
+    # 回退到资产层时附加的说明（各来源特有，如 md 的"图片相对路径已失锚"）
+    FALLBACK_NOTE: str = ""
+
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
         self.cfg = cfg
@@ -342,6 +300,10 @@ class MarkdownSource(BaseSource):
     """
 
     type = "markdown"
+    kind = BY_SOURCE["markdown"]
+    FALLBACK_NOTE = ("图片相对路径**已失锚**（assets/md 是扁平副本），"
+                     "只能按文件名到 assets/images 尽力反查，未命中的一律占位"
+                     "（正文仍不含路径）；如需完整图片/OCR 请恢复 imports 目录")
 
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
@@ -351,7 +313,7 @@ class MarkdownSource(BaseSource):
         self._title_re = re.compile(self.title_pattern)
 
     def _assets_dir(self) -> Path:
-        return self.resolve("data/assets/md")
+        return self.resolve(f"data/assets/{self.kind.asset_sub}")
 
     def pull(self, max_issues: Optional[int] = None) -> int:
         """扫描导入目录，把 md 复制到资产层（幂等）。返回新增条数。"""
@@ -360,11 +322,14 @@ class MarkdownSource(BaseSource):
             return 0
         added = 0
         registered: list[tuple[str, str, str]] = []
-        for p in sorted(self.import_dir.rglob("*.md")) + sorted(self.import_dir.rglob("*.markdown")):
-            rel, sha, copied = _copy_asset(p, self.resolve("data/assets"), "md")
-            registered.append(_asset_entry(rel, sha, "doc_markdown", self.resolve(rel)))
-            if copied:
-                added += 1
+        for pat in self.kind.patterns:
+            for p in sorted(self.import_dir.rglob(pat)):
+                rel, sha, copied = _copy_asset(p, self.resolve("data/assets"),
+                                               self.kind.asset_sub)
+                registered.append(_asset_entry(rel, sha, self.kind.source_type,
+                                               self.resolve(rel)))
+                if copied:
+                    added += 1
         self._register_asset_mappings(registered)
         print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 md）")
         return added
@@ -387,27 +352,15 @@ class MarkdownSource(BaseSource):
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
         img_assets: list[tuple] = []  # 图片资产（末尾统一注册到 asset_registry）
-        md_files, fallback = _discover_source_files(
-            self, ("*.md", "*.markdown"), self.import_dir, self._assets_dir())
-        if fallback:
-            print(f"[sources:{self.id}] ⚠ 导入目录无 md（{self.import_dir}），已回退到资产层副本 "
-                  f"{self._assets_dir()}：图片相对路径**已失锚**（assets/md 是扁平副本），"
-                  f"只能按文件名到 assets/images 尽力反查，未命中的一律占位"
-                  f"（正文仍不含路径）；如需完整图片/OCR 请恢复 imports 目录", flush=True)
-        # 同名 stem 冲突检测：md:<stem> 会互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）
-        stem_counts: dict[str, int] = {}
-        for _p, _fi, stem in md_files:
-            stem_counts[stem] = stem_counts.get(stem, 0) + 1
-        dup_stems = {s for s, n in stem_counts.items() if n > 1}
-        if dup_stems:
-            shown = ", ".join(sorted(dup_stems)[:5]) + (" …" if len(dup_stems) > 5 else "")
-            print(f"[sources:{self.id}] ⚠ 检测到 {len(dup_stems)} 组同名 md（{shown}）："
-                  f"已用相对路径指纹消歧为 md:<stem>--<sha8>，避免互相覆盖", flush=True)
+        # 发现 + 回退告警 + 同名消歧告警统一由 source_files.discover 负责
+        found = _discover_for(self, self.kind, self.import_dir)
+        md_files = found.files
         total = len(md_files)
         start_ts = time.time()
         if total:
             print(f"[sources:{self.id}] 解析 {total} 个 Markdown …", flush=True)
-        for p, from_imports, stem in md_files:
+        for f in md_files:
+            p, from_imports, stem = f.path, f.from_imports, f.stem
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError as e:
@@ -426,16 +379,7 @@ class MarkdownSource(BaseSource):
             title = title_raw.group(1).strip() if title_raw else stem
             sha = _sha256(p)
             asset_id = sha[:16]
-            # 同名 stem：加相对路径指纹（默认不动 → 存量 source_id 不漂移）
-            if stem in dup_stems:
-                base_dir = self.import_dir if from_imports else self._assets_dir()
-                try:
-                    rel_key = p.relative_to(base_dir).as_posix()
-                except ValueError:
-                    rel_key = p.name
-                sid = f"md:{stem}--{_path_tag(rel_key)}"
-            else:
-                sid = f"md:{stem}"
+            sid = f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir())
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
             tags, cands = extract_tags(stem, headings_from_markdown(text), registry=registry)
             extra: dict[str, Any] = {
@@ -448,7 +392,7 @@ class MarkdownSource(BaseSource):
                     "images_unresolved": sum(1 for e in evidence
                                              if e.get("kind") == "unresolved"),
                 },
-                "verification": "unverified",  # 质量参差：先入库，审核工作台补标
+                "verification": self.kind.default_verification,  # 质量参差：先入库，审核台补标
                 "structure": {},
                 # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
                 "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
@@ -456,7 +400,7 @@ class MarkdownSource(BaseSource):
             if evidence:
                 extra["evidence"] = evidence
             docs.append(KbDocument(
-                source_type="doc_markdown",
+                source_type=self.kind.source_type,
                 source_id=sid,
                 url="",
                 title=title,
@@ -588,6 +532,7 @@ class PdfSource(BaseSource):
     """
 
     type = "pdf"
+    kind = BY_SOURCE["pdf"]
 
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
@@ -597,7 +542,7 @@ class PdfSource(BaseSource):
     # ---------- 布局 ----------
 
     def _assets_dir(self) -> Path:
-        return self.resolve("data/assets/pdf")
+        return self.resolve(f"data/assets/{self.kind.asset_sub}")
 
     def _parsed_dir(self) -> Path:
         return self.resolve("data/parsed/pdf")
@@ -611,11 +556,14 @@ class PdfSource(BaseSource):
             return 0
         added = 0
         registered: list[tuple[str, str, str]] = []
-        for p in sorted(self.import_dir.rglob("*.pdf")):
-            rel, sha, copied = _copy_asset(p, self.resolve("data/assets"), "pdf")
-            registered.append(_asset_entry(rel, sha, "doc_pdf", self.resolve(rel)))
-            if copied:
-                added += 1
+        for pat in self.kind.patterns:
+            for p in sorted(self.import_dir.rglob(pat)):
+                rel, sha, copied = _copy_asset(p, self.resolve("data/assets"),
+                                               self.kind.asset_sub)
+                registered.append(_asset_entry(rel, sha, self.kind.source_type,
+                                               self.resolve(rel)))
+                if copied:
+                    added += 1
         self._register_asset_mappings(registered)
         print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 pdf）")
         return added
@@ -1236,7 +1184,7 @@ class ExcelSource(BaseSource):
     """
 
     type = "excel"
-    _EXCEL_SUFFIXES = (".xlsx", ".xlsm")
+    kind = BY_SOURCE["excel"]
 
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
@@ -1244,16 +1192,16 @@ class ExcelSource(BaseSource):
         self.import_path = self.resolve(self.cfg.get("path", f"data/imports/{self.id}"))
 
     def _assets_dir(self) -> Path:
-        return self.resolve("data/assets/excel")
+        return self.resolve(f"data/assets/{self.kind.asset_sub}")
 
     def _excel_files(self) -> list[Path]:
         p = self.import_path
         if p.is_dir():
             out = []
-            for suffix in self._EXCEL_SUFFIXES:
-                out.extend(sorted(p.rglob(f"*{suffix}")))
+            for pat in self.kind.patterns:
+                out.extend(sorted(p.rglob(pat)))
             return out
-        if p.is_file() and p.suffix in self._EXCEL_SUFFIXES:
+        if p.is_file() and p.suffix in self.kind.suffixes:
             return [p]
         return []
 
@@ -1266,8 +1214,9 @@ class ExcelSource(BaseSource):
         added = 0
         registered: list[tuple[str, str, str]] = []
         for f in files:
-            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"), "excel")
-            registered.append(_asset_entry(rel, sha, "doc_excel", self.resolve(rel)))
+            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"),
+                                           self.kind.asset_sub)
+            registered.append(_asset_entry(rel, sha, self.kind.source_type, self.resolve(rel)))
             if copied:
                 added += 1
         self._register_asset_mappings(registered)
@@ -1295,8 +1244,8 @@ class ExcelSource(BaseSource):
         if not assets.exists():
             return docs
         n_files = 0
-        for suffix in self._EXCEL_SUFFIXES:
-            for p in sorted(assets.glob(f"*{suffix}")):
+        for pat in self.kind.patterns:
+            for p in sorted(assets.glob(pat)):
                 n_files += 1
                 sha = _sha256(p)
                 asset_id = sha[:16]
@@ -1323,7 +1272,7 @@ class ExcelSource(BaseSource):
                                 continue
                             title = cells[0][:80]
                             docs.append(KbDocument(
-                                source_type="doc_excel",
+                                source_type=self.kind.source_type,
                                 source_id=f"excel:{p.stem}:{sheet_idx}:{row_idx}",
                                 url="",
                                 title=title or f"{p.stem} {sheet_idx} 行 {row_idx}",
@@ -1335,7 +1284,7 @@ class ExcelSource(BaseSource):
                                     "asset": {"asset_id": asset_id, "sha256": sha,
                                               "format": "excel"},
                                     "quality": {"text_source": "table", "parsed_with": "openpyxl"},
-                                    "verification": "unverified",  # 登记表低优先级
+                                    "verification": self.kind.default_verification,
                                 },
                             ))
                 finally:
@@ -1384,7 +1333,7 @@ class WordSource(BaseSource):
     """
 
     type = "word"
-    _SUFFIXES = ("*.docx", "*.docm")
+    kind = BY_SOURCE["word"]
     # 本来源**不支持**、但用户很可能放进来的格式：只用于给出指向性提示
     _LEGACY_SUFFIXES = ("*.doc", "*.rtf", "*.wps", "*.odt", "*.pages", "*.pdf")
 
@@ -1396,7 +1345,7 @@ class WordSource(BaseSource):
     # ---------- 布局 ----------
 
     def _assets_dir(self) -> Path:
-        return self.resolve("data/assets/word")
+        return self.resolve(f"data/assets/{self.kind.asset_sub}")
 
     def _parsed_dir(self) -> Path:
         return self.resolve("data/parsed/word")
@@ -1406,10 +1355,10 @@ class WordSource(BaseSource):
         p = self.import_dir
         if p.is_dir():
             out: list[Path] = []
-            for pat in self._SUFFIXES:
+            for pat in self.kind.patterns:
                 out.extend(sorted(p.rglob(pat)))
             return out
-        if p.is_file() and p.suffix.lower() in (".docx", ".docm"):
+        if p.is_file() and p.suffix.lower() in self.kind.suffixes:
             return [p]
         return []
 
@@ -1441,8 +1390,9 @@ class WordSource(BaseSource):
         added = 0
         registered: list[tuple] = []
         for f in files:
-            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"), "word")
-            registered.append(_asset_entry(rel, sha, "doc_word", self.resolve(rel)))
+            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"),
+                                           self.kind.asset_sub)
+            registered.append(_asset_entry(rel, sha, self.kind.source_type, self.resolve(rel)))
             if copied:
                 added += 1
         self._register_asset_mappings(registered)
@@ -1468,33 +1418,22 @@ class WordSource(BaseSource):
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
         sanitize_on, keep_paths, keep_ips = self.sanitize_params()
         collector: dict = {}  # 会被脱敏的原始 IP/路径（落盘维护，不进库）
-        files, fallback = _discover_source_files(
-            self, self._SUFFIXES, self.import_dir, self._assets_dir())
-        if fallback:
-            print(f"[sources:{self.id}] ⚠ 导入目录无 Word 文件（{self.import_dir}），已回退到资产层"
-                  f"副本 {self._assets_dir()}（按版本族收敛，每族只取最新一份）；"
-                  f"如需按目录树消歧/保留原始组织方式，请恢复 imports 目录", flush=True)
+        # 发现 + 回退告警 + 同名消歧告警统一由 source_files.discover 负责
+        found = _discover_for(self, self.kind, self.import_dir)
+        files = found.files
         if not files:
             # 提示只在 canonicalize 打一次（pull 也会打"无 Word 文件"，两处都带上就重复了）
             print(f"[sources:{self.id}] 导入路径无 Word 文件: {self.import_dir}"
                   f"{self._legacy_hint()}", flush=True)
             return docs
-        # 同名 stem 冲突检测：word:<stem> 会互相覆盖（ingest 用 INSERT OR REPLACE，后者胜）
-        stem_counts: dict[str, int] = {}
-        for _p, _fi, stem in files:
-            stem_counts[stem] = stem_counts.get(stem, 0) + 1
-        dup_stems = {s for s, n in stem_counts.items() if n > 1}
-        if dup_stems:
-            shown = ", ".join(sorted(dup_stems)[:5]) + (" …" if len(dup_stems) > 5 else "")
-            print(f"[sources:{self.id}] ⚠ 检测到 {len(dup_stems)} 组同名 Word（{shown}）："
-                  f"已用相对路径指纹消歧为 word:<stem>--<sha8>，避免互相覆盖", flush=True)
         parsed_dir = self._parsed_dir()
         parsed_dir.mkdir(parents=True, exist_ok=True)
         total = len(files)
         start_ts = time.time()
         img_assets: list[tuple] = []   # 内嵌图片资产（末尾与 word 原件同批注册）
         print(f"[sources:{self.id}] 解析 {total} 个 Word …", flush=True)
-        for i, (p, from_imports, stem) in enumerate(files, 1):
+        for i, f in enumerate(files, 1):
+            p, from_imports, stem = f.path, f.from_imports, f.stem
             t0 = time.time()
             try:
                 parsed, cached = self._parse_docx(p, parsed_dir)
@@ -1508,7 +1447,7 @@ class WordSource(BaseSource):
             img_assets.extend(registered)
             doc = self._doc_from_extract(
                 p, sha, sha[:16], parsed, registry,
-                sid=self._sid_for(p, stem, dup_stems, from_imports),
+                sid=f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir()),
                 evidence=evidence, injects=injects)
             if sanitize_on:
                 ips, paths = collect_sanitize_hits(doc.body, keep_paths, keep_ips)
@@ -1528,17 +1467,6 @@ class WordSource(BaseSource):
         self._register_asset_mappings(img_assets)
         self.save_sanitize_log(collector)
         return docs
-
-    def _sid_for(self, p: Path, stem: str, dup_stems: set[str], from_imports: bool) -> str:
-        """文档身份 `word:<stem>`；同名 stem 加相对路径指纹消歧（默认不动 → 存量 id 不漂移）。"""
-        if stem not in dup_stems:
-            return f"word:{stem}"
-        base_dir = self.import_dir if from_imports else self._assets_dir()
-        try:
-            rel_key = p.relative_to(base_dir).as_posix()
-        except ValueError:
-            rel_key = p.name
-        return f"word:{stem}--{_path_tag(rel_key)}"
 
     def _parse_docx(self, p: Path, parsed_dir: Path):
         """解析单篇 Word，返回 (parsed | None, 是否缓存命中)。
@@ -1812,7 +1740,7 @@ class WordSource(BaseSource):
                 "images_unresolved": sum(1 for e in imgs
                                          if e.get("in_body") and not e.get("sha256")),
             },
-            "verification": "unverified",  # 与 markdown/excel 统一：先入库，审核台补标
+            "verification": self.kind.default_verification,  # 与 markdown/excel 统一：先入库，审核台补标
             "structure": {"tables": tables_rel},
             # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
             "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
@@ -1820,7 +1748,7 @@ class WordSource(BaseSource):
         if evidence:
             extra["evidence"] = evidence
         return KbDocument(
-            source_type="doc_word",
+            source_type=self.kind.source_type,
             source_id=sid,
             url="",
             title=title,
@@ -1843,7 +1771,11 @@ _REGISTRY: dict[str, type[BaseSource]] = {
 
 
 def register_source(source_type: str, cls: type[BaseSource]) -> None:
-    """注册新的来源类型（第三方 adapter 接入点）。"""
+    """注册新的来源类型（第三方 adapter 接入点）。
+
+    **文件型**来源还应：① 在 `doc_kinds.KINDS` 里声明种类；② 设 `cls.kind` 指向它。
+    两处不一致会被 `tests/test_doc_kinds.py` 的护栏测试拦住。
+    """
     _REGISTRY[source_type] = cls
 
 

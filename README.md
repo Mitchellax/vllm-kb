@@ -545,6 +545,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | 模块 | 职责 |
 |---|---|
 | `sources.py` / `github_pull.py` | 数据源适配器（`BaseSource`：github/markdown/pdf/excel/word/image）+ GitHub 采集（限流、断点续传、评论 GraphQL 内联、`--incremental` 增量 + updatedAt 状态同步、`--numbers`/`--force-numbers` 单条） |
+| `doc_kinds.py` / `source_files.py` | **文件型来源的两条接缝**：`doc_kinds` 是"文档种类"的唯一声明表（`source_type`/资产子目录/`source_id` 前缀/后缀/分块策略/默认验证状态）——`chunking` 的章节切分与 `review` 的"外源文档"收录范围都由它派生；`source_files` 是格式无关的发现骨架（**导入路径优先** + 版本族收敛 + 族名即身份 + 同名路径指纹消歧 + 资产层偏离诊断），四个文件型来源共用，不含任何解析库 |
 | `md_images.py` | Markdown 图片引用扫描/重写：行内（含空格、尖括号、目标含括号、跨行）、引用式（含定义行去路径）、HTML `<img>` 全支持；```/`code` 代码区跳过；**任何未识别或未闭合的图片语法也一律占位**——保证"正文不含服务器路径"对任意输入成立 |
 | `models.py` / `config.py` | Canonical 统一中间格式 + 唯一配置入口（旧版单源折叠兼容；secrets 自动加载） |
 | `chunking.py` / `embed.py` | 讨论线按段切块 + 批量嵌入（攒批降 API 调用） |
@@ -594,6 +595,9 @@ python -m unittest discover tests    # 453 个测试（含文档-命令一致性
 欢迎提交 PR / issue。开发注意：
 
 - 代码遵循 `vllm_kb/` 模块化结构，新增数据源实现 `BaseSource` 适配器即可；
+  **文件型**来源（一个文件一篇文档）另加两步：在 `doc_kinds.KINDS` 里声明种类、让来源类挂上
+  `kind = BY_SOURCE["..."]`，文件发现改走 `source_files.discover`（经 `_discover_for` 装配）——
+  分块章节切分与审核台「文档管理」收录范围会自动跟上（护栏见 `tests/test_doc_kinds.py`）；
 - 环境变量约定：`GITHUB_TOKEN`（采集）、`EMBEDDING_API_KEY`（嵌入）、`VLLM_KB_BASE`（远程 API 地址）、`VLLM_KB_DATA_ROOT`（远程数据根）；
 - 密钥一律走环境变量或审核工作台写入的 `data/secrets.local.json`，config.json 不入库（模板见 `.env.example`）。
 

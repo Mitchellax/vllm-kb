@@ -18,6 +18,8 @@ import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from .doc_kinds import EXTERNAL_DOC_TYPES
+
 if TYPE_CHECKING:
     from .config import AppConfig
 
@@ -390,13 +392,15 @@ def default_review_path(cfg: Optional["AppConfig"] = None) -> Path:
 
 # ---------------- 外源文档管理（审核工作台"文档管理"页签） ----------------
 
-# 外源文档 = 非 GitHub 采集来源（导入的 PDF / Markdown / Word / 表格 / OCR 等）
-_EXTERNAL_SOURCE_TYPES = ("doc_pdf", "doc_markdown", "doc_word", "doc_excel", "doc_other")
+# 外源文档 = 导入的业务来源（PDF / Markdown / Word / 表格 / OCR 等），由文档种类声明表派生。
+# 原先这里是一份**没人引用**的字面量（实际查询用的是 `NOT LIKE 'github%'` 这个 hack）——
+# 声明看着存在却不生效；现在真的被 list_external_docs 使用。
+_EXTERNAL_SOURCE_TYPES = EXTERNAL_DOC_TYPES
 
 
 def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = None,
                        limit: int = 200, offset: int = 0) -> list[dict]:
-    """列出 kb.sqlite3 中的外源文档（source_type 以 doc_ 开头，排除 github_*）。
+    """列出 kb.sqlite3 中的外源文档（source_type 在 `_EXTERNAL_SOURCE_TYPES` 内）。
 
     返回 {source_id, source_type, title, component, url, verification,
     asset_id, asset_path（管理员侧 rel_path，经 asset_registry）,
@@ -407,10 +411,10 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
     conn = sqlite3.connect(str(kb_path))
     try:
         rows = conn.execute(
-            """SELECT source_id, source_type, title, component, url, extra
-               FROM docs WHERE source_type NOT LIKE 'github%'
-               ORDER BY source_type, source_id LIMIT ? OFFSET ?""",
-            (int(limit), int(offset)),
+            f"""SELECT source_id, source_type, title, component, url, extra
+                FROM docs WHERE source_type IN ({','.join('?' * len(_EXTERNAL_SOURCE_TYPES))})
+                ORDER BY source_type, source_id LIMIT ? OFFSET ?""",
+            (*_EXTERNAL_SOURCE_TYPES, int(limit), int(offset)),
         ).fetchall()
         overlay = load_doc_tags_conn(conn)
         # 人工补标覆盖层：verification 本身已在 extra（ingest 合并后的生效值），
@@ -792,7 +796,7 @@ def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, acti
 # 表结构见顶部 _ASSET_REGISTRY_DDL（ReviewStore._SCHEMA 与 register_asset 共用）。
 
 def _stem_of(source_id: str) -> str:
-    """`pdf:x` / `md:x` → `x`；并剥掉自动消歧后缀 `--<sha8>`（sources._path_tag 加的）。
+    """`pdf:x` / `md:x` → `x`；并剥掉自动消歧后缀 `--<sha8>`（sources 走 source_files.path_tag 加的）。
 
     消歧后 `md:same--d7878d1f` 的 stem 仍是 `same`，否则"同 stem 重名"提示会因
     后缀不同而永不触发（消歧把原本能触发的告警抵消掉了）。

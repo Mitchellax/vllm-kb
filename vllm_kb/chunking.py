@@ -4,15 +4,17 @@
 - 按空行分段（段落），累积到 max_chunk_chars 切块；
 - 单段超长按 max_chunk_chars 硬切；
 - 相邻块间用前一 block 尾部 overlap_chars 字符做重叠，保留上下文；
-- **PDF 手册（doc_pdf）带章节结构**：识别章节标题（如 "2.34 获取network版本号信息"），
-  每个 chunk 记录所属 section 并在文本前缀注入标题行——命中正文可同时看到所属章节，
-  标题文本也参与向量/FTS 匹配；
-- **Markdown（doc_markdown）带章节结构**：按 `#` 标题切分（与标签提取同源复用标题结构）。
+- **带章节结构的来源**：识别章节标题，每个 chunk 记录所属 section 并在文本前缀注入
+  标题行——命中正文可同时看到所属章节，标题文本也参与向量/FTS 匹配。
+
+"哪个来源用哪种切分策略"由 `doc_kinds.DocKind.section_splitter` **声明**，本模块只负责
+把策略名映射到实现（`_SPLITTERS`）——新增一种文档来源时**不必改本模块**。
 """
 from __future__ import annotations
 
 import re
 
+from .doc_kinds import SPLITTER_MARKDOWN, SPLITTER_PDF, section_splitter_for
 from .models import KbChunk, KbDocument
 
 _PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
@@ -62,6 +64,14 @@ def _split_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
+# 章节切分策略名（doc_kinds 声明）→ 实现。新增策略只在这里加一行。
+# 用 lambda 延迟取名字：两个实现函数定义在本模块靠后位置。
+_SPLITTERS = {
+    SPLITTER_PDF: lambda text: _split_sections(text),
+    SPLITTER_MARKDOWN: lambda text: _split_markdown_sections(text),
+}
+
+
 def chunk_doc(
     doc: KbDocument,
     max_chunk_chars: int = 4000,
@@ -71,11 +81,11 @@ def chunk_doc(
     if not text:
         return []
 
-    # PDF 手册：带章节结构切分；Markdown / Word：按 # 标题切分；其他来源保持原逻辑（section 为空）
-    if doc.source_type == "doc_pdf":
-        return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, _split_sections)
-    if doc.source_type in ("doc_markdown", "doc_word"):
-        return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, _split_markdown_sections)
+    # 章节切分策略由来源声明（见 doc_kinds），这里只做"策略名 → 实现"的映射；
+    # 未声明的来源保持原逻辑（不切 section）。
+    splitter = _SPLITTERS.get(section_splitter_for(doc.source_type))
+    if splitter is not None:
+        return _chunk_sections(doc, text, max_chunk_chars, overlap_chars, splitter)
 
     if len(text) <= max_chunk_chars:
         return [KbChunk(chunk_id=f"{doc.source_id}#0", doc_id=doc.source_id, seq=0, text=text)]

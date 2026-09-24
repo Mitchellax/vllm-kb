@@ -80,6 +80,28 @@
 | 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 
+### 2.2a 文件型来源的统一契约（发现 / 身份 / 分块）
+
+PDF / Markdown / Word / Excel 都是"一个文件一篇文档"，原先各自实现扫目录、收敛历史版本、
+造 `source_id`，于是同一类 bug 要修四遍。现在收成两条接缝（`doc_kinds.py` + `source_files.py`）：
+
+| 维度 | 契约 | 落点 |
+|---|---|---|
+| **种类声明** | `source_type` / 资产子目录 / `source_id` 前缀 / 后缀 / 章节切分策略 / 默认验证状态，**只声明一次** | `doc_kinds.KINDS`（`BY_SOURCE`/`BY_TYPE` 索引） |
+| **文件发现** | `source_files.discover(DiscoverSpec)`：**导入路径优先**（`rglob` 保留目录树），扫不到才回退资产层扁平副本 | `sources._discover_for` 装配，四个来源共用 |
+| **身份** | `source_id = <前缀>:<族名>`；族名在**内容改动下稳定**（不含 `_copy_asset` 写的 `.<sha12>`）；同族名多份才追加**相对路径**指纹 `--<sha8>` | `SourceFile.sid()` / `source_files.path_tag` |
+| **版本族收敛** | 回退模式按 `(族名, 后缀)` 分组，每族只取 mtime 最大者（并列取文件名字典序较大者），并取**族名**作 stem | `source_files.latest_versions` |
+| **偏离诊断** | 导入路径非空时，资产层"有、导入路径没有"的族 → 打告警（这些文档**已不再纳入 canonical**） | `Discovery.stray` |
+| **章节切分** | 由 `DocKind.section_splitter` 决定（`pdf`=编号标题 / `markdown`= `#` 标题 / `""`=不切），实现表在 `chunking._SPLITTERS` | `chunking.chunk_doc` |
+| **外源文档范围** | 审核台「文档管理」收录哪些 `source_type`，由声明表派生 | `review._EXTERNAL_SOURCE_TYPES = doc_kinds.EXTERNAL_DOC_TYPES` |
+
+> **为什么"偏离诊断"必须有**：`ingest` 不删文档、`pipeline.upsert_unified_canonical` 也不删行，
+> 所以"某文件不再被刷新"是**静默偏离**（文档还在库里、还能被检索到，只是永远停在旧内容），
+> 比直接丢掉更难发现。发现层因此把"资产层有、导入路径没有"的族显式打出来。
+>
+> **刻意不纳入本表**：`confidence.py` 的来源可靠度基线与 `graph.py` 的节点类型映射——
+> 那是**评分语义**与**图语义**，不是"文件型来源"的属性，硬塞进来会让声明表退化成万能配置表。
+
 > **OCR 置信度单一来源**：`custom`=服务端返回 / `paddle`=引擎逐行平均 / `openai`=**模型自报**
 > （提示词要求末行 `CONFIDENCE: <0~1 小数>`）。自报异常（缺失/不可解析/越界/不在末行/正文空却高置信）
 > → `confidence=null` + `anomaly`，交人工审核，**不回退**启发式评分。**只有高置信文本进正文**

@@ -389,9 +389,9 @@ class TestWordHelpers(unittest.TestCase):
         self.assertEqual(kinds, ["前", "table", "后"])
 
     def test_discover_prefers_import_dir(self):
-        """发现逻辑：导入目录有文件就不看资产层（且返回 from_imports=True）。"""
+        """发现逻辑：导入目录有文件就不看资产层（且 from_imports=True）。"""
         from vllm_kb.config import SourceCfg
-        from vllm_kb.sources import _discover_source_files, WordSource
+        from vllm_kb.sources import WordSource, _discover_for
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -401,23 +401,21 @@ class TestWordHelpers(unittest.TestCase):
             (root / "data" / "assets" / "word").mkdir(parents=True)
             (root / "data" / "imports" / "word" / "a.docx").write_bytes(b"x")
             (root / "data" / "assets" / "word" / "b.docx").write_bytes(b"y")
-            files, fallback = _discover_source_files(
-                src, ("*.docx",), src.import_dir, src._assets_dir())
-            self.assertFalse(fallback)
-            self.assertEqual([p.name for p, _, _ in files], ["a.docx"])
-            self.assertTrue(all(fi for _, fi, _ in files))
+            found = _discover_for(src, src.kind, src.import_dir)
+            self.assertFalse(found.fallback)
+            self.assertEqual([f.path.name for f in found.files], ["a.docx"])
+            self.assertTrue(all(f.from_imports for f in found.files))
             # 导入目录空 → 回退
             (root / "data" / "imports" / "word" / "a.docx").unlink()
-            files, fallback = _discover_source_files(
-                src, ("*.docx",), src.import_dir, src._assets_dir())
-            self.assertTrue(fallback)
-            self.assertEqual([p.name for p, _, _ in files], ["b.docx"])
-            self.assertFalse(any(fi for _, fi, _ in files))
+            found = _discover_for(src, src.kind, src.import_dir)
+            self.assertTrue(found.fallback)
+            self.assertEqual([f.path.name for f in found.files], ["b.docx"])
+            self.assertFalse(any(f.from_imports for f in found.files))
             # 导入目录不存在、资产层也不存在 → 空
             shutil.rmtree(root / "data" / "assets")
-            self.assertEqual(
-                _discover_source_files(src, ("*.docx",), src.import_dir, src._assets_dir()),
-                ([], False))
+            found = _discover_for(src, src.kind, src.import_dir)
+            self.assertEqual(found.files, ())
+            self.assertTrue(found.fallback)
 
 
 class TestWordEmbeddedImages(_WordCase):
