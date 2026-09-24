@@ -604,8 +604,14 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - **表格**：转 Markdown 表格**拼入正文**（表内错误码/命令可被 FTS 检索），同时落
   `data/parsed/word/{asset_id}.tables.json` 供结构化消费（建图时提取表格 → 错误码/命令的
   `DOCUMENTS` 边）；
+- **内嵌图片**：正文按文档顺序插入**不透明占位符** `[图片]` / `[图片:alt]`（alt 取 `wp:docPr/@descr`），
+  图片本身落 `data/assets/images/img_{sha256前16位}.{ext}` 并注册 `asset_registry`；
+  正文出现过的图片走 OCR（`data/parsed/images/<asset>.ocr.json` 幂等缓存）——
+  **高置信文本注入占位符之后**随正文进 FTS + 向量，低置信/自报异常只留签名线索并进
+  「低置信 OCR」审核队列（与 markdown 图片、`ImageSource` **同一套 OCR 缓存与通路**，同图不重复调用）；
 - **解析缓存**：`data/parsed/word/{asset_id}.extract.json`（内容寻址）——文件未变时复用提取结果，
-  标签/元数据每次重算，**升级提取规则无需清缓存**；删该目录即强制重解析；
+  标签/元数据/**OCR 注入**每轮重算（升级提取规则或调 `ocr_min_confidence` 都**无需清缓存**；
+  缓存带 schema 位，提取逻辑升级会自动失效旧缓存）；删该目录即强制重解析；
 - **身份**：`word:<文件名去后缀>`（同名不同目录用相对路径指纹消歧为 `word:<stem>--<sha8>`）。
   与 markdown 同构：**优先读 `imports/word`**（保留目录树 → 可消歧、编辑源文件不会因资产层累积
   副本而变成多篇），扫不到时回退 `assets/word` 扁平副本并按版本族收敛（每族只取最新一份、
@@ -615,11 +621,17 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - **脱敏**：默认启用（`config.sanitize.sources` 默认含 `word`），正文原文入库、出口统一脱敏，
   被脱敏的 IP/路径落 `data/sanitize_log.json`。
 
-**本版边界（不提取，因此正文不含任何路径）**：
+**本版边界**（因此正文不含任何路径）：
 
-- 页眉/页脚/脚注/尾注/文本框：python-docx 无原生 API（需手撸 XML），留待后续；
-- 嵌套表格只取外层单元格文本；合并单元格会重复文本；
-- **内嵌图片**：留待后续版本（提取 + 资产注册 + OCR 复用）；
+- 页眉/页脚/脚注/尾注是**独立部件**（`/word/header1.xml` 等），不在正文遍历范围内 →
+  其文字与图片都不提取；
+- 文本框：其**图片**在正文 XML 内（`w:txbxContent`）会被遍历到并产占位，但其**文字**
+  不在 `Paragraph.text` 里（python-docx 只取直接 run）→ 文字不提取（两者不对称，已知）；
+- 表格内图片的占位符统一排在表格之后（塞进单元格会破 Markdown 表格）；
+- 嵌套表格只取外层单元格文本；合并单元格重复文本；
+- **矢量/多页图片**（emf/wmf/svg/tiff）注册资产但**不送 OCR**（引擎不收，白花一次调用）；
+- 孤儿图片（包内有关系、正文未引用）注册资产但不插占位、不 OCR（没有正文落点）；
+- 外链图片（`r:link`，内容不在包里）只留占位，不登记资产（也**不记链接**，避免路径进库）；
 - `.doc`（旧二进制格式）与加密 docx 不支持 → 跳过并提示先另存为 `.docx`。
 
 **验证**：`python -m unittest tests.test_word_source -v`

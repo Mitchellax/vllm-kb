@@ -37,7 +37,8 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   API 请求为 0，不受未认证限流约束；写回前版本号正则校验，非法值置空
 - **业务来源导入**：PDF 手册（文字层 + 表格→结构化 JSON/错误码/命令 → 图）、Markdown（图片自动收集、正文不透明占位）、
   Excel 登记表（**schema-free**：任意 sheet/列序拼接入库，每行一条文档）、
-  Word 文档（标题样式→章节、列表、表格→结构化 JSON；复用同一套分块/标签/图/审核链路）、
+  Word 文档（标题样式→章节、列表、表格→结构化 JSON、内嵌图片→内容寻址资产 + OCR；
+  复用同一套分块/标签/图/审核链路）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；
    **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列）；
    **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
@@ -435,7 +436,7 @@ data/
 采集/导入层
    ├─ GitHub REST + GraphQL（issues/PRs/comments/releases）
    ├─ PdfSource / MarkdownSource / ExcelSource / WordSource（业务来源：资产层 + 解析层；
-   │  Excel schema-free；Word 标题样式→章节、表格→JSON）
+   │  Excel schema-free；Word 标题样式→章节、表格→JSON、内嵌图片→资产+OCR）
    └─ ImageSource（签名导向 OCR，provider 可插拔；高置信文本注入所属文档正文，低置信进审核队列）
    ▼
 Canonical 规范化（统一中间格式，可重放可重嵌）
@@ -569,7 +570,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | 1 | 全量采集 + 版本日历 | ✅ 完成 |
 | 2 | 图 + 向量双存储（Kùzu，修复链路/手册定义） | ✅ 核心完成（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）；多来源（PDF/MD/Word/Excel/OCR/审核工作台）✅；Evidence 互证 ✅；等价合并 🔲 |
 | 3 | MCP Server 封装（任意 MCP 客户端接入） | 🔲 规划 |
-| 4 | wiki/文档通用 adapter（word/html 等） | 🚧 部分完成（**word 已接入**：标题样式→章节、列表、表格→JSON；excel 已提前完成：schema-free 导入 ✅；html 🔲） |
+| 4 | wiki/文档通用 adapter（word/html 等） | 🚧 部分完成（**word 已接入**：标题样式→章节、列表、表格→JSON、内嵌图片→内容寻址资产+OCR 复用；excel 已提前完成：schema-free 导入 ✅；html 🔲） |
 | 5 | 评估集 + 置信度参数调优（真实故障案例） | 🔲 规划 |
 
 ## 🧪 测试

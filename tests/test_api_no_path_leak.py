@@ -127,10 +127,17 @@ DIRTY_DOCS = [
         extra={
             "verification": "unverified",
             "asset": {"asset_id": "w0rd", "sha256": "w0rd", "format": "word",
-                      "paragraphs": 12, "tables": 2},
-            "quality": {"text_source": "text_layer", "parsed_with": "python-docx"},
+                      "paragraphs": 12, "tables": 2, "images": 1},
+            "quality": {"text_source": "text_layer", "parsed_with": "python-docx",
+                        "images": 1, "images_unreferenced": 0, "images_unresolved": 0},
             # 表格 JSON 是服务器相对路径——出口只留数量
             "structure": {"tables": ["parsed/word/w0rd.tables.json"]},
+            # 内嵌图片证据：只允许 asset_id/sha256 + OCR 摘要；历史残留的 path 必须剥离
+            "evidence": [{"kind": "embedded", "asset_id": "1m9g", "sha256": "1m9g",
+                          "path": "assets/images/img_1m9g.png",
+                          "ocr": {"confidence": 0.31, "confidence_source": "engine",
+                                  "anomaly": "", "text_included": False,
+                                  "signatures": [{"text": "561000", "kind": "errcode"}]}}],
         },
     ),
 ]

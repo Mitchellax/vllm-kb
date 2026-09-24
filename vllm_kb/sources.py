@@ -850,6 +850,104 @@ def _iter_docx_blocks(document):
             yield Table(child, document)
 
 
+# ---------------- Word 内嵌图片（OOXML 包内 media part） ----------------
+
+# VML 命名空间：旧版/兼容模式粘贴的图片走 `v:imagedata`。python-docx 的 nsmap **不含 v**，
+# 不能经 qn() 取，这里显式写 URI。
+_VML_IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+# 标记兼容分支：Word 给部分图形/文本框写 `mc:AlternateContent`（Choice=DrawingML +
+# Fallback=VML），**两支引用同一个 rId**。全遍历会把一张图数成两张（重复占位 + 重复资产），
+# 按 OOXML 惯例只认 Choice、丢掉 Fallback 子树。
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+# 送 OCR 的栅格格式：emf/wmf/svg 是矢量、tiff 多页支持参差，OCR 引擎不收（白花一次调用）
+_OCR_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp"})
+# content_type → 后缀（partname 后缀缺失/异常时的兜底）
+_CT_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif",
+           "image/webp": "webp", "image/bmp": "bmp", "image/x-ms-bmp": "bmp",
+           "image/tiff": "tiff", "image/x-emf": "emf", "image/emf": "emf",
+           "image/x-wmf": "wmf", "image/wmf": "wmf", "image/svg+xml": "svg"}
+# 解析中间产物 schema 位：1=纯文本/表格；2=+内嵌图片清单（占位 + 资产）。
+# **必须校验**——`_extract_docx` 升级后旧缓存仍带旧 sha256，不校验的话图片永远不会生效，
+# 而且现象是"静默无图"（比报错难查得多）。
+_WORD_EXTRACT_SCHEMA = 2
+
+
+def _word_walk(el):
+    """按文档顺序深度优先遍历子元素，跳过 `mc:Fallback` 分支与注释/PI。"""
+    for child in el:
+        if not isinstance(child.tag, str):
+            continue
+        if child.tag == _MC_FALLBACK:
+            continue
+        yield child
+        yield from _word_walk(child)
+
+
+def _word_image_ext(part) -> str:
+    """图片 part 的后缀（小写，jpeg→jpg）：优先 partname 后缀，其次 content_type。
+
+    注意 python-docx 的 `ImagePart` **没有** `.ext` 属性（实测），只能从 partname/content_type 推。
+    """
+    ext = Path(str(getattr(part, "partname", "") or "")).suffix.lstrip(".").lower()
+    if ext:
+        return "jpg" if ext == "jpeg" else ext
+    return _CT_EXT.get(str(getattr(part, "content_type", "") or "").lower(), "png")
+
+
+def _word_images_in(el) -> list[tuple[str, str]]:
+    """元素内的图片引用（按 XML 文档顺序）→ `[(rId, alt)]`；段落与表格共用。
+
+    两种承载方式都扫：DrawingML（`a:blip/@r:embed`，现代 Word）与 VML（`v:imagedata/@r:id`，
+    兼容模式/旧版粘贴）。一个块里多张图时先后关系是准的。
+    `r:link` 是**外链**图片（内容不在包里）——照样产占位（用户看得见图），但取不到字节、
+    也不该把目标路径记进库，所以只取 rId 不记链接。
+    alt 取 `wp:docPr/@descr`（`wp:docPr` 位于 `a:blip` 之前，先记后用）。
+    """
+    from docx.oxml.ns import qn
+
+    out: list[tuple[str, str]] = []
+    alt = ""
+    for node in _word_walk(el):
+        tag = node.tag
+        if tag == qn("wp:docPr"):
+            alt = str(node.get("descr") or "").strip()
+        elif tag == qn("a:blip"):
+            rid = node.get(qn("r:embed")) or node.get(qn("r:link"))
+            if rid:
+                out.append((rid, alt))
+        elif tag == _VML_IMAGEDATA:
+            rid = node.get(qn("r:id"))
+            if rid:
+                out.append((rid, alt))
+    return out
+
+
+def _word_alt_text(alt: str) -> str:
+    """alt 规范化：压掉换行/连续空白并限长——alt 是文档内容（随正文进 FTS），畸形值能到几 KB。"""
+    return " ".join(str(alt or "").split())[:120]
+
+
+def _word_img_placeholder(alt: str) -> str:
+    """图片**不透明占位符**（与 markdown 同构）：有 alt → `[图片:alt]`，否则 `[图片]`。"""
+    a = _word_alt_text(alt)
+    return f"[图片:{a}]" if a else "[图片]"
+
+
+def _word_image_entry(document, rid: str, alt: str, *, in_body: bool) -> dict:
+    """图片清单条目：读包内字节算 sha256（**内容寻址**），取不到内容则 `sha256=""`。
+
+    sha256 为空 = 外链图（`r:link`）或损坏引用——内容不在包里，只留占位、不登记资产。
+    条目按**出现次数**记（同图在正文出现两次就是两条），顺序即正文占位符顺序。
+    """
+    part = document.part.related_parts.get(rid)
+    blob = getattr(part, "blob", None) if part is not None else None
+    if not isinstance(blob, (bytes, bytearray)):
+        return {"rid": rid, "sha256": "", "ext": "", "alt": _word_alt_text(alt),
+                "in_body": in_body}
+    return {"rid": rid, "sha256": hashlib.sha256(bytes(blob)).hexdigest(),
+            "ext": _word_image_ext(part), "alt": _word_alt_text(alt), "in_body": in_body}
+
+
 class ImageSource(BaseSource):
     """图片证据 OCR 来源：对 data/assets/images/ 未 OCR 的图片做**签名导向 OCR**。
 
@@ -1136,15 +1234,26 @@ class WordSource(BaseSource):
         （粘成一段会让 FTS 命中粒度变差）；
       * 表格 → Markdown 表格拼入正文（表内错误码/命令可被 FTS 检索），另存
         `data/parsed/word/{asset_id}.tables.json` 供结构化消费（图/查询）；
+      * 内嵌图片 → **不透明占位符** `[图片]`/`[图片:alt]` 按文档顺序插入正文，图片本身落
+        `data/assets/images/img_{sha256[:16]}.{ext}`（内容寻址，跨文档去重）并注册 asset_registry；
+        正文出现过的图片走 OCR（`ocr.json` 幂等缓存），高置信文本注入占位符之后参与检索，
+        低置信/自报异常只留签名线索并进审核队列（与 markdown 图片同一套通路）；
     - 解析中间产物按 asset_id（内容寻址）缓存到 `parsed/word/{asset_id}.extract.json`，与 PDF 同构：
-      耗时提取复用缓存，标签/元数据每次重算（升级提取规则**无需清缓存**）；
+      耗时提取复用缓存，标签/元数据/OCR 注入每轮重算（升级提取规则或调 OCR 阈值**无需清缓存**；
+      缓存带 schema 位，提取逻辑升级会自动失效旧缓存）；
     - verification=unverified（与 markdown/excel **统一路径**：人工文档先入库，审核工作台补标）；
     - 与 markdown 同构：**优先读导入目录**（保留目录树 → 同名不同目录可消歧、编辑源文件不会
       因资产层累积副本而变成多篇），导入目录扫不到时回退资产层扁平副本并按版本族收敛。
 
-    **本版边界**（因此正文不含任何路径）：页眉/页脚/脚注/尾注/文本框不提取（python-docx
-    无原生 API，需手撸 XML）；嵌套表格只取外层单元格文本；内嵌图片留待后续版本；
-    `.doc`（旧二进制格式）与加密 docx 不支持 → 明确跳过并提示另存为 `.docx`。
+    **本版边界**（因此正文不含任何路径）：
+    - 页眉/页脚/脚注/尾注是**独立部件**（`/word/header1.xml` 等），不在正文遍历范围内 →
+      其文字与图片都不提取；
+    - 文本框：其**图片**在正文 XML 内（`w:txbxContent`）会被遍历到并产占位，但其**文字**
+      不在 `Paragraph.text` 里（python-docx 只取直接 run）→ 文字不提取（两者不对称，已知）；
+    - 表格内图片的占位符统一排在表格之后（塞进单元格会破 Markdown 表格）；
+    - 嵌套表格只取外层单元格文本；合并单元格重复文本；
+    - 矢量/多页图片（emf/wmf/svg/tiff）注册资产但不送 OCR（引擎不收，白花一次调用）；
+    - `.doc`（旧二进制格式）与加密 docx 不支持 → 明确跳过并提示另存为 `.docx`。
     """
 
     type = "word"
@@ -1234,6 +1343,7 @@ class WordSource(BaseSource):
         parsed_dir.mkdir(parents=True, exist_ok=True)
         total = len(files)
         start_ts = time.time()
+        img_assets: list[tuple] = []   # 内嵌图片资产（末尾与 word 原件同批注册）
         print(f"[sources:{self.id}] 解析 {total} 个 Word …", flush=True)
         for i, (p, from_imports, stem) in enumerate(files, 1):
             t0 = time.time()
@@ -1245,9 +1355,12 @@ class WordSource(BaseSource):
             if parsed is None:
                 continue
             sha = _sha256(p)
+            evidence, injects, registered = self._materialize_images(p, parsed)
+            img_assets.extend(registered)
             doc = self._doc_from_extract(
                 p, sha, sha[:16], parsed, registry,
-                sid=self._sid_for(p, stem, dup_stems, from_imports))
+                sid=self._sid_for(p, stem, dup_stems, from_imports),
+                evidence=evidence, injects=injects)
             if sanitize_on:
                 ips, paths = collect_sanitize_hits(doc.body, keep_paths, keep_ips)
                 if ips:
@@ -1256,11 +1369,14 @@ class WordSource(BaseSource):
                     collector.setdefault("paths", set()).update(paths)
             docs.append(doc)
             cache_tag = "，缓存命中" if cached else ""
+            n_img = int(doc.extra.get("quality", {}).get("images", 0))
             print(f"[sources:{self.id}] [{i}/{total}] 解析完成 {p.name}"
-                  f"（{parsed.get('paragraphs', '?')} 段 / {parsed.get('tables', 0)} 表，"
-                  f"{time.time() - t0:.1f}s{cache_tag}）", flush=True)
+                  f"（{parsed.get('paragraphs', '?')} 段 / {parsed.get('tables', 0)} 表"
+                  f" / {n_img} 图，{time.time() - t0:.1f}s{cache_tag}）", flush=True)
         print(f"[sources:{self.id}] 解析完成：成功 {len(docs)}/{total}（耗时 "
               f"{time.time() - start_ts:.0f}s）", flush=True)
+        # 内嵌图片资产注册（审核侧经 asset_id 反查路径/预览；低置信 OCR 项由 review 扫描入队）
+        self._register_asset_mappings(img_assets)
         self.save_sanitize_log(collector)
         return docs
 
@@ -1288,7 +1404,10 @@ class WordSource(BaseSource):
         if cache.exists():
             try:
                 data = json.loads(cache.read_text(encoding="utf-8"))
-                if data.get("sha256") == sha:
+                # schema 位必须校验：`_extract_docx` 升级后旧缓存的 sha256 仍然匹配，
+                # 不校验就会**静默无图**（比报错难查得多）
+                if (data.get("sha256") == sha
+                        and data.get("schema") == _WORD_EXTRACT_SCHEMA):
                     return data, True
             except (OSError, ValueError):
                 pass  # 缓存损坏 → 重新解析
@@ -1300,10 +1419,18 @@ class WordSource(BaseSource):
         return parsed, False
 
     def _extract_docx(self, p: Path):
-        """python-docx 按文档顺序单遍解析（可缓存）：正文 → Markdown + 结构化表格。
+        """python-docx 按文档顺序单遍解析（可缓存）：正文 → Markdown + 结构化表格 + 图片清单。
 
-        返回 {"sha256", "asset_id", "paragraphs", "tables", "first_heading", "first_text",
-              "body", "tables_data"}；无法解析（非 OOXML / 加密 / 空正文）返回 None。
+        返回 {"schema", "sha256", "asset_id", "paragraphs", "tables", "images", "img_offsets",
+              "first_heading", "first_text", "body", "tables_data"}；
+        无法解析（非 OOXML / 加密 / 既无正文又无图片）返回 None。
+
+        `images` 是**逐次出现**的清单（同一张图在正文出现两次就是两条），顺序即正文占位符顺序：
+        `in_body=true` 的条目与正文里的 `[图片]` 占位符**一一对应**（含解析不到内容的外链图，
+        以 `sha256=""` 标记）；`in_body=false` 的是包里存在但正文未引用的孤儿图，只注册资产。
+
+        `img_offsets` 是各正文占位符在 `body` 中的**结束**偏移——OCR 文本在每轮运行时按它回插
+        （见 `_apply_ocr_injections`），所以缓存里只有占位符、**不含 OCR 文本**。
         """
         import docx
 
@@ -1315,44 +1442,81 @@ class WordSource(BaseSource):
             return None
         parts: list[str] = []
         tables_data: list[dict] = []
+        images: list[dict] = []
+        img_part_idx: list[int] = []   # 正文占位符在 parts 中的下标（→ 换算 body 偏移）
         first_heading = ""
         first_text = ""
         n_par = 0
+
+        def _add_images(refs: list[tuple[str, str]]) -> None:
+            """登记本块的图片引用：清单条目 + 一个独立 part 的占位符（正文不含任何路径）。"""
+            for rid, alt in refs:
+                images.append(_word_image_entry(document, rid, alt, in_body=True))
+                img_part_idx.append(len(parts))
+                parts.append(_word_img_placeholder(alt))
+
         for block in _iter_docx_blocks(document):
             if hasattr(block, "rows"):  # Table
                 rows = [[c.text.strip() for c in row.cells] for row in block.rows]
                 rows = [r for r in rows if any(r)]      # 全空行丢掉（合并单元格常见）
-                if not rows:
-                    continue
-                tables_data.append({"index": len(tables_data), "rows": rows})
-                md = _table_to_markdown(rows)
-                if md:
-                    parts.append(md)
+                if rows:
+                    tables_data.append({"index": len(tables_data), "rows": rows})
+                    md = _table_to_markdown(rows)
+                    if md:
+                        parts.append(md)
+                # 表格里的图片：占位符塞进单元格会破 Markdown 表格，统一跟在表格之后。
+                # 扫表格 XML（而非逐 cell.paragraphs）——合并单元格会让同一段落被重复枚举。
+                _add_images(_word_images_in(block._tbl))
                 continue
             text = (block.text or "").strip()
-            if not text:
+            refs = _word_images_in(block._p)
+            if not text and not refs:
                 continue
-            n_par += 1
-            if not first_text:
-                first_text = text[:120]
-            level = _word_heading_level(block)
-            if level:
-                if not first_heading:
-                    first_heading = text[:120]
-                parts.append("#" * level + " " + text)
+            if text:
+                n_par += 1
+                if not first_text:
+                    first_text = text[:120]
+                level = _word_heading_level(block)
+                if level:
+                    if not first_heading:
+                        first_heading = text[:120]
+                    parts.append("#" * level + " " + text)
+                else:
+                    prefix = _word_list_prefix(block)
+                    parts.append(f"{prefix}{text}" if prefix else text)
+            _add_images(refs)
+        # 孤儿图片：包内已建立关系、正文却未引用的 media（残留关系/未走正文的部件引用）。
+        # 注册资产（审核台可预览原图）但**不插占位**——没有正文落点，OCR 文本也无处可去。
+        # 注意页眉/页脚/脚注是**独立部件**（/word/header1.xml 等），不在此列（本版不提取）。
+        used = {str(e.get("rid") or "") for e in images}
+        for rid, part in document.part.related_parts.items():
+            if rid in used or not str(getattr(part, "content_type", "")).startswith("image/"):
                 continue
-            prefix = _word_list_prefix(block)
-            parts.append(f"{prefix}{text}" if prefix else text)
-        body = "\n\n".join(parts).strip()
-        if not body:
-            print(f"[sources:{self.id}] 跳过无正文 Word 文件（可能只含图片/文本框）: {p.name}")
+            images.append(_word_image_entry(document, rid, "", in_body=False))
+        body = "\n\n".join(parts)
+        # 占位符的**结束**偏移（回插 OCR 文本用；从后往前插，偏移不失效）
+        starts: list[int] = []
+        off = 0
+        for s in parts:
+            starts.append(off)
+            off += len(s) + 2
+        img_offsets = [starts[i] + len(parts[i]) for i in img_part_idx]
+        lead = len(body) - len(body.lstrip())
+        body = body.strip()
+        if lead:                       # parts 均非空且不以空白开头，理论上 lead=0；防御性对齐
+            img_offsets = [o - lead for o in img_offsets]
+        if not body and not images:
+            print(f"[sources:{self.id}] 跳过无正文 Word 文件（可能只含页眉/页脚/文本框）: {p.name}")
             return None
         sha = _sha256(p)
         return {
+            "schema": _WORD_EXTRACT_SCHEMA,
             "sha256": sha,
             "asset_id": sha[:16],
             "paragraphs": n_par,
             "tables": len(tables_data),
+            "images": images,
+            "img_offsets": img_offsets,
             "first_heading": first_heading,
             "first_text": first_text,
             "body": body,
@@ -1371,18 +1535,139 @@ class WordSource(BaseSource):
         )
         return [f"parsed/word/{tpath.name}"]
 
+    # ---------- 内嵌图片：资产化 + OCR ----------
+
+    def _materialize_images(self, p: Path, parsed: dict,
+                            ) -> tuple[list[dict], list[str], list[tuple]]:
+        """把内嵌图片落到资产层（内容寻址）并按需 OCR。
+
+        返回 `(evidence, 正文注入后缀, 资产注册项)`；`injects` 与正文占位符**逐位对齐**
+        （未 OCR / 解析不到的图片对应空串）。
+
+        **每轮运行都执行**（不进 extract 缓存）：OCR 文本与阈值判定因此不被缓存冻结——
+        调 `ocr_min_confidence`、OCR 服务从不可用恢复，下次构建即生效（与 markdown 同构）。
+
+        - 资产命名 `img_{sha256[:16]}.{ext}`：**内容寻址**。包内 media 名（image1.png…）
+          在文档之间必然重名，且同图跨文档自动去重（与 markdown 的 base64 图片共用命名空间）；
+        - 只对**正文出现过的**图片做 OCR：孤儿图没有正文落点，OCR 文本无处可去
+          （仍是有效资产，照常注册供审核台预览）；
+        - 矢量/多页格式（emf/wmf/svg/tiff）不送 OCR（引擎不收，白花一次调用），只注册资产。
+        """
+        entries = parsed.get("images") or []
+        if not entries:
+            return [], [], []
+        images_dir = self.resolve("data/assets/images")
+        try:
+            import docx
+
+            rels = docx.Document(str(p)).part.related_parts
+        except Exception as e:      # 已成功解析过，这里只可能是文件被移走/改坏
+            print(f"[sources:{self.id}] 内嵌图片读取失败（{p.name}）：{e}（跳过图片）")
+            return [], [], []
+        evidence: list[dict] = []
+        injects: list[str] = []
+        registered: list[tuple] = []
+        for ent in entries:
+            in_body = bool(ent.get("in_body"))
+            sha = str(ent.get("sha256") or "")
+            ev: dict = {"kind": "embedded", "ocr": None}
+            evidence.append(ev)
+            if not in_body:
+                # 孤儿图：注册资产即可，不插占位、不 OCR（没有正文落点）
+                if sha:
+                    target = self._write_image(images_dir, rels, ent, sha)
+                    if target is not None:
+                        ev.update({"asset_id": sha[:16], "sha256": sha})
+                        registered.append(
+                            _asset_entry(f"assets/images/{target.name}", sha, "image", target))
+                continue
+            if not sha:      # 外链图/损坏引用：内容不在包里 → 只留占位
+                injects.append("")
+                continue
+            target = self._write_image(images_dir, rels, ent, sha)
+            if target is None:
+                injects.append("")
+                continue
+            rel = f"assets/images/{target.name}"
+            ev.update({"asset_id": sha[:16], "sha256": sha})
+            registered.append(_asset_entry(rel, sha, "image", target))
+            if str(ent.get("ext") or "").lower() in _OCR_IMAGE_EXTS:
+                ocr_ev, inject = self._ocr_artifact_for(target, sha, rel)
+                if ocr_ev is not None:
+                    ev["ocr"] = ocr_ev
+                injects.append(inject)
+            else:
+                injects.append("")      # 矢量/多页：资产照常注册，不送 OCR
+        return evidence, injects, registered
+
+    @staticmethod
+    def _write_image(images_dir: Path, rels, ent: dict, sha: str) -> Optional[Path]:
+        """把清单条目对应的图片写进资产层（同 sha 已存在则跳过），返回落盘路径。"""
+        target = images_dir / f"img_{sha[:16]}.{str(ent.get('ext') or 'png')}"
+        if target.is_file() and _sha256(target) == sha:
+            return target            # 内容寻址：同图只落一份，稳态重建不读 docx
+        blob = getattr(rels.get(str(ent.get("rid") or "")), "blob", None)
+        if not isinstance(blob, (bytes, bytearray)):
+            return None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(bytes(blob))
+        return target
+
+    @staticmethod
+    def _apply_ocr_injections(body: str, parsed: dict, injects: list[str]) -> str:
+        """把本轮 OCR 文本插回各占位符之后（extract 缓存里只有占位符、不含 OCR 文本）。
+
+        按 `img_offsets`（占位符在 body 中的结束偏移）**从后往前**插，前面的偏移不失效。
+        缓存因此不会冻结 OCR 结果——调 `ocr_min_confidence`、OCR 服务恢复，下次构建即生效。
+        """
+        offs = parsed.get("img_offsets") or []
+        if not body or not offs or not injects:
+            return body
+        out = body
+        for off, inj in sorted(zip(offs, injects), key=lambda t: t[0], reverse=True):
+            if inj:
+                out = out[:off] + inj + out[off:]
+        return out
+
     def _doc_from_extract(self, p: Path, sha: str, asset_id: str, parsed: dict,
-                          registry: TagRegistry, *, sid: str) -> KbDocument:
+                          registry: TagRegistry, *, sid: str,
+                          evidence: Optional[list[dict]] = None,
+                          injects: Optional[list[str]] = None) -> KbDocument:
         """用解析中间产物构造 KbDocument（确定性提取，毫秒级，每次运行重算）。
 
-        缓存命中与首次解析共用本函数——标签/元数据始终以最新规则执行，解析器升级不影响一致性。
+        缓存命中与首次解析共用本函数——标签/元数据/OCR 注入始终以最新规则执行，
+        解析器与 OCR 阈值升级都不受缓存影响。
         """
-        body = str(parsed.get("body") or "")
+        body = self._apply_ocr_injections(str(parsed.get("body") or ""), parsed, injects or [])
         title = (str(parsed.get("first_heading") or "").strip()
                  or str(parsed.get("first_text") or "").strip() or p.stem)
         # 正文标题已渲染为 Markdown `#`，标题结构与标签提取与 markdown 同源
         tags, cands = extract_tags(p.stem, headings_from_markdown(body), registry=registry)
         tables_rel = [f"parsed/word/{asset_id}.tables.json"] if parsed.get("tables_data") else []
+        imgs = parsed.get("images") or []
+        n_body = sum(1 for e in imgs if e.get("in_body"))
+        extra: dict[str, Any] = {
+            "asset": {"asset_id": asset_id, "sha256": sha, "format": "word",
+                      "paragraphs": int(parsed.get("paragraphs") or 0),
+                      "tables": int(parsed.get("tables") or 0),
+                      "images": n_body},
+            "quality": {
+                "text_source": "text_layer",
+                "parsed_with": "python-docx",
+                "images": n_body,
+                # 包里存在但正文未引用的图（已注册资产，无占位、无 OCR）
+                "images_unreferenced": len(imgs) - n_body,
+                # 正文引用了但内容不在包里（外链/损坏）→ 只有占位
+                "images_unresolved": sum(1 for e in imgs
+                                         if e.get("in_body") and not e.get("sha256")),
+            },
+            "verification": "unverified",  # 与 markdown/excel 统一：先入库，审核台补标
+            "structure": {"tables": tables_rel},
+            # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+            "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
+        }
+        if evidence:
+            extra["evidence"] = evidence
         return KbDocument(
             source_type="doc_word",
             source_id=sid,
@@ -1392,16 +1677,7 @@ class WordSource(BaseSource):
             created_at=None,
             component="",
             tags=[t.name for t in tags],
-            extra={
-                "asset": {"asset_id": asset_id, "sha256": sha, "format": "word",
-                          "paragraphs": int(parsed.get("paragraphs") or 0),
-                          "tables": int(parsed.get("tables") or 0)},
-                "quality": {"text_source": "text_layer", "parsed_with": "python-docx"},
-                "verification": "unverified",  # 与 markdown/excel 统一：先入库，审核台补标
-                "structure": {"tables": tables_rel},
-                # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
-                "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
-            },
+            extra=extra,
         )
 
 

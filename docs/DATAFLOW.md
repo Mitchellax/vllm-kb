@@ -75,7 +75,7 @@
 | 阶段 | 处理 | 产物 |
 |---|---|---|
 | 1. 资产复制 | `BaseSource.pull()` 把导入文件复制进资产层 | `data/assets/{pdf,md,word,images}/`，sha256 命名不可变（**资产路径不进检索库**，只存 asset_id） |
-| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；**Word**（`python-docx` 按文档顺序单遍解析：标题样式 `Heading 1-6`/「标题 1」/`Title` → Markdown `#` 层级（分块复用 markdown 章节切分，chunk 带 `section`）、列表样式 → `- `/`1. `、表格 → Markdown 拼入正文；与 markdown 同构：优先读 `imports/word`（保留目录树、可消歧），扫不到时回退 `assets/word` 并按版本族收敛；`.doc`/加密 docx 跳过）；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF/Word 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
+| 2. 解析 | PDF 文字层 + 表格提取；Markdown 正文 + 图片收集（`md_images.py`：行内/引用式/HTML 全形态、```/`code` 代码区跳过、**未识别形态也占位**；引用的本地/base64 图片即时 OCR；内嵌图按内容寻址命名；同名 stem 用**相对路径指纹**消歧 `md:<stem>--<sha8>`；imports 缺失时回退 `assets/md`（**按版本族收敛**：`case.md` 与 `case.<sha12>.md` 是同篇不同版本，只取最新一份且 `source_id` 取族名 `md:case` 以防 id 漂移）并按文件名反查图片，`extra.quality.source_mode` 标记）；Excel schema-free 任意 sheet/列拼接入库；**Word**（`python-docx` 按文档顺序单遍解析：标题样式 `Heading 1-6`/「标题 1」/`Title` → Markdown `#` 层级（分块复用 markdown 章节切分，chunk 带 `section`）、列表样式 → `- `/`1. `、表格 → Markdown 拼入正文；**内嵌图片** → `[图片]`/`[图片:alt]` 不透明占位（DrawingML `a:blip` 与 VML `v:imagedata` 都扫、`mc:AlternateContent` 只认 Choice 以免一张图数成两张）+ `assets/images/img_{sha16}.{ext}` 内容寻址资产 + 复用同一套 OCR 幂等缓存（高置信注入占位符之后，低置信进审核队列）；与 markdown 同构：优先读 `imports/word`（保留目录树、可消歧），扫不到时回退 `assets/word` 并按版本族收敛；`.doc`/加密 docx 跳过）；截图 OCR（provider 可插拔：`api`（含 `mode=custom` 自研协议 / `openai` 兼容）/ `paddle` / `none` 默认关闭，未知值报错） | `data/parsed/`（PDF/Word 表格 JSON `*.tables.json` 与解析缓存 `*.extract.json`、OCR 产物 `*.ocr.json`，可重跑） |
 | 3. 规范化 | `canonicalize()`：正文拼装（高置信 OCR 文本注入 `[图片]` 占位符之后）+ `extra.evidence[].ocr` 摘要 + 文档级**两级标签**（tagging：词典 `config.tags.registry` 子串命中 + 文件名/标题 token） | 同 2.1 步骤 2 → canonical.jsonl |
 | 4. 入库 | 同 2.6 | LanceDB + kb.sqlite3 |
 
@@ -171,7 +171,7 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 | 命令 / 组件 | 产物 | 说明 |
 |---|---|---|
 | `python scripts/build_fts.py` | 重建 `kb.sqlite3` 的 `chunks_fts`（读现有 chunk 原文重新 jieba 分词，chunk_id 与向量库严格一致） | 升级分词规则/旧库升级后使用；**不重新分块、不重嵌向量**，普通增量入库自动分词无需运行 |
-| `python scripts/review_ui.py` | `data/review.sqlite3`（`review_items` 审核队列 / `asset_registry` 资产路径注册 / `doc_tags` 标签覆盖层） | 审核工作台独立端口，**只读检索 API 全程不碰该库**；资产路径只存 `asset_id → rel_path`，不进 canonical/检索库。图片资产由 `ImageSource`/`MarkdownSource` 批量注册（内容寻址：同内容多副本共用一行），审核台按 `rel_path` 经 `/assets` 静态挂载预览原图 |
+| `python scripts/review_ui.py` | `data/review.sqlite3`（`review_items` 审核队列 / `asset_registry` 资产路径注册 / `doc_tags` 标签覆盖层） | 审核工作台独立端口，**只读检索 API 全程不碰该库**；资产路径只存 `asset_id → rel_path`，不进 canonical/检索库。图片资产由 `ImageSource`/`MarkdownSource`/`WordSource` 批量注册（内容寻址：同内容多副本共用一行），审核台按 `rel_path` 经 `/assets` 静态挂载预览原图 |
 
 > 审核队列的 7 类人工确认项、API 配置中心、知识缺口展示见
 > [使用指南 §3.2](USAGE.md#32-审核工作台人工确认统一入口--api-配置中心)。

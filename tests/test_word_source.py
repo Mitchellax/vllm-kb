@@ -7,13 +7,27 @@
 import json
 import os
 import shutil
+import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
 from vllm_kb.config import AppConfig, SourceCfg
 from vllm_kb.sources import WordSource
+
+
+def make_png(w=8, h=8, color=(255, 0, 0)) -> bytes:
+    """纯 zlib 造一张 PNG（不依赖 PIL）：夹具要够小、可 review，且内容可区分（测内容寻址）。"""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+
+    raw = b"".join(b"\x00" + bytes(color) * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
 def make_docx(path: Path, *, headings=True, table=True, lists=True,
@@ -48,6 +62,56 @@ def make_docx(path: Path, *, headings=True, table=True, lists=True,
     d.add_paragraph("")          # 空段落应跳过
     path.parent.mkdir(parents=True, exist_ok=True)
     d.save(str(path))
+
+
+def make_docx_with_images(path: Path, *, n=1, alt=None, colors=None, orphan=False,
+                          only_image=False, heading=True) -> None:
+    """造含**内嵌图片**的 docx（现场生成，不塞二进制夹具）。
+
+    - `n`：正文里的图片张数；`colors` 决定每张图的内容（不同内容 → 不同 sha，测内容寻址）；
+    - `alt`：写进 `wp:docPr/@descr`（→ `[图片:alt]` 占位）；
+    - `orphan=True`：插一张图后把 `w:drawing` 摘掉——**关系仍在 rels 里**，于是成为孤儿图；
+    - `only_image=True`：只放一张图、不放任何文字（回归：以前这种文档会被整篇跳过）。
+    """
+    import io
+
+    import docx
+    from docx.oxml.ns import qn
+
+    d = docx.Document()
+    if not only_image and heading:
+        d.add_heading("图片案例", level=1)
+        d.add_paragraph("下图是拓扑：")
+    colors = list(colors or [(255, 0, 0), (0, 128, 255), (0, 200, 0)])
+    for i in range(n):
+        if not only_image:
+            d.add_paragraph(f"图 {i + 1}：")
+        run = d.add_paragraph().add_run()
+        run.add_picture(io.BytesIO(make_png(color=colors[i % len(colors)])))
+        if alt:
+            run._r.xpath(".//wp:docPr")[0].set("descr", alt)
+    if orphan:
+        run = d.add_paragraph().add_run()
+        run.add_picture(io.BytesIO(make_png(color=(9, 9, 9))))
+        drawing = run._r.xpath(".//w:drawing")[0]
+        drawing.getparent().remove(drawing)      # 摘掉引用，关系留在 rels → 孤儿
+    if not only_image and heading:
+        d.add_paragraph("结尾正文")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    d.save(str(path))
+
+
+def _docx_rId(path: Path, index: int = 0) -> str:
+    """取第 index 张图片的 rId（造 VML / AlternateContent 用例要用真实关系 id）。"""
+    import docx
+    from docx.oxml.ns import qn
+
+    d = docx.Document(str(path))
+    for par in d.paragraphs:
+        blips = par._p.xpath(".//a:blip")
+        if blips:
+            return blips[index].get(qn("r:embed"))
+    raise AssertionError("文档里没有图片")
 
 
 class _WordCase(unittest.TestCase):
@@ -354,6 +418,396 @@ class TestWordHelpers(unittest.TestCase):
             self.assertEqual(
                 _discover_source_files(src, ("*.docx",), src.import_dir, src._assets_dir()),
                 ([], False))
+
+
+class TestWordEmbeddedImages(_WordCase):
+    """内嵌图片：不透明占位 + 内容寻址资产 + asset_registry 注册 + 正文不含路径。"""
+
+    def _write_img(self, name="图片案例.docx", **kw) -> Path:
+        p = self.import_dir / name
+        make_docx_with_images(p, **kw)
+        return p
+
+    def test_placeholder_and_asset(self):
+        """图片 → 正文 `[图片]` 占位（无路径），图片落 assets/images（内容寻址命名）。"""
+        self._write_img()
+        docs = self._docs()
+        self.assertEqual(len(docs), 1)
+        d = docs[0]
+        self.assertIn("[图片]", d.body)
+        self.assertEqual(d.extra["quality"]["images"], 1)
+        # 资产以 sha 命名：不含 Word 文件名（包内 media 名在文档间必然重名）
+        imgs = sorted((self.root / "data" / "assets" / "images").glob("*.png"))
+        self.assertEqual(len(imgs), 1)
+        self.assertRegex(imgs[0].name, r"^img_[0-9a-f]{16}\.png$")
+        # evidence：只有 asset_id/sha256，无 source_ref（不记任何路径）
+        ev = d.extra["evidence"][0]
+        self.assertEqual(ev["kind"], "embedded")
+        self.assertNotIn("source_ref", ev)
+        self.assertEqual(ev["asset_id"], imgs[0].stem.split("_", 1)[1])
+        # 正文/整条 extra 不含路径形态
+        blob = json.dumps(d.extra, ensure_ascii=False)
+        for bad in ("imports", "assets/", "parsed/", ".docx", "media"):
+            self.assertNotIn(bad, blob, f"extra 泄漏 {bad!r}")
+
+    def test_asset_registry_registration(self):
+        """图片注册进 asset_registry（source_type=image）→ 审核台可反查路径并预览。"""
+        from vllm_kb.review import list_assets
+
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+        self._write_img()
+        src = self._src(app_cfg=AppConfig.model_validate({}))
+        src.pull()
+        src.canonicalize()
+        assets = list_assets(self.root / "data" / "review.sqlite3")
+        by_type = {}
+        for reg in assets.values():
+            by_type.setdefault(reg["source_type"], []).append(reg["rel_path"])
+        self.assertEqual(len(by_type.get("image", [])), 1)
+        self.assertTrue(by_type["image"][0].startswith("assets/images/img_"))
+        # word 原件与图片同批注册
+        self.assertEqual(len(by_type.get("doc_word", [])), 1)
+
+    def test_alt_text_in_placeholder(self):
+        """`wp:docPr/@descr` → `[图片:alt]`（alt 是文档内容，随正文进 FTS）。"""
+        self._write_img(alt="拓扑图")
+        body = self._docs()[0].body
+        self.assertIn("[图片:拓扑图]", body)
+
+    def test_alt_text_normalized_and_truncated(self):
+        """alt 压掉换行、限长（畸形 alt 能到几 KB，不该整段进正文）。"""
+        from vllm_kb.sources import _word_alt_text
+
+        self.assertEqual(_word_alt_text("a\n\n b\t c "), "a b c")
+        self.assertEqual(len(_word_alt_text("x" * 500)), 120)
+
+    def test_identical_images_share_one_asset(self):
+        """同图重复出现 → 只落一份资产（内容寻址），但占位符各留一个。"""
+        self._write_img(n=2, colors=[(7, 7, 7), (7, 7, 7)])
+        d = self._docs()[0]
+        self.assertEqual(d.body.count("[图片]"), 2)
+        self.assertEqual(d.extra["quality"]["images"], 2)
+        self.assertEqual(len(list((self.root / "data" / "assets" / "images").glob("*.png"))), 1)
+
+    def test_distinct_images_two_assets(self):
+        self._write_img(n=2, colors=[(1, 2, 3), (4, 5, 6)])
+        self._docs()
+        self.assertEqual(len(list((self.root / "data" / "assets" / "images").glob("*.png"))), 2)
+
+    def test_orphan_image_registered_without_placeholder(self):
+        """孤儿图（包内有关系、正文未引用）：注册资产但不插占位（没有正文落点）。"""
+        self._write_img(orphan=True)
+        d = self._docs()[0]
+        self.assertEqual(d.extra["quality"]["images"], 1)               # 正文 1 张
+        self.assertEqual(d.extra["quality"]["images_unreferenced"], 1)  # 孤儿 1 张
+        self.assertEqual(d.body.count("[图片]"), 1)
+        # 两张图都落了资产（孤儿图仍可被审核台预览）
+        self.assertEqual(len(list((self.root / "data" / "assets" / "images").glob("*.png"))), 2)
+
+    def test_image_only_document_not_skipped(self):
+        """纯图片文档不再被整篇跳过（回归：以前 `无正文 → 跳过`，图里的信息完全丢失）。"""
+        self._write_img(only_image=True)
+        docs = self._docs()
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].body, "[图片]")
+        self.assertEqual(docs[0].title, "图片案例")   # 无标题/正文 → 回退文件名
+
+    def test_image_in_table_placeholder_after_table(self):
+        """表格里的图片：占位符排在表格之后（塞进单元格会破 Markdown 表格）。"""
+        import io
+
+        import docx
+
+        p = self.import_dir / "表内图.docx"
+        d = docx.Document()
+        d.add_heading("表内图", level=1)
+        t = d.add_table(rows=1, cols=2)
+        t.cell(0, 0).text = "错误码"
+        t.cell(0, 1).paragraphs[0].add_run().add_picture(io.BytesIO(make_png()))
+        d.save(str(p))
+        body = self._docs()[0].body
+        self.assertIn("| 错误码 |", body)
+        self.assertIn("[图片]", body)
+        self.assertLess(body.index("| 错误码 |"), body.index("[图片]"))
+        # 合并单元格不会让同一段落被重复枚举 → 只有 1 个占位
+        self.assertEqual(body.count("[图片]"), 1)
+
+    def test_external_link_image_placeholder_only(self):
+        """外链图（`r:link`，内容不在包里）：照常占位，但不登记资产、不记链接（不泄漏路径）。"""
+        import docx
+        from docx.oxml import parse_xml
+
+        p = self.import_dir / "外链图.docx"
+        d = docx.Document()
+        d.add_heading("外链图", level=1)
+        par = d.add_paragraph()
+        par._p.append(parse_xml(
+            '<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:v="urn:schemas-microsoft-com:vml" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<v:shape><v:imagedata r:id="rIdExternal" r:link="rIdExternal"/></v:shape></w:pict>'))
+        d.save(str(p))
+        docs = self._docs()
+        self.assertEqual(len(docs), 1)
+        self.assertIn("[图片]", docs[0].body)
+        self.assertEqual(docs[0].extra["quality"]["images"], 1)
+        self.assertEqual(docs[0].extra["quality"]["images_unresolved"], 1)
+        self.assertEqual(list((self.root / "data" / "assets" / "images").glob("*")), [])
+        self.assertNotIn("rIdExternal", json.dumps(docs[0].extra, ensure_ascii=False))
+
+
+class TestWordImageOoxml(unittest.TestCase):
+    """OOXML 图片遍历的边界（手搓 XML：真实 Word 的兼容/旧版形态很难用 python-docx 造）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.p = self.root / "t.docx"
+        make_docx_with_images(self.p, n=1, heading=False)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_vml_imagedata_found(self):
+        """VML（`v:imagedata`，兼容模式/旧版粘贴）也要认出来——只扫 a:blip 会漏图。"""
+        import docx
+        from docx.oxml import parse_xml
+
+        from vllm_kb.sources import _word_images_in
+
+        rid = _docx_rId(self.p)
+        d = docx.Document(str(self.p))
+        # 摘掉原 drawing，换成 VML 形态引用同一 rId
+        drawing = d.paragraphs[1]._p.xpath(".//w:drawing")[0]
+        drawing.getparent().remove(drawing)
+        d.paragraphs[1]._p.append(parse_xml(
+            '<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:v="urn:schemas-microsoft-com:vml" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<v:shape><v:imagedata r:id="{rid}"/></v:shape></w:pict>'))
+        got = _word_images_in(d.paragraphs[1]._p)
+        self.assertEqual([r for r, _ in got], [rid])
+
+    def test_alternate_content_fallback_not_double_counted(self):
+        """`mc:AlternateContent` 的 Choice 与 Fallback 引用同一 rId → 只能算一张图。
+
+        全遍历会把一张图数成两张：正文出现两个占位、资产重复登记、OCR 白跑一次。
+        """
+        import docx
+        from docx.oxml import parse_xml
+
+        from vllm_kb.sources import _word_images_in
+
+        rid = _docx_rId(self.p)
+        d = docx.Document(str(self.p))
+        drawing = d.paragraphs[1]._p.xpath(".//w:drawing")[0]
+        drawing.getparent().remove(drawing)
+        d.paragraphs[1]._p.append(parse_xml(
+            '<mc:AlternateContent '
+            'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+            'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            'xmlns:v="urn:schemas-microsoft-com:vml">'
+            '<mc:Choice Requires="wps"><w:drawing><wp:inline><a:graphic>'
+            f'<a:blip r:embed="{rid}"/></a:graphic></wp:inline></w:drawing></mc:Choice>'
+            f'<mc:Fallback><w:pict><v:shape><v:imagedata r:id="{rid}"/>'
+            '</v:shape></w:pict></mc:Fallback></mc:AlternateContent>'))
+        got = _word_images_in(d.paragraphs[1]._p)
+        self.assertEqual([r for r, _ in got], [rid], "Fallback 分支被重复计数")
+
+    def test_comment_nodes_ignored(self):
+        """XML 注释/PI 不是元素（`.tag` 是函数），遍历必须跳过而不是崩。"""
+        import docx
+        from docx.oxml import parse_xml
+
+        from vllm_kb.sources import _word_images_in
+
+        d = docx.Document(str(self.p))
+        par = d.add_paragraph()          # 新段落：本身没有图片
+        par._p.append(parse_xml(
+            '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<!-- 注释 --><w:t>x</w:t></w:r>'))
+        self.assertEqual(_word_images_in(par._p), [])
+
+
+class _WordOcrCase(_WordCase):
+    """OCR 用例：需要 app_cfg（OCR 配置来自 image source）+ 数据根重定向。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+
+    def _app(self, min_conf: float = 0.6) -> AppConfig:
+        return AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "storage": {"vector_backend": "python", "review_path": "data/review.sqlite3"},
+            "sources": [
+                {"id": "cases", "type": "word", "path": "data/imports/word", "enabled": True},
+                {"id": "images", "type": "image", "ocr_provider": "api",
+                 "ocr_api_base": "http://ocr.local:8000",
+                 "ocr_min_confidence": min_conf, "enabled": True},
+            ],
+        })
+
+    def _docs_ocr(self, min_conf: float = 0.6):
+        if not any(self.import_dir.rglob("*.docx")):
+            make_docx_with_images(self.import_dir / "图片案例.docx")
+        src = self._src(app_cfg=self._app(min_conf))
+        src.pull()
+        return src.canonicalize()
+
+    def _img_docx(self) -> Path:
+        """给直接调 `_materialize_images` 的用例一个真实 docx（它要打开包读 rels）。"""
+        p = self.import_dir / "直接调用.docx"
+        if not p.exists():
+            make_docx_with_images(p)
+        return p
+
+
+class TestWordImageOcr(_WordOcrCase):
+    """内嵌图片 OCR：高置信注入正文、低置信只留线索、阈值不被缓存冻结。"""
+
+    def _mock(self, text: str, conf: float):
+        from vllm_kb.ocr import OcrResult
+
+        return mock.patch("vllm_kb.ocr.ocr_image_detail",
+                          return_value=OcrResult(text=text, confidence=conf,
+                                                 confidence_source="engine", provider="api"))
+
+    def test_high_confidence_text_injected(self):
+        """高置信 OCR 文本注入占位符之后 → 随正文进 FTS + 向量。"""
+        with self._mock("halMemCreate failed drvRetCode=6", 0.92):
+            d = self._docs_ocr()[0]
+        self.assertIn("halMemCreate failed drvRetCode=6", d.body)
+        self.assertLess(d.body.index("[图片]"), d.body.index("halMemCreate"))
+        ev = d.extra["evidence"][0]
+        self.assertEqual(ev["kind"], "embedded")
+        self.assertTrue(ev["ocr"]["text_included"])
+        self.assertEqual(ev["ocr"]["confidence"], 0.92)
+
+    def test_low_confidence_not_injected_but_queued(self):
+        """低置信/自报异常：不注入正文，只留签名线索 + evidence（→ 审核队列据此入队）。"""
+        with self._mock("maybe 561000", 0.30):
+            d = self._docs_ocr()[0]
+        self.assertNotIn("maybe 561000", d.body)
+        self.assertIn("[图片]", d.body)
+        ocr = d.extra["evidence"][0]["ocr"]
+        self.assertFalse(ocr["text_included"])
+        self.assertEqual(ocr["confidence"], 0.3)
+
+    def test_ocr_text_not_frozen_in_extract_cache(self):
+        """**关键不变量**：OCR 文本不进 extract 缓存 → 调阈值只重判定、不重解析。
+
+        缓存里若冻结了 OCR 结果，会出现两个坑：① 调 `ocr_min_confidence` 不生效（要清缓存）；
+        ② 首次构建时 OCR 服务不可用 → 空文本被永久冻结，服务恢复后也永远补不回来。
+        """
+        with self._mock("halMemCreate failed drvRetCode=6", 0.70):
+            first = self._docs_ocr(min_conf=0.9)[0]      # 0.70 < 0.9 → 不注入
+        self.assertNotIn("halMemCreate", first.body)
+        cache = next((self.root / "data" / "parsed" / "word").glob("*.extract.json"))
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertNotIn("halMemCreate", cached["body"], "OCR 文本被冻结进 extract 缓存")
+        self.assertIn("[图片]", cached["body"])
+        # 同一份 extract 缓存（sha 未变）+ 放宽阈值 → 立刻注入，**不需要清缓存**
+        with self._mock("halMemCreate failed drvRetCode=6", 0.70):
+            second = self._docs_ocr(min_conf=0.5)[0]
+        self.assertIn("halMemCreate failed drvRetCode=6", second.body)
+        self.assertEqual(cache.read_text(encoding="utf-8"),
+                         json.dumps(cached, ensure_ascii=False), "缓存被重写了（应命中）")
+
+    def test_ocr_unavailable_degrades_then_recovers(self):
+        """OCR 不可用 → 导入不受阻（只占位）；服务恢复后同一缓存即注入（不冻结空结果）。"""
+        from vllm_kb.ocr import OcrApiError
+
+        with mock.patch("vllm_kb.ocr.ocr_image_detail", side_effect=OcrApiError("svc down")):
+            d = self._docs_ocr()[0]
+        self.assertEqual(d.body.count("[图片]"), 1)
+        self.assertIsNone(d.extra["evidence"][0]["ocr"])
+        with self._mock("recovered text 561000", 0.9):
+            d2 = self._docs_ocr()[0]
+        self.assertIn("recovered text 561000", d2.body)
+
+    def test_ocr_cache_reused_across_runs(self):
+        """同一张图 OCR 结果按 sha 缓存（ocr.json）→ 第二次构建不再调 OCR。"""
+        with self._mock("cached text", 0.9) as m:
+            self._docs_ocr()
+            calls_first = m.call_count
+        with self._mock("cached text", 0.9) as m2:
+            self._docs_ocr()
+            calls_second = m2.call_count
+        self.assertEqual(calls_first, 1)
+        self.assertEqual(calls_second, 0, "第二次构建仍调了 OCR（幂等缓存失效）")
+
+    def test_non_raster_not_sent_to_ocr(self):
+        """矢量/多页格式（emf/wmf/svg/tiff）注册资产但不送 OCR（引擎不收，白花调用）。"""
+        entries = [{"rid": "rId1", "sha256": "a" * 64, "ext": "emf",
+                    "alt": "", "in_body": True}]
+        src = self._src(app_cfg=self._app())
+        with mock.patch.object(WordSource, "_write_image") as w, \
+                mock.patch("vllm_kb.ocr.ocr_image_detail") as ocr_m:
+            w.return_value = self.root / "data" / "assets" / "images" / "img_x.emf"
+            evidence, injects, registered = src._materialize_images(
+                self._img_docx(), {"images": entries})
+        self.assertEqual(injects, [""])
+        ocr_m.assert_not_called()
+        self.assertEqual(evidence[0]["sha256"], "a" * 64)
+        self.assertEqual(len(registered), 1)
+
+    def test_orphan_image_not_ocrd(self):
+        """孤儿图不做 OCR（没有正文落点，文本无处可去）——只注册资产。"""
+        entries = [{"rid": "rId1", "sha256": "b" * 64, "ext": "png",
+                    "alt": "", "in_body": False}]
+        src = self._src(app_cfg=self._app())
+        with mock.patch.object(WordSource, "_write_image") as w, \
+                mock.patch("vllm_kb.ocr.ocr_image_detail") as ocr_m:
+            w.return_value = self.root / "data" / "assets" / "images" / "img_y.png"
+            evidence, injects, registered = src._materialize_images(
+                self._img_docx(), {"images": entries})
+        self.assertEqual(injects, [])
+        ocr_m.assert_not_called()
+        self.assertEqual(len(registered), 1)
+        self.assertIsNone(evidence[0]["ocr"])
+
+
+class TestWordExtractCacheSchema(_WordCase):
+    """extract 缓存的 schema 位：提取逻辑升级必须让旧缓存失效。"""
+
+    def test_stale_schema_cache_invalidated(self):
+        """旧 schema 缓存（sha 仍匹配）必须被重新解析——否则图片**静默不生效**。"""
+        p = self.import_dir / "图片案例.docx"
+        make_docx_with_images(p, n=1)
+        src = self._src()
+        src.pull()
+        docs = src.canonicalize()
+        self.assertIn("[图片]", docs[0].body)
+        cache = next((self.root / "data" / "parsed" / "word").glob("*.extract.json"))
+        # 伪造 step1（无图片清单）的旧缓存：sha 一致、schema 缺失、body 无占位
+        stale = json.loads(cache.read_text(encoding="utf-8"))
+        stale.pop("schema")
+        stale["body"] = "# 图片案例\n\n下图是拓扑："
+        stale.pop("images")
+        stale.pop("img_offsets")
+        cache.write_text(json.dumps(stale, ensure_ascii=False), encoding="utf-8")
+        # 重跑：schema 不符 → 重新解析 → 图片回来了
+        again = self._src().canonicalize()
+        self.assertIn("[图片]", again[0].body)
+        self.assertEqual(again[0].extra["quality"]["images"], 1)
+        self.assertEqual(json.loads(cache.read_text(encoding="utf-8")).get("schema"), 2)
+
+    def test_matching_schema_cache_hits(self):
+        """schema 一致 → 命中缓存（不重写文件，mtime 不变）。"""
+        p = self.import_dir / "图片案例.docx"
+        make_docx_with_images(p, n=1)
+        src = self._src()
+        src.pull()
+        src.canonicalize()
+        cache = next((self.root / "data" / "parsed" / "word").glob("*.extract.json"))
+        before = cache.stat().st_mtime_ns
+        docs = self._src().canonicalize()
+        self.assertEqual(cache.stat().st_mtime_ns, before, "缓存被重写（应命中）")
+        self.assertIn("[图片]", docs[0].body)
 
 
 if __name__ == "__main__":
