@@ -162,6 +162,11 @@ def fetch_image_config(tag_info: dict, token: str, timeout: int = 60, max_retrie
     默认 60s / 4 次（原 30s / 3 次）：config blob 由 quay 302 到 `cdn0N.quay.io`，
     实测同一 URL 在抖动的链路上有 **0.6s 成功**、也有 **90s 读超时**（连续 3 次全废），
     30s 会把能拿到的证据误判为缺失（config 一空，该行的 vllm 配套版本 / fork 信息就没了）。
+
+    令牌过期自愈：quay 的 pull token 是 JWT，实测 `exp - iat = 3600` 秒；整个矩阵
+    长跑（实测一次 5149 秒）必然跨过有效期，之后所有 blob 请求返回 401
+    （日志里表现为"从某个 tag 起集体 401 UNAUTHORIZED"）。收到 401 就换新令牌再试，
+    而不是把过期当"这个 tag 没有 config"。
     """
     from vllm_kb.net import get_session
 
@@ -183,11 +188,17 @@ def fetch_image_config(tag_info: dict, token: str, timeout: int = 60, max_retrie
                 cm.raise_for_status()
                 md = json.loads(cm.json()["manifest_data"])
             cfg_digest = md["config"]["digest"]
-            blob = session.get(
-                f"{v2}/blobs/{cfg_digest}",
-                headers={"Authorization": "Bearer " + token},
-                timeout=timeout,
-            )
+            blob_url = f"{v2}/blobs/{cfg_digest}"
+            blob = session.get(blob_url,
+                               headers={"Authorization": "Bearer " + token},
+                               timeout=timeout)
+            if getattr(blob, "status_code", 200) == 401:
+                token = get_quay_token(insecure=insecure, qbase=qbase)
+                print(f"[matrix] {tag_info['name']} 令牌已过期(401)，换新令牌重发", flush=True)
+                # 换完立刻重发（不消耗重试预算）：401 说的是令牌过期，不是这个 tag 有问题
+                blob = session.get(blob_url,
+                                   headers={"Authorization": "Bearer " + token},
+                                   timeout=timeout)
             blob.raise_for_status()
             cfg = blob.json()
             env = cfg.get("config", {}).get("Env", []) or []
@@ -385,12 +396,13 @@ def _scan_tar_for_git_sha(fileobj) -> str:
 
 
 def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
-                            timeout: int = 300) -> str:
+                            timeout: int = 300, qbase: str = "https://quay.io",
+                            insecure: bool = False) -> str:
     """下载 clone 层 blob（~75MB）并扫描 .git，返回锁定 commit（失败 ''）。
 
     流式下载 + 每 10MB 进度行（75MB 层在业务环境慢链路上要跑数分钟，静默会被
     误判为卡死）。先按 gzip 流解（docker 层标准存储格式），失败再按未压缩
-    tar 兜底。
+    tar 兜底。401 视为令牌过期（长跑必踩，见 fetch_image_config）→ 换新令牌重下一次。
     """
     import gzip
     import io
@@ -399,6 +411,12 @@ def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
     r = session.get(f"{v2}/blobs/{layer_digest}",
                     headers={"Authorization": "Bearer " + token},
                     timeout=timeout, stream=True)
+    if getattr(r, "status_code", 200) == 401:
+        token = get_quay_token(insecure=insecure, qbase=qbase)
+        print("[matrix]    clone 层令牌已过期(401)，换新令牌重下", flush=True)
+        r = session.get(f"{v2}/blobs/{layer_digest}",
+                        headers={"Authorization": "Bearer " + token},
+                        timeout=timeout, stream=True)
     r.raise_for_status()
     buf = io.BytesIO()
     got = 0
@@ -456,7 +474,8 @@ def extract_fork_sha(tag_info: dict, token: str, timeout: int = 60, max_retries:
     v2 = _quay_v2(qbase)
     for attempt in range(2):
         try:
-            sha = _scan_layer_for_git_sha(session, v2, layer_digest, token, timeout=max(timeout, 300))
+            sha = _scan_layer_for_git_sha(session, v2, layer_digest, token, timeout=max(timeout, 300),
+                                  qbase=qbase, insecure=insecure)
             if sha:
                 out["sha"] = sha
                 cache[layer_digest] = {"sha": sha, "scanned_at": time.time()}

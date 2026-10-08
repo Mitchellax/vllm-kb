@@ -196,6 +196,13 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 > 注册表代理同样生效 → 直连）。`fetch_tags` 在检测到生效代理时会把地址和这条绕过提示
 > 一并打进失败日志，省一次排查。
 >
+> **令牌有效期**：quay 的 pull token 是 JWT，实测 `exp - iat = 3600` 秒；而一次完整矩阵
+> 实测跑 5149 秒 → **必然**跨过有效期，此后所有 `{v2}/blobs/...` 请求返回 401，日志表现为
+> "从某个 tag 起集体 401 UNAUTHORIZED"。这**不是**那些 tag 没有 config——若按缺失处理，
+> 该行的配套版本只能退化成启发式推断（实测后半段约 20 个 tag 被这样误判）。
+> `fetch_image_config` / `_scan_layer_for_git_sha` 收到 401 即换新令牌并**当场重发**
+> （不消耗重试预算：401 说的是令牌过期，不是这个 tag 有问题）。
+>
 > **日历的失败语义：抓不到 ≠ 没有 release**。`build_release_calendar.py` 任一页拉取失败
 > 抛 `CalendarFetchError`（附已抓到部分），**不落盘**；写盘前还有一道 `would_drop_releases`
 > 检查：新结果为空而现有文件非空 → 抛 `CalendarWriteRefused`，**保留上一版**。

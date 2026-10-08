@@ -1468,6 +1468,20 @@ python scripts/build_release_calendar.py --all-repos
   里面的 release 关联仍是上一次成功建图时固化的完整数据（实测本机：日历被写空的当天，
   图仍是更早一次成功建图的结果，`MERGED_IN` 与 release_tag 完好）。
 
+**Q: 矩阵跑到后半段（约一小时）全是 `401 Client Error: UNAUTHORIZED for url: .../v2/ascend/vllm-ascend/blobs/...`？**
+
+A: 是 **pull token 过期**，不是那些镜像有问题。quay 的 token 是 JWT，实测有效期
+`exp - iat = 3600` 秒；而一次完整矩阵实测要跑 5149 秒（重试很费时）→ 60 分钟后所有
+blob 请求都 401。症状很好认：**从某个 tag 起集体 401**，且这些行最后只能靠
+"启发式(版本号跟踪上游)/release说明" 填 `vllm`，`cann` 大面积为空。
+
+现在收到 401 会**自动换新令牌并当场重发**（不消耗重试预算），一个进程跑完全程没问题；
+`clone 层` 扫描同理。若日志里 401 之后没有紧跟"换新令牌重发"，说明是旧版本脚本。
+
+顺带：本步与 `GITHUB_TOKEN` 有关——未配置时脚本会**跳过** tag→commit 解析
+（未认证 GitHub 限流 60 次/小时不够），日志会打印"跳过 N 个 tag 的 commit 解析"，
+配上 token 重跑即可补齐；已缓存的不受影响。
+
 **Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
 
 A: fork 行要下载 ~75MB clone 层 blob，业务环境慢链路需数分钟——脚本每 10MB 打一行进度，

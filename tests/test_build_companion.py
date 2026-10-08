@@ -50,6 +50,97 @@ class TestQuayBudget(unittest.TestCase):
         self.assertEqual(out, {"env": [], "history": [], "layers": []})
 
 
+class _Resp:
+    """最小响应替身（status_code/json/raise_for_status）。"""
+
+    def __init__(self, status=200, payload=None):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class TestQuayTokenRefresh(unittest.TestCase):
+    """令牌过期自愈：quay 的 pull token 实测 exp-iat=3600s，而整次矩阵实测跑 5149s，
+    必然跨过有效期——之后所有 blob 请求 401。若把 401 当成"这个 tag 没有 config"，
+    那些行的配套版本就只能靠启发式猜（实测后半段约 20 个 tag 全被这样误判）。"""
+
+    def _md(self) -> dict:
+        return {"config": {"digest": "sha256:cfg"}, "layers": []}
+
+    def test_fetch_image_config_refreshes_token_on_401(self):
+        md = self._md()
+
+        class S:
+            def __init__(self):
+                self.auth: list = []
+                self.blobs = 0
+
+            def get(self, url, headers=None, **kw):
+                if "/blobs/" in url:
+                    self.blobs += 1
+                    self.auth.append((headers or {}).get("Authorization"))
+                    if self.blobs == 1:
+                        return _Resp(401)
+                    return _Resp(200, {"config": {"Env": ["VLLM_VERSION=0.23.0"]},
+                                       "history": [{"created_by": "ARG VLLM_TAG=0.23.0"}]})
+                return _Resp(200, {"manifest_data": json.dumps(md)})
+
+        s = S()
+        with mock.patch("build_companion_matrix.get_quay_token", return_value="newtok") as tok:
+            with mock.patch("vllm_kb.net.get_session", return_value=s):
+                out = bm.fetch_image_config({"name": "v0.23.0", "manifest_digest": "sha256:m"},
+                                            "oldtok", timeout=1, max_retries=1)
+        tok.assert_called_once()
+        self.assertEqual(s.auth, ["Bearer oldtok", "Bearer newtok"])
+        self.assertIn("VLLM_VERSION=0.23.0", out["env"])
+
+    def test_fetch_image_config_401_is_not_a_failed_attempt(self):
+        """401 在本次尝试内换令牌后直接继续，不该消耗重试预算。"""
+        md = self._md()
+
+        class S:
+            def __init__(self):
+                self.blobs = 0
+
+            def get(self, url, headers=None, **kw):
+                if "/blobs/" in url:
+                    self.blobs += 1
+                    if self.blobs == 1:
+                        return _Resp(401)
+                    return _Resp(200, {"config": {"Env": ["VLLM_VERSION=0.27.1"]}, "history": []})
+                return _Resp(200, {"manifest_data": json.dumps(md)})
+
+        s = S()
+        with mock.patch("build_companion_matrix.get_quay_token", return_value="newtok"):
+            with mock.patch("vllm_kb.net.get_session", return_value=s):
+                out = bm.fetch_image_config({"name": "x", "manifest_digest": "sha256:m"},
+                                            "oldtok", timeout=1, max_retries=0)
+        self.assertEqual(s.blobs, 2)
+        self.assertIn("VLLM_VERSION=0.27.1", out["env"])
+
+    def test_layer_scan_refreshes_token_on_401(self):
+        class S:
+            def __init__(self):
+                self.auth: list = []
+
+            def get(self, url, headers=None, **kw):
+                self.auth.append((headers or {}).get("Authorization"))
+                return _Resp(401)
+
+        s = S()
+        with mock.patch("build_companion_matrix.get_quay_token", return_value="newtok"):
+            with self.assertRaises(RuntimeError):
+                bm._scan_layer_for_git_sha(s, "https://quay.io/v2", "sha256:layer", "oldtok",
+                                           timeout=1)
+        self.assertEqual(s.auth, ["Bearer oldtok", "Bearer newtok"])
+
+
 class TestStripSuffix(unittest.TestCase):
     def test_platform_suffixes(self):
         cases = {

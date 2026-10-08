@@ -200,6 +200,10 @@ python scripts/maintain.py --insecure update
 > 保留上一版（抓不到 ≠ 没有 release），详见 `docs/USAGE.md` FAQ。日历被**查询期**
 > （`w_ver` 版本上界，改完立即生效）与**建图期**（release_tag，建图时固化）两处消费：
 > 补回日历后，只有"日历为空期间重建过图"才需要再重跑一次建图。
+>
+> **长跑要注意 quay 令牌会过期**：pull token 是 JWT，实测有效期 3600 秒，而配套矩阵
+> 整步实测要跑 5149 秒 → 后半段 `blobs` 请求会集体 401（看着像"这些 tag 没有 config"）。
+> 现在收到 401 会自动换新令牌并当场重发，见 `docs/USAGE.md` FAQ。
 
 ### 定时自动更新（每晚停服务 → 增量更新 → 重启）
 
