@@ -54,8 +54,11 @@ class TestDocCommands(unittest.TestCase):
         # 对代表性子命令保留深层 --help（校验参数定义），其余 client.py 子命令跳过逐条 --help
         client_top_done = False
         for cmd in cmds:
-            if "-m unittest" in cmd:
-                continue  # 模块调用，另行验证
+            # `python -m <模块>` / `python -c "<内联代码>"`：不是脚本路径，跳过（后者
+            # 的第一段是 `-c`，会被 resolve_script 误当成脚本名 → 假失败）
+            head = cmd.split()[1:3]
+            if "-m" in head or "-c" in head:
+                continue
             script = resolve_script(cmd)
             if script is None:
                 failures.append(f"{cmd}  → 脚本不存在")

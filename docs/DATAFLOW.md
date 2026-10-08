@@ -182,6 +182,32 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 | `python scripts/build_release_calendar.py --all-repos` | `data/compatibility/release_calendar.{repo}.json`（分仓，slug 如 `vllm-project-vllm-ascend`；单仓模式写无后缀的 `release_calendar.json`） | 版本形态判断（release/rc/pre）+ 置信度版本上界（查询期现算） |
 | `python scripts/build_companion_matrix.py`（`fetch_quay_tags.py` 辅助） | `data/compatibility/vllm-ascend.json`（每行含 `image_created`（镜像最后推送时间）、`vllm_commit`/`vllm_commit_date`（vllm 代码 commit 与提交日期）；fork 行另有 `vllm_repo/ref/base/sha/image_digest`）+ 跨运行缓存 `data/cache/`（fork 层 SHA 永久 / GitHub releases TTL 7 天 / requirements 永久 / tag→commit 永久，`--refresh-cache` 强制刷新） | 组件配套反向展开（vllm-ascend:0.18.0 → vllm/cann/pytorch-ascend）；commit 溯源回答"这个镜像对应哪个 commit"（官方行 tag→commit，fork 行 `vllm_sha`）；fork 行锁定 commit 供 `build_fork_snapshots.py` 按 SHA 拉快照 |
 
+> **quay 传输特性**（实测）：quay.io 在国内链路上首连可达 20s+，且 TCP 连接**间歇性**超时
+> （同一 URL 有 0.98s 成功、也有 30s/63s 连接超时）。所以 `fetch_quay_tags.fetch_tags` 默认
+> `timeout=60` / `max_retries=4`（指数退避）；请求异常按 `type(e).__name__` 记日志并重试，
+> 耗尽才抛 `RuntimeError`（**带原始错误**，不得吞掉原因）。分页按 `has_additional` 推进。
+>
+> ⚠️ **系统代理是常见元凶**：Windows 注册表配置的代理会被 `requests` 自动探测
+> （`trust_env=True`，`getproxies()` 直接返回它，**无需任何 env 变量**），实测
+> `127.0.0.1:7892` 这类本地代理会把 `quay.io` 的 TLS 握手**卡死**（`_ssl.c:990 handshake
+> operation timed out`，`--insecure` 也无效，因为失败在证书校验之前），并间歇性把 GitHub
+> 掐成 `SSLEOFError`。此时**显式设同名 `HTTP_PROXY`/`HTTPS_PROXY` 是空操作**（同一个地址），
+> 正解是绕过：`NO_PROXY=quay.io,api.github.com,github.com`（`should_bypass_proxies` 对
+> 注册表代理同样生效 → 直连）。`fetch_tags` 在检测到生效代理时会把地址和这条绕过提示
+> 一并打进失败日志，省一次排查。
+>
+> **日历的失败语义：抓不到 ≠ 没有 release**。`build_release_calendar.py` 任一页拉取失败
+> 抛 `CalendarFetchError`（附已抓到部分），**不落盘**；写盘前还有一道 `would_drop_releases`
+> 检查：新结果为空而现有文件非空 → 抛 `CalendarWriteRefused`，**保留上一版**。
+> 这道防护是踩出来的——代理掐 TLS 时 `fetch_releases` 静默 `break` 并返回 `[]`，
+> 一次 deploy 就把带 v0.23.0 的日历写成 `"releases": []`（113 字节），
+> 下游 w_ver 版本上界与图里 `MERGED_IN → release` 关联整体消失。
+> 日历是**图的输入**：修好日历后要重跑建图步骤，否则图里的 release_tag 仍是空。
+> 注意 urllib（本脚本用）与 requests（拉取链路用）**证书来源不同**：
+> urllib 走 Windows 证书库、requests 走 certifi——前者可能报
+> `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` 而后者正常，
+> 此时设 `SSL_CERT_FILE=<venv>/Lib/site-packages/certifi/cacert.pem` 即可（比 `--insecure` 好）。
+
 ### 2.5 图存储（Kùzu）
 
 命令：`python scripts/build_graph.py`（**必须先停检索服务**，Kùzu 单写者）。

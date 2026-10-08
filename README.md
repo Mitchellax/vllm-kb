@@ -174,6 +174,30 @@ python scripts/maintain.py --insecure update
 > 每条评论数，调小可显著缩小单次传输（游标与页大小无关，中途调小不会让断点失效）。
 > 注意 `--insecure` 只关证书校验，**治不了** `SSLEOFError` 这类隧道被掐；
 > 那种情况靠上面的重试 + 降级，或改用 `--github-base` 指到内网镜像。
+>
+> ⚠️ **本机"系统代理"是常见元凶，且它会自动生效**：Windows 注册表里配置的代理会被
+> `requests` 自动探测（`trust_env=True`，`getproxies()` 直接返回它，**不需要任何环境变量**）。
+> 实测本地代理（如 `127.0.0.1:7892`）会把 `quay.io` 的 TLS 握手卡死
+> （`_ssl.c:990 handshake operation timed out`，`--insecure` 无效——失败发生在证书校验之前），
+> 并间歇性把 GitHub 掐成 `SSLEOFError`。此时**显式设同名 `HTTP_PROXY`/`HTTPS_PROXY` 是空操作**
+> （同一个地址），正解是**绕开**它：
+>
+> ```bash
+> # Linux/macOS
+> export NO_PROXY=quay.io,api.github.com,github.com,codeload.github.com
+> # Windows PowerShell
+> $env:NO_PROXY="quay.io,api.github.com,github.com,codeload.github.com"
+> ```
+>
+> `NO_PROXY` 对**注册表探测到的代理同样生效**（`should_bypass_proxies`），即变成直连；
+> `NO_PROXY=quay.io` 会一并覆盖 `cdn01.quay.io` 等子域（quay 的 blob 由 302 跳到这些 CDN）。
+>
+> 另外两点实测差异：**urllib 走 Windows 证书库，requests 走 certifi**——同一个网络下
+> `build_release_calendar.py`（urllib）可能报 `CERTIFICATE_VERIFY_FAILED: unable to get
+> local issuer certificate` 而拉取链路（requests）正常，此时设
+> `SSL_CERT_FILE=<venv>/Lib/site-packages/certifi/cacert.pem` 即可，比 `--insecure` 稳妥；
+> 且**网络失败不会再把版本日历写空**——`build_release_calendar.py` 拉取失败直接报错退出、
+> 保留上一版（抓不到 ≠ 没有 release），详见 `docs/USAGE.md` FAQ。
 
 ### 定时自动更新（每晚停服务 → 增量更新 → 重启）
 

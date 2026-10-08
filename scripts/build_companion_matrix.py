@@ -149,7 +149,7 @@ def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io") -> st
     return parse_json(r, "quay token 响应")["token"]
 
 
-def fetch_image_config(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
+def fetch_image_config(tag_info: dict, token: str, timeout: int = 60, max_retries: int = 4,
                        insecure: bool = False, qbase: str = "https://quay.io") -> dict:
     """拉取镜像 config（manifest list -> amd64 子清单 -> config blob）。
 
@@ -158,6 +158,10 @@ def fetch_image_config(tag_info: dict, token: str, timeout: int = 30, max_retrie
     （ARG 值 / RUN 内联参数 / git clone 命令行），是 vllm 配套版本与 fork 仓信息
     的最直接证据（Env 里通常没有）；layers 为子 manifest 层 digest 列表（按序对应
     history 非空条目，供 clone 层定位）。
+
+    默认 60s / 4 次（原 30s / 3 次）：config blob 由 quay 302 到 `cdn0N.quay.io`，
+    实测同一 URL 在抖动的链路上有 **0.6s 成功**、也有 **90s 读超时**（连续 3 次全废），
+    30s 会把能拿到的证据误判为缺失（config 一空，该行的 vllm 配套版本 / fork 信息就没了）。
     """
     from vllm_kb.net import get_session
 
@@ -419,7 +423,7 @@ def _scan_layer_for_git_sha(session, v2: str, layer_digest: str, token: str,
     return ""
 
 
-def extract_fork_sha(tag_info: dict, token: str, timeout: int = 30, max_retries: int = 3,
+def extract_fork_sha(tag_info: dict, token: str, timeout: int = 60, max_retries: int = 4,
                      insecure: bool = False, qbase: str = "https://quay.io",
                      refresh: bool = False) -> dict:
     """扫描 fork 镜像的 git clone 层，读出镜像内实际代码的锁定 commit。

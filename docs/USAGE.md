@@ -1395,6 +1395,73 @@ A: 这是**传输层**故障（对端/代理把 TLS 隧道掐了），不是限�
 4. 中断本身不丢进度：raw 与 checkpoint 每页落盘，重跑同一命令**从游标续传**；
    想先把已拉数据入库再继续拉，用 `build_kb.py --skip-pull`。
 
+**Q: quay / GitHub 报 TLS 超时、`SSLEOFError`、`handshake operation timed out`，怎么办？**
+
+A: 先怀疑**本机系统代理**——它是这类故障最常见的元凶，而且**会悄悄生效**：
+
+```bash
+# 看当前实际生效的代理（没设任何 env 变量也可能有值：来自 Windows 注册表）
+python -c "import requests.utils; print(requests.utils.getproxies())"
+# 例如 {'http': 'http://127.0.0.1:7892', 'https': 'http://127.0.0.1:7892'}
+```
+
+实测该本地代理对 `quay.io` 是 **TLS 握手超时**（`_ssl.c:990`，`--insecure` 无效——失败在
+证书校验之前），对 GitHub 是**间歇性 `SSLEOFError`**；而 `https://quay.io/` 直连 1~16s 即 200。
+**注意方向**：这种情况下"把 `HTTP_PROXY`/`HTTPS_PROXY` 指向同一个地址"是**空操作**
+（`requests` 本来就在用它），要的是**绕开**：
+
+```bash
+export NO_PROXY=quay.io,api.github.com,github.com,codeload.github.com,objects.githubusercontent.com
+# PowerShell: $env:NO_PROXY="quay.io,api.github.com,github.com,codeload.github.com"
+```
+
+- `NO_PROXY` 对**注册表探测到的代理同样生效**（`should_bypass_proxies`）→ 变成直连；
+- `quay.io` 会一并覆盖 `cdn01.quay.io` / `cdn02` / `cdn03`（quay 的 manifest/blob 由 302
+  跳到这些 CDN，同一域名后缀）；
+- Clash 之类的 TUN + fake-ip 工具即使"直连"也仍走它的隧道（DNS 返回 `100.64/10` 段假 IP），
+  所以 `*.quay.io` 的可用性取决于它选中的节点——**换节点/换规则，或直接在 Linux 服务器上跑**更省事。
+
+若仍偶发失败：quay 的 CDN 在抖动链路上实测同一 URL 有 **0.6s 成功**、也有 **90s 读超时**
+（连续 3 次全废），所以 `fetch_quay_tags.py` / `build_companion_matrix.py` 的 quay 预算已放宽到
+`timeout=60`、`max_retries=4`（指数退避）；单个 tag 拿不到 config 只在日志告警并**降级继续**
+（不致命）。`data/cache/` 会累计：fork 层 SHA（永久）、GitHub releases（7 天）、requirements
+（永久）、tag→commit（永久）——**重复跑同一命令会逐步收敛**；但**镜像 config 不进缓存**，
+那部分缺口只能靠重跑补齐。
+
+**Q: 版本日历变成 `{"releases": []}`，置信度的版本上界（w_ver）全退化了？**
+
+A: 这是**旧版本脚本的已知缺陷**（已修）：`build_release_calendar.py` 的 `fetch_releases`
+在某一页拉取失败时只是 `[warn]` 并 `break`，返回已经抓到的部分（往往一个都没有），
+随后**照样写盘覆盖**——于是"抓取失败"被写成了"这个仓库没有 release"。实测本机代理掐 TLS 时，
+一次 `maintain.py deploy` 就把带 `v0.23.0` 的日历写成了 113 字节的空文件，
+下游 `w_ver` 版本上界和图里 `MERGED_IN → release` 关联**一起消失**。
+
+现在有两道防护，都**保留上一版日历**：
+
+1. 任一页失败 → 抛 `CalendarFetchError`（附已抓到部分），**不落盘**（残缺结果若落盘，
+   日历会比原来更小，旧版本文档的 tag→日期映射会丢）；
+2. 写盘前 `would_drop_releases` 检查：新结果为空而现有文件非空 → `CalendarWriteRefused`
+   （首次生成、现有文件缺失/损坏时不拦）；
+3. 失败时脚本以退出码 1 结束并打印原因（`maintain.py deploy` 里该步骤是非致命的，
+   只告警继续）。
+
+恢复办法（先修网络再重跑）：
+
+```bash
+export NO_PROXY=api.github.com,github.com            # 绕开会掐 TLS 的本地代理
+export SSL_CERT_FILE=".venv/Lib/site-packages/certifi/cacert.pem"   # urllib 用 Windows 证书库，可能校验失败
+python scripts/build_release_calendar.py --all-repos
+```
+
+> 注意 **urllib（本脚本）与 requests（拉取链路）证书来源不同**：前者读 Windows 证书库、
+> 后者用 certifi。所以会出现"requests 拉 GitHub 正常、本脚本报
+> `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`"这种矛盾现象——
+> 指向 certifi 的 `SSL_CERT_FILE` 即可，不必 `--insecure`。
+
+⚠️ 日历是**建图步骤的输入**（MERGED_IN 的 release 映射）：恢复日历后要重跑建图
+（`maintain.py deploy` 里的 `build_graph` 步骤，需先停 `serve_api`——Kùzu 单写者），
+否则图里已有的 `release_tag` 仍是空的（`/graph/chain` 会返回 `release_tag: null`）。
+
 **Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
 
 A: fork 行要下载 ~75MB clone 层 blob，业务环境慢链路需数分钟——脚本每 10MB 打一行进度，

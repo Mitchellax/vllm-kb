@@ -1,9 +1,15 @@
-"""版本日历测试：版本形态判断（正式版/rc）、tag->日期映射。"""
+"""版本日历测试：版本形态判断（正式版/rc）、tag->日期映射、生成脚本的丢数据防护。"""
 import json
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+
+import build_release_calendar as brc  # noqa: E402
 
 from vllm_kb.confidence import (
     load_release_calendar,
@@ -68,6 +74,86 @@ class TestReleaseCalendar(unittest.TestCase):
 
     def test_load_meta_returns_none_missing(self):
         self.assertIsNone(load_release_meta(Path(self.tmp.name) / "nope.json"))
+
+
+class TestCalendarNoDataLoss(unittest.TestCase):
+    """生成脚本：抓取失败/空结果绝不能把好日历覆盖掉（实测踩过：代理掐 TLS 后
+    一次 deploy 就把带 v0.23.0 的日历写成 releases: []，w_ver 与图关联整体消失）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "release_calendar.vllm-project-vllm-ascend.json"
+        make_calendar(self.path)
+        self.cfg = mock.Mock()
+        self.cfg.resolve.side_effect = lambda p: Path(self.tmp.name) / Path(p).name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _before(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def test_fetch_raises_on_first_page_failure(self):
+        with mock.patch("vllm_kb.net.get_opener") as opener:
+            opener.return_value.open.side_effect = OSError("proxy closed TLS tunnel")
+            with self.assertRaises(brc.CalendarFetchError) as cm:
+                brc.fetch_releases("vllm-project/vllm-ascend")
+        self.assertEqual(cm.exception.page, 1)
+        self.assertEqual(cm.exception.partial, [])
+        self.assertIn("proxy closed TLS tunnel", str(cm.exception))
+
+    def test_fetch_raises_on_later_page_failure_not_partial_result(self):
+        """第 2 页失败 → 抛错（不返回残缺列表，否则日历会比原来更小）。"""
+        page1 = [
+            {"tag_name": f"v0.{i}.0", "published_at": "2026-01-01T00:00:00Z", "prerelease": False}
+            for i in range(100)
+        ]
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps(page1).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch("vllm_kb.net.get_opener") as opener:
+            opener.return_value.open.side_effect = [resp, OSError("boom")]
+            with self.assertRaises(brc.CalendarFetchError) as cm:
+                brc.fetch_releases("vllm-project/vllm-ascend")
+        self.assertEqual(cm.exception.page, 2)
+        self.assertEqual(len(cm.exception.partial), 100)
+
+    def test_write_refuses_empty_over_existing(self):
+        before = self._before()
+        empty = {"generated_at": "x", "repo": "vllm-project/vllm-ascend", "releases": []}
+        with self.assertRaises(brc.CalendarWriteRefused) as cm:
+            brc.write_calendar(self.cfg, empty)
+        self.assertIn("拒绝覆盖", str(cm.exception))
+        self.assertEqual(self._before(), before, "现有日历必须原样保留")
+
+    def test_write_allows_first_creation_empty(self):
+        """首次生成（无现有文件）允许写空——那才是"该仓库真没有 release"。"""
+        fresh = Path(self.tmp.name) / "fresh.json"
+        empty = {"generated_at": "x", "repo": "vllm-project/vllm-ascend", "releases": []}
+        out = brc.write_calendar(self.cfg, empty, path=fresh)
+        self.assertEqual(out, fresh)
+        self.assertEqual(json.loads(fresh.read_text(encoding="utf-8"))["releases"], [])
+
+    def test_write_force_overrides_guard(self):
+        before = self._before()
+        self.assertTrue(before["releases"], "前置条件：现有日历非空")
+        empty = {"generated_at": "x", "repo": "vllm-project/vllm-ascend", "releases": []}
+        brc.write_calendar(self.cfg, empty, force=True)
+        self.assertEqual(self._before()["releases"], [])
+
+    def test_write_normal_result_replaces(self):
+        cal = {"generated_at": "x", "repo": "vllm-project/vllm-ascend",
+               "releases": [{"tag": "v9.9.9", "date": "2026-09-01T00:00:00Z",
+                             "prerelease": False, "kind": "release"}]}
+        brc.write_calendar(self.cfg, cal)
+        self.assertEqual([r["tag"] for r in self._before()["releases"]], ["v9.9.9"])
+
+    def test_would_drop_releases_ignores_corrupt_existing(self):
+        """现有文件损坏 → 不拦（否则永远修不回来）。"""
+        self.path.write_text("{ not json", encoding="utf-8")
+        empty = {"generated_at": "x", "repo": "r", "releases": []}
+        self.assertEqual(brc.would_drop_releases(self.path, empty), "")
 
 
 if __name__ == "__main__":

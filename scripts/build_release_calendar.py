@@ -39,8 +39,33 @@ from vllm_kb.config import AppConfig  # noqa: E402
 _UA = {"User-Agent": "vllm-kb"}
 
 
+class CalendarFetchError(RuntimeError):
+    """releases 拉取失败（网络/证书/限流/镜像不可用）。
+
+    **绝不能**用它的结果覆盖已有日历：抓不到 ≠ 没有 release。实测（本地代理掐 TLS）
+    一次失败就把带 v0.23.0 的日历写成 `"releases": []`，下游 w_ver 与图里
+    MERGED_IN→release 关联整体消失，而且**静默**（只有一行 warn）。
+    """
+
+    def __init__(self, repo: str, page: int, cause: Exception, partial: list[dict]):
+        super().__init__(f"{repo} releases 拉取失败（page {page}）: {cause}")
+        self.repo = repo
+        self.page = page
+        self.cause = cause
+        self.partial = partial
+
+
+class CalendarWriteRefused(RuntimeError):
+    """写盘会丢数据（新结果为空而现有日历非空）→ 拒绝覆盖。"""
+
+
 def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.github.com") -> list[dict]:
-    """GitHub Releases API 全量拉取（分页）。返回 [{tag, date, prerelease}...] 按日期降序。"""
+    """GitHub Releases API 全量拉取（分页）。返回 [{tag, date, prerelease}...] 按日期降序。
+
+    任何一页失败都抛 CalendarFetchError（带已抓到的部分），**不返回残缺列表**：
+    部分结果若落盘，会让日历比原来更小（旧版本文档的 tag->日期映射丢失），
+    且与"真失败"无法区分。宁可保留上一版完整日历，下次再拉。
+    """
     from vllm_kb.net import get_opener
 
     opener = get_opener(insecure)
@@ -54,7 +79,7 @@ def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.
                 batch = json.loads(r.read().decode("utf-8"))
         except Exception as e:
             print(f"[warn] {repo} releases 拉取失败（page {page}）: {e}")
-            break
+            raise CalendarFetchError(repo, page, e, releases) from e
         if not batch:
             break
         for rel in batch:
@@ -100,17 +125,46 @@ def build_calendar(repo: str, insecure: bool = False, gbase: str = "https://api.
     }
 
 
-def write_calendar(cfg: AppConfig, calendar: dict, path: Path | None = None) -> Path:
-    """写日历：--all-repos 时每仓库独立文件 release_calendar.{repo}.json，
+def calendar_output_path(cfg: AppConfig, calendar: dict, path: Path | None = None) -> Path:
+    """日历输出路径：--all-repos 时每仓库独立文件 release_calendar.{repo}.json，
     单仓库默认 data/compatibility/release_calendar.json。"""
-    if path is None:
-        repo_slug = calendar.get("repo", "").replace("/", "-")
-        if repo_slug:
-            out = cfg.resolve(f"data/compatibility/release_calendar.{repo_slug}.json")
-        else:
-            out = cfg.resolve("data/compatibility/release_calendar.json")
-    else:
-        out = path
+    if path is not None:
+        return path
+    repo_slug = calendar.get("repo", "").replace("/", "-")
+    if repo_slug:
+        return cfg.resolve(f"data/compatibility/release_calendar.{repo_slug}.json")
+    return cfg.resolve("data/compatibility/release_calendar.json")
+
+
+def would_drop_releases(out: Path, calendar: dict) -> str:
+    """写盘前的丢数据检查。返回拒绝原因，空串 = 可以写。
+
+    只拦"新结果为空、现有非空"这一种**确定**的丢数据：抓取失败（见
+    CalendarFetchError）与"该仓库真的没有 release"在结果上无从区分，所以
+    宁可保留旧日历并告警。现有文件缺失/为空/损坏时不拦（首次生成照常）。
+    """
+    new_n = len(calendar.get("releases") or [])
+    if new_n:
+        return ""
+    try:
+        old = json.loads(out.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    old_n = len((old or {}).get("releases") or [])
+    if old_n:
+        return (f"新结果 0 个 release，而现有 {out.name} 有 {old_n} 个——"
+                f"拒绝覆盖（抓取失败 ≠ 没有 release）")
+    return ""
+
+
+def write_calendar(cfg: AppConfig, calendar: dict, path: Path | None = None,
+                   force: bool = False) -> Path:
+    """写日历。默认受保护：会用空结果清掉现有 release 时抛 CalendarWriteRefused。"""
+    out = calendar_output_path(cfg, calendar, path)
+    if not force:
+        reason = would_drop_releases(out, calendar)
+        if reason:
+            raise CalendarWriteRefused(reason)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(calendar, ensure_ascii=False, indent=1), encoding="utf-8")
     return out
@@ -140,10 +194,21 @@ def main() -> None:
     else:
         repos = [args.repo or cfg.code.repo]
 
+    failed: list[str] = []
     for repo in repos:
         print(f"[calendar] 拉取 {repo} releases ...", flush=True)
-        cal = build_calendar(repo, insecure=insecure, gbase=gbase)
-        out = write_calendar(cfg, cal)
+        try:
+            cal = build_calendar(repo, insecure=insecure, gbase=gbase)
+        except CalendarFetchError as e:
+            print(f"[warn] {repo}: {e}；**保留上一版日历不覆盖**", flush=True)
+            failed.append(repo)
+            continue
+        try:
+            out = write_calendar(cfg, cal)
+        except CalendarWriteRefused as e:
+            print(f"[warn] {repo}: {e}；**保留上一版日历不覆盖**", flush=True)
+            failed.append(repo)
+            continue
         kinds = {}
         for r in cal["releases"]:
             kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
@@ -153,6 +218,10 @@ def main() -> None:
             print(f"[calendar] 最近 5 个:")
             for r in cal["releases"][:5]:
                 print(f"  {r['tag']:14s} {r['date'][:10]}  {r['kind']}")
+    if failed:
+        print(f"[calendar] 失败 {len(failed)}/{len(repos)}：{', '.join(failed)}"
+              f"（旧日历已保留；检查代理/证书，必要时 --insecure 或 VLLM_KB_GITHUB_BASE）")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

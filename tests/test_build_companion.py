@@ -1,14 +1,53 @@
 """build_companion_matrix.py 纯逻辑测试（不触网）：去重、env/buildkit 提取、release 提取、
 合并、缺口报告、fork 层扫描（内存构造 tar.gz，不触网）。"""
 import json
+import inspect
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import build_companion_matrix as bm  # noqa: E402
+
+
+class TestQuayBudget(unittest.TestCase):
+    """quay 请求预算（实测看护，不触网）。
+
+    config blob 由 quay 302 到 `cdn0N.quay.io`；实测同一 URL 在抖动链路上有 0.6s 成功、
+    也有 90s 读超时（连续 3 次全废）。预算过小会把**本来能拿到**的 env/history 证据
+    误判为缺失，直接让该行的 vllm 配套版本 / fork 信息变空——所以这里钉住下限。
+    """
+
+    def test_image_config_budget(self):
+        sig = inspect.signature(bm.fetch_image_config)
+        self.assertGreaterEqual(sig.parameters["timeout"].default, 60)
+        self.assertGreaterEqual(sig.parameters["max_retries"].default, 4)
+
+    def test_fork_sha_budget(self):
+        sig = inspect.signature(bm.extract_fork_sha)
+        self.assertGreaterEqual(sig.parameters["timeout"].default, 60)
+        self.assertGreaterEqual(sig.parameters["max_retries"].default, 4)
+
+    def test_fork_layer_scan_gets_big_blob_budget(self):
+        """75MB clone 层要长超时：extract_fork_sha 会以 max(timeout, 300) 调它。"""
+        sig = inspect.signature(bm._scan_layer_for_git_sha)
+        self.assertGreaterEqual(sig.parameters["timeout"].default, 300)
+
+    def test_config_failure_returns_empty_not_raise(self):
+        """单个 tag 拿不到 config 必须降级为空（其余 tag 继续），不能中断整步。"""
+
+        class FakeSession:
+            def get(self, *a, **k):
+                raise RuntimeError("boom")
+
+        with mock.patch("vllm_kb.net.get_session", return_value=FakeSession()):
+            with mock.patch("time.sleep"):
+                out = bm.fetch_image_config({"name": "x", "manifest_digest": "sha256:0"},
+                                            "tok", timeout=1, max_retries=0)
+        self.assertEqual(out, {"env": [], "history": [], "layers": []})
 
 
 class TestStripSuffix(unittest.TestCase):

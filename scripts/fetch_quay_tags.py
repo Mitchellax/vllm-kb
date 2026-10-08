@@ -24,6 +24,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vllm_kb.net import parse_json
@@ -47,9 +49,13 @@ def _tags_url(base: str) -> str:
     return f"{base.rstrip('/')}/api/v1/repository/ascend/vllm-ascend/tag/"
 
 
-def fetch_tags(timeout: int = 30, max_retries: int = 3, insecure: bool = False,
+def fetch_tags(timeout: int = 60, max_retries: int = 4, insecure: bool = False,
                base: str = "https://quay.io") -> list[dict]:
-    """分页拉取全部活跃 tag；带重试与逐页进度日志。"""
+    """分页拉取全部活跃 tag；带重试与逐页进度日志。
+
+    超时默认 60s / 重试 4 次：quay.io 在国内链路上首连可达 20s+，且 TCP 连接会**间歇性**
+    超时（实测同一 URL 有 0.98s 成功、也有 30s/63s 连接超时），30s / 3 次过于激进。
+    """
     from vllm_kb.net import get_session
 
     url = _tags_url(base)
@@ -57,6 +63,13 @@ def fetch_tags(timeout: int = 30, max_retries: int = 3, insecure: bool = False,
     tags: list[dict] = []
     page = 1
     start = time.time()
+    # 代理提示：本机实测"系统代理（注册表自动探测）会把 quay.io 的 TLS 握手卡死"，
+    # 而失败现场只看到超时、看不出是代理干的——把生效代理写进日志，省一次排查。
+    _proxies = requests.utils.getproxies()
+    hint = ""
+    if _proxies.get("https") or _proxies.get("http"):
+        hint = (f"（当前生效代理 {_proxies.get('https') or _proxies.get('http')}；"
+                f"若代理不稳可用 NO_PROXY=quay.io 绕过直连）")
     print(
         f"[quay] 开始拉取 {url}（onlyActiveTags=true, timeout={timeout}s, 最大重试 {max_retries} 次"
         + (", 跳过SSL校验" if insecure else "") + "）",
@@ -70,9 +83,16 @@ def fetch_tags(timeout: int = 30, max_retries: int = 3, insecure: bool = False,
                 r = session.get(url, params=params, timeout=timeout)
             except requests.RequestException as e:
                 if attempt == max_retries:
-                    raise RuntimeError(f"page {page} 请求异常（已重试 {max_retries} 次）: {e}") from e
+                    raise RuntimeError(
+                        f"page {page} 请求异常（{type(e).__name__}，已重试 {max_retries} 次）: {e}"
+                        + ("\n        提示：" + hint if hint else "")
+                    ) from e
                 wait = 2 ** attempt
-                print(f"[quay] page {page} 请求异常: {e}，{wait}s 后重试（{attempt + 1}/{max_retries}）", flush=True)
+                print(
+                    f"[quay] page {page} 请求异常（{type(e).__name__}）: {e}，"
+                    f"{wait}s 后重试（{attempt + 1}/{max_retries}）{hint}",
+                    flush=True,
+                )
                 time.sleep(wait)
                 continue
             if r.status_code == 200:
