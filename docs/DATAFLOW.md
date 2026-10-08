@@ -203,6 +203,10 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 > `fetch_image_config` / `_scan_layer_for_git_sha` 收到 401 即换新令牌并**当场重发**
 > （不消耗重试预算：401 说的是令牌过期，不是这个 tag 有问题）。
 >
+> **重跑收敛**：矩阵写回时**保留行内已有非空字段**，所以网络抖动导致的单轮缺口会被后续轮次
+> 填上而不会回退（实测两跑：`cann` 31→34、commit 溯源 8→14；某轮 `v0.23.0` 拉取失败仍完整
+> 保留上一轮的值）。弱网环境就让 deploy 多跑几轮，缺口清单每轮都会打印。
+>
 > **日历的失败语义：抓不到 ≠ 没有 release**。`build_release_calendar.py` 任一页拉取失败
 > 抛 `CalendarFetchError`（附已抓到部分），**不落盘**；写盘前还有一道 `would_drop_releases`
 > 检查：新结果为空而现有文件非空 → 抛 `CalendarWriteRefused`，**保留上一版**。

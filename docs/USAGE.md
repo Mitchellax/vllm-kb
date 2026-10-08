@@ -1428,6 +1428,14 @@ export NO_PROXY=quay.io,api.github.com,github.com,codeload.github.com,objects.gi
 （永久）、tag→commit（永久）——**重复跑同一命令会逐步收敛**；但**镜像 config 不进缓存**，
 那部分缺口只能靠重跑补齐。
 
+而且**重跑是收敛的、不会回退**：矩阵写回时保留行内已有非空字段。实测连续两跑：
+`cann` 31→34、`pytorch-ascend` 58、commit 溯源 8→14（含 2 条 fork 的 `vllm_sha`），
+某轮 `v0.23.0` 的 config 拉取失败，但该行仍完整保留上一轮的
+`cann=9.1.0 / vllm=0.23.0 / pta=2.10.0.post4 / vllm_commit=0fc695fc6d1d`。
+所以**弱网下最省事的做法就是隔一阵重跑一次 deploy**，让缺口被逐轮填上
+（缺口清单每轮都会打印，剩下的多为老版本镜像 Env 里本就没有 CANN 证据，需人工对照
+quay build history 补）。
+
 **Q: 版本日历变成 `{"releases": []}`，置信度的版本上界（w_ver）全退化了？**
 
 A: 这是**旧版本脚本的已知缺陷**（已修）：`build_release_calendar.py` 的 `fetch_releases`

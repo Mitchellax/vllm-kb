@@ -204,6 +204,7 @@ python scripts/maintain.py --insecure update
 > **长跑要注意 quay 令牌会过期**：pull token 是 JWT，实测有效期 3600 秒，而配套矩阵
 > 整步实测要跑 5149 秒 → 后半段 `blobs` 请求会集体 401（看着像"这些 tag 没有 config"）。
 > 现在收到 401 会自动换新令牌并当场重发，见 `docs/USAGE.md` FAQ。
+> 弱网下**多跑几轮 deploy 即可**：矩阵写回保留已有非空字段，缺口会被逐轮填上（不回退）。
 
 ### 定时自动更新（每晚停服务 → 增量更新 → 重启）
 
