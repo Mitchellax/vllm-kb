@@ -44,6 +44,11 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 class BaseVectorStore(ABC):
+    # 后端标识（构建汇总/日志用；ReadOnlyVectorStore 会转发）
+    backend_name: str = "?"
+    # 后端实际使用的存储位置（回退时会与正式库**不同**，必须可见）
+    location: str = ""
+
     @abstractmethod
     def add_items(self, items: list[VectorItem]) -> None: ...
 
@@ -72,8 +77,11 @@ class BaseVectorStore(ABC):
 class PythonVectorStore(BaseVectorStore):
     """纯标准库兜底：内存 + JSON 持久化。"""
 
+    backend_name = "python"
+
     def __init__(self, path: Path):
         self.path = path
+        self.location = str(path)
         self._items: dict[str, VectorItem] = {}
         self._load()
 
@@ -133,11 +141,14 @@ class PythonVectorStore(BaseVectorStore):
 class LanceDBVectorStore(BaseVectorStore):
     """正式后端（lancedb）。表结构：id, doc_id, text, meta_json, vector。"""
 
+    backend_name = "lancedb"
+
     def __init__(self, path: Path, table_name: str = "chunks"):
         import lancedb  # 延迟导入：未安装时由 build_vector_store 回退
 
         self._lancedb = lancedb
         self.path = path
+        self.location = str(path)
         self.table_name = table_name
         self.db = lancedb.connect(str(path))
         self._table = None
@@ -252,6 +263,8 @@ class ReadOnlyVectorStore(BaseVectorStore):
 
     def __init__(self, store: BaseVectorStore):
         self._store = store
+        self.backend_name = getattr(store, "backend_name", "?")
+        self.location = getattr(store, "location", "")
 
     def add_items(self, items: list[VectorItem]) -> None:
         raise ReadOnlyError("知识库为只读：禁止写入向量库")
@@ -272,13 +285,76 @@ class ReadOnlyVectorStore(BaseVectorStore):
         return self._store.count()
 
 
+_fallback_warned = False
+
+
+def _dir_size_mb(path: Path) -> float:
+    """目录大小（MB）；不可读时返回 0。"""
+    try:
+        if not path.exists():
+            return 0.0
+        if path.is_file():
+            return path.stat().st_size / 1048576
+        total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return total / 1048576
+    except OSError:
+        return 0.0
+
+
+def _warn_fallback(exc: ImportError, formal_path: Path, py_path: Path) -> None:
+    """回退到纯 Python 后端时的**如实**告警（每次进程只打一次）。
+
+    关键：原实现把一切 ImportError 都说成"未安装 lancedb"，而实际现场是
+    **装了但原生库加载不了**（Windows 智能应用控制/WDAC 拦截 pyarrow/lancedb 的 DLL，
+    `ImportError: DLL load failed while importing lib: 应用程序控制策略已阻止此文件。`）。
+    谎报"未安装"会把排查引向 `pip install`（无用），而真正该看的是安全策略。
+
+    更要紧的是**换了库**：正式库与回退库是两个不同文件，回退库若为空，
+    既有向量在本次检索里就"消失"了——这必须显式说出来，不能只留一句轻飘飘的 warn。
+    """
+    global _fallback_warned
+    if _fallback_warned:
+        return
+    _fallback_warned = True
+
+    import importlib.util
+
+    installed = importlib.util.find_spec("lancedb") is not None
+    if installed:
+        why = ("lancedb **已安装但无法加载**（不是“未安装”）："
+               f"{type(exc).__name__}: {exc}\n"
+               "        常见原因：Windows 智能应用控制（Smart App Control）/ WDAC / AppLocker "
+               "拦截了 pyarrow、lancedb 的原生 DLL；也可能是缺少 VC++ 运行库。\n"
+               "        → 先确认 `python -c \"import lancedb\"` 的真实报错，再决定放行策略或换环境；"
+               "重装 lancedb 通常无效。")
+    else:
+        why = "未安装 lancedb（pip install lancedb 可启用正式后端）。"
+
+    print(f"[warn] ⚠️  向量后端降级为纯 Python（暴力余弦检索）：{why}")
+    print(f"[warn] ⚠️  本次向量写入 {py_path}"
+          f"（与正式库 {formal_path} **不是同一个库**）。")
+
+    formal_mb = _dir_size_mb(formal_path)
+    if formal_mb >= 1:
+        print(f"[warn] ⚠️  正式库 {formal_path} 已有 {formal_mb:.0f} MB 数据：降级后端**看不到**"
+              f"这些既有向量，向量检索只会命中本次新嵌入的文档。\n"
+              f"        处理二选一：(1) 放行原生 DLL 后重跑；(2) 显式接受回退后端 —— "
+              f"设 storage.vector_backend=python 并用 `build_kb.py --rebuild` 全量重建到该库。")
+
+
 def build_vector_store(cfg: AppConfig) -> BaseVectorStore:
-    """按配置构建向量存储；lancedb 未安装时自动回退纯 Python 后端并告警。"""
+    """按配置构建向量存储。
+
+    - `storage.vector_backend=python`：显式选择兜底后端（不告警，用户已知情）；
+    - 否则用 lancedb；**加载失败时**回退纯 Python 后端并打印**如实**告警
+      （区分"未安装"与"装了但加载不了"，并说明换库的影响，见 `_warn_fallback`）。
+    """
     sc = cfg.storage
+    py_path = cfg.resolve(sc.lancedb_path + "_py.json")
     if sc.vector_backend == "python":
-        return PythonVectorStore(cfg.resolve(sc.lancedb_path + "_py.json"))
+        return PythonVectorStore(py_path)
     try:
         return LanceDBVectorStore(cfg.resolve(sc.lancedb_path))
-    except ImportError:
-        print("[warn] 未安装 lancedb，回退纯 Python 向量后端（pip install lancedb 可启用正式后端）")
-        return PythonVectorStore(cfg.resolve(sc.lancedb_path + "_py.json"))
+    except ImportError as e:
+        _warn_fallback(e, cfg.resolve(sc.lancedb_path), py_path)
+        return PythonVectorStore(py_path)

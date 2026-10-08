@@ -155,6 +155,8 @@ def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | Non
     vector_store = build_vector_store(cfg)
     stats = ingest_docs(cfg, docs, embed_client, vector_store)
     stats["chunks_in_store"] = vector_store.count()
+    # 后端标识进汇总：回退后端用的是**另一个库**，跑完必须能从汇总里看出来
+    stats["vector_backend"] = getattr(vector_store, "backend_name", "?")
     print(f"[build] 来源 {src.id} 入库完成: {stats}")
     return stats
 
@@ -172,7 +174,8 @@ def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
     失败详情进返回值的 `failed`，由调用方决定退出码（见 `_report_and_exit`）：
     部分失败=降级继续，**全部失败**才算致命。
     """
-    grand = {"pulled": 0, "ingested_docs": 0, "sources_ok": 0, "failed": []}
+    grand = {"pulled": 0, "ingested_docs": 0, "sources_ok": 0, "failed": [],
+             "vector_backends": set()}
     for src in build_sources(cfg):
         try:
             stats = process_source(src, cfg, pull, limit, incremental,
@@ -180,6 +183,8 @@ def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
                                    force_numbers=force_numbers)
             grand["pulled"] += stats.get("pulled", 0)
             grand["ingested_docs"] += stats.get("docs", 0)
+            if stats.get("vector_backend"):
+                grand["vector_backends"].add(stats["vector_backend"])
             grand["sources_ok"] += 1
         except NotImplementedError as e:
             print(f"[warn] 来源 {src.id} ({src.type}) 未实现，跳过：{e}")
@@ -188,6 +193,7 @@ def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
                   f"{type(e).__name__}: {e}\n", flush=True)
             grand["failed"].append({"id": src.id, "type": src.type,
                                     "error": f"{type(e).__name__}: {e}"})
+    grand["vector_backends"] = sorted(grand["vector_backends"])
     return grand
 
 

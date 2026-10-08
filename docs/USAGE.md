@@ -119,6 +119,8 @@ python scripts/maintain.py --insecure update
 
 - **kuzu 未装** → 建图步骤失败告警跳过（KB 入库不受影响，图查询暂不可用）；
 - **jieba 未装** → FTS 分词降级为原文（中文词无法独立命中，索引结构不变）；
+- **lancedb 加载失败** → 向量后端降级为纯 Python（暴力余弦检索）。**回退会换库**：
+  正式库 `data/lancedb/`、回退库 `data/lancedb_py.json`，回退库看不到既有向量；
 - **网络不可达** → 版本日历 / 配套矩阵 / 代码快照步骤失败告警跳过；
 - **数据拉取与入库按来源隔离**（`build_kb.py`）：某个来源失败只告警并继续处理其余来源。
   本地文件来源（PDF/Markdown/Word/Excel）不依赖网络，GitHub 掉线时它们照常更新；
@@ -1343,6 +1345,29 @@ A: 干净向量库约 **0.8GB**（122K chunks × 1024 维）。体积膨胀是 L
 数据完整时用 `db.open_table('chunks').cleanup_old_versions()` 清理即可恢复 ~772MB；
 业务环境 `--rebuild` 全新库天然无历史版本。也可存算分离把数据放远程，或换更小维度模型。
 
+**Q: 构建日志说"向量后端降级为纯 Python"，但 lancedb 明明装了？**
+
+A: 这两件事不矛盾——**装了 ≠ 能加载**。回退告警现在会如实区分：
+`pip list` 里有 lancedb，但 `python -c "import lancedb"` 抛
+`ImportError: DLL load failed while importing lib: 应用程序控制策略已阻止此文件。`
+（`WinError 4551`）说明原生 DLL 被**安全策略**拦了——Windows 智能应用控制
+（Smart App Control）/ WDAC / AppLocker 的典型症状（pyarrow 同样被拦，lancedb 依赖它；
+PyMuPDF/Kùzu 通常正常，所以是选择性拦截，不是全局限制）。`pip install` / 重装**无用**。
+
+要紧的不是那句提示，而是**换了库**：正式库 `data/lancedb/`（列式数据集，带 ANN）、
+回退库 `data/lancedb_py.json`（单 JSON，暴力余弦）。回退库若为空，既有向量在本次检索里
+**全部看不到**（告警会在正式库非空时明确点出这一点）。二选一：
+
+1. **放行原生 DLL**（安全策略里给 pyarrow/lancedb 目录开例外，或换到不受策略约束的环境/容器）
+   → 然后正常重跑；
+2. **显式接受回退后端**：设 `storage.vector_backend=python`，再
+   `python scripts/build_kb.py --rebuild` 把向量全量重建到回退库（万级 chunk 内可用，
+   再大就不合适了）。
+
+排查顺序：`python -c "import lancedb"`（看真实异常）→ 确认 `storage.vector_backend`
+是不是被显式设成了 python → 看正式库目录大小与 `data/lancedb_py.json` 是否存在。
+构建汇总里的 `vector_backends` 会告诉你本轮实际用了哪个后端。
+
 **Q: 真实业务环境 SSL 被禁 / 证书不受信？**
 
 A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳过证书校验；若域名不可达
@@ -1354,6 +1379,21 @@ A: 联网脚本（代码快照/版本日历/配套矩阵）加 `--insecure` 跳�
 本库已内置请求级 `verify=False` hook 修正（`vllm_kb/net.py`，端到端测试固化
 `tests/test_net_tls.py`）；若用自己的脚本复用 `get_session(insecure=True)` 即可，
 不要裸设 `session.verify = False`（会被环境变量覆盖）。
+
+**Q: 全量部署中途报 `SSLEOFError: EOF occurred in violation of protocol` 然后部署中止？**
+
+A: 这是**传输层**故障（对端/代理把 TLS 隧道掐了），不是限流、不是 token、也**不是
+`--insecure` 能治的**（它关的是证书校验，失败发生在校验之前）。现在：
+
+1. `build_kb.py` **按来源隔离**——某个来源失败只告警并继续其余来源，本地文件来源
+   （PDF/Markdown/Word/Excel）不依赖网络，照常更新；
+2. 退出码：部分失败 = `0`（降级完成，日志有醒目告警），**所有来源都失败才 = 1**。
+   所以 `maintain.py deploy` 不会再因一次网络抖动整体中止；
+3. 传输类错误按 `transport_retries`（默认 6）**独立预算**重试，每次换新连接、
+   逐次打日志；单页体积可用 `graphql_page_size`/`comments_page_size` 调小（弱网推荐
+   25/50），游标与页大小无关，**中途调小不会让断点失效**；
+4. 中断本身不丢进度：raw 与 checkpoint 每页落盘，重跑同一命令**从游标续传**；
+   想先把已拉数据入库再继续拉，用 `build_kb.py --skip-pull`。
 
 **Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
 

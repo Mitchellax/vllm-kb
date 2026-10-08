@@ -220,6 +220,31 @@ DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
 
 > FTS 分词只影响索引列，向量库（原文嵌入）不受影响——`build_fts.py` 重建全文索引**无需重嵌向量**。
 
+#### 向量后端的回退（`build_vector_store`）—— 会换库，必须可见
+
+`storage.vector_backend=lancedb`（默认）时若 lancedb 加载失败，自动回退
+`PythonVectorStore`（纯标准库、JSON 持久化、暴力余弦）。两个后端**不是同一个库**：
+
+| 后端 | 位置 | 能力 |
+|---|---|---|
+| `lancedb` | `data/lancedb/`（列式数据集） | 正式后端，带 ANN，十万级 chunk 无压力 |
+| `python`（回退） | `data/lancedb_py.json`（单 JSON） | 语义能力完整，但暴力检索、全量载入内存（万级以内可用） |
+
+回退时**如实**区分两种原因，并说明换库的影响（`_warn_fallback`，每进程只打一次）：
+
+- **未安装** → 提示 `pip install lancedb`；
+- **已安装但无法加载** → 打印真实异常。实测现场是 Windows 智能应用控制（Smart App Control）/
+  WDAC / AppLocker 拦截 pyarrow、lancedb 的**原生 DLL**
+  （`ImportError: DLL load failed while importing lib: 应用程序控制策略已阻止此文件。`；
+  `WinError 4551`）。此时 `pip install` 无用，要么放行安全策略，要么显式接受回退后端；
+- **正式库非空时额外警告**：回退后端**看不到**既有向量（本次向量检索只会命中新嵌入的文档）。
+  处理二选一：放行原生 DLL 后重跑，或设 `storage.vector_backend=python` 并
+  `build_kb.py --rebuild` 全量重建到该库。
+
+后端标识（`backend_name` / `location`）进 `process_source` 的 stats 与 `run_build` 汇总
+（`vector_backends`），所以**跑完能从日志看出向量到底写进了哪个库**——"静默换库"是这套设计里
+最危险的一种降级（库还在、文档还在，只是向量检索悄悄少了一大半）。
+
 ### 2.7 索引重建与审核侧存储（不参与检索）
 
 | 命令 / 组件 | 产物 | 说明 |
