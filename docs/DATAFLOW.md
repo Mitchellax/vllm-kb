@@ -64,6 +64,29 @@
 | 2. 规范化 | `src.canonicalize()`：原始 JSON → 统一 `KbDocument`（source_id / title / body / 组件 / 版本区间 / status / extra） | 追加/upsert 到统一 `data/raw/canonical.jsonl`（按 source_id 幂等） |
 | 3. 入库 | `ingest_docs()`（见 2.6） | LanceDB 向量 + kb.sqlite3 |
 
+#### 拉取的失败分类与降级（部署韧性）
+
+失败按**可恢复性**分三类，处置方式完全不同（对应外网/代理环境实测到的
+`SSLEOFError: EOF occurred in violation of protocol` 事故）：
+
+| 类别 | 判定 | 处置 |
+|---|---|---|
+| **传输类** | 连接被拒/超时/TLS 隧道被掐/读 body 中途断流（`RequestException` 及其子类，含 `SSLEOFError`、`ChunkedEncodingError`） | 按 `transport_retries`（默认 6）**独立预算**重试，指数退避 + 抖动、上限 `transport_backoff_max_seconds`；**每次重试前 `session.close()` 丢弃连接池换新连接**（隧道被掐后池中连接可能已损坏）；每次重试打一行日志；耗尽抛 `GithubUnreachable` |
+| **限流 / 5xx / 200 但非 JSON** | 服务端明确响应（主限流 HTTP 200 + body errors、次级限流 403/429 + `Retry-After`、网关页） | 按 `max_retries`（默认 3）重试；限流按 `Retry-After` > `X-RateLimit-Reset` > 指数退避精确等待；耗尽抛 `GithubUnreachable` |
+| **永久错误** | 4xx（401 token 失效 / 403 非限流 / 422 查询非法） | **不重试**，立即失败并打印状态码语义（重试无用），抛普通 `RuntimeError` |
+
+- **传输预算与限流预算独立**：否则限流等待会把传输重试额度挤掉（反之亦然）；
+- **读 body 也在传输重试单元内**：大页响应读到一半断流是 `ChunkedEncodingError`，
+  放在单元外就永远不会被重试（GraphQL 查询只读，整页重发安全）；
+- **单页体积可调**：`graphql_page_size` / `comments_page_size`（默认 100/100）——单页
+  = 页大小 × 每条最多评论数，弱网下调小可显著降低"大传输被掐"概率；游标与页大小无关，
+  **中途调小不会让 checkpoint 失效**；
+- **来源级隔离**：`run_build` 逐来源 `try/except`，某来源失败只告警并继续其余来源
+  （与 `collect_docs` 既有行为一致）；失败进 `failed`、成功计数进 `sources_ok`，退出码
+  由 `_report_and_exit` 决定：全成功/部分失败 = 0（部分失败打印降级告警，`--strict` 时 1），
+  **所有来源都失败 = 1**。这样"GitHub 掉线"不会连带牺牲不依赖网络的本地文件来源，
+  也不会把已成功入库的成果变成一次失败部署。
+
 > **只再生 canonical（不入库）**：`scripts/build_canonical.py` 遍历来源 canonicalize → upsert
 > canonical.jsonl，不 ingest——提取逻辑（版本/kind/组件/标签规则）升级后先跑它再 `build_graph.py`
 > 建图，无需重嵌向量；`build_kb.py` 内部复用同一 canonical 处理（`pipeline.upsert_unified_canonical`）。

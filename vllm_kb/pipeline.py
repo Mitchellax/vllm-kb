@@ -17,6 +17,7 @@
     python -m vllm_kb.pipeline --numbers 9749,9750  # REST 单条补拉指定编号（隐含 missing）
     python -m vllm_kb.pipeline --numbers 9749,9750 --force-numbers  # 强制重拉（已存在也覆盖）
     python -m vllm_kb.pipeline --rebuild      # 清库后全量重建（换 embedding 模型时）
+    python -m vllm_kb.pipeline --strict       # 任一来源失败即退 1（CI/严格流水线）
     只再生 canonical（不入库）：scripts/build_canonical.py（提取逻辑升级后供建图用）
 """
 from __future__ import annotations
@@ -162,8 +163,16 @@ def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
               incremental: bool = False, missing: bool = False,
               numbers: list[int] | None = None,
               force_numbers: bool = False) -> dict:
-    """逐来源处理（先配置在前的来源）。全量马拉松期间，先完成的来源立即可用。"""
-    grand = {"pulled": 0, "ingested_docs": 0}
+    """逐来源处理（先配置在前的来源）。全量马拉松期间，先完成的来源立即可用。
+
+    **来源级隔离**（部署韧性）：任一来源失败只打印告警并**继续处理其余来源**，不中止
+    整个构建。理由：本地文件来源（PDF/md/Word/Excel）不依赖网络，GitHub 抖动时它们的
+    数据与入库不该被一起放弃；而且中止会把"已成功入库的来源成果"也变成一次失败部署。
+
+    失败详情进返回值的 `failed`，由调用方决定退出码（见 `_report_and_exit`）：
+    部分失败=降级继续，**全部失败**才算致命。
+    """
+    grand = {"pulled": 0, "ingested_docs": 0, "sources_ok": 0, "failed": []}
     for src in build_sources(cfg):
         try:
             stats = process_source(src, cfg, pull, limit, incremental,
@@ -171,9 +180,42 @@ def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
                                    force_numbers=force_numbers)
             grand["pulled"] += stats.get("pulled", 0)
             grand["ingested_docs"] += stats.get("docs", 0)
+            grand["sources_ok"] += 1
         except NotImplementedError as e:
             print(f"[warn] 来源 {src.id} ({src.type}) 未实现，跳过：{e}")
+        except Exception as e:  # noqa: BLE001 —— 来源级隔离：单个来源失败不拖垮整轮
+            print(f"\n[warn] ⚠️  来源 {src.id} ({src.type}) 失败，**已降级继续**其余来源："
+                  f"{type(e).__name__}: {e}\n", flush=True)
+            grand["failed"].append({"id": src.id, "type": src.type,
+                                    "error": f"{type(e).__name__}: {e}"})
     return grand
+
+
+def _report_and_exit(grand: dict, strict: bool) -> None:
+    """按来源级隔离的结果决定退出码（部署脚本据此判断要不要人工介入）。
+
+    - 全部来源成功 → 0；
+    - **部分来源失败（降级）** → 0：数据可用、失败来源的既有数据未受影响，下次
+      update/deploy 从 checkpoint 续传即可补上；`--strict` 时退 1（严格流水线/CI 用）；
+    - **所有来源都失败** → 1：真正致命（数据源/密钥/网络问题，本轮没有任何可用产出）。
+    """
+    failed = grand.get("failed") or []
+    if not failed:
+        return
+    detail = "\n".join(f"  ❌ {f['id']} ({f['type']}): {f['error']}" for f in failed)
+    if not grand.get("sources_ok"):
+        print("[build] 💥 **所有来源均失败**：本轮没有产出任何可用数据。"
+              "请检查数据源/密钥/网络后重跑（断点续传，不会重复劳动）。")
+        print(detail)
+        sys.exit(1)
+    print(f"[build] ⚠️  本轮**降级完成**：{grand['sources_ok']} 个来源成功、"
+          f"{len(failed)} 个失败——失败来源的既有数据未受影响（不删文档），"
+          f"下次 update/deploy 会从 checkpoint 续传：")
+    print(detail)
+    if strict:
+        print("[build] --strict：有来源失败即视为失败。")
+        sys.exit(1)
+    print("[build] 提示：本地文件来源不受网络影响；GitHub 类失败多为链路/配额，重跑即可续传。")
 
 
 def main() -> None:
@@ -197,6 +239,9 @@ def main() -> None:
                     help="高危：清空向量库与 SQLite 后全量重建（需交互确认，或加 --yes）")
     ap.add_argument("--yes", action="store_true",
                     help="跳过 --rebuild 的确认提示（自动化/无人值守用）")
+    ap.add_argument("--strict", action="store_true",
+                    help="严格模式：任一来源失败即退出码 1（默认只有**所有**来源都失败才退 1；"
+                         "部分失败属降级完成，数据仍可用）")
     from .net import DEFAULT_GITHUB_BASE
 
     ap.add_argument("--insecure", action="store_true",
@@ -240,6 +285,7 @@ def main() -> None:
                       numbers=numbers, force_numbers=args.force_numbers)
     print(f"[build] 本轮汇总: {grand}")
     print("[build] 提示：中途 Ctrl-C 后重跑同一命令即断点续传；逐来源处理，先完成的来源已可用。")
+    _report_and_exit(grand, strict=args.strict)
 
 
 def _confirm_rebuild(yes: bool) -> None:

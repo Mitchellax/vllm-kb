@@ -113,14 +113,30 @@ python scripts/maintain.py --insecure update
 | `update --skip-graph` | 仅增量入库不改图（API 不便停时；图稍后 `build_graph.py` 单独补） |
 | `deploy/update --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
 | `deploy/update --config path` | 指定 config.json（默认项目根自动发现） |
+| `build_kb.py --strict` | 严格模式：任一来源失败即退出码 1（CI/严格流水线用） |
 
 **自动降级**（子步骤失败不中断，只打印告警）：
 
 - **kuzu 未装** → 建图步骤失败告警跳过（KB 入库不受影响，图查询暂不可用）；
 - **jieba 未装** → FTS 分词降级为原文（中文词无法独立命中，索引结构不变）；
 - **网络不可达** → 版本日历 / 配套矩阵 / 代码快照步骤失败告警跳过；
-- 唯一致命步骤是「数据拉取与入库」（`build_kb.py`）——它失败说明数据源/密钥有问题，
-  需人工处理后重跑；其余步骤失败均不影响已入库数据。
+- **数据拉取与入库按来源隔离**（`build_kb.py`）：某个来源失败只告警并继续处理其余来源。
+  本地文件来源（PDF/Markdown/Word/Excel）不依赖网络，GitHub 掉线时它们照常更新；
+  已成功入库的来源成果也不会因后面的来源失败而白跑。
+  - **退出码**：全部成功 = `0`；部分失败（降级完成）= `0` + 醒目告警（失败来源的既有数据
+    不删，下次重跑从 checkpoint 续传）；**所有来源都失败 = `1`**（真正致命，需人工处理）。
+  - `--strict`：把"部分失败"也变成退出码 1。
+
+> **弱网 / 代理环境调优**（`config.json` 对应 github source 的字段，都可选）：
+> `transport_retries`（默认 6）——连接/超时/TLS 隧道被掐这类**传输错误**的独立重试预算，
+> 每次重试都换新连接（丢弃连接池）；`transport_backoff_max_seconds`（默认 60）退避上限；
+> `graphql_page_size` / `comments_page_size`（默认 100/100）——GraphQL 单页体积 =
+> 页大小 × 每条最多评论数，100×100 时单页可达数十 MB，弱网下调小能显著降低"大传输被掐"
+> 的概率（游标与页大小无关，**中途调小不会让断点失效**）。
+>
+> ⚠️ `--insecure` 只跳过**证书校验**，治不了 `SSLEOFError`（那是隧道被对端/代理掐断，
+> 发生在校验之前）。这类故障靠上面的传输重试 + 来源级降级兜住；根治要么换稳定链路，
+> 要么用 `--github-base` / `VLLM_KB_GITHUB_BASE` 指到内网镜像。
 
 ```bash
 # 全量拉取 + 入库（issues/PRs/comments/releases，数小时~数十小时，可 Ctrl-C 中断后重跑续传）

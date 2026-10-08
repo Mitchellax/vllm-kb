@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -32,6 +33,16 @@ from .components import default_component_for_repo, extract_component_versions
 from .config import PROJECT_ROOT, SourceCfg
 from .models import KbDocument, VersionSpan
 from .net import github_api_base, get_session, insecure_from_env, parse_json
+
+
+class GithubUnreachable(RuntimeError):
+    """GitHub **不可达**（连接/超时/TLS 层耗尽重试）。
+
+    与"服务端明确报错"（4xx/GraphQL errors）区分开：这类失败是**环境/链路**问题，
+    数据源本身没坏，调用方（pipeline）可以降级继续（本轮不更新该来源），
+    而不是把整个构建判为失败。
+    """
+
 
 _LABEL_VERSION_RE = re.compile(r"v?(0\.\d+(?:\.\d+)?)")  # vLLM/vllm-ascend 均为 0.x.y 系，排除 3.5/26.1.0 等噪音
 _BODY_VERSION_RE = re.compile(r"(?i)vllm\s+version[^0-9]*(\d+\.\d+(?:\.\d+)?)")
@@ -87,6 +98,16 @@ class GithubPuller:
         self.request_timeout_seconds = source.get("request_timeout_seconds", 30)
         self.max_retries = source.get("max_retries", 3)
         self.retry_backoff_seconds = source.get("retry_backoff_seconds", 5)
+        # 传输类错误（连接/超时/TLS 隧道被掐）**独立预算**：与"服务端返回 5xx/限流"不是一回事。
+        # 外网/代理环境下 SSLEOFError 这类瞬时故障可能持续几分钟，3 次重试扛不住；
+        # 而限流等待本身要花很久，两者混在一个预算里会互相挤占（限流等完就没额度重试传输错误了）。
+        self.transport_retries = source.get("transport_retries", 6)
+        self.transport_backoff_max_seconds = source.get("transport_backoff_max_seconds", 60)
+        # GraphQL 单页大小：100 条 × 每节点 100 条评论 = 单页可达数十 MB，弱网/代理下
+        # 每次大传输都是一个"隧道被掐"窗口。调小 → 传输变小、重试代价变低（游标与页大小无关，
+        # 中途改这个值不会让 checkpoint 失效）。
+        self.page_size = max(1, min(100, int(source.get("graphql_page_size", 100))))
+        self.comments_page_size = max(1, min(100, int(source.get("comments_page_size", 100))))
         self.raw_dir = project_root / source.get("raw_dir", f"data/raw/{source.id}")
         self.checkpoint_path = project_root / source.get(
             "checkpoint_file", f"data/checkpoints/{source.id}.json"
@@ -107,15 +128,87 @@ class GithubPuller:
 
     # ---------------- HTTP 与限流 ----------------
 
-    def _get(self, url: str, params: dict | None = None) -> requests.Response:
+    @staticmethod
+    def _root_cause(e: BaseException) -> BaseException:
+        """追到最内层根因异常。
+
+        requests/urllib3 的包装方式随版本而异：有时用 `raise ... from`（`__cause__`），
+        有时 `SSLError(urllib3_err, request=...)` 把根因塞进 `args[0]`，有时只留 `__context__`。
+        三种都试，带环路保护——只打外层 `SSLError` 会把 `SSLEOFError` 这个关键信息丢掉。
+        """
+        seen: set[int] = set()
+        cur: BaseException = e
+        while id(cur) not in seen:
+            seen.add(id(cur))
+            nxt: BaseException | None = None
+            for cand in (getattr(cur, "__cause__", None),):
+                if isinstance(cand, BaseException):
+                    nxt = cand
+                    break
+            if nxt is None and cur.args and isinstance(cur.args[0], BaseException):
+                nxt = cur.args[0]
+            if nxt is None:
+                ctx = getattr(cur, "__context__", None)
+                nxt = ctx if isinstance(ctx, BaseException) else None
+            if nxt is None:
+                break
+            cur = nxt
+        return cur
+
+    @classmethod
+    def _err_label(cls, e: Exception) -> str:
+        """传输类异常的短标签（日志用）：外层类型/根因类型。"""
+        root = cls._root_cause(e)
+        outer, inner = type(e).__name__, type(root).__name__
+        return outer if outer == inner else f"{outer}/{inner}"
+
+    def _transport_wait(self, attempt: int) -> float:
+        """传输类错误退避：指数增长 + 抖动，上限 transport_backoff_max_seconds。
+
+        抖动（±25%）避免多个来源/多个进程同时重连打同一跳，把瞬时抖动放大成雪崩。
+        """
+        base = min(self.transport_backoff_max_seconds,
+                   self.retry_backoff_seconds * (2 ** attempt))
+        return base * random.uniform(0.75, 1.25)
+
+    def _with_transport_retry(self, tag: str, fn):
+        """执行 fn()；对**传输类**错误按独立预算重试，耗尽抛 GithubUnreachable。
+
+        传输类 = 连接被拒/超时/TLS 隧道被掐/读 body 中途断流（`RequestException` 及其子类）。
+        与服务端"明确响应"的失败（4xx/5xx/限流）**分开**：后者由调用方的状态码分支处理，
+        预算也独立——否则限流等待会把传输重试的额度挤掉，反之亦然。
+
+        每次重试前 `session.close()` **丢弃连接池**：隧道被代理/中间设备掐断后，
+        池里那条连接可能已损坏，复用同一个池只会把同一个错误再吃一遍。
+        （PoolManager 在 close() 后仍可继续发包，只是重建连接池。）
+        """
         last_exc: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(self.transport_retries + 1):
             try:
-                r = self.session.get(url, params=params, timeout=self.request_timeout_seconds)
+                return fn()
             except requests.RequestException as e:
                 last_exc = e
-                time.sleep(self.retry_backoff_seconds * (attempt + 1))
-                continue
+                if attempt >= self.transport_retries:
+                    break
+                wait = self._transport_wait(attempt)
+                print(f"[github:{self.id}] {tag} 网络异常（{self._err_label(e)}），"
+                      f"{wait:.0f}s 后换新连接重试（{attempt + 1}/{self.transport_retries}）："
+                      f"{str(e)[:160]}", flush=True)
+                self.session.close()
+                time.sleep(wait)
+        raise GithubUnreachable(
+            f"{tag} 网络不可达（已重试 {self.transport_retries} 次，每次均换新连接；"
+            f"最后错误 {type(last_exc).__name__}: {str(last_exc)[:200]}）"
+        ) from last_exc
+
+    def _get(self, url: str, params: dict | None = None) -> requests.Response:
+        note = ""
+        for attempt in range(self.max_retries + 1):
+            r = self._with_transport_retry(
+                "REST",
+                lambda: self.session.request("GET", url, params=params,
+                                             timeout=self.request_timeout_seconds),
+            )
 
             remaining = r.headers.get("X-RateLimit-Remaining")
             if remaining is not None and int(remaining) < 100:
@@ -125,14 +218,31 @@ class GithubPuller:
                 return r
             if r.status_code in (403, 429):
                 if r.status_code == 403 and "rate limit" not in r.text.lower():
-                    r.raise_for_status()  # 非限流的 403（权限等），直接报错
+                    # 非限流的 403（权限/鉴权）：永久错误，重试无用
+                    print(f"[github:{self.id}] REST 403 非限流（权限/鉴权），"
+                          f"判定永久错误不重试：{url}", flush=True)
+                    r.raise_for_status()
                 self._sleep_for_rate_limit(r, tag="REST", attempt=attempt)
+                note = f"限流 HTTP {r.status_code}（已等待 {attempt + 1} 次）"
                 continue
             if r.status_code >= 500:
-                time.sleep(self.retry_backoff_seconds * (attempt + 1))
+                note = f"HTTP {r.status_code}"
+                if attempt < self.max_retries:
+                    wait = self.retry_backoff_seconds * (attempt + 1)
+                    print(f"[github:{self.id}] REST 服务端 {r.status_code}，"
+                          f"{wait}s 后重试（{attempt + 1}/{self.max_retries}）：{url}", flush=True)
+                    time.sleep(wait)
                 continue
+            # 其余 4xx（404 等）：永久错误，不重试。
+            # **必须原样抛 requests.HTTPError**：调用方按 status_code 分支——
+            # `_pull_numbers` 就是用 404 回退 `/pulls/{n}` → `/issues/{n}`，
+            # 换成别的异常类型会让这条回退静默失效（测试若 mock 掉 _get 就测不出来）。
+            print(f"[github:{self.id}] REST HTTP {r.status_code}（永久错误，不重试）：{url}",
+                  flush=True)
             r.raise_for_status()
-        raise RuntimeError(f"GET 重试失败: {url} ({last_exc})")
+        raise RuntimeError(
+            f"GET 重试失败（已尝试 {self.max_retries + 1} 次）：{url} —— "
+            f"最后原因 {note or '未知'}")
 
     # ---------------- checkpoint ----------------
 
@@ -147,18 +257,22 @@ class GithubPuller:
 
     # ---------------- 采集（GraphQL 游标分页，无 10k 上限） ----------------
 
+    # 分页大小走变量（$first / $commentsFirst）：单页 = N 条 × 每条最多 M 条评论，
+    # 100×100 时单页可达数十 MB，弱网/代理下每次大传输都是一个"隧道被掐"窗口。
+    # 游标（endCursor）与页大小无关，**中途调小不会让 checkpoint 失效**。
     _ISSUES_QUERY = """
     query($owner: String!, $repo: String!, $states: [IssueState!], $after: String,
-          $withComments: Boolean!, $filter: IssueFilters, $order: IssueOrder!) {
+          $withComments: Boolean!, $filter: IssueFilters, $order: IssueOrder!,
+          $first: Int!, $commentsFirst: Int!) {
       repository(owner: $owner, name: $repo) {
-        issues(first: 100, after: $after, states: $states, filterBy: $filter, orderBy: $order) {
+        issues(first: $first, after: $after, states: $states, filterBy: $filter, orderBy: $order) {
           totalCount
           pageInfo { hasNextPage endCursor }
           nodes {
             number title body state createdAt updatedAt closedAt url
             author { login }
             labels(first: 20) { nodes { name } }
-            comments(first: 100) @include(if: $withComments) {
+            comments(first: $commentsFirst) @include(if: $withComments) {
               pageInfo { hasNextPage }
               nodes { author { login } createdAt body }
             }
@@ -170,9 +284,10 @@ class GithubPuller:
 
     _PRS_QUERY = """
     query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: String,
-          $withComments: Boolean!, $order: IssueOrder!) {
+          $withComments: Boolean!, $order: IssueOrder!,
+          $first: Int!, $commentsFirst: Int!) {
       repository(owner: $owner, name: $repo) {
-        pullRequests(first: 100, after: $after, states: $states, orderBy: $order) {
+        pullRequests(first: $first, after: $after, states: $states, orderBy: $order) {
           totalCount
           pageInfo { hasNextPage endCursor }
           nodes {
@@ -183,7 +298,7 @@ class GithubPuller:
             commits(last: 1) { nodes { commit { oid } } }
             author { login }
             labels(first: 20) { nodes { name } }
-            comments(first: 100) @include(if: $withComments) {
+            comments(first: $commentsFirst) @include(if: $withComments) {
               pageInfo { hasNextPage }
               nodes { author { login } createdAt body }
             }
@@ -200,44 +315,71 @@ class GithubPuller:
         - 主限流超限时 HTTP 状态码**仍是 200**，body 报错且 x-ratelimit-remaining=0
           （必须识别并等到 X-RateLimit-Reset，而不是当普通错误抛异常中止）；
         - 次级限流返回 403/429 + Retry-After，按 header 精确等待。
+
+        重试分三类，互不挤占预算：
+        - **传输类**（连接/超时/TLS 隧道被掐/读 body 中途断流）→ `_with_transport_retry`
+          独立预算，换新连接重试，耗尽抛 `GithubUnreachable`（可降级、稍后重试）；
+        - **限流 / 5xx / 200 但非 JSON** → 本循环按 `max_retries` 重试；
+        - **4xx 永久错误**（token 失效/权限/查询错误）→ 立即失败，不浪费时间重试。
+
+        **读 body 也在传输重试单元内**：大页响应读到一半隧道被掐会抛
+        `ChunkedEncodingError`（`RequestException` 子类），此时整页重发是安全的
+        （GraphQL 查询只读、不产生副作用）；若放在单元外，这种断流根本不会被重试。
         """
-        last_exc: Exception | None = None
+        note = ""
         for attempt in range(self.max_retries + 1):
-            try:
-                r = self.session.post(
-                    self.graphql_url,
+            def _send() -> tuple[requests.Response, dict | None]:
+                r = self.session.request(
+                    "POST", self.graphql_url,
                     json={"query": query, "variables": variables},
                     timeout=self.request_timeout_seconds,
                 )
-            except requests.RequestException as e:
-                last_exc = e
-                time.sleep(self.retry_backoff_seconds * (attempt + 1))
+                if r.status_code != 200:
+                    return r, None          # 状态码交给外层分类
+                return r, parse_json(r, "GraphQL 响应")
+
+            try:
+                r, data = self._with_transport_retry("GraphQL", _send)
+            except GithubUnreachable:
+                raise  # 传输预算耗尽：不要再被下面的 RuntimeError 分支吞掉
+            except RuntimeError as e:
+                # parse_json：200 但 body 非 JSON（网关/代理限流页/空体）
+                note = f"200 响应非 JSON: {e}"
+                if attempt < self.max_retries:
+                    wait = self.retry_backoff_seconds * (attempt + 1)
+                    print(f"[github:{self.id}] GraphQL 200 响应非 JSON（第 {attempt + 1}/"
+                          f"{self.max_retries + 1} 次），{wait}s 后重试：{e}", flush=True)
+                    time.sleep(wait)
                 continue
-            if r.status_code == 200:
-                try:
-                    data = parse_json(r, "GraphQL 响应")
-                except RuntimeError as e:
-                    last_exc = e
-                    print(f"[github:{self.id}] GraphQL 200 响应非 JSON（attempt {attempt}）："
-                          f"{e}")
-                    time.sleep(self.retry_backoff_seconds * (attempt + 1))
-                    continue
+
+            if data is not None:
                 if data.get("errors"):
                     msgs = [e.get("message", "") for e in data["errors"]]
                     joined = " ".join(msgs).lower()
                     if "rate limit" in joined or "rate_limit" in joined:
                         self._sleep_for_rate_limit(r, tag="GraphQL", attempt=attempt)
+                        note = f"GraphQL 限流（已等待 {attempt + 1} 次）"
                         continue
                     raise RuntimeError(f"GraphQL 错误: {data['errors']}")
                 return data["data"]["repository"]
+
             if r.status_code in (403, 429):
                 self._sleep_for_rate_limit(r, tag="GraphQL", attempt=attempt)
+                note = f"限流 HTTP {r.status_code}（已等待 {attempt + 1} 次）"
                 continue
             if r.status_code >= 500:
-                time.sleep(self.retry_backoff_seconds * (attempt + 1))
+                note = f"HTTP {r.status_code}"
+                if attempt < self.max_retries:
+                    wait = self.retry_backoff_seconds * (attempt + 1)
+                    print(f"[github:{self.id}] GraphQL 服务端 {r.status_code}，"
+                          f"{wait}s 后重试（{attempt + 1}/{self.max_retries}）", flush=True)
+                    time.sleep(wait)
                 continue
-            r.raise_for_status()
-        raise RuntimeError(f"GraphQL 重试失败: {last_exc}")
+            # 其余 4xx：永久错误（token 失效/权限/查询非法），重试无用
+            raise RuntimeError(
+                f"GraphQL 请求被拒（HTTP {r.status_code}，非限流，重试无用）：{r.text[:200]}")
+        raise GithubUnreachable(
+            f"GraphQL 重试失败（已尝试 {self.max_retries + 1} 次）：{note or '未知原因'}")
 
     def _sleep_for_rate_limit(self, r: requests.Response, tag: str, attempt: int = 0) -> None:
         """按限流响应头精确等待：Retry-After > X-RateLimit-Reset > 指数退避。"""
@@ -413,6 +555,8 @@ class GithubPuller:
             variables = {
                 "owner": owner, "repo": repo, "states": states, "after": cursor,
                 "withComments": self.fetch_comments,
+                # 分页大小（弱网可调小：单页变小 → 单次传输不易被掐，代价是请求数变多）
+                "first": self.page_size, "commentsFirst": self.comments_page_size,
                 # 增量按更新时间排序（新更新在前，提前停止）；断点续传保持创建时间
                 # 排序不变（checkpoint 游标兼容）。
                 "order": {"field": "UPDATED_AT" if incremental else "CREATED_AT",

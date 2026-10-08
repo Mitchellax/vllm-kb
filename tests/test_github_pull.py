@@ -575,7 +575,7 @@ class TestGithubConvert(unittest.TestCase):
                 ),
             ])
             puller.session = mock.Mock()
-            puller.session.post = mock.Mock(side_effect=lambda *a, **k: next(responses))
+            puller.session.request = mock.Mock(side_effect=lambda *a, **k: next(responses))
             sleeps: list = []
             with mock.patch.object(_time, "sleep", side_effect=lambda s: sleeps.append(s)):
                 result = puller._graphql_request("q", {})
@@ -610,6 +610,258 @@ class TestGithubConvert(unittest.TestCase):
         with mock.patch.object(_time, "sleep", side_effect=lambda s: sleeps.append(s)):
             puller._sleep_for_rate_limit(r3, tag="REST", attempt=2)
         self.assertEqual(sleeps, [puller.retry_backoff_seconds * 3])
+
+
+class TestTransportResilience(unittest.TestCase):
+    """传输类故障（连接/超时/TLS 隧道被掐）的处置——全量部署的实际故障现场。
+
+    背景：外网 + 本地代理环境下 `SSLEOFError: EOF occurred in violation of protocol`
+    在 vllm 全量 PR 枚举中途发生，旧实现只有 4 次静默重试、复用同一个连接池，
+    耗尽后抛裸 RuntimeError 并让整个部署中止。
+    """
+
+    def _puller(self, **overrides):
+        from vllm_kb.github_pull import GithubPuller
+
+        overrides.setdefault("retry_backoff_seconds", 0)
+        src = make_source(token="fake-token", **overrides)
+        return GithubPuller(src, PROJECT_ROOT)
+
+    @staticmethod
+    def _sock_err():
+        """构造与现场一致的 SSLEOFError（requests 会把它包成 SSLError）。"""
+        import ssl as _ssl
+
+        return requests.exceptions.SSLError(
+            _ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:1007)"))
+
+    def test_transport_retry_is_independent_and_typed(self):
+        """传输异常按 transport_retries 独立预算重试，耗尽抛 GithubUnreachable（可降级）。"""
+        import time as _time
+        from unittest import mock
+
+        from vllm_kb.github_pull import GithubUnreachable
+
+        puller = self._puller(transport_retries=3)
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise self._sock_err()
+
+        with mock.patch.object(puller.session, "request", side_effect=boom):
+            with mock.patch.object(_time, "sleep"):
+                with self.assertRaises(GithubUnreachable) as ctx:
+                    puller._graphql_request("q", {})
+        # 尝试次数 = transport_retries + 1（与 max_retries 无关）
+        self.assertEqual(len(calls), 4)
+        msg = str(ctx.exception)
+        self.assertIn("SSLError", msg)
+        self.assertIn("已重试 3 次", msg)
+        self.assertNotIn("None", msg)  # 旧实现耗尽时打的是 last_exc=None
+
+    def test_transport_retries_exceed_status_budget(self):
+        """传输预算独立于 max_retries：max_retries=1 也要给传输故障足够次数。"""
+        import time as _time
+        from unittest import mock
+
+        from vllm_kb.github_pull import GithubUnreachable
+
+        puller = self._puller(max_retries=1, transport_retries=5)
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise self._sock_err()
+
+        with mock.patch.object(puller.session, "request", side_effect=boom):
+            with mock.patch.object(_time, "sleep"):
+                with self.assertRaises(GithubUnreachable):
+                    puller._graphql_request("q", {})
+        self.assertEqual(len(calls), 6)
+
+    def test_transport_retry_recovers_and_drops_pool(self):
+        """中途抖动后恢复：换新连接（session.close 被调用）且最终返回数据。"""
+        import time as _time
+        from unittest import mock
+
+        puller = self._puller(transport_retries=3)
+        ok = mock.Mock(status_code=200, headers={},
+                       json=lambda: {"data": {"repository": {"issues": {"totalCount": 7}}}})
+        seq = [self._sock_err(), self._sock_err(), ok]
+        closes = []
+
+        def flaky(*a, **k):
+            item = seq.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with mock.patch.object(puller.session, "request", side_effect=flaky):
+            with mock.patch.object(puller.session, "close", side_effect=lambda: closes.append(1)):
+                with mock.patch.object(_time, "sleep"):
+                    result = puller._graphql_request("q", {})
+        self.assertEqual(result["issues"]["totalCount"], 7)
+        self.assertEqual(len(closes), 2, "每次重试都应丢弃连接池换新连接")
+
+    def test_retry_is_logged(self):
+        """重试必须留痕：旧实现对传输异常完全静默（部署日志看不出重试过）。"""
+        import io
+        import contextlib
+        import time as _time
+        from unittest import mock
+
+        from vllm_kb.github_pull import GithubUnreachable
+
+        puller = self._puller(transport_retries=2)
+        buf = io.StringIO()
+
+        def boom(*a, **k):
+            raise self._sock_err()
+
+        with mock.patch.object(puller.session, "request", side_effect=boom):
+            with mock.patch.object(puller.session, "close"):
+                with mock.patch.object(_time, "sleep"):
+                    with contextlib.redirect_stdout(buf):
+                        with self.assertRaises(GithubUnreachable):
+                            puller._graphql_request("q", {})
+        out = buf.getvalue()
+        self.assertIn("网络异常", out)
+        self.assertIn("换新连接重试", out)
+        self.assertIn("SSLEOFError", out)  # 根因类型要打出来
+
+    def test_permanent_4xx_fails_fast(self):
+        """401（token 失效）是永久错误：不重试、信息明确（重试无用）。"""
+        from unittest import mock
+
+        puller = self._puller(transport_retries=3, max_retries=3)
+        calls = []
+        r401 = mock.Mock(status_code=401, headers={}, text='{"message":"Bad credentials"}')
+        with mock.patch.object(puller.session, "request",
+                               side_effect=lambda *a, **k: calls.append(1) or r401):
+            with self.assertRaises(RuntimeError) as ctx:
+                puller._graphql_request("q", {})
+        self.assertEqual(len(calls), 1, "永久错误不应重试")
+        self.assertIn("401", str(ctx.exception))
+        self.assertIn("重试无用", str(ctx.exception))
+
+    def test_status_exhaustion_message_not_none(self):
+        """5xx/限流耗尽时，报错必须说明原因（旧实现是 `GraphQL 重试失败: None`）。"""
+        import time as _time
+        from unittest import mock
+
+        from vllm_kb.github_pull import GithubUnreachable
+
+        puller = self._puller(max_retries=2)
+        r500 = mock.Mock(status_code=500, headers={}, text="")
+        with mock.patch.object(puller.session, "request", return_value=r500):
+            with mock.patch.object(_time, "sleep"):
+                with self.assertRaises(GithubUnreachable) as ctx:
+                    puller._graphql_request("q", {})
+        self.assertIn("HTTP 500", str(ctx.exception))
+        self.assertIn("已尝试 3 次", str(ctx.exception))
+
+    def test_body_read_failure_is_retried(self):
+        """读 body 中途断流（ChunkedEncodingError）也必须重试——否则大页断流无处兜。"""
+        import time as _time
+        from unittest import mock
+
+        puller = self._puller(transport_retries=2)
+        r = mock.Mock(status_code=200, headers={})
+        r.json = mock.Mock(side_effect=requests.exceptions.ChunkedEncodingError("断流"))
+        ok = mock.Mock(status_code=200, headers={},
+                       json=lambda: {"data": {"repository": {"issues": {"totalCount": 1}}}})
+        seq = [(r, None), (ok, None)]
+        with mock.patch.object(puller.session, "request", side_effect=lambda *a, **k: seq.pop(0)[0]):
+            with mock.patch.object(puller.session, "close"):
+                with mock.patch.object(_time, "sleep"):
+                    result = puller._graphql_request("q", {})
+        self.assertEqual(result["issues"]["totalCount"], 1)
+
+    def test_rest_get_keeps_httperror_contract(self):
+        """`_get` 的永久 4xx 必须仍抛 requests.HTTPError（带 .response）。
+
+        `_pull_numbers`（`--numbers`）用它按 status_code 分支：404 → 回退
+        `/pulls/{n}` → `/issues/{n}`。若改成别的异常类型，回退会**静默失效**；
+        而既有测试都 mock 掉了 `_get`，所以必须直接钉住 `_get` 本身。
+        """
+        from unittest import mock
+
+        puller = self._puller()
+        r404 = mock.Mock(status_code=404, headers={}, text="not found")
+        r404.raise_for_status = mock.Mock(
+            side_effect=requests.HTTPError("404 Client Error", response=r404))
+        with mock.patch.object(puller.session, "request", return_value=r404):
+            with self.assertRaises(requests.HTTPError) as ctx:
+                puller._get("https://api.github.com/repos/o/r/pulls/1")
+        self.assertEqual(ctx.exception.response.status_code, 404)
+
+    def test_rest_get_permanent_error_not_retried(self):
+        """永久 4xx 不重试（省时间），限流/5xx 才重试。"""
+        from unittest import mock
+
+        puller = self._puller(max_retries=3)
+        calls = []
+        r404 = mock.Mock(status_code=404, headers={}, text="nf")
+        r404.raise_for_status = mock.Mock(
+            side_effect=requests.HTTPError("404", response=r404))
+        with mock.patch.object(puller.session, "request",
+                               side_effect=lambda *a, **k: calls.append(1) or r404):
+            with self.assertRaises(requests.HTTPError):
+                puller._get("https://api.github.com/x")
+        self.assertEqual(len(calls), 1)
+
+
+class TestPageSizeConfig(unittest.TestCase):
+    """GraphQL 分页大小可配（弱网调小以缩小单次传输）。"""
+
+    def test_defaults_are_100(self):
+        from vllm_kb.github_pull import GithubPuller
+
+        puller = GithubPuller(make_source(token="t"), PROJECT_ROOT)
+        self.assertEqual(puller.page_size, 100)
+        self.assertEqual(puller.comments_page_size, 100)
+
+    def test_query_uses_variables_not_literals(self):
+        """查询里不能再写死 first: 100（否则配置无效）。"""
+        from vllm_kb.github_pull import GithubPuller
+
+        for q in (GithubPuller._ISSUES_QUERY, GithubPuller._PRS_QUERY):
+            self.assertIn("$first: Int!", q)
+            self.assertIn("$commentsFirst: Int!", q)
+            self.assertNotIn("first: 100", q)
+            self.assertNotIn("comments(first: 100", q)
+
+    def test_configured_page_size_reaches_variables(self):
+        import tempfile
+        from unittest import mock
+
+        from vllm_kb.github_pull import GithubPuller
+
+        with tempfile.TemporaryDirectory() as td:
+            src = make_source(token="t", graphql_page_size=25, comments_page_size=10,
+                              fetch_comments=True, raw_dir=f"{td}/raw",
+                              checkpoint_file=f"{td}/cp.json")
+            puller = GithubPuller(src, PROJECT_ROOT)
+            self.assertEqual((puller.page_size, puller.comments_page_size), (25, 10))
+            seen = {}
+
+            def fake_request(query, variables):
+                seen.update(variables)
+                return {"issues": {"totalCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}}
+
+            puller._graphql_request = fake_request
+            puller._collect_graphql({"issues": {}}, {}, kind="issues", incremental=False)
+            self.assertEqual(seen["first"], 25)
+            self.assertEqual(seen["commentsFirst"], 10)
+
+    def test_page_size_clamped_to_github_max(self):
+        from vllm_kb.github_pull import GithubPuller
+
+        puller = GithubPuller(make_source(token="t", graphql_page_size=500,
+                                          comments_page_size=0), PROJECT_ROOT)
+        self.assertEqual(puller.page_size, 100)
+        self.assertEqual(puller.comments_page_size, 1)
 
 
 class TestPullIncremental(unittest.TestCase):
