@@ -197,7 +197,9 @@ python scripts/maintain.py --insecure update
 > local issuer certificate` 而拉取链路（requests）正常，此时设
 > `SSL_CERT_FILE=<venv>/Lib/site-packages/certifi/cacert.pem` 即可，比 `--insecure` 稳妥；
 > 且**网络失败不会再把版本日历写空**——`build_release_calendar.py` 拉取失败直接报错退出、
-> 保留上一版（抓不到 ≠ 没有 release），详见 `docs/USAGE.md` FAQ。
+> 保留上一版（抓不到 ≠ 没有 release），详见 `docs/USAGE.md` FAQ。日历被**查询期**
+> （`w_ver` 版本上界，改完立即生效）与**建图期**（release_tag，建图时固化）两处消费：
+> 补回日历后，只有"日历为空期间重建过图"才需要再重跑一次建图。
 
 ### 定时自动更新（每晚停服务 → 增量更新 → 重启）
 

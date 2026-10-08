@@ -202,7 +202,10 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 > 这道防护是踩出来的——代理掐 TLS 时 `fetch_releases` 静默 `break` 并返回 `[]`，
 > 一次 deploy 就把带 v0.23.0 的日历写成 `"releases": []`（113 字节），
 > 下游 w_ver 版本上界与图里 `MERGED_IN → release` 关联整体消失。
-> 日历是**图的输入**：修好日历后要重跑建图步骤，否则图里的 release_tag 仍是空。
+> 日历有**两处消费者，恢复后的影响不同**：**查询期现算**的 `w_ver` 版本上界立即恢复
+> （`confidence.version_at_date` 读当前文件）；**建图时固化**的 `release_tag` 只在
+> "日历为空那段时间重建过图"时才为空，那种情况需重跑 `build_graph`（停 `serve_api`，
+> Kùzu 单写者）。图未被重建则保留上一次建图时固化的完整关联。
 > 注意 urllib（本脚本用）与 requests（拉取链路用）**证书来源不同**：
 > urllib 走 Windows 证书库、requests 走 certifi——前者可能报
 > `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` 而后者正常，

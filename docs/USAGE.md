@@ -1458,9 +1458,15 @@ python scripts/build_release_calendar.py --all-repos
 > `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`"这种矛盾现象——
 > 指向 certifi 的 `SSL_CERT_FILE` 即可，不必 `--insecure`。
 
-⚠️ 日历是**建图步骤的输入**（MERGED_IN 的 release 映射）：恢复日历后要重跑建图
-（`maintain.py deploy` 里的 `build_graph` 步骤，需先停 `serve_api`——Kùzu 单写者），
-否则图里已有的 `release_tag` 仍是空的（`/graph/chain` 会返回 `release_tag: null`）。
+⚠️ 日历有**两处消费者，恢复后的影响不同**：
+
+- **查询期现算**（`confidence.version_at_date`）：`w_ver` 版本上界**立即恢复**，
+  不需要重建任何东西——但日历被写空的那段时间里的查询，置信度是退化的；
+- **建图时固化**（`MERGED_IN` 的 release_tag）：只有"在日历为空的那段时间里重建过图"，
+  图里的 `release_tag` 才会是空的（`/graph/chain` 返回 `release_tag: null`），
+  那时要重跑 `build_graph`（需先停 `serve_api`——Kùzu 单写者）。图若没在那段时间重建过，
+  里面的 release 关联仍是上一次成功建图时固化的完整数据（实测本机：日历被写空的当天，
+  图仍是更早一次成功建图的结果，`MERGED_IN` 与 release_tag 完好）。
 
 **Q: 矩阵生成慢 / 卡在"扫描 clone 层固化锁定 commit"？**
 
