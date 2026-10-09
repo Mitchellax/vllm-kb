@@ -8,13 +8,16 @@
 import importlib
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts.maintain import (
     _DEPLOY_STEPS,
     _UPDATE_STEPS,
     _filter_steps,
+    _foreign_python_warning,
     _insecure_env_from_args,
     _resolve,
     _run_step,
@@ -27,6 +30,45 @@ class FakeArgs:
     insecure = False
     github_base = None
     quay_base = None
+
+
+class TestForeignPythonWarning(unittest.TestCase):
+    """解释器提醒：各步骤继承 sys.executable，用系统 python 跑 deploy 会悄悄换掉整套依赖。
+
+    实测踩过：用 ...\\Python310\\python.exe 跑 maintain.py deploy（仓库 venv 在 .venv），
+    同一脚本在两边行为不一致，归因成本很高。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / ".venv" / "Scripts").mkdir(parents=True)
+        self.venv_exe = self.root / ".venv" / "Scripts" / "python.exe"
+        self.venv_exe.write_text("", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_warns_for_foreign_interpreter(self):
+        warn = _foreign_python_warning(self.root, exe="C:/Python310/python.exe")
+        self.assertIn("不是仓库 venv", warn)
+        self.assertIn("Python310", warn)
+
+    def test_silent_for_venv_interpreter(self):
+        self.assertEqual(_foreign_python_warning(self.root, exe=str(self.venv_exe)), "")
+
+    def test_silent_when_no_venv_present(self):
+        """部署机上没有 .venv（如 Linux 服务器）不该打扰用户。"""
+        empty = self.root / "no-venv"
+        empty.mkdir()
+        self.assertEqual(_foreign_python_warning(empty, exe="C:/Python310/python.exe"), "")
+
+    def test_posix_venv_layout_also_detected(self):
+        root = self.root / "posix"
+        (root / ".venv" / "bin").mkdir(parents=True)
+        (root / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
+        self.assertIn("不是仓库 venv",
+                      _foreign_python_warning(root, exe="/usr/bin/python3"))
 
 
 class TestMaintainUtils(unittest.TestCase):

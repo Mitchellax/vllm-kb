@@ -129,6 +129,12 @@ python scripts/maintain.py deploy --insecure --all-code
 python scripts/maintain.py --insecure update
 ```
 
+> ⚠️ **用仓库 venv 的解释器跑**：各步骤都以 `sys.executable` 启动，即"用什么 python 跑
+> `maintain.py`，整条流水线就用谁"。用系统 Python（如 `...\Python310\python.exe`）跑时，
+> 依赖集合与验证环境不一致、行为差异很难归因——脚本检测到仓库里存在 `.venv` 而解释器不是它时
+> 会打印醒目提醒（部署机上没有 venv 则不打扰）。显式写法：
+> `\.venv\Scripts\python.exe scripts\maintain.py deploy`（Linux：`.venv/bin/python ...`）。
+
 > ⚠️ **更新前必须停止检索服务**（`serve_api`）——`deploy`/`update` 都包含建图步骤，
 > Kùzu 是单写者（图被 API 占用时建图会失败）。更新完成后再启动 `serve_api` 即可。
 > 若 API 不便停（如线上有人用），用 `update --skip-graph` 只做增量入库，图稍后单独补建。

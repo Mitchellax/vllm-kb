@@ -71,6 +71,30 @@ _STEP_KEY = {  # 步骤名 → key（供 --skip-* 过滤）
 }
 
 
+def _foreign_python_warning(repo_root: Path = REPO_ROOT, exe: str | None = None) -> str:
+    """当前解释器不是仓库 venv 时给出提醒（否则返回空串）。
+
+    各步骤都用 `sys.executable` 启动，所以**用什么 python 跑 maintain.py，整条流水线就用谁**。
+    实测踩过：用系统 Python310 跑 deploy（仓库 venv 在 .venv），依赖集合与验证环境不一致，
+    行为差异很难归因（例如同一脚本在 venv 下正常、在系统解释器下报兼容性错误）。
+    只在仓库里**确实存在** venv 时提醒；部署机上没 venv（如 Linux 服务器）不打扰。
+    """
+    exe_path = Path(exe or sys.executable)
+    for rel in ("Scripts/python.exe", "bin/python"):
+        venv_exe = repo_root / ".venv" / rel
+        if not venv_exe.exists():
+            continue
+        try:
+            same = exe_path.resolve() == venv_exe.resolve()
+        except OSError:  # pragma: no cover - resolve 失败按不同处理
+            same = False
+        if not same:
+            return (f"⚠️ 当前解释器 {exe_path} 不是仓库 venv（{venv_exe}）——各步骤都继承它，"
+                    f"依赖版本可能与验证环境不一致；建议改用 {venv_exe} 跑（见 docs/USAGE.md）")
+        return ""
+    return ""
+
+
 def _remind_stop_api(skip_keys: set[str]):
     """在图相关步骤将执行时打印停服务提醒。"""
     if "graph" not in skip_keys:
@@ -187,6 +211,9 @@ def cmd_deploy(args) -> int:
         print(f"[maintain] 不安全模式: {insecure_env}")
     if args.skip:
         print(f"[maintain] 跳过步骤: {', '.join(sorted(args.skip))}")
+    warn = _foreign_python_warning()
+    if warn:
+        print(f"[maintain] {warn}")
     _remind_stop_api(args.skip)
     print()
 
@@ -218,6 +245,9 @@ def cmd_update(args) -> int:
         print(f"[maintain] 不安全模式: {insecure_env}")
     if args.skip:
         print(f"[maintain] 跳过步骤: {', '.join(sorted(args.skip))}")
+    warn = _foreign_python_warning()
+    if warn:
+        print(f"[maintain] {warn}")
     _remind_stop_api(args.skip)
     print()
 

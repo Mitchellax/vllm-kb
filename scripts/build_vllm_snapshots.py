@@ -22,6 +22,7 @@
 import argparse
 import json
 import os
+import re
 import sqlite3
 import ssl
 import sys
@@ -31,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from vllm_kb.confidence import parse_version  # noqa: E402
 from vllm_kb.config import AppConfig  # noqa: E402
 
 VLLM_REPO = "vllm-project/vllm"
@@ -47,8 +49,32 @@ def _opener(insecure: bool) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
 
 
+_SUFFIX_RE = re.compile(r"(\d+(?:\.\d+)*)[.\-]?(dev|alpha|beta|rc|post|a|b)(\d*)", re.I)
+_KIND_RANK = {"dev": 0, "a": 0, "alpha": 0, "b": 1, "beta": 1, "rc": 2, "post": 4}
+
+
+def version_sort_key(v: str) -> tuple:
+    """版本排序键：`0.11.0rc3` / `0.23.0.post1` / `0.9.0` 都能排，且**绝不抛异常**。
+
+    旧实现 `[int(x) for x in s.split(".")]` 遇到矩阵里真实存在的 `0.11.0rc3`
+    （镜像的 VLLM_TAG 本来就可能带 rc/post 后缀）直接 ValueError，把
+    "代码快照（vllm 主仓，companion 对应）"整步打挂。
+
+    规则：数值核心用 confidence.parse_version（忽略后缀）；后缀折算成序号
+    预发布(dev/a/beta/rc) < 正式(3) < post(4)，同后缀比尾号（rc3 < rc10）；
+    解析不出来的值统一排最后（按字符串稳定排序），不丢、不炸。
+    """
+    core = parse_version(v)
+    if core is None:
+        return (1, (0, 0, 0), 0, 0, v)
+    m = _SUFFIX_RE.search(v)
+    if not m:
+        return (0, core, 3, 0, "")
+    return (0, core, _KIND_RANK.get(m.group(2).lower(), 4), int(m.group(3) or 0), "")
+
+
 def companion_vllm_versions(cfg: AppConfig) -> list[str]:
-    """从 companion 矩阵提取 vllm-ascend -> vllm 的唯一 vllm 版本列表。"""
+    """从 companion 矩阵提取 vllm-ascend -> vllm 的唯一 vllm 版本列表（按版本升序）。"""
     path = cfg.resolve(cfg.storage.companion_file)
     if not path.exists():
         return []
@@ -59,7 +85,7 @@ def companion_vllm_versions(cfg: AppConfig) -> list[str]:
         vv = (r.get("vllm") or "").strip()
         if va and vv and va.startswith("v") and "." in va:
             versions.add(vv)
-    return sorted(versions, key=lambda s: [int(x) for x in s.split(".")])
+    return sorted(versions, key=version_sort_key)
 
 
 def _vllm_root(cfg: AppConfig) -> Path:

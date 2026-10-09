@@ -1476,6 +1476,31 @@ python scripts/build_release_calendar.py --all-repos
   里面的 release 关联仍是上一次成功建图时固化的完整数据（实测本机：日历被写空的当天，
   图仍是更早一次成功建图的结果，`MERGED_IN` 与 release_tag 完好）。
 
+**Q: 部署到"代码快照（vllm 主仓，companion 对应）"时崩了：`ValueError: invalid literal for int() with base 10: '0rc3'`？**
+
+A: 已修（旧版本的 `build_vllm_snapshots.companion_vllm_versions` 用
+`int(x) for x in version.split(".")` 排序，而配套矩阵里的 `vllm` 值**本来就可能带后缀**——
+镜像的 `VLLM_TAG` 就是 `0.11.0rc3` 这种；该步骤是非致命的，所以表现为"静默没有快照"）。
+现在排序键用 `confidence.parse_version` 取数值核心，后缀折算成序号
+（预发布 `rc/a/beta/dev` < 正式 < `post`；同后缀比尾号 `rc3 < rc10`；无法解析的值排最后），
+不丢、不炸。
+
+顺带一提：这一步依赖**配套矩阵文件**，所以它与配套矩阵的产物同生共死——矩阵若没生成
+（见上一条），这里就是空的待处理列表。
+
+**Q: deploy 用的是哪个 python？为什么和我在 venv 里跑的单步脚本表现不一致？**
+
+A: `maintain.py` 用 `sys.executable` 启动每个子步骤，也就是**用什么 python 跑
+`maintain.py`，整条流水线就用那个解释器**。实测踩过：用系统的
+`...\Python310\python.exe` 跑 `deploy`（仓库 venv 在 `.venv`），同一步在两边依赖版本不同、
+报错也难归因。现在脚本会检测：仓库里存在 `.venv` 却用了别的解释器时打印醒目提醒
+（部署机上没有 venv 则不打扰）。规范写法：
+
+```bash
+.venv/Scripts/python.exe scripts/maintain.py deploy      # Windows
+.venv/bin/python scripts/maintain.py deploy              # Linux/macOS
+```
+
 **Q: 矩阵跑到后半段（约一小时）全是 `401 Client Error: UNAUTHORIZED for url: .../v2/ascend/vllm-ascend/blobs/...`？**
 
 A: 是 **pull token 过期**，不是那些镜像有问题。quay 的 token 是 JWT，实测有效期

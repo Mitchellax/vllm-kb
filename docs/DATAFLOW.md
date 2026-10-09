@@ -174,6 +174,13 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 | `python scripts/build_image_snapshots.py --index-only` | 镜像插件源码派生数据重建：`data/code/images/{tag}/index.sqlite3`（独立符号索引，不联网） |
 
 > 各命名空间索引 schema 同步（含 `kind` 列迁移）在对应 `--index-only` 内部自动完成（旧索引缺 `kind` 列时自动补列）；503 报错详情按命名空间给对应重建命令。
+>
+> ⚠️ **矩阵里的 `vllm` 值可带后缀**：镜像的 `VLLM_TAG` 本来就可能是 `0.11.0rc3` 这种，
+> 所以消费方不能假设纯 `X.Y.Z`——`build_vllm_snapshots.companion_vllm_versions` 旧实现
+> 用 `int(x) for x in v.split(".")` 排序，实测直接 `ValueError: ... '0rc3'` 把
+> "代码快照（vllm 主仓）"整步打挂（非致命 → 静默没有快照）。现统一用
+> `version_sort_key`（`confidence.parse_version` 取数值核心 + 后缀序号：
+> 预发布 < 正式 < `post`，同后缀比尾号，无法解析排最后）。
 
 ### 2.4 辅助数据
 
