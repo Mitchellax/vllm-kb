@@ -24,7 +24,6 @@ import json
 import os
 import re
 import sqlite3
-import ssl
 import sys
 import urllib.request
 import zipfile
@@ -40,13 +39,14 @@ DEFAULT_DOWNLOAD_BASE = "https://codeload.github.com"
 
 
 def _opener(insecure: bool) -> urllib.request.OpenerDirector:
-    """按需构造跳过证书校验的 opener（真实业务环境自签证书/SSL 被禁时用）。"""
-    if not insecure:
-        return urllib.request.build_opener()
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    """按需构造跳过证书校验的 opener（真实业务环境自签证书/SSL 被禁时用）。
+
+    证书上下文统一走 vllm_kb.net.ssl_context：它给默认上下文**叠加 certifi 根证书**，
+    否则本机（OpenSSL 默认只带 26 张 CA）所有 HTTPS 都 CERTIFICATE_VERIFY_FAILED。
+    """
+    from vllm_kb.net import get_opener
+
+    return get_opener(insecure)
 
 
 _SUFFIX_RE = re.compile(r"(\d+(?:\.\d+)*)[.\-]?(dev|alpha|beta|rc|post|a|b)(\d*)", re.I)

@@ -846,11 +846,36 @@ def _image_created(tag_info: dict) -> str:
     return ""
 
 
+_SECRETS_LOADED = False
+
+
+def _load_local_secrets_once() -> None:
+    """把 data/secrets.local.json 的密钥注入环境变量（只做一次，未设置时不覆盖）。
+
+    本脚本**刻意不依赖 AppConfig**（只读 config.json 的少数字段，启动更快、无 pydantic
+    校验负担），代价是拿不到 AppConfig.load() 里那次 secrets 注入——实测后果：
+    审核工作台写进 data/secrets.local.json 的 GITHUB_TOKEN 完全看不到，deploy 里
+    配套矩阵就会打印"未配置 GITHUB_TOKEN：跳过 N 个 tag 的 commit 解析"（用户实测踩到）。
+    这里显式补上这一步，保持"脚本零 pydantic 依赖"不变。
+    """
+    global _SECRETS_LOADED
+    if _SECRETS_LOADED:
+        return
+    _SECRETS_LOADED = True
+    try:
+        from vllm_kb.secrets import load_secrets
+
+        load_secrets()
+    except Exception:
+        pass  # 缺文件/损坏不影响主流程（退化为未认证限流）
+
+
 def _github_token() -> str:
-    """GitHub token：config.json 的 github source（token / token_env）→ GITHUB_TOKEN 环境变量。
+    """GitHub token：data/secrets.local.json → config.json 的 github source → 环境变量。
 
     未配置时返回 ''（未认证限流 60 次/小时，tag→commit 解析靠缓存摊薄）。
     """
+    _load_local_secrets_once()
     try:
         cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
         for s in cfg.get("sources", []) or []:

@@ -189,6 +189,14 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 | `python scripts/build_release_calendar.py --all-repos` | `data/compatibility/release_calendar.{repo}.json`（分仓，slug 如 `vllm-project-vllm-ascend`；单仓模式写无后缀的 `release_calendar.json`） | 版本形态判断（release/rc/pre）+ 置信度版本上界（查询期现算） |
 | `python scripts/build_companion_matrix.py`（`fetch_quay_tags.py` 辅助） | `data/compatibility/vllm-ascend.json`（每行含 `image_created`（镜像最后推送时间）、`vllm_commit`/`vllm_commit_date`（vllm 代码 commit 与提交日期）；fork 行另有 `vllm_repo/ref/base/sha/image_digest`）+ 跨运行缓存 `data/cache/`（fork 层 SHA 永久 / GitHub releases TTL 7 天 / requirements 永久 / tag→commit 永久，`--refresh-cache` 强制刷新） | 组件配套反向展开（vllm-ascend:0.18.0 → vllm/cann/pytorch-ascend）；commit 溯源回答"这个镜像对应哪个 commit"（官方行 tag→commit，fork 行 `vllm_sha`）；fork 行锁定 commit 供 `build_fork_snapshots.py` 按 SHA 拉快照 |
 
+> **矩阵的 GitHub token 来源链**（`_github_token()`）：`data/secrets.local.json` →
+> config.json 的 github source（`token` / `token_env`）→ 同名环境变量，未配置则"跳过 tag→commit
+> 解析"（未认证限流 60 次/小时不够，缓存命中不受影响）。踩过的坑：本脚本**刻意不依赖
+> AppConfig**（只读 config.json 少数字段，省掉 pydantic 校验），因而拿不到
+> `AppConfig.load()` 里那次 secrets 注入——工作台写进 `secrets.local.json` 的 token 谁都看不见，
+> deploy 日志照旧打印"未配置 GITHUB_TOKEN：跳过 23 个 tag"。现在脚本内显式调用
+> `load_secrets()`（一次性，只注入未设置的环境变量），与其余脚本行为一致。
+>
 > **quay 传输特性**（实测）：quay.io 在国内链路上首连可达 20s+，且 TCP 连接**间歇性**超时
 > （同一 URL 有 0.98s 成功、也有 30s/63s 连接超时）。所以 `fetch_quay_tags.fetch_tags` 默认
 > `timeout=60` / `max_retries=4`（指数退避）；请求异常按 `type(e).__name__` 记日志并重试，
@@ -224,10 +232,15 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 > （`confidence.version_at_date` 读当前文件）；**建图时固化**的 `release_tag` 只在
 > "日历为空那段时间重建过图"时才为空，那种情况需重跑 `build_graph`（停 `serve_api`，
 > Kùzu 单写者）。图未被重建则保留上一次建图时固化的完整关联。
-> 注意 urllib（本脚本用）与 requests（拉取链路用）**证书来源不同**：
-> urllib 走 Windows 证书库、requests 走 certifi——前者可能报
-> `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` 而后者正常，
-> 此时设 `SSL_CERT_FILE=<venv>/Lib/site-packages/certifi/cacert.pem` 即可（比 `--insecure` 好）。
+> **urllib 与 requests 的证书来源（曾不一致，现已自动对齐）**：requests 自带 certifi；
+> urllib 走 `ssl.create_default_context()`，其默认 CA 列表在部分 venv 上**不足以验证
+> GitHub/quay**（本机实测 26 张，缺 GitHub 的根证书）→ 日历 / 三个快照脚本全线
+> `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate (_ssl.c:1007)`，
+> 而拉取链路（requests）正常，症状像"整个网络坏了"。现在 `vllm_kb.net.ssl_context()`
+> 给上下文**叠加 certifi 根证书**（26 → 138 张，只增不减），所有 `get_opener()` 调用点
+> （`build_release_calendar.py` + 三个 `build_*snapshots.py`）都走它，**无需再设
+> `SSL_CERT_FILE`，也不必 `--insecure`**；反过来，若业务侧显式设了 `SSL_CERT_FILE` /
+> `REQUESTS_CA_BUNDLE`，叠加会被**跳过**（完全尊重"只用内部根证书"的既有配置）。
 
 ### 2.5 图存储（Kùzu）
 

@@ -21,6 +21,9 @@ from typing import Optional
 DEFAULT_GITHUB_BASE = "https://api.github.com"
 DEFAULT_QUAY_BASE = "https://quay.io"
 
+# certifi 叠加提示只打一次（多个 opener 共用一个进程时避免刷屏）
+_CERTIFI_ANNOUNCED = False
+
 
 def insecure_from_env() -> bool:
     return os.environ.get("VLLM_KB_INSECURE", "").strip().lower() in ("1", "true", "yes", "on")
@@ -56,15 +59,52 @@ def get_session(insecure: bool) -> object:
     return s
 
 
-def get_opener(insecure: bool):
-    """返回 urllib opener（insecure 时 CERT_NONE，不校验证书）。"""
-    if not insecure:
-        return __import__("urllib.request", fromlist=["build_opener"]).build_opener()
+def ssl_context(insecure: bool = False) -> ssl.SSLContext:
+    """HTTPS 客户端上下文：默认校验，并叠加 certifi 根证书（**修 urllib 全线 SSL 失败**）。
+
+    背景（本仓库真实踩到，Windows 实测）：这台机器的 venv 是 OpenSSL 1.1.1t，
+    `ssl.create_default_context()` 只加载到 **26 张 CA**（缺 GitHub/quay 需要的根证书），
+    于是所有 urllib HTTPS 都报
+    `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate (_ssl.c:1007)`——
+    表现为版本日历/代码快照/vllm 快照"全部 SSL 失败"。叠加 certifi 后 138 张，直连正常。
+    `requests` 自带 certifi 所以一直没事：这就是同一台机器上 requests 能跑、urllib 全废的根因。
+
+    叠加 certifi 是**只增不减**（公开根证书，requests 对每个请求都是这么做的），
+    不会挤掉业务侧自签根证书；用户若显式设了 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`，
+    则完全尊重其选择（不叠加）。insecure 时退回 CERT_NONE（自签/SSL 被禁环境）。
+    """
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return __import__("urllib.request", fromlist=["build_opener"]).build_opener(
-        __import__("urllib.request", fromlist=["HTTPSHandler"]).HTTPSHandler(context=ctx)
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE"):
+        return ctx
+    global _CERTIFI_ANNOUNCED
+    try:
+        import certifi
+
+        before = ctx.cert_store_stats().get("x509_ca", 0)
+        ctx.load_verify_locations(certifi.where())
+        if not _CERTIFI_ANNOUNCED:
+            _CERTIFI_ANNOUNCED = True
+            after = ctx.cert_store_stats().get("x509_ca", 0)
+            print(f"[net] 已叠加 certifi 根证书（{before} → {after} 张）：{certifi.where()}",
+                  flush=True)
+    except Exception:
+        pass
+    return ctx
+
+
+def get_opener(insecure: bool):
+    """返回 urllib opener（insecure 时 CERT_NONE，不校验证书）。
+
+    证书上下文统一走 ssl_context（系统 CA 为空时自动兜底 certifi，见其文档）。
+    """
+    import urllib.request
+
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl_context(insecure))
     )
 
 

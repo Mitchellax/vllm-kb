@@ -2,6 +2,7 @@
 合并、缺口报告、fork 层扫描（内存构造 tar.gz，不触网）。"""
 import json
 import inspect
+import os
 import sys
 import tempfile
 import unittest
@@ -48,6 +49,89 @@ class TestQuayBudget(unittest.TestCase):
                 out = bm.fetch_image_config({"name": "x", "manifest_digest": "sha256:0"},
                                             "tok", timeout=1, max_retries=0)
         self.assertEqual(out, {"env": [], "history": [], "layers": []})
+
+
+class TestGithubTokenSources(unittest.TestCase):
+    """token 来源：data/secrets.local.json → config.json → 环境变量（用户实测踩到的缺口）。
+
+    症状：审核工作台已把 GITHUB_TOKEN 写进 data/secrets.local.json，deploy 里配套矩阵仍打印
+    "未配置 GITHUB_TOKEN：跳过 N 个 tag 的 commit 解析"。原因：本脚本**刻意不依赖 AppConfig**
+    （只读 config.json 的少数字段），而 secrets→环境变量 的注入只发生在 AppConfig.load() 里，
+    于是文件里的 token 谁也看不到。这里钉住"矩阵自己会加载 secrets"。
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = _P(self.tmp.name)
+        (self.root / "data").mkdir()
+        self._cwd = os.getcwd()
+        os.chdir(self.root)
+        self._saved = {k: os.environ.get(k) for k in ("GITHUB_TOKEN", "MY_GH_TOKEN")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        bm._SECRETS_LOADED = False          # 每用例重置一次性加载标志
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bm._SECRETS_LOADED = False
+        self.tmp.cleanup()
+
+    def _write(self, config_sources, secrets=None):
+        import json as _j
+
+        (self.root / "config.json").write_text(
+            _j.dumps({"sources": config_sources}), encoding="utf-8")
+        if secrets is not None:
+            (self.root / "data" / "secrets.local.json").write_text(
+                _j.dumps(secrets), encoding="utf-8")
+
+    def test_reads_token_from_secrets_file(self):
+        self._write([{"type": "github", "token": "", "token_env": "GITHUB_TOKEN"}],
+                    {"GITHUB_TOKEN": "ghp_from_file"})
+        self.assertEqual(bm._github_token(), "ghp_from_file")
+        self.assertEqual(os.environ.get("GITHUB_TOKEN"), "ghp_from_file",
+                         "secrets 注入后环境变量也应可见（供其他子流程复用）")
+
+    def test_config_token_wins_over_secrets(self):
+        self._write([{"type": "github", "token": "ghp_from_config",
+                      "token_env": "GITHUB_TOKEN"}],
+                    {"GITHUB_TOKEN": "ghp_from_file"})
+        self.assertEqual(bm._github_token(), "ghp_from_config")
+
+    def test_existing_env_is_not_overwritten(self):
+        os.environ["GITHUB_TOKEN"] = "ghp_from_env"
+        self._write([{"type": "github", "token": "", "token_env": "GITHUB_TOKEN"}],
+                    {"GITHUB_TOKEN": "ghp_from_file"})
+        self.assertEqual(bm._github_token(), "ghp_from_env")
+
+    def test_custom_token_env_name_needs_real_env(self):
+        """自定义 token_env 名（非三个规范 key）→ secrets 文件不注入，必须由真实环境变量提供。
+
+        data/secrets.local.json 只认 SECRET_KEYS = EMBEDDING_API_KEY / OCR_API_KEY / GITHUB_TOKEN；
+        config.json 里把 token_env 写成别的名字时，只能靠外部环境变量（如 CI 注入）。
+        """
+        self._write([{"type": "github", "token": "", "token_env": "MY_GH_TOKEN"}],
+                    {"MY_GH_TOKEN": "ghp_should_be_ignored"})
+        self.assertEqual(bm._github_token(), "")
+        os.environ["MY_GH_TOKEN"] = "ghp_from_env"
+        self.assertEqual(bm._github_token(), "ghp_from_env")
+
+    def test_no_token_returns_empty(self):
+        self._write([{"type": "github", "token": "", "token_env": "GITHUB_TOKEN"}])
+        self.assertEqual(bm._github_token(), "")
+
+    def test_broken_secrets_file_does_not_raise(self):
+        self._write([{"type": "github", "token": "", "token_env": "GITHUB_TOKEN"}])
+        (self.root / "data" / "secrets.local.json").write_text("{ not json", encoding="utf-8")
+        self.assertEqual(bm._github_token(), "")
 
 
 class _Resp:

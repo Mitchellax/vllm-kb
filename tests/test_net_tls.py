@@ -23,6 +23,8 @@ import os
 import ssl
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from vllm_kb.net import get_session
@@ -117,6 +119,88 @@ class TestInsecureTlsEndToEnd(unittest.TestCase):
         os.environ["REQUESTS_CA_BUNDLE"] = str(self.server_cert)
         r = get_session(False).get(self.url, timeout=10, proxies=_NO_PROXY)
         self.assertEqual(r.status_code, 200)
+
+
+class TestUrllibOpenerTlsEndToEnd(unittest.TestCase):
+    """urllib 侧（build_*_snapshots / build_release_calendar 用的 get_opener）同样的故障注入。
+
+    与 requests 版同源问题：urllib 走的是 `ssl.create_default_context()`，而本机 venv 的
+    OpenSSL 默认 CA 列表不足以验证外网站点（实测 26 张，缺 GitHub 的根）→ 全线
+    CERTIFICATE_VERIFY_FAILED。修复是给上下文叠加 certifi；这里用**本地自签服务器**
+    确认叠加不是"无脑信任一切"：自签证书依旧被拒（负对照），而 SSL_CERT_FILE 指向
+    服务器自身证书时能通过（证明环境变量确实驱动校验，负对照不空洞）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server_cert = _FIXTURES / "server.pem"
+        cls.server_key = _FIXTURES / "server.key"
+        cls.fault_ca = _FIXTURES / "fault_ca.pem"
+        if not (cls.server_cert.exists() and cls.server_key.exists()
+                and cls.fault_ca.exists()):
+            raise unittest.SkipTest("缺 TLS fixture（tests/fixtures/tls/）")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cls.server_cert), str(cls.server_key))
+        cls.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls.httpd.socket = ctx.wrap_socket(cls.httpd.socket, server_side=True)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.url = f"https://127.0.0.1:{cls.port}/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")}
+        os.environ.pop("REQUESTS_CA_BUNDLE", None)   # 只测 urllib 语境
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _open(self, insecure):
+        """绕开系统代理（本机注册表里配了 127.0.0.1:7892），只测 TLS 行为。"""
+        from vllm_kb.net import ssl_context
+
+        op = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ssl_context(insecure)),
+        )
+        return op.open(self.url, timeout=10)
+
+    def test_secure_still_rejects_self_signed(self):
+        """负对照：叠加 certifi ≠ 信任一切，自签证书依旧失败。"""
+        os.environ.pop("SSL_CERT_FILE", None)
+        with self.assertRaises(urllib.error.URLError):
+            self._open(False)
+
+    def test_secure_with_unrelated_ca_fails(self):
+        os.environ["SSL_CERT_FILE"] = str(self.fault_ca)
+        with self.assertRaises(urllib.error.URLError):
+            self._open(False)
+
+    def test_secure_with_server_ca_succeeds(self):
+        """环境变量确实驱动校验（防上一条空洞化）。"""
+        os.environ["SSL_CERT_FILE"] = str(self.server_cert)
+        with self._open(False) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_insecure_connects_self_signed(self):
+        os.environ["SSL_CERT_FILE"] = str(self.fault_ca)
+        with self._open(True) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_insecure_ignores_env_ca(self):
+        """insecure 时 SSL_CERT_FILE 不得让校验"复活"（与 requests 版同一回归点）。"""
+        os.environ["SSL_CERT_FILE"] = str(self.server_cert)
+        with self._open(True) as r:
+            self.assertEqual(r.status, 200)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,10 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；
    **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列）；
    **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
-   把用户截图转成文本 + 报错签名再检索；置信度取 OCR 模型自报单一来源，自报异常标记待人工复核）；
+   把用户截图转成文本 + 报错签名再检索；置信度取 OCR 模型自报单一来源，自报异常标记待人工复核；
+   **与模型视觉能力无关**，但需要"可读的本地路径"——DSH 默认路由未声明图像模态时，
+   粘贴的图片会在准入前被硬拒（agent 收不到任何东西），此时请用户存文件给路径即可，
+   详见 `skills/vllm-kb/SKILL.md`「图片/截图排查」）；
   入库自动打**文档级两级标签**（主题/领域类 + 具体作用类，确定性提取自文件名+内部标题，
   词典 `config.tags.registry` 驱动）——经 skill 的 `tags`/`context` 命令做**能力发现**
   （agent 先知道"知识库有哪些文档类别可提供知识"，如 HCCL 超时 → 命中 HCCL 领域 +
@@ -198,11 +201,14 @@ python scripts/maintain.py --insecure update
 > `NO_PROXY` 对**注册表探测到的代理同样生效**（`should_bypass_proxies`），即变成直连；
 > `NO_PROXY=quay.io` 会一并覆盖 `cdn01.quay.io` 等子域（quay 的 blob 由 302 跳到这些 CDN）。
 >
-> 另外两点实测差异：**urllib 走 Windows 证书库，requests 走 certifi**——同一个网络下
-> `build_release_calendar.py`（urllib）可能报 `CERTIFICATE_VERIFY_FAILED: unable to get
-> local issuer certificate` 而拉取链路（requests）正常，此时设
-> `SSL_CERT_FILE=<venv>/Lib/site-packages/certifi/cacert.pem` 即可，比 `--insecure` 稳妥；
-> 且**网络失败不会再把版本日历写空**——`build_release_calendar.py` 拉取失败直接报错退出、
+> 另外两点实测差异：**urllib（日历/快照/矩阵）与 requests（拉取链路）的证书来源曾不一致**——
+> requests 自带 certifi，urllib 走 `ssl.create_default_context()`，而某些 venv 的 OpenSSL 默认
+> CA 列表**不足以验证 GitHub/quay**（本机实测只有 26 张 CA，缺 GitHub 的根证书），于是同一个网络下
+> `build_release_calendar.py`（urllib）报 `CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+> certificate`，而拉取链路（requests）正常。**现在 urllib 侧自动叠加 certifi 根证书**
+> （`vllm_kb.net.ssl_context()`，26 → 138 张，只增不减），无需再设 `SSL_CERT_FILE`，
+> 也不必 `--insecure`；业务侧若要"只用内部根证书"，显式设 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`
+> 即可关掉叠加。且**网络失败不会再把版本日历写空**——`build_release_calendar.py` 拉取失败直接报错退出、
 > 保留上一版（抓不到 ≠ 没有 release），详见 `docs/USAGE.md` FAQ。日历被**查询期**
 > （`w_ver` 版本上界，改完立即生效）与**建图期**（release_tag，建图时固化）两处消费：
 > 补回日历后，只有"日历为空期间重建过图"才需要再重跑一次建图。
@@ -482,7 +488,8 @@ data/
 ├── tag_candidates_manual.json  # 标签候选人工审阅输出（可手动同步进 config.tags.registry）
 ├── checkpoints/            # 采集断点（续传）
 ├── sanitize_log.json       # 脱敏维护日志（被脱敏的原始 IP/路径，供调整白名单）
-├── secrets.local.json      # 本地密钥（审核工作台写入；AppConfig 自动加载，不入库）
+├── secrets.local.json      # 本地密钥（审核工作台写入；AppConfig 自动加载，不入库；
+│                           #   不经 AppConfig 的脚本——如配套矩阵——也会显式 load_secrets()）
 └── compatibility/          # 组件配套矩阵 + 分仓版本日历
     ├── vllm-ascend.json                        # 配套矩阵（vllm-ascend → vllm/cann/pytorch-ascend）
     └── release_calendar.{repo}.json            # 版本日历（--all-repos 按仓库分文件）
@@ -617,7 +624,7 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | `telemetry.py` / `feedback_model.py` | 行为遥测采集（logging middleware + 独立 telemetry 库）+ 后验置信度模型（Beta 后验 + 时间维度指数遗忘 + w_hist 三段式）——与 w_rel 正交不乘进，保护审计链 |
 | `review.py` / `secrets.py` | 审核队列（认证/存疑/删除+撤回）+ 外源文档管理（四层彻底删除）+ **资产注册表 `asset_registry`**（`asset_id → rel_path`，md/pdf/word/excel/**图片**统一批量注册，审核台据此反查与预览）+ 本地密钥文件 + 知识缺口展示 |
 | `ocr.py` | 签名导向 OCR：api(custom/openai 兼容)/paddle/none，可插拔；openai 模式置信度 = **模型自报单一来源**（自报异常 → 待人工复核，无启发式二次评分）；`OcrArtifact` 产物按 **sha256 + 引擎指纹**（provider/mode/model/提示词版本）幂等，阈值 `ocr_min_confidence` 不进指纹（调阈值只重判定不重跑 OCR） |
-| `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置） |
+| `net.py` | 网络统一入口：真实业务环境支持（跳过 SSL 校验 + GitHub/quay 镜像源覆盖，环境变量配置）；`ssl_context()` 给 urllib 上下文**叠加 certifi 根证书**（默认 CA 列表缺 GitHub 根证书的机器上修掉全线 `CERTIFICATE_VERIFY_FAILED`，显式配 `SSL_CERT_FILE` 时不叠加） |
 | `logging_setup.py` | 总日志：打屏 + 可选落盘分卷（RotatingFileHandler） |
 | `api.py` | 只读 FastAPI 检索服务组装入口（SQLite `mode=ro`、向量库只读包装、无写端点）；出口白名单 `_sanitize_extra`（`structure.tables` 只留数量、字符串字段 fail-closed 丢弃）；按检索域拆分路由：`api_meta`（辅助）/`api_community`（社区+文档）/`api_code`（本地代码仓）/`api_code_graph`（gh-puller 图谱，enabled 时注册）/`api_image`（请求期图片 OCR，有 image source 时注册） |
 

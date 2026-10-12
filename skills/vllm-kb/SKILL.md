@@ -426,8 +426,9 @@ python client.py context "vllm-ascend:0.23.0 HCCL 超时"   # 问题→标签匹
 ## 图片 / 截图排查（重要——看不到图就不要猜）
 
 用户常常直接贴一张截图（报错日志、官方文档说明、npu-smi 输出）。**图片内容不一定
-能进入你的上下文**：当前模型可能不具备图像输入能力，或图片未随消息传入——此时你
-只看到图片占位/附件标识而没有可用内容。
+能进入你的上下文**：当前会话路由的模型可能不具备图像输入能力。此时有两种表现——
+**要么你什么都收不到（整个提示词被拒，见下表 A），要么图片被替换成一行占位文本（见下表 B）**；
+无论哪种，你都**没有**可用图片内容，也**不要**指望会有图片本身传进来。
 
 **绝对禁止**：猜测或编造图片内容；声称"我看到图片里是……"；凭截图文件名或上下文
 推断报错文本后当作事实检索。
@@ -447,6 +448,42 @@ python client.py context "vllm-ascend:0.23.0 HCCL 超时"   # 问题→标签匹
 3. **`ocr` 报"OCR 服务不可用"或命令不存在**（服务端未配置 OCR / OCR 服务未启动）→
    **如实告知用户图片识别当前不可用**，回到第 1 步请用户贴文字。
    不要因为拿不到文字就跳过检索，也不要编造。
+
+**你实际会遇到的两种情况（DSH 侧的真实行为，别等一个不会来的占位符）**：
+
+| 情况 | 你看到什么 | 该怎么办 |
+|---|---|---|
+| **A. 提示词被硬拒**：会话路由的模型**明确声明**为纯文本（`inputModalities` 不含 image） | 你**什么都收不到**——图片在准入前就被拒（`session/attachment-invalid` / `MODEL_DOES_NOT_SUPPORT_IMAGES`，用户界面提示 `Model "<id>" does not support image input.`），这一轮根本没有生成 | 请用户**把图片存成文件并给出路径**（或放进工作区让用户用 `@` 引用），再走第 2 步 `client.py ocr <路径>`。此时连图片 sha 都没有，不要追问"图里写了什么" |
+| **B. 历史里的图片被投影成占位符**：会话中途从视觉模型切到纯文本模型（图片已在会话历史里） | 一条文本占位 `[image omitted because this model accepts text only; attachment sha256:xxxxxxxx]`（**不含路径**）；请求本身正常成功 | 同样请用户给路径。若图片是刚才由用户粘贴/工具读入的，可按 sha 前缀反查附件实体：`%USERPROFILE%\.dsh\attachments\v1\objects\<sha前2位>\<sha>`（内容寻址，同图只存一份，永不自动删除），拿到路径后喂给 `client.py ocr` |
+
+> 另一类占位 `[image omitted to fit request image limits; ...]` 是**请求图片配额**挤掉的老图，
+> 这种占位**带**只读路径，可直接拿来 OCR。
+
+**想让"用户贴图即可识别"更顺（DSH 侧配置，需用户操作）**：模型没在配置里声明模态时，
+DSH 就按纯文本对待（准入阶段直接拒绝，不会把附件存下来），所以贴图会被硬拒。
+若该模型确实具备图像能力，让用户改 `%USERPROFILE%\.dsh\settings.yaml`：
+
+```yaml
+llm-pi-ai:                       # 本机默认模型走这个网关适配器（provider=huawei-huoshan）
+  providers:
+    huawei-huoshan:
+      defaultInput: [text, image]        # 该 provider 下所有模型都声明支持图片
+      # 或只给单个模型声明（更保险）：
+      models:
+        - id: deepseek-v4.1-flash
+          name: DeepSeek V4.1 Flash
+          input: [text, image]           # per-model 模态声明
+```
+
+改完重开会话（不生效再重启 dsh）。声明后粘贴的图片会落盘到
+`<DSH_HOME>/attachments/v1/objects/...`，且请求里会给模型一句
+`Normalized copy (read-only; ...): "<路径>"`——**那条路径可以直接喂给 `client.py ocr`**。
+若模型其实不能吃图，**不要**这样声明（DSH 注释明说：过度声明会在回合已落库之后
+才被 provider 拒，会话会反复重试一个不可能成功的请求）。
+
+**本 skill 与模型视觉能力无关**：`client.py ocr` 只是把本地图片 base64 后 POST 给知识库
+服务端，服务端再调外接 OCR——纯文本模型照常能跑这条 HTTP 请求。真正的门槛只有两个：
+图片必须是**可读的本地路径**，且服务端**已配置 OCR**。
 
 **置信度与可信度**：
 

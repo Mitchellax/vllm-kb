@@ -6,7 +6,10 @@ insecure 因此失效（真实业务环境常设这两个变量过 MITM，实测
 修复为请求级 verify=False hook，本测试锁定该行为。
 """
 import os
+import ssl
+import sys
 import unittest
+import urllib.request
 from unittest import mock
 
 from vllm_kb.net import get_session, insecure_from_env
@@ -94,6 +97,123 @@ class TestGetSessionInsecure(unittest.TestCase):
         self.assertFalse(insecure_from_env())
         os.environ.pop("VLLM_KB_INSECURE", None)
         self.assertFalse(insecure_from_env())
+
+
+class TestUrllibSslContext(unittest.TestCase):
+    """urllib 侧证书上下文：默认叠加 certifi（修"同一机器上 requests 能跑、urllib 全废"）。
+
+    实测背景（本机 venv，OpenSSL 1.1.1t）：`ssl.create_default_context()` 只带 26 张 CA，
+    缺 GitHub/quay 的根 → 所有 urllib HTTPS 报
+    `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate (_ssl.c:1007)`，
+    表现为版本日历/代码快照/vllm 快照"全部 SSL 失败"；叠加 certifi（138 张）后正常。
+    """
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")}
+        os.environ.pop("SSL_CERT_FILE", None)
+        os.environ.pop("REQUESTS_CA_BUNDLE", None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    @staticmethod
+    def _certifi_calls(m):
+        """只挑"加载 certifi 根证书"的调用——create_default_context() 内部也会调
+        load_verify_locations（加载默认 cafile/capath，本机 26 张），不能混为一谈。
+        autospec 记录 C 方法时不一定带 self，故按"任一实参等于 certifi 路径"匹配。"""
+        import certifi
+
+        path = certifi.where()
+        out = []
+        for c in m.call_args_list:
+            vals = [str(a) for a in c.args] + [str(v) for v in c.kwargs.values()]
+            if path in vals:
+                out.append(c)
+        return out
+
+    def test_secure_adds_certifi_roots(self):
+        from vllm_kb.net import ssl_context
+
+        with mock.patch.object(ssl.SSLContext, "load_verify_locations",
+                               autospec=True) as m:
+            ssl_context(False)
+        self.assertEqual(len(self._certifi_calls(m)), 1,
+                         "默认校验路径必须叠加一次 certifi 根证书")
+
+    def test_secure_context_really_trusts_more_roots(self):
+        """不看 mock 的真实效果：叠加后 CA 数量必须比默认上下文多。"""
+        from vllm_kb.net import ssl_context
+
+        before = ssl.create_default_context().cert_store_stats().get("x509_ca", 0)
+        after = ssl_context(False).cert_store_stats().get("x509_ca", 0)
+        self.assertGreater(after, before,
+                           f"叠加 certifi 后 CA 应增多（{before} → {after}）")
+
+    def test_insecure_disables_verification_without_loading_ca(self):
+        from vllm_kb.net import ssl_context
+
+        with mock.patch.object(ssl.SSLContext, "load_verify_locations",
+                               autospec=True) as m:
+            ctx = ssl_context(True)
+        self.assertEqual(self._certifi_calls(m), [])
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(ctx.check_hostname)
+
+    def test_explicit_env_ca_is_respected(self):
+        """业务环境显式指定 CA（SSL_CERT_FILE / REQUESTS_CA_BUNDLE）时不叠加 certifi，
+        避免破坏"只用内部根证书"的既有配置。"""
+        from vllm_kb.net import ssl_context
+
+        for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+            os.environ[key] = "Z:/fake/ca.pem"
+            with mock.patch.object(ssl.SSLContext, "load_verify_locations",
+                                   autospec=True) as m:
+                ssl_context(False)
+            self.assertEqual(self._certifi_calls(m), [],
+                             f"{key} 存在时不应叠加 certifi")
+            os.environ.pop(key, None)
+
+    def test_missing_certifi_does_not_crash(self):
+        from vllm_kb.net import ssl_context
+
+        with mock.patch.dict(sys.modules, {"certifi": None}):
+            ctx = ssl_context(False)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_get_opener_uses_the_shared_context(self):
+        from vllm_kb.net import get_opener
+
+        op = get_opener(False)
+        https = [h for h in op.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+        self.assertEqual(len(https), 1)
+        with mock.patch.object(ssl.SSLContext, "load_verify_locations",
+                               autospec=True) as m:
+            https2 = [h for h in get_opener(True).handlers
+                      if isinstance(h, urllib.request.HTTPSHandler)]
+        self.assertEqual(self._certifi_calls(m), [], "insecure opener 不加载 CA")
+        self.assertEqual(https2[0]._context.verify_mode, ssl.CERT_NONE)
+
+
+class TestSnapshotsScriptsUseSharedOpener(unittest.TestCase):
+    """三个快照脚本的 _opener 必须复用共享上下文（否则各自的 build_opener() 又没 CA）。"""
+
+    def test_scripts_delegate_to_net(self):
+        import importlib
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        for name in ("build_vllm_snapshots", "build_code_snapshots",
+                     "build_fork_snapshots"):
+            mod = importlib.import_module(name)
+            with mock.patch("vllm_kb.net.get_opener", return_value="SENTINEL") as m:
+                self.assertEqual(mod._opener(True), "SENTINEL", name)
+                self.assertEqual(mod._opener(False), "SENTINEL", name)
+                self.assertEqual([c.args for c in m.call_args_list], [(True,), (False,)])
 
 
 if __name__ == "__main__":
