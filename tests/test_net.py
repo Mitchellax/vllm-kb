@@ -99,6 +99,120 @@ class TestGetSessionInsecure(unittest.TestCase):
         self.assertFalse(insecure_from_env())
 
 
+class TestProxyTlsFallback(unittest.TestCase):
+    """代理掐 TLS → 直连重试（实测回归，不触网）。
+
+    实测（本机注册表代理 127.0.0.1:7892）：quay.io `/v2/auth` 走代理 **3/3 失败**
+    （`SSLError: Max retries exceeded ... SSLEOFError(8, 'EOF occurred in violation of
+    protocol (_ssl.c:1007)')`，每次约 10s），**同一 URL 直连 3/3 成功**（0.8s）。
+    `--insecure` 治不了（失败在证书校验之前）；deploy 的配套矩阵因此整步失败
+    （日志：[maintain] ❌ 配套矩阵 退出码 1）。此处的兜底 = 请求级
+    `proxies={"http": None, "https": None}` 再试一次。
+    """
+
+    @staticmethod
+    def _patched_session(results, insecure=False):
+        """返回 (session, request mock)：底层 request 先抛错、再按 results 返回。"""
+        import requests
+
+        m = mock.MagicMock(side_effect=list(results))
+        with mock.patch.object(requests.Session, "request", m):
+            s = get_session(insecure)   # orig_request 绑定到被 patch 的类方法
+        return s, m
+
+    @staticmethod
+    def _proxy_on():
+        return mock.patch("requests.utils.getproxies",
+                          return_value={"http": "http://127.0.0.1:7892",
+                                        "https": "http://127.0.0.1:7892"})
+
+    def test_ssl_eof_falls_back_to_direct(self):
+        import contextlib
+        import io
+
+        import requests
+
+        err = requests.exceptions.SSLError(
+            "HTTPSConnectionPool(host='quay.io', port=443): Max retries exceeded ... "
+            "SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:1007)')")
+        s, m = self._patched_session([err, "DIRECT-OK"])
+        buf = io.StringIO()
+        with self._proxy_on(), contextlib.redirect_stdout(buf):
+            out = s.get("https://quay.io/v2/auth")
+        self.assertEqual(out, "DIRECT-OK")
+        self.assertEqual(m.call_count, 2)
+        self.assertNotIn("proxies", m.call_args_list[0].kwargs, "首次必须仍按环境代理策略")
+        self.assertEqual(m.call_args_list[1].kwargs.get("proxies"),
+                         {"http": None, "https": None}, "兜底那次必须显式直连")
+        self.assertIn("直连", buf.getvalue(), "兜底要留一行可查日志")
+
+    def test_proxy_error_also_falls_back(self):
+        import requests
+
+        err = requests.exceptions.ProxyError("Cannot connect to proxy")
+        s, m = self._patched_session([err, "OK"])
+        with self._proxy_on():
+            self.assertEqual(s.get("https://quay.io/v2/auth"), "OK")
+        self.assertEqual(m.call_count, 2)
+
+    def test_no_proxy_in_effect_is_not_retried(self):
+        """直连环境（无代理生效）里 SSL 失败就是真失败，不做无谓的二次请求。"""
+        import requests
+
+        err = requests.exceptions.SSLError("certificate verify failed")
+        s, m = self._patched_session([err])
+        with mock.patch("requests.utils.getproxies", return_value={}):
+            with self.assertRaises(requests.exceptions.SSLError):
+                s.get("https://quay.io/v2/auth")
+        self.assertEqual(m.call_count, 1)
+
+    def test_caller_bypassing_proxy_is_not_retried(self):
+        """调用方已显式直连还失败 → 不重复请求（避免把失败时间翻倍）。"""
+        import requests
+
+        err = requests.exceptions.SSLError("boom")
+        s, m = self._patched_session([err])
+        with self._proxy_on():
+            with self.assertRaises(requests.exceptions.SSLError):
+                s.get("https://quay.io/v2/auth",
+                      proxies={"http": None, "https": None})
+        self.assertEqual(m.call_count, 1)
+
+    def test_post_body_is_not_replayed(self):
+        """只对 GET/HEAD 兜底：非幂等请求重放请求体不安全。"""
+        import requests
+
+        err = requests.exceptions.SSLError("boom")
+        s, m = self._patched_session([err])
+        with self._proxy_on():
+            with self.assertRaises(requests.exceptions.SSLError):
+                s.post("https://quay.io/v2/auth", json={"a": 1})
+        self.assertEqual(m.call_count, 1)
+
+    def test_fallback_call_keeps_insecure_verify_false(self):
+        import requests
+
+        err = requests.exceptions.SSLError("boom")
+        s, m = self._patched_session([err, "OK"], insecure=True)
+        with self._proxy_on():
+            self.assertEqual(s.get("https://quay.io/v2/auth"), "OK")
+        self.assertIs(m.call_args_list[0].kwargs.get("verify"), False)
+        self.assertIs(m.call_args_list[1].kwargs.get("verify"), False,
+                      "兜底那次也要保持 verify=False")
+
+    def test_proxy_fallback_can_be_disabled(self):
+        import requests
+
+        err = requests.exceptions.SSLError("boom")
+        m = mock.MagicMock(side_effect=[err])
+        with mock.patch.object(requests.Session, "request", m):
+            s = get_session(False, proxy_fallback=False)
+        with self._proxy_on():
+            with self.assertRaises(requests.exceptions.SSLError):
+                s.get("https://quay.io/v2/auth")
+        self.assertEqual(m.call_count, 1)
+
+
 class TestUrllibSslContext(unittest.TestCase):
     """urllib 侧证书上下文：默认叠加 certifi（修"同一机器上 requests 能跑、urllib 全废"）。
 

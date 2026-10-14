@@ -1407,7 +1407,9 @@ A: 这是**传输层**故障（对端/代理把 TLS 隧道掐了），不是限�
    逐次打日志；单页体积可用 `graphql_page_size`/`comments_page_size` 调小（弱网推荐
    25/50），游标与页大小无关，**中途调小不会让断点失效**；
 4. 中断本身不丢进度：raw 与 checkpoint 每页落盘，重跑同一命令**从游标续传**；
-   想先把已拉数据入库再继续拉，用 `build_kb.py --skip-pull`。
+   想先把已拉数据入库再继续拉，用 `build_kb.py --skip-pull`；
+5. requests 侧另有一层**直连兜底**：`SSLError`/`ProxyError` 且确有代理生效时，自动改用请求级
+   直连重试一次（详见下一条 FAQ 的实测数据）。
 
 **Q: quay / GitHub 报 TLS 超时、`SSLEOFError`、`handshake operation timed out`，怎么办？**
 
@@ -1428,6 +1430,20 @@ python -c "import requests.utils; print(requests.utils.getproxies())"
 export NO_PROXY=quay.io,api.github.com,github.com,codeload.github.com,objects.githubusercontent.com
 # PowerShell: $env:NO_PROXY="quay.io,api.github.com,github.com,codeload.github.com"
 ```
+
+**requests 侧已自动直连兜底（部署时通常不用再手工设 `NO_PROXY`）**：`vllm_kb.net.get_session()`
+在遇到 `SSLError`/`ProxyError` 且**确实有代理生效**时，会用请求级
+`proxies={"http":None,"https":None}` **直连重试一次**（只对 GET/HEAD；调用方已显式直连、
+或环境里根本没有代理时不重复请求）。实测数据（本机代理 `127.0.0.1:7892`）：
+
+| 请求 | 走系统代理 | 直连 |
+|---|---|---|
+| `GET https://quay.io/v2/auth`（配套矩阵入口） | **3/3 失败**：`SSLError ... SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:1007)')`，每次约 10s | **3/3 成功**，0.8s |
+
+现场表现是 `[maintain] ❌ 配套矩阵 退出码 1`（该步骤非致命，但一次整跑约 85 分钟）。
+除这层兜底外，`get_quay_token` 自身也带 3 次重试预算（每次间隔 2s/4s，日志会打出
+`[quay] /v2/auth 失败（第 n/3 次）…`）。**超时类**（`handshake operation timed out`、读超时）
+不走这条快速兜底（要等满 timeout 才会失败），弱网下仍建议手工设 `NO_PROXY`。
 
 - `NO_PROXY` 对**注册表探测到的代理同样生效**（`should_bypass_proxies`）→ 变成直连；
 - `quay.io` 会一并覆盖 `cdn01.quay.io` / `cdn02` / `cdn03`（quay 的 manifest/blob 由 302

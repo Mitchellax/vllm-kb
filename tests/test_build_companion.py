@@ -50,6 +50,57 @@ class TestQuayBudget(unittest.TestCase):
                                             "tok", timeout=1, max_retries=0)
         self.assertEqual(out, {"env": [], "history": [], "layers": []})
 
+    def test_quay_token_has_retry_budget(self):
+        """`/v2/auth` 是矩阵入口，必须有重试预算（现场实测被代理掐 TLS 整步失败）。
+
+        日志：`[maintain] ❌ 配套矩阵 退出码 1` + `SSLEOFError(8, 'EOF occurred in violation
+        of protocol')`，发生在 `get_quay_token`；一次整跑约 85 分钟，不该在第一步判死。"""
+        sig = inspect.signature(bm.get_quay_token)
+        self.assertGreaterEqual(sig.parameters["max_retries"].default, 3)
+        self.assertGreaterEqual(sig.parameters["timeout"].default, 30)
+
+    def test_quay_token_retries_then_succeeds(self):
+        """前两次失败、第三次成功 → 返回 token（不抛）。"""
+        import requests
+
+        calls = {"n": 0}
+
+        class FakeResp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"token": "tok3"}
+
+        class FakeSession:
+            def get(self, *a, **k):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise requests.exceptions.SSLError("EOF occurred in violation of protocol")
+                return FakeResp()
+
+        with mock.patch("vllm_kb.net.get_session", return_value=FakeSession()):
+            with mock.patch("time.sleep"):
+                self.assertEqual(bm.get_quay_token(max_retries=3), "tok3")
+        self.assertEqual(calls["n"], 3)
+
+    def test_quay_token_exhausted_raises_with_cause(self):
+        """用尽预算后要抛出来（并由 maintain 侧降级），且带上最后一次的真实原因。"""
+        import requests
+
+        class FakeSession:
+            def get(self, *a, **k):
+                raise requests.exceptions.SSLError("SSLEOFError(8, 'EOF ...')")
+
+        with mock.patch("vllm_kb.net.get_session", return_value=FakeSession()):
+            with mock.patch("time.sleep"):
+                with self.assertRaises(RuntimeError) as cm:
+                    bm.get_quay_token(max_retries=2)
+        self.assertIn("SSLError", str(cm.exception))
+        self.assertIn("SSLEOFError", str(cm.exception))
+
 
 class TestGithubTokenSources(unittest.TestCase):
     """token 来源：data/secrets.local.json → config.json → 环境变量（用户实测踩到的缺口）。

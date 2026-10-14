@@ -137,16 +137,36 @@ def _quay_v2(qbase: str) -> str:
     return f"{qbase.rstrip('/')}/v2/ascend/vllm-ascend"
 
 
-def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io") -> str:
+def get_quay_token(insecure: bool = False, qbase: str = "https://quay.io",
+                   timeout: int = 30, max_retries: int = 3) -> str:
+    """拉取 quay pull token（整个矩阵的入口，失败即整步失败）。
+
+    默认重试 3 次：实测这一步的失败是"注册表代理掐 TLS"（`SSLError/SSLEOFError`，
+    每次约 10s；`get_session` 内部已带"直连重试"兜底）与瞬时抖动。矩阵一次整跑约 85 分钟，
+    不该在第一步就把整步判死（该步骤在 deploy 里非致命，但重跑成本高）。
+    """
     from vllm_kb.net import get_session, parse_json
 
-    r = get_session(insecure).get(
-        f"{qbase.rstrip('/')}/v2/auth",
-        params={"service": "quay.io", "scope": "repository:ascend/vllm-ascend:pull"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return parse_json(r, "quay token 响应")["token"]
+    last: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = get_session(insecure).get(
+                f"{qbase.rstrip('/')}/v2/auth",
+                params={"service": "quay.io", "scope": "repository:ascend/vllm-ascend:pull"},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return parse_json(r, "quay token 响应")["token"]
+        except Exception as e:   # noqa: BLE001 —— 网络类失败一律重试，原因原样带出
+            last = e
+            if attempt < max_retries:
+                wait = 2 * attempt
+                print(f"[quay] /v2/auth 失败（第 {attempt}/{max_retries} 次）："
+                      f"{type(e).__name__}: {str(e)[:100]}；{wait}s 后重试", flush=True)
+                time.sleep(wait)
+    raise RuntimeError(
+        f"quay /v2/auth 连续 {max_retries} 次失败（最后一次 {type(last).__name__}: {last}）"
+    ) from last
 
 
 def fetch_image_config(tag_info: dict, token: str, timeout: int = 60, max_retries: int = 4,

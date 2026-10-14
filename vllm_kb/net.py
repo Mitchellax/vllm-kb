@@ -29,7 +29,23 @@ def insecure_from_env() -> bool:
     return os.environ.get("VLLM_KB_INSECURE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def get_session(insecure: bool) -> object:
+def _proxies_in_effect(kwargs: dict) -> bool:
+    """该请求是否真的会走代理（请求级 proxies 优先，其次环境/注册表探测）。"""
+    p = kwargs.get("proxies")
+    if isinstance(p, dict):
+        return bool(p.get("http") or p.get("https") or p.get("all"))
+    if p is not None:
+        return True
+    try:
+        import requests
+
+        env = requests.utils.getproxies()
+    except Exception:
+        env = {}
+    return bool(env.get("http") or env.get("https") or env.get("all"))
+
+
+def get_session(insecure: bool, proxy_fallback: bool = True) -> object:
     """返回 requests.Session（insecure 时跳过 SSL 证书校验 + 抑制告警）。
 
     insecure 实现为 **请求级 verify=False hook**（包装 session.request 缺省注入），
@@ -40,6 +56,17 @@ def get_session(insecure: bool) -> object:
     （requests 2.34 实测复现；真实业务环境常设这两个变量让其他工具过 MITM）。
     请求级显式 False 不进覆盖分支，merge_setting 直接取 False——与
     requests.get(verify=False) 行为严格一致。trust_env 保持 True（代理不受影响）。
+
+    **代理掐 TLS 时的直连兜底**（proxy_fallback=True，默认开）：本地代理（Windows
+    注册表探测到的，如 127.0.0.1:7892）会在 CONNECT 隧道之后直接掐断 TLS，表现为
+    `requests.exceptions.SSLError: ... SSLEOFError(8, 'EOF occurred in violation of
+    protocol')`；**同一 URL 直连正常**——实测 quay.io/v2/auth 走代理 3/3 失败（每次 10s）、
+    直连 3/3 成功（0.8s）。`--insecure` 治不了这种（失败发生在证书校验之前），
+    显式设 HTTP(S)_PROXY 也是空操作（requests 仍按环境/注册表走代理）。所以这里在
+    SSLError / ProxyError 且**确实有代理生效**时，用请求级
+    `proxies={"http": None, "https": None}` **直连重试一次**（只对 GET/HEAD，避免重放请求体）。
+    顺序始终是"先按现有代理策略、再退直连"，不会改变有代理才能出网的环境（那种直连也失败，
+    抛的是直连那次异常，两个原因都可查）。
     """
     import requests
 
@@ -47,15 +74,28 @@ def get_session(insecure: bool) -> object:
     if insecure:
         import urllib3
 
-        orig_request = s.request
-
-        def _request(method, url, **kwargs):
-            kwargs.setdefault("verify", False)
-            return orig_request(method, url, **kwargs)
-
-        s.request = _request  # 实例属性遮蔽；get/post/redirect 均经此入口
-        s.verify = False      # 双保险（请求级缺省时 merge_setting 的 session 级值）
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        s.verify = False      # 双保险（请求级 verify 缺省时 merge_setting 的 session 级值）
+
+    orig_request = s.request
+
+    def _request(method, url, **kwargs):
+        if insecure:
+            kwargs.setdefault("verify", False)
+        try:
+            return orig_request(method, url, **kwargs)
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as e:
+            if not proxy_fallback or method.upper() not in ("GET", "HEAD"):
+                raise
+            if not _proxies_in_effect(kwargs):
+                raise
+            print(f"[net] {url} 经代理失败（{type(e).__name__}: {str(e)[:90]}），改为直连重试…",
+                  flush=True)
+            direct = dict(kwargs)
+            direct["proxies"] = {"http": None, "https": None}
+            return orig_request(method, url, **direct)
+
+    s.request = _request  # 实例属性遮蔽；get/post/redirect 均经此入口
     return s
 
 

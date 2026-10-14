@@ -188,8 +188,16 @@ python scripts/maintain.py --insecure update
 > `requests` 自动探测（`trust_env=True`，`getproxies()` 直接返回它，**不需要任何环境变量**）。
 > 实测本地代理（如 `127.0.0.1:7892`）会把 `quay.io` 的 TLS 握手卡死
 > （`_ssl.c:990 handshake operation timed out`，`--insecure` 无效——失败发生在证书校验之前），
-> 并间歇性把 GitHub 掐成 `SSLEOFError`。此时**显式设同名 `HTTP_PROXY`/`HTTPS_PROXY` 是空操作**
-> （同一个地址），正解是**绕开**它：
+> 并间歇性把 GitHub/quay 掐成 `SSLEOFError`。此时**显式设同名 `HTTP_PROXY`/`HTTPS_PROXY` 是空操作**
+> （同一个地址）。
+>
+> **现在 requests 侧会自动直连兜底，不必再手工绕过**：`SSLError`/`ProxyError` 且确实有代理生效时，
+> `vllm_kb.net.get_session()` 会用请求级 `proxies={"http":None,"https":None}` **直连重试一次**
+> （只对 GET/HEAD）。实测 quay.io `/v2/auth` 走代理 **3/3 失败**（`SSLEOFError`，每次约 10s）、
+> **直连 3/3 成功**（0.8s）——所以这是确定性的救命路径：现场日志
+> `[maintain] ❌ 配套矩阵 退出码 1` 的那个 `get_quay_token` 现在既有这一层兜底，入口本身也带
+> 3 次重试预算（整步实测跑 85 分钟，不该在第一步判死）。若是**连接/握手超时**类（不会快速失败、
+> 要等满 timeout），仍建议手工绕过：
 >
 > ```bash
 > # Linux/macOS
@@ -215,7 +223,8 @@ python scripts/maintain.py --insecure update
 >
 > **长跑要注意 quay 令牌会过期**：pull token 是 JWT，实测有效期 3600 秒，而配套矩阵
 > 整步实测要跑 5149 秒 → 后半段 `blobs` 请求会集体 401（看着像"这些 tag 没有 config"）。
-> 现在收到 401 会自动换新令牌并当场重发，见 `docs/USAGE.md` FAQ。
+> 现在收到 401 会自动换新令牌并当场重发，见 `docs/USAGE.md` FAQ；
+> 入口的 `/v2/auth` 则带 3 次重试 + 直连兜底（见上）。
 > 弱网下**多跑几轮 deploy 即可**：矩阵写回保留已有非空字段，缺口会被逐轮填上（不回退）。
 
 ### 定时自动更新（每晚停服务 → 增量更新 → 重启）

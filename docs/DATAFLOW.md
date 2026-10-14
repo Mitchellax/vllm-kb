@@ -207,9 +207,18 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 > `127.0.0.1:7892` 这类本地代理会把 `quay.io` 的 TLS 握手**卡死**（`_ssl.c:990 handshake
 > operation timed out`，`--insecure` 也无效，因为失败在证书校验之前），并间歇性把 GitHub
 > 掐成 `SSLEOFError`。此时**显式设同名 `HTTP_PROXY`/`HTTPS_PROXY` 是空操作**（同一个地址），
-> 正解是绕过：`NO_PROXY=quay.io,api.github.com,github.com`（`should_bypass_proxies` 对
+> 绕过方式：`NO_PROXY=quay.io,api.github.com,github.com`（`should_bypass_proxies` 对
 > 注册表代理同样生效 → 直连）。`fetch_tags` 在检测到生效代理时会把地址和这条绕过提示
 > 一并打进失败日志，省一次排查。
+>
+> **requests 侧已自动直连兜底**：`vllm_kb.net.get_session()` 包装 `session.request`，
+> 遇到 `SSLError`/`ProxyError` 且**确实有代理生效**时改为请求级
+> `proxies={"http":None,"https":None}` **直连重试一次**（只 GET/HEAD——不重放请求体；
+> 调用方已显式直连或环境无代理时不重复请求，`proxy_fallback=False` 可整体关掉）。
+> 触发条件是**快速失败**的 SSL/代理错误：实测 quay `/v2/auth` 走代理 3/3 失败
+> （`SSLEOFError`，每次约 10s）、直连 3/3 成功（0.8s）；**超时类不受益**（要等满 timeout）。
+> 配套矩阵入口 `get_quay_token` 另带 3 次重试预算（间隔 2s/4s，失败按次打日志，
+> 用尽后抛 `RuntimeError` 带最后一次原因）——这一步失败会让整步（实测 85 分钟）白跑。
 >
 > **令牌有效期**：quay 的 pull token 是 JWT，实测 `exp - iat = 3600` 秒；而一次完整矩阵
 > 实测跑 5149 秒 → **必然**跨过有效期，此后所有 `{v2}/blobs/...` 请求返回 401，日志表现为
