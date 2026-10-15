@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from .config import PROJECT_ROOT, SourceCfg
 from .doc_kinds import BY_SOURCE, DocKind
 # 表格渲染全库唯一实现在 html_convert（html 来源主用；pdf/word 别名引用，调用点不变）
+from . import html_convert
 from .html_convert import table_to_markdown as _table_to_markdown
 from .models import KbDocument
 from .source_files import DiscoverSpec, Discovery, discover
@@ -198,6 +199,107 @@ class BaseSource(ABC):
                                     f"{art.text.strip()}")
         return art.evidence(), ""
 
+    # ---------- 正文图片收集（md/html 通用：资产化 + 不透明占位 + OCR 注入） ----------
+
+    def _resolve_images(self, md_path: Path, text: str, *,
+                        assets_only: bool = False) -> tuple[str, list[dict], list[tuple]]:
+        """扫描正文图片引用：本地/base64 资产化（**不透明占位**替换引用，原引用只进 evidence）；
+        URL 引用标记 remote（V1 不下载）；解析失败标记 unresolved。
+        返回 (占位化后的 body, evidence 列表, 新增资产 [(rel, sha, "image", size)])。
+
+        形态解析与代码感知在 `md_images.py`：行内（含空格/尖括号/括号/跨行）、引用式
+        （含定义行去路径）、HTML `<img>` 均支持；**任何未识别或未闭合的图片语法也一律占位**，
+        保证"正文与 canonical 不含服务器路径"对任意输入都成立。
+        md 与 html 来源共用（html 的 src 由 html_convert 原样保留后交到这里）。
+
+        assets_only=True（imports 缺失的回退模式）：相对路径基准 assets/<kind> 是**扁平副本**，
+        原相对结构已丢失——先按文档同目录找，未命中再按**文件名**到 assets/images 尽力反查；
+        仍未命中的照常占位（不记 source_ref），所以回退模式同样不泄漏路径。
+
+        安全约束：正文与 canonical **不含任何服务器路径**——evidence 只记 asset_id/sha256
+        （管理员侧经 asset_registry 映射回文件），unresolved 不保留原文引用（可能是路径形态）。
+
+        **图片 OCR 文本注入**：本地/base64 图片资产化后立即走 OCR（ocr.json 幂等缓存）；
+        高置信文本追加在占位符之后随正文进 FTS + 向量，低置信/自报异常不注入（只留签名线索）。
+        """
+        from .md_images import rewrite_images
+
+        evidence: list[dict] = []
+        registered: list[tuple] = []
+        images_dir = self.resolve("data/assets/images")
+
+        def _reg(rel: str, sha: str, path: Path) -> None:
+            """登记图片资产（审核侧反查路径/预览；不进 canonical）。"""
+            registered.append(_asset_entry(rel, sha, "image", path))
+
+        def resolve(ref) -> str:
+            alt = ref.alt or ""
+            placeholder = f"[图片:{alt}]" if alt.strip() else "[图片]"
+            dest = (ref.dest or "").strip()
+            ev: dict = {"kind": "unresolved", "ocr": None}
+            if not dest:
+                evidence.append(ev)
+                return placeholder
+            if dest.startswith(("http://", "https://")):
+                ev = {"kind": "remote", "source_ref": dest, "ocr": None}
+                evidence.append(ev)
+                return placeholder
+            if dest.startswith("data:"):
+                bm = _BASE64_IMG_RE.match(dest)
+                if not bm:
+                    evidence.append(ev)
+                    return placeholder
+                ext = _IMG_EXT.get(bm.group(1).lower(), "png")
+                try:
+                    data = base64.b64decode(bm.group(2))
+                except Exception:
+                    evidence.append(ev)
+                    return placeholder
+                b64_sha = hashlib.sha256(data).hexdigest()
+                # 内容寻址命名：同图只落一份（跨文档自动去重），且不含文档文件名 → 同名文档也不撞
+                name = f"img_{b64_sha[:16]}.{ext}"
+                target = images_dir / name
+                if not target.is_file() or _sha256(target) != b64_sha:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                sha = b64_sha
+                ev.update({"kind": "base64", "asset_id": sha[:16], "sha256": sha})
+                _reg(f"assets/images/{name}", sha, target)
+                ocr_ev, inject = self._ocr_artifact_for(target, sha, f"assets/images/{name}")
+                if ocr_ev is not None:
+                    ev["ocr"] = ocr_ev
+                evidence.append(ev)
+                return placeholder + inject
+            # 本地路径（file:// 剥前缀；相对路径以文档所在目录为基准）
+            local = dest[len("file://"):] if dest.startswith("file://") else dest
+            p = Path(local)
+            if not p.is_absolute():
+                p = md_path.parent / p
+            try:
+                p = p.resolve()
+            except OSError:
+                evidence.append(ev)
+                return placeholder
+            if not p.is_file() and assets_only:
+                # 回退模式：相对结构已丢失，按文件名到资产层尽力反查（命中即视为该图）
+                cand = images_dir / Path(local).name
+                if cand.is_file():
+                    p = cand.resolve()
+            if not p.is_file():   # 目录/不存在一律 unresolved（不记 source_ref，避免路径形态进库）
+                evidence.append(ev)
+                return placeholder
+            rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
+            ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
+            _reg(rel, sha, self.resolve(rel))
+            ocr_ev, inject = self._ocr_artifact_for(self.resolve(rel), sha, rel)
+            if ocr_ev is not None:
+                ev["ocr"] = ocr_ev
+            evidence.append(ev)
+            return placeholder + inject
+
+        body, _refs = rewrite_images(text, resolve)
+        return body, evidence, registered
+
     def _materialize_doc_asset(self, p: Path, sha: Optional[str] = None) -> tuple:
         """把**文档原件**复制进资产层并返回 asset_registry 条目。
 
@@ -230,7 +332,7 @@ class BaseSource(ABC):
     # ---------------- 内部数据脱敏（config.sanitize 控制启用范围） ----------------
 
     # 默认启用脱敏的业务来源（github 公开数据不脱敏；PDF 手册默认不启用，config 加 "pdf" 即开）
-    DEFAULT_SANITIZE_SOURCES = ("excel", "markdown", "word")
+    DEFAULT_SANITIZE_SOURCES = ("excel", "html", "markdown", "word")
 
     def sanitize_enabled(self) -> bool:
         """该来源是否启用脱敏（config.sanitize.sources 控制；None=默认业务来源，[]=全关）。"""
@@ -435,106 +537,6 @@ class MarkdownSource(BaseSource):
         self._register_asset_mappings(doc_assets + img_assets)
         self.save_sanitize_log(collector)
         return docs
-
-    # ---------- Markdown 图片收集（确保图片与 md 一起入库） ----------
-
-    def _resolve_images(self, md_path: Path, text: str, *,
-                        assets_only: bool = False) -> tuple[str, list[dict], list[tuple]]:
-        """扫描正文图片引用：本地/base64 资产化（**不透明占位**替换引用，原引用只进 evidence）；
-        URL 引用标记 remote（V1 不下载）；解析失败标记 unresolved。
-        返回 (占位化后的 body, evidence 列表, 新增资产 [(rel, sha, "image", size)])。
-
-        形态解析与代码感知在 `md_images.py`：行内（含空格/尖括号/括号/跨行）、引用式
-        （含定义行去路径）、HTML `<img>` 均支持；**任何未识别或未闭合的图片语法也一律占位**，
-        保证"正文与 canonical 不含服务器路径"对任意输入都成立。
-
-        assets_only=True（imports 缺失的回退模式）：相对路径基准 assets/md 是**扁平副本**，
-        原相对结构已丢失——先按 md 同目录找，未命中再按**文件名**到 assets/images 尽力反查；
-        仍未命中的照常占位（不记 source_ref），所以回退模式同样不泄漏路径。
-
-        安全约束：正文与 canonical **不含任何服务器路径**——evidence 只记 asset_id/sha256
-        （管理员侧经 asset_registry 映射回文件），unresolved 不保留原文引用（可能是路径形态）。
-
-        **图片 OCR 文本注入**：本地/base64 图片资产化后立即走 OCR（ocr.json 幂等缓存）；
-        高置信文本追加在占位符之后随正文进 FTS + 向量，低置信/自报异常不注入（只留签名线索）。
-        """
-        from .md_images import rewrite_images
-
-        evidence: list[dict] = []
-        registered: list[tuple] = []
-        images_dir = self.resolve("data/assets/images")
-
-        def _reg(rel: str, sha: str, path: Path) -> None:
-            """登记图片资产（审核侧反查路径/预览；不进 canonical）。"""
-            registered.append(_asset_entry(rel, sha, "image", path))
-
-        def resolve(ref) -> str:
-            alt = ref.alt or ""
-            placeholder = f"[图片:{alt}]" if alt.strip() else "[图片]"
-            dest = (ref.dest or "").strip()
-            ev: dict = {"kind": "unresolved", "ocr": None}
-            if not dest:
-                evidence.append(ev)
-                return placeholder
-            if dest.startswith(("http://", "https://")):
-                ev = {"kind": "remote", "source_ref": dest, "ocr": None}
-                evidence.append(ev)
-                return placeholder
-            if dest.startswith("data:"):
-                bm = _BASE64_IMG_RE.match(dest)
-                if not bm:
-                    evidence.append(ev)
-                    return placeholder
-                ext = _IMG_EXT.get(bm.group(1).lower(), "png")
-                try:
-                    data = base64.b64decode(bm.group(2))
-                except Exception:
-                    evidence.append(ev)
-                    return placeholder
-                b64_sha = hashlib.sha256(data).hexdigest()
-                # 内容寻址命名：同图只落一份（跨文档自动去重），且不含 md 文件名 → 同名 md 也不撞
-                name = f"img_{b64_sha[:16]}.{ext}"
-                target = images_dir / name
-                if not target.is_file() or _sha256(target) != b64_sha:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(data)
-                sha = b64_sha
-                ev.update({"kind": "base64", "asset_id": sha[:16], "sha256": sha})
-                _reg(f"assets/images/{name}", sha, target)
-                ocr_ev, inject = self._ocr_artifact_for(target, sha, f"assets/images/{name}")
-                if ocr_ev is not None:
-                    ev["ocr"] = ocr_ev
-                evidence.append(ev)
-                return placeholder + inject
-            # 本地路径（file:// 剥前缀；相对路径以 md 目录为基准）
-            local = dest[len("file://"):] if dest.startswith("file://") else dest
-            p = Path(local)
-            if not p.is_absolute():
-                p = md_path.parent / p
-            try:
-                p = p.resolve()
-            except OSError:
-                evidence.append(ev)
-                return placeholder
-            if not p.is_file() and assets_only:
-                # 回退模式：相对结构已丢失，按文件名到资产层尽力反查（命中即视为该图）
-                cand = images_dir / Path(local).name
-                if cand.is_file():
-                    p = cand.resolve()
-            if not p.is_file():   # 目录/不存在一律 unresolved（不记 source_ref，避免路径形态进库）
-                evidence.append(ev)
-                return placeholder
-            rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
-            ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
-            _reg(rel, sha, self.resolve(rel))
-            ocr_ev, inject = self._ocr_artifact_for(self.resolve(rel), sha, rel)
-            if ocr_ev is not None:
-                ev["ocr"] = ocr_ev
-            evidence.append(ev)
-            return placeholder + inject
-
-        body, _refs = rewrite_images(text, resolve)
-        return body, evidence, registered
 
 
 class PdfSource(BaseSource):
@@ -1836,6 +1838,254 @@ class WordSource(BaseSource):
         )
 
 
+class HtmlSource(BaseSource):
+    """网页案例来源（浏览器"另存为"的 .html/.htm 单文件；V1 不联网抓取）。
+
+    配置示例：
+        {"id": "webpages", "type": "html", "path": "data/imports/html", "enabled": true}
+
+    - pull()：扫描配置 path 下 *.html/*.htm，复制到 data/assets/html/（不可变层）；
+    - canonicalize()：html_convert 混合引擎（表格收割 → trafilatura 正文）→ Markdown：
+      * 表格**抽取前收割**：内容表 → 结构化 rows 写 data/parsed/html/{asset_id}.tables.json
+        （建图抽错误码消费；graph 按 doc_kinds.asset_sub 寻径），正文以 pipe table 补回
+        （渲染单一实现 html_convert.table_to_markdown，pdf/word 同源）；
+      * 图片 src 原样保留 → `_resolve_images` 统一资产化/占位/OCR（本地相对路径以 html
+        所在目录为基准、data:URI 落资产、远程只留占位——与 markdown 来源同一通路）；
+      * 浏览器 saved-from-url 注释 → KbDocument.url（phase2 设计"保留 URL"）；
+      * 页面骨架（nav/aside/footer）先于引擎修剪；trafilatura 失败 → baseline 兜底。
+    - verification=unverified（与 md/word 统一路径：人工文档先入库，审核台补标）；
+    - 脱敏默认启用（与 md/word/excel 同组：内网 wiki 保存页含内部信息）；
+    - 解析中间产物缓存 parsed/html/{asset_id}.extract.json（schema 位，与 pdf/word 同构：
+      缓存只有收割补表后的正文/表格元数据，图片占位解析与标签每轮重算）。
+
+    **V1 边界**：只认本地保存的 .html/.htm（远程图片不下载只留占位）；.mht/.mhtml/.url
+    明确跳过并提示另存；trafilatura 正文不含 markdown 标题 → chunk 无 section（已知代价，
+    chunking 有段落级兜底切块，见 html_convert 模块说明）。
+    """
+
+    type = "html"
+    kind = BY_SOURCE["html"]
+    # 本来源**不支持**、但用户很可能放进来的格式：只用于给出指向性提示
+    _LEGACY_SUFFIXES = ("*.mht", "*.mhtml", "*.url", "*.webarchive")
+    _EXTRACT_SCHEMA = 1
+
+    def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
+                 app_cfg: Optional["AppConfig"] = None):
+        super().__init__(cfg, project_root, app_cfg=app_cfg)
+        self.import_dir = self.resolve(self.cfg.get("path", f"data/imports/{self.id}"))
+
+    def _assets_dir(self) -> Path:
+        return self.resolve(f"data/assets/{self.kind.asset_sub}")
+
+    def _parsed_dir(self) -> Path:
+        return self.resolve("data/parsed/html")
+
+    def _html_files(self) -> list[Path]:
+        """导入路径下的网页文件（path 可为文件或目录）。"""
+        p = self.import_dir
+        if p.is_dir():
+            out: list[Path] = []
+            for pat in self.kind.patterns:
+                out.extend(sorted(p.rglob(pat)))
+            return out
+        if p.is_file() and p.suffix.lower() in self.kind.suffixes:
+            return [p]
+        return []
+
+    def _legacy_hint(self) -> str:
+        """目录里只有本来源不支持的格式时给出**指向性**提示（与 WordSource 同构）。"""
+        if not self.import_dir.is_dir():
+            return ""
+        found: list[str] = []
+        for pat in self._LEGACY_SUFFIXES:
+            found.extend(sorted(p.name for p in self.import_dir.rglob(pat)))
+        if not found:
+            return ""
+        shown = ", ".join(found[:5]) + (" …" if len(found) > 5 else "")
+        return (f"；另检测到 {len(found)} 个**单文件归档/快捷方式**（{shown}）——本来源只认"
+                f"另存为的 .html/.htm 网页文件（.mht 请在浏览器里另存为「网页，仅 HTML」）")
+
+    def pull(self, max_issues: Optional[int] = None) -> int:
+        """扫描导入路径，把网页复制到资产层（幂等）。返回新增条数。"""
+        files = self._html_files()
+        if not files:
+            print(f"[sources:{self.id}] 导入路径无网页文件: {self.import_dir}"
+                  f"{self._legacy_hint()}")
+            return 0
+        added = 0
+        registered: list[tuple] = []
+        for f in files:
+            rel, sha, copied = _copy_asset(f, self.resolve("data/assets"),
+                                           self.kind.asset_sub)
+            registered.append(_asset_entry(rel, sha, self.kind.source_type,
+                                           self.resolve(rel)))
+            if copied:
+                added += 1
+        self._register_asset_mappings(registered)
+        print(f"[sources:{self.id}] 资产层扫描完成（新增 {added} 个 html）")
+        return added
+
+    def canonicalize(self) -> list[KbDocument]:
+        """从原始网页再生 KbDocument（每篇一个，body=Markdown，正文不含任何服务器路径）。
+
+        - **优先读 imports 源文件**：图片相对路径以 html 所在目录为基准解析
+          （复制到 assets 后相对路径失锚）；imports 被清空时回退 assets 副本；
+        - 缺依赖预检：lxml 未安装 → 整来源跳过（与 pdf/word 缺依赖同一姿态）；
+          trafilatura 未安装 → 醒目告警后用 lxml 全文兜底（表格收割不受影响）；
+        - **后置脱敏**：body/title 以**原文入库**（原文检索）；仅按 config.sanitize 扫描
+          会被脱敏的 IP/路径落盘 sanitize_log.json（出口脱敏由 serve_api 统一做）；
+        - evidence 记录图片清单（供审核台与图文互证消费）。
+        """
+        from .sanitize import collect_sanitize_hits
+
+        try:
+            import lxml  # noqa: F401
+        except ImportError as e:
+            print(f"[sources:{self.id}] 未安装 lxml：pip install trafilatura（{e}）"
+                  f"——html 来源需要它解析页面，本轮跳过全部网页")
+            return []
+        try:
+            import trafilatura  # noqa: F401
+        except ImportError as e:
+            print(f"[sources:{self.id}] 未安装 trafilatura：pip install trafilatura（{e}）"
+                  f"——将用 lxml 全文兜底（无去噪；表格收割不受影响）")
+
+        docs: list[KbDocument] = []
+        registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
+        sanitize_on, keep_paths, keep_ips = self.sanitize_params()
+        collector: dict = {}           # 会被脱敏的原始 IP/路径（落盘维护，不进库）
+        doc_assets: list[tuple] = []   # html 原件资产（canonicalize 也落资产层）
+        img_assets: list[tuple] = []   # 图片资产（末尾统一注册到 asset_registry）
+        # 发现 + 回退告警 + 同名消歧告警统一由 source_files.discover 负责
+        found = _discover_for(self, self.kind, self.import_dir)
+        pages = found.files
+        total = len(pages)
+        start_ts = time.time()
+        if total:
+            print(f"[sources:{self.id}] 解析 {total} 个网页 …", flush=True)
+        for f in pages:
+            p, from_imports, stem = f.path, f.from_imports, f.stem
+            try:
+                raw = p.read_bytes()
+            except OSError as e:
+                print(f"[sources:{self.id}] 跳过 {p.name}: {e}")
+                continue
+            parsed, cached = self._parse_html(p, raw)
+            if parsed is None:
+                continue
+            sha, asset_id = parsed["sha256"], parsed["asset_id"]
+            body, evidence, registered = self._resolve_images(
+                p, parsed["body"], assets_only=not from_imports)
+            img_assets.extend(registered)
+            if sanitize_on:
+                ips, paths = collect_sanitize_hits(body, keep_paths, keep_ips)
+                if ips:
+                    collector.setdefault("ips", set()).update(ips)
+                if paths:
+                    collector.setdefault("paths", set()).update(paths)
+            sid = f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir())
+            doc_assets.append(self._materialize_doc_asset(p, sha))
+            quality: dict[str, Any] = {
+                "text_source": "text_layer",
+                "parsed_with": f"html_convert({parsed['extractor']})",
+                "charset": parsed.get("charset", ""),
+                "source_mode": "imports" if from_imports else "assets_fallback",
+                "images_unresolved": sum(1 for e in evidence
+                                         if e.get("kind") == "unresolved"),
+                "layout_tables_dropped": int(parsed.get("layout_tables_dropped") or 0),
+                "tables_unwrapped": int(parsed.get("tables_unwrapped") or 0),
+                "cached": cached,
+            }
+            if parsed.get("warnings"):
+                quality["convert_warnings"] = parsed["warnings"]
+            # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
+            tags, cands = extract_tags(stem, headings_from_markdown(parsed["body"]),
+                                       registry=registry)
+            extra: dict[str, Any] = {
+                "asset": {"asset_id": asset_id, "sha256": sha, "format": "html"},
+                "quality": quality,
+                "verification": self.kind.default_verification,  # 先入库，审核台补标
+                "structure": {"tables": parsed.get("tables_rel") or []},
+                # 未收录强候选（进审核队列 tag_candidate 人工采纳后入词典）
+                "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
+            }
+            if evidence:
+                extra["evidence"] = evidence
+            docs.append(KbDocument(
+                source_type=self.kind.source_type,
+                source_id=sid,
+                url=str(parsed.get("source_url") or ""),
+                title=str(parsed.get("title") or stem),
+                body=body,
+                created_at=None,
+                component="",
+                tags=[t.name for t in tags],
+                extra=extra,
+            ))
+        if total:
+            print(f"[sources:{self.id}] 解析完成：{len(docs)}/{total} 篇（耗时 "
+                  f"{time.time() - start_ts:.0f}s）", flush=True)
+        # 图片资产注册（审核侧经 asset_id 反查路径/预览）；与 html 原件、图片同批注册
+        self._register_asset_mappings(doc_assets + img_assets)
+        self.save_sanitize_log(collector)
+        return docs
+
+    def _parse_html(self, p: Path, raw: bytes) -> tuple[Optional[dict], bool]:
+        """解析单页（可缓存）：html_convert 混合引擎 + tables.json 落盘。
+
+        返回 (parsed dict, 是否缓存命中)；无正文返回 (None, False)。
+        缓存里是**收割补表后的正文**与表格元数据（图片占位解析、标签每轮重算，不进缓存）；
+        schema 位必须校验：转换器升级后旧缓存的 sha256 仍然匹配，不校验就会静默沿用旧解析。
+        """
+        sha = _sha256(p)
+        asset_id = sha[:16]
+        cache = self._parsed_dir() / f"{asset_id}.extract.json"
+        if cache.is_file():
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+                if (data.get("sha256") == sha
+                        and data.get("schema") == self._EXTRACT_SCHEMA):
+                    data["tables_rel"] = ([f"parsed/html/{asset_id}.tables.json"]
+                                          if data.get("tables") else [])
+                    return data, True
+            except (OSError, ValueError):
+                pass  # 缓存损坏 → 重新解析
+        res = html_convert.html_to_markdown(raw, fallback_title=p.stem)
+        if not res.body.strip():
+            print(f"[sources:{self.id}] 跳过无正文网页: {p.name}")
+            return None, False
+        parsed: dict[str, Any] = {
+            "schema": self._EXTRACT_SCHEMA,
+            "sha256": sha,
+            "asset_id": asset_id,
+            "body": res.body,
+            "title": res.title,
+            "tables": res.tables,
+            "charset": res.charset,
+            "source_url": res.source_url,
+            "extractor": res.extractor,
+            "warnings": res.warnings,
+            "layout_tables_dropped": res.layout_tables_dropped,
+            "tables_unwrapped": res.tables_unwrapped,
+        }
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
+        parsed["tables_rel"] = self._write_tables(asset_id, res.tables)
+        return parsed, False
+
+    def _write_tables(self, asset_id: str, tables: list[dict]) -> list[str]:
+        """结构化表格落盘（可重跑产物，以 asset_id 命名——不暴露文件名/路径）。"""
+        if not tables:
+            return []
+        tpath = self._parsed_dir() / f"{asset_id}.tables.json"
+        tpath.write_text(
+            json.dumps({"source": f"html:{asset_id}", "tables": tables},
+                       ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        return [f"parsed/html/{tpath.name}"]
+
+
 _REGISTRY: dict[str, type[BaseSource]] = {
     "github": GithubSource,
     "markdown": MarkdownSource,
@@ -1843,6 +2093,7 @@ _REGISTRY: dict[str, type[BaseSource]] = {
     "image": ImageSource,
     "excel": ExcelSource,
     "word": WordSource,
+    "html": HtmlSource,
 }
 
 

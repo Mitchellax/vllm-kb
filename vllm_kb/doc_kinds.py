@@ -68,6 +68,9 @@ KINDS: tuple[DocKind, ...] = (
     DocKind(source_type="doc_excel", source="excel", label="Excel", asset_sub="excel",
             sid_prefix="excel", suffixes=(".xlsx", ".xlsm"), section_splitter="lines",
             external_doc=True, default_verification="unverified"),
+    DocKind(source_type="doc_html", source="html", label="HTML", asset_sub="html",
+            sid_prefix="html", suffixes=(".html", ".htm"), section_splitter="markdown",
+            external_doc=True, default_verification="unverified"),
 )
 
 # 历史/预留种类：没有任何来源类产出它，但旧库里可能存在——保留在"外源文档"集合里，

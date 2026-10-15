@@ -33,13 +33,15 @@ class TestKindTable(unittest.TestCase):
     def test_external_doc_types_matches_legacy_literal(self):
         """审核台收录范围原先是一份硬编码字面量（且没人引用）——派生结果必须逐字相等。"""
         self.assertEqual(dk.EXTERNAL_DOC_TYPES,
-                         ("doc_pdf", "doc_markdown", "doc_word", "doc_excel", "doc_other"))
+                         ("doc_pdf", "doc_markdown", "doc_word", "doc_excel", "doc_html",
+                          "doc_other"))
 
     def test_patterns_derived_from_suffixes(self):
         self.assertEqual(dk.BY_SOURCE["pdf"].patterns, ("*.pdf",))
         self.assertEqual(dk.BY_SOURCE["markdown"].patterns, ("*.md", "*.markdown"))
         self.assertEqual(dk.BY_SOURCE["word"].patterns, ("*.docx", "*.docm"))
         self.assertEqual(dk.BY_SOURCE["excel"].patterns, ("*.xlsx", "*.xlsm"))
+        self.assertEqual(dk.BY_SOURCE["html"].patterns, ("*.html", "*.htm"))
 
     def test_suffixes_are_bare(self):
         """后缀统一成裸后缀（原先 word 存 `*.docx`、excel 存 `.xlsx` 两种写法混用）。"""
@@ -58,7 +60,7 @@ class TestKindTable(unittest.TestCase):
 
     def test_pdf_is_expert_others_unverified(self):
         self.assertEqual(dk.BY_TYPE["doc_pdf"].default_verification, "expert")
-        for st in ("doc_markdown", "doc_word", "doc_excel"):
+        for st in ("doc_markdown", "doc_word", "doc_excel", "doc_html"):
             self.assertEqual(dk.BY_TYPE[st].default_verification, "unverified")
 
 
@@ -68,6 +70,7 @@ class TestSplitterDerivation(unittest.TestCase):
         self.assertEqual(dk.section_splitter_for("doc_markdown"), dk.SPLITTER_MARKDOWN)
         self.assertEqual(dk.section_splitter_for("doc_word"), dk.SPLITTER_MARKDOWN)
         self.assertEqual(dk.section_splitter_for("doc_excel"), dk.SPLITTER_LINES)
+        self.assertEqual(dk.section_splitter_for("doc_html"), dk.SPLITTER_MARKDOWN)
         self.assertEqual(dk.section_splitter_for("github_issue"), "")
         self.assertEqual(dk.section_splitter_for("不存在的类型"), "")
 
