@@ -15,6 +15,7 @@ pillow>=9.0             # 图片处理（md 图片收集 / OCR 测试图）
 pymupdf>=1.23           # PDF 文字层 + 表格提取
 python-docx>=1.1        # Word 案例（业务环境启用）
 trafilatura>=1.6        # 网页案例（业务环境启用）
+lxml_html_clean>=0.4    # lxml≥5.2 拆出 lxml.html.clean——trafilatura 依赖链（justext）缺它 import 即崩
 openpyxl>=3.0           # Excel（schema-free：任意列/sheet，行 cell 拼接入库）
 
 # ---- 中文分词（FTS5 中文检索，可选——不装则 FTS 中文按整段匹配，行为同旧版）----
