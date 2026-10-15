@@ -283,5 +283,47 @@ class DocVerificationTest(unittest.TestCase):
         self.assertIn("人工标签", tags, "rebuild 后人工标签丢了")
 
 
+class TestContentShaOverlay(unittest.TestCase):
+    """内容指纹覆盖层：认证时记 sha；内容变更后旧认证不适用（表格"改了要重审"的底层）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.kb = Path(self.tmp.name) / "kb.sqlite3"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_content_sha_roundtrip(self):
+        from vllm_kb.review import load_doc_verification_map_conn
+
+        conn = sqlite3.connect(self.kb)
+        try:
+            set_doc_verification_conn(conn, "excel:t", "tested", "alice", content_sha="s1")
+            conn.commit()
+            g = get_doc_verification_conn(conn, "excel:t")
+            self.assertEqual(g["content_sha"], "s1")
+            m = load_doc_verification_map_conn(conn)
+            self.assertEqual(m, {"excel:t": {"verification": "tested", "content_sha": "s1"}})
+            # 重新认证（新内容）→ 指纹刷新
+            set_doc_verification_conn(conn, "excel:t", "tested", "bob", content_sha="s2")
+            conn.commit()
+            self.assertEqual(get_doc_verification_conn(conn, "excel:t")["content_sha"], "s2")
+        finally:
+            conn.close()
+
+    def test_effective_overlay(self):
+        from vllm_kb.review import effective_overlay
+
+        # 指纹一致 → 适用；不一致 → 内容已变，旧认证不适用
+        self.assertEqual(effective_overlay({"verification": "tested", "content_sha": "s1"}, "s1"),
+                         "tested")
+        self.assertIsNone(effective_overlay({"verification": "tested", "content_sha": "s1"}, "s2"))
+        # 旧数据无指纹（升级前的覆盖层）→ 仍然适用（向后兼容）
+        self.assertEqual(effective_overlay({"verification": "tested", "content_sha": ""}, None),
+                         "tested")
+        self.assertIsNone(effective_overlay(None, "s1"))
+        self.assertIsNone(effective_overlay({}, "s1"))
+
+
 if __name__ == "__main__":
     unittest.main()

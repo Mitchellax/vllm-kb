@@ -248,6 +248,24 @@ class ReviewStore:
         finally:
             conn.close()
 
+    def cleanup_legacy_row_items(self) -> int:
+        """删除旧版**逐行** excel 补标项（item_ref 形如 `excel:文件:sheet:行`，pending）。
+
+        表格审核已升级为**文件粒度**（`excelfile:<文件>:<sha8>`），逐行 pending 项被取代；
+        已处理（approved/suspected）的保留作历史。当前格式 `excel:<文件名>`（恰好一个
+        冒号）不受影响。返回删除条数。
+        """
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "DELETE FROM review_items WHERE category='verification_pending' "
+                "AND status='pending' AND item_ref GLOB 'excel:*:*:*'"
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
     def list_items(self, category: Optional[str] = None, status: Optional[str] = None,
                    limit: int = 50, offset: int = 0) -> list[dict]:
         """审核队列：未审核（pending）优先、存疑（suspected）其次，已处理最后。"""
@@ -316,18 +334,39 @@ class ReviewStore:
                      note: str = "") -> bool:
         """标记删除：**只删除 kb.sqlite3 的数据库记录**，原始资产文件保留
         （由人员到"待实际删除"列表手动本地删除）。删除前把完整 docs 行存入
-        payload.doc_row，供撤回恢复。"""
+        payload.doc_row，供撤回恢复。
+
+        **文件级表格项**（payload.rows 聚合多行）：备份并删除文件内全部行
+        （payload.doc_rows 列表），撤回整体恢复。
+        """
         it = self.get_item(item_id)
         if it is None:
             return False
-        doc_row = _read_doc_row(kb_path, it["item_ref"])
-        if doc_row is None:
-            raise ValueError(f"kb.sqlite3 中不存在 {it['item_ref']}（可能已删除）")
-        _delete_doc_row(kb_path, it["item_ref"])
+        rows = [r.get("source_id") for r in ((it["payload"] or {}).get("rows") or [])
+                if isinstance(r, dict) and r.get("source_id")]
         payload = dict(it["payload"] or {})
-        payload["doc_row"] = doc_row
-        payload["asset"] = (doc_row.get("extra") or {}).get("asset", {})
-        payload["deleted_note"] = note
+        if rows:
+            # 文件级：批量备份 + 删除（单行缺失不阻断——可能已被单独处理）
+            doc_rows = []
+            for sid in rows:
+                d = _read_doc_row(kb_path, sid)
+                if d is not None:
+                    doc_rows.append(d)
+            if not doc_rows:
+                raise ValueError("文件内已无可删除的文档记录（可能已全部删除）")
+            for d in doc_rows:
+                _delete_doc_row(kb_path, d["source_id"])
+            payload["doc_rows"] = doc_rows
+            payload["asset"] = (doc_rows[0].get("extra") or {}).get("asset", {})
+            payload["deleted_note"] = note
+        else:
+            doc_row = _read_doc_row(kb_path, it["item_ref"])
+            if doc_row is None:
+                raise ValueError(f"kb.sqlite3 中不存在 {it['item_ref']}（可能已删除）")
+            _delete_doc_row(kb_path, it["item_ref"])
+            payload["doc_row"] = doc_row
+            payload["asset"] = (doc_row.get("extra") or {}).get("asset", {})
+            payload["deleted_note"] = note
         conn = self._connect()
         try:
             cur = conn.execute(
@@ -342,16 +381,22 @@ class ReviewStore:
             conn.close()
 
     def undo_delete(self, item_id: int, kb_path: str | Path) -> bool:
-        """撤回删除：用 payload.doc_row 恢复 kb.sqlite3 记录，审核项回到 pending 重新入队。"""
+        """撤回删除：用 payload.doc_row / doc_rows 恢复 kb.sqlite3 记录，审核项回到 pending。"""
         it = self.get_item(item_id)
         if it is None or it["status"] != "deleted":
             raise ValueError(f"审核项 {item_id} 不存在或不是 deleted 状态（当前 {it['status'] if it else '?'}）")
+        doc_rows = (it.get("payload") or {}).get("doc_rows") or []
         doc_row = (it.get("payload") or {}).get("doc_row")
-        if not doc_row:
+        if doc_rows:
+            for d in doc_rows:
+                _restore_doc_row(kb_path, d)
+        elif doc_row:
+            _restore_doc_row(kb_path, doc_row)
+        else:
             raise ValueError("该审核项缺少 doc_row 备份，无法撤回（可能由旧版本生成）")
-        _restore_doc_row(kb_path, doc_row)
         payload = dict(it["payload"] or {})
         payload.pop("doc_row", None)
+        payload.pop("doc_rows", None)
         payload.pop("deleted_note", None)
         conn = self._connect()
         try:
@@ -631,6 +676,7 @@ def _ensure_doc_verification(conn: sqlite3.Connection) -> None:
                  source_id TEXT PRIMARY KEY,
                  verification TEXT NOT NULL,
                  canonical_verification TEXT,
+                 content_sha TEXT,
                  reviewer TEXT,
                  updated_at TEXT
                )"""
@@ -641,6 +687,10 @@ def _ensure_doc_verification(conn: sqlite3.Connection) -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(doc_verification)")]
         if "canonical_verification" not in cols:
             conn.execute("ALTER TABLE doc_verification ADD COLUMN canonical_verification TEXT")
+        if "content_sha" not in cols:
+            # 内容指纹：认证时文档的内容 sha256。内容变更后旧认证不适用
+            # （seed 清过期覆盖层重新入队；ingest 合并时跳过不匹配的覆盖——见 effective_overlay）
+            conn.execute("ALTER TABLE doc_verification ADD COLUMN content_sha TEXT")
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -654,41 +704,68 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def load_doc_verification_conn(conn: sqlite3.Connection) -> dict[str, str]:
-    """批量读取覆盖层：{source_id: verification}（ingest 预读合并用）。"""
-    out: dict[str, str] = {}
+    """批量读取覆盖层：{source_id: verification}（兼容旧调用方/测试；ingest 用带指纹版）。"""
+    return {sid: ov["verification"]
+            for sid, ov in load_doc_verification_map_conn(conn).items()}
+
+
+def load_doc_verification_map_conn(conn: sqlite3.Connection) -> dict[str, dict]:
+    """批量读取覆盖层（含内容指纹）：{source_id: {"verification", "content_sha"}}。
+
+    ingest 合并时用 `effective_overlay` 判定指纹是否仍匹配——不匹配 = 内容已变，
+    旧认证不适用（按 canonical 入库，seed 会重新生成审核项）。
+    """
+    out: dict[str, dict] = {}
     _ensure_doc_verification(conn)
     try:
-        rows = conn.execute("SELECT source_id, verification FROM doc_verification").fetchall()
+        rows = conn.execute(
+            "SELECT source_id, verification, content_sha FROM doc_verification").fetchall()
     except sqlite3.OperationalError:
         return out  # 旧库尚无该表
-    for sid, v in rows:
+    for sid, v, csha in rows:
         if v in VERIFICATION_LEVELS:
-            out[sid] = v
+            out[sid] = {"verification": v, "content_sha": csha or ""}
     return out
+
+
+def effective_overlay(overlay: Optional[dict], doc_asset_sha: Optional[str]) -> Optional[str]:
+    """覆盖层是否仍适用：认证时记录的内容指纹与当前文档内容一致（或覆盖层无指纹=旧数据）。
+
+    内容变了 → 返回 None（按 canonical 入库），由 seed_verification_pending 清过期
+    覆盖层并重新生成审核项——"表格内容有变动需要重新审核"的执行点。
+    """
+    if not overlay:
+        return None
+    stamped = str(overlay.get("content_sha") or "")
+    if stamped and doc_asset_sha and stamped != str(doc_asset_sha):
+        return None
+    return overlay.get("verification") or None
 
 
 def get_doc_verification_conn(conn: sqlite3.Connection, source_id: str) -> dict:
     """单篇覆盖层（审核页展示"人工补标为 X"用）。"""
     _ensure_doc_verification(conn)
     row = conn.execute(
-        "SELECT verification, canonical_verification, reviewer, updated_at "
+        "SELECT verification, canonical_verification, content_sha, reviewer, updated_at "
         "FROM doc_verification WHERE source_id=?",
         (source_id,),
     ).fetchone()
     if row is None:
         return {"source_id": source_id, "verification": None, "canonical_verification": None,
-                "reviewer": None, "updated_at": None}
+                "content_sha": None, "reviewer": None, "updated_at": None}
     return {"source_id": source_id, "verification": row[0], "canonical_verification": row[1],
-            "reviewer": row[2], "updated_at": row[3]}
+            "content_sha": row[2], "reviewer": row[3], "updated_at": row[4]}
 
 
 def set_doc_verification_conn(conn: sqlite3.Connection, source_id: str, verification: str,
                               reviewer: Optional[str] = None,
-                              canonical: Optional[str] = None) -> None:
+                              canonical: Optional[str] = None,
+                              content_sha: Optional[str] = None) -> None:
     """写覆盖层（整体替换）。verification 必须是合法级别。
 
     `canonical` 只在**首次**覆盖时记录（覆盖前的 canonical 值），供撤销回退；
     已有覆盖行时不覆盖它——否则连续两次认证会把第一次的覆盖值当成 canonical 存下来。
+    `content_sha` 每次认证都刷新为**当时**的内容指纹（重新认证 = 对新内容认证）。
     """
     if verification not in VERIFICATION_LEVELS:
         raise ValueError(f"非法验证级别: {verification}（支持 {VERIFICATION_LEVELS}）")
@@ -698,9 +775,9 @@ def set_doc_verification_conn(conn: sqlite3.Connection, source_id: str, verifica
     canon = row[0] if row is not None else canonical
     conn.execute(
         "INSERT OR REPLACE INTO doc_verification"
-        "(source_id, verification, canonical_verification, reviewer, updated_at) "
-        "VALUES(?,?,?,?,?)",
-        (source_id, verification, canon, reviewer or "", _now()),
+        "(source_id, verification, canonical_verification, content_sha, reviewer, updated_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (source_id, verification, canon, content_sha or "", reviewer or "", _now()),
     )
 
 
@@ -713,6 +790,43 @@ def clear_doc_verification_conn(conn: sqlite3.Connection, source_id: str) -> Opt
         return None
     conn.execute("DELETE FROM doc_verification WHERE source_id=?", (source_id,))
     return row[0]
+
+
+def _apply_verification_conn(conn: sqlite3.Connection, source_id: str,
+                             verification: Optional[str], reviewer: str,
+                             confidence, *, clear: bool = False) -> dict:
+    """apply_verification 的连接内实现（单连接批量复用）。
+
+    认证时把文档**当前**内容指纹（extra.asset.sha256）写进覆盖层 content_sha——
+    "内容变更需重新审核"的凭证；撤销（clear）回到覆盖前 canonical 值。
+    """
+    from .confidence import reliability_score
+
+    row = conn.execute(
+        "SELECT source_type, status, resolved_at, extra FROM docs WHERE source_id=?",
+        (source_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"kb.sqlite3 中不存在文档 {source_id}")
+    source_type, status, resolved_at, extra_raw = row
+    extra = json.loads(extra_raw or "{}")
+    cur_sha = str(((extra.get("asset") or {}).get("sha256")) or "")
+    if clear:
+        # 撤销：回到**覆盖前**的 canonical 值（存在覆盖层里；无覆盖行则保持原值）
+        prev = clear_doc_verification_conn(conn, source_id)
+        effective = prev if prev is not None else extra.get("verification", "")
+    else:
+        # 首次覆盖时把当前（canonical）值记进覆盖层，供撤销回退；内容指纹每次刷新
+        set_doc_verification_conn(conn, source_id, verification or "", reviewer,
+                                  canonical=extra.get("verification", ""),
+                                  content_sha=cur_sha or None)
+        effective = verification or ""
+    extra["verification"] = effective
+    rel = reliability_score(source_type, status, resolved_at, None, confidence,
+                            kind=extra.get("kind", ""), verification=effective or None)
+    conn.execute("UPDATE docs SET extra=?, reliability=? WHERE source_id=?",
+                 (json.dumps(extra, ensure_ascii=False), rel, source_id))
+    return {"source_id": source_id, "verification": effective, "reliability": rel}
 
 
 def apply_verification(cfg: "AppConfig", source_id: str, verification: Optional[str],
@@ -728,39 +842,51 @@ def apply_verification(cfg: "AppConfig", source_id: str, verification: Optional[
     **不动 content_hash**：下次 ingest 会因 meta_hash 不符走"仅刷新元数据"路径
     （embed_hash 未变 → 不重嵌），结果一致且自愈。
     """
-    from .confidence import reliability_score
-
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
         raise ValueError(f"kb.sqlite3 不存在：{kb}（先跑 build_kb.py 入库）")
     conn = sqlite3.connect(str(kb))
     try:
-        row = conn.execute(
-            "SELECT source_type, status, resolved_at, extra FROM docs WHERE source_id=?",
-            (source_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"kb.sqlite3 中不存在文档 {source_id}")
-        source_type, status, resolved_at, extra_raw = row
-        extra = json.loads(extra_raw or "{}")
-        if clear:
-            # 撤销：回到**覆盖前**的 canonical 值（存在覆盖层里；无覆盖行则保持原值）
-            prev = clear_doc_verification_conn(conn, source_id)
-            effective = prev if prev is not None else extra.get("verification", "")
-        else:
-            # 首次覆盖时把当前（canonical）值记进覆盖层，供撤销回退
-            set_doc_verification_conn(conn, source_id, verification or "", reviewer,
-                                      canonical=extra.get("verification", ""))
-            effective = verification or ""
-        extra["verification"] = effective
-        rel = reliability_score(source_type, status, resolved_at, None, cfg.confidence,
-                                kind=extra.get("kind", ""), verification=effective or None)
-        conn.execute("UPDATE docs SET extra=?, reliability=? WHERE source_id=?",
-                     (json.dumps(extra, ensure_ascii=False), rel, source_id))
+        r = _apply_verification_conn(conn, source_id, verification, reviewer,
+                                     cfg.confidence, clear=clear)
         conn.commit()
     finally:
         conn.close()
-    return {"source_id": source_id, "verification": effective, "reliability": rel}
+    return r
+
+
+def apply_verification_many(cfg: "AppConfig", source_ids: list[str],
+                            verification: Optional[str], reviewer: str, *,
+                            clear: bool = False) -> dict:
+    """批量人工补标（**文件级表格审核**用）：单连接逐行写覆盖层 + 刷新 docs。
+
+    - 认证：每行覆盖层的 content_sha 记**该行当时**的内容指纹（同一文件的行共享文件
+      sha；个别行缺 asset 也能处理）；
+    - 撤销（clear=True）：逐行清除覆盖层、回 canonical；
+    - 单行失败（文档已被删等）不阻断整批，计入 failed。
+    """
+    from .confidence import reliability_score  # noqa: F401  # _apply_verification_conn 内用
+
+    if not clear and verification not in VERIFICATION_LEVELS:
+        raise ValueError(f"非法验证级别: {verification}（支持 {VERIFICATION_LEVELS}）")
+    kb = cfg.resolve(cfg.storage.sqlite_path)
+    if not kb.exists():
+        raise ValueError(f"kb.sqlite3 不存在：{kb}（先跑 build_kb.py 入库）")
+    verified = 0
+    failed: list[dict] = []
+    conn = sqlite3.connect(str(kb))
+    try:
+        for sid in source_ids:
+            try:
+                _apply_verification_conn(conn, sid, verification, reviewer,
+                                         cfg.confidence, clear=clear)
+                verified += 1
+            except ValueError as e:
+                failed.append({"source_id": sid, "reason": str(e)})
+        conn.commit()
+    finally:
+        conn.close()
+    return {"verified": verified, "failed": failed}
 
 
 def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, action: str,
@@ -770,12 +896,37 @@ def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, acti
     action=approved → 覆盖层写 `tested`（`result.verification="expert"` 可升级为专家认证）；
     action=suspected → **清除覆盖层**（回到 unverified，可反悔；不是写 unverified，
     因为 canonical 可能自带更高值如 PDF 的 expert）。
+
+    **文件级表格审核项**（payload.rows 聚合了同一文件的多行/多篇）：认证/存疑**批量**
+    应用到全部行——一次审核整表生效；行内容指纹逐行记入覆盖层，表格内容变更后由
+    seed 重新入队（见 seed_verification_pending）。
     """
     it = store.get_item(item_id)
     if it is None:
         raise ValueError(f"审核项不存在: {item_id}")
     if it["category"] != "verification_pending":
         raise ValueError(f"审核项 {item_id} 类别为 {it['category']}，不是补标项")
+    rows = [r.get("source_id") for r in ((it["payload"] or {}).get("rows") or [])
+            if isinstance(r, dict) and r.get("source_id")]
+    if rows:
+        # 文件级（表格）：批量应用到全部行
+        if action == "approved":
+            want = (result or {}).get("verification") or "tested"
+            if want not in ("tested", "expert"):
+                raise ValueError(f"approved 的 verification 只能是 tested/expert，收到 {want!r}")
+            r = apply_verification_many(cfg, rows, want, reviewer)
+        elif action == "suspected":
+            r = apply_verification_many(cfg, rows, None, reviewer, clear=True)
+        else:
+            raise ValueError(f"非法标注动作: {action}（支持 approved | suspected）")
+        store.review(item_id, action, reviewer,
+                     result={"action": "verification", "verification": (result or {}).get("verification") or "tested",
+                             "rows_count": len(rows), "rows_verified": r["verified"],
+                             "rows_failed": len(r["failed"]), **(result or {})})
+        return {"ok": True, "source_id": rows[0], "aggregate": "excel_file",
+                "rows_count": len(rows), "rows_verified": r["verified"],
+                "rows_failed": len(r["failed"]), "failed": r["failed"]}
+    # 单文档项
     source_id = it["item_ref"]
     if action == "approved":
         want = (result or {}).get("verification") or "tested"
@@ -1108,33 +1259,126 @@ def delete_tag(cfg: "AppConfig", name: str,
 
 # ---------------- 审核项生成（seed，幂等） ----------------
 
+def _excel_file_of(source_id: str) -> str:
+    """excel source_id → 文件身份。
+
+    当前格式 `excel:<文件名>`（一个文件一篇）；旧逐行格式 `excel:<文件名>:<sheet>:<行>`
+    取文件段——同一登记表的新旧行聚合到同一个文件级审核项。
+    """
+    parts = source_id.split(":")
+    return parts[1] if len(parts) > 1 else source_id
+
+
 def seed_verification_pending(cfg: "AppConfig", store: ReviewStore) -> int:
     """扫描 kb.sqlite3 中**生效** verification=unverified 的文档，生成补标审核项（幂等）。
 
     读的是生效值（`docs.extra.verification`，ingest 已把人工补标覆盖层合并进去），
     所以补标过的文档不会再进队列。LIKE 只作**预筛**（键名不受 json 分隔符影响），
     真正判定用 JSON 精确比对——否则 json.dumps 的格式一变，这里会静默地什么都捞不到。
+
+    **表格按文件粒度**：doc_excel 的待补标文档按源文件聚成**一条**审核项
+    （item_ref = `excelfile:<文件名>:<sha8>`）——认证一次应用到文件内全部行，
+    不逐行审；`payload.rows` 带行清单供批量应用与展示。
+
+    **内容变更重审**：认证时的内容指纹记录在覆盖层 content_sha；文档内容变更后
+    旧认证不适用——这里清掉过期覆盖层（docs 回 canonical），文档随即进入下面的
+    待补标集合重新入队。item_ref 带 sha8，内容变了 = 新 ref，dedupe 挡不住新内容。
+
+    **兼容**：旧版逐行格式的 pending excel 项（`excel:文件:sheet:行`）被文件级项取代，
+    自动清理（已处理的保留作历史）。
     """
+    from .confidence import reliability_score
+
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
         return 0
-    conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(str(kb))   # 可写：清过期覆盖层要改 docs/覆盖层
     added = 0
     try:
-        rows = conn.execute(
-            'SELECT source_id, title, url, extra FROM docs WHERE extra LIKE \'%"verification"%\''
-        ).fetchall()
-        for source_id, title, url, extra in rows:
+        _ensure_doc_verification(conn)
+        docs_cols = {r[1] for r in conn.execute("PRAGMA table_info(docs)")}
+        # 最小测试库/旧库可能缺列：缺 source_type 按非表格处理，缺 reliability 不刷该列
+        has_stype = "source_type" in docs_cols
+        sel_cols = "source_id, title, url, extra" if not has_stype else \
+            "source_id, source_type, title, url, extra"
+        # ---- 过期覆盖层：内容指纹与当前文档不符 → 清除 + docs 回 canonical ----
+        cur_sha: dict[str, str] = {}
+        for sid, extra_raw in conn.execute("SELECT source_id, extra FROM docs").fetchall():
             try:
-                if json.loads(extra or "{}").get("verification") != "unverified":
-                    continue
+                ex = json.loads(extra_raw or "{}")
             except ValueError:
                 continue
-            if store.add_item("verification_pending", source_id,
-                              {"source_id": source_id, "title": title, "url": url}):
+            cur_sha[sid] = str((((ex.get("asset") or {}).get("sha256"))) or "")
+        stale: dict[str, str] = {}
+        for sid, _v, canonical, csha in conn.execute(
+                "SELECT source_id, verification, canonical_verification, content_sha "
+                "FROM doc_verification").fetchall():
+            if csha and cur_sha.get(sid, "") and csha != cur_sha[sid]:
+                conn.execute("DELETE FROM doc_verification WHERE source_id=?", (sid,))
+                stale[sid] = canonical or "unverified"
+        if stale:
+            reset_cols = ["extra"] + [c for c in ("source_type", "status", "resolved_at")
+                                      if c in docs_cols]
+            for sid, canon in stale.items():
+                row = conn.execute(
+                    f"SELECT {','.join(reset_cols)} FROM docs WHERE source_id=?",
+                    (sid,)).fetchone()
+                if row is None:
+                    continue
+                vals = dict(zip(reset_cols, row))
+                try:
+                    ex = json.loads(vals.get("extra") or "{}")
+                except ValueError:
+                    ex = {}
+                ex["verification"] = canon
+                rel = reliability_score(vals.get("source_type") or "",
+                                        vals.get("status") or "",
+                                        vals.get("resolved_at"), None, cfg.confidence,
+                                        kind=ex.get("kind", ""), verification=canon or None)
+                if "reliability" in docs_cols:
+                    conn.execute("UPDATE docs SET extra=?, reliability=? WHERE source_id=?",
+                                 (json.dumps(ex, ensure_ascii=False), rel, sid))
+                else:
+                    conn.execute("UPDATE docs SET extra=? WHERE source_id=?",
+                                 (json.dumps(ex, ensure_ascii=False), sid))
+            conn.commit()
+        # ---- 待补标集合：单文档逐条；表格按文件聚合 ----
+        groups: dict[tuple[str, str], dict] = {}
+        for row in conn.execute(f"SELECT {sel_cols} FROM docs").fetchall():
+            source_id, title, url, extra_raw = (row[0], row[1], row[2], row[3]) if not has_stype \
+                else (row[0], row[2], row[3], row[4])
+            stype = row[1] if has_stype else ""
+            try:
+                ex = json.loads(extra_raw or "{}")
+            except ValueError:
+                continue
+            if ex.get("verification") != "unverified":
+                continue
+            sha = str((((ex.get("asset") or {}).get("sha256"))) or "")
+            if has_stype and stype == "doc_excel":
+                key = (_excel_file_of(source_id), sha)
+                g = groups.setdefault(key, {"title": title or key[0], "url": url or "",
+                                            "rows": []})
+                g["rows"].append({"source_id": source_id, "title": title or source_id})
+            else:
+                if store.add_item("verification_pending", source_id,
+                                  {"source_id": source_id, "title": title, "url": url,
+                                   "content_sha": sha}):
+                    added += 1
+        for (file_key, sha), g in sorted(groups.items()):
+            ref = f"excelfile:{file_key}:{sha[:8]}" if sha else f"excelfile:{file_key}"
+            payload = {"source_id": g["rows"][0]["source_id"], "title": g["title"],
+                       "url": g["url"], "file": file_key, "file_sha": sha,
+                       "aggregate": "excel_file", "row_count": len(g["rows"]),
+                       "rows": g["rows"][:200]}  # 展示/批量上限，超出走文件身份全量应用
+            if store.add_item("verification_pending", ref, payload):
                 added += 1
     finally:
         conn.close()
+    # 旧逐行 pending 项被文件级项取代（已处理的保留作历史）
+    removed = store.cleanup_legacy_row_items()
+    if removed:
+        print(f"[review] 清理旧版逐行 excel 审核项 {removed} 条（已由文件级项取代）")
     return added
 
 

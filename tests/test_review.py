@@ -12,6 +12,8 @@ from vllm_kb.ocr import OcrApiError
 from vllm_kb.review import (
     ReviewStore,
     api_configs,
+    get_doc_verification_conn,
+    review_verification,
     seed_case_title_flags,
     seed_verification_pending,
     probe_ocr_connectivity,
@@ -263,6 +265,143 @@ class TestSeeds(unittest.TestCase):
         self.assertEqual(n, 1)  # 只有"待审核"标题
         items = self.store.list_items(category="case_title_flag")
         self.assertEqual(items[0]["item_ref"], "md:caseA")
+
+
+class TestFileLevelVerification(unittest.TestCase):
+    """表格文件粒度审核：seed 按文件聚合、认证批量应用到全部行、内容变更重新审核。"""
+
+    FILE_SHA = "a" * 64
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.kb = self.root / "kb.sqlite3"
+        conn = sqlite3.connect(self.kb)
+        conn.executescript(
+            "CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT,"
+            " component TEXT, url TEXT, status TEXT, resolved_at TEXT, extra TEXT, reliability REAL)"
+        )
+        rows = [
+            # 旧逐行格式（业务存量库形态）：同文件两行 + 一篇 md
+            ("excel:登记表:Sheet1:1", "doc_excel", "问题登记表 行1", "", "", None, None,
+             json.dumps({"verification": "unverified",
+                         "asset": {"sha256": self.FILE_SHA}}), 0.5),
+            ("excel:登记表:Sheet1:2", "doc_excel", "问题登记表 行2", "", "", None, None,
+             json.dumps({"verification": "unverified",
+                         "asset": {"sha256": self.FILE_SHA}}), 0.5),
+            ("md:case", "doc_markdown", "案例", "", "", None, None,
+             json.dumps({"verification": "unverified",
+                         "asset": {"sha256": "b" * 64}}), 0.5),
+        ]
+        conn.executemany("INSERT INTO docs VALUES(?,?,?,?,?,?,?,?,?)", rows)
+        conn.commit()
+        conn.close()
+        self.cfg = make_cfg(self.root)
+        self.store = ReviewStore(self.root / "review.sqlite3")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _file_item(self):
+        items = [i for i in self.store.list_items(category="verification_pending")
+                 if i["item_ref"].startswith("excelfile:")]
+        self.assertEqual(len(items), 1)
+        return items[0]
+
+    def test_seed_groups_excel_rows_by_file(self):
+        n = seed_verification_pending(self.cfg, self.store)
+        self.assertEqual(n, 2)  # 1 个文件级项 + 1 篇 md
+        it = self._file_item()
+        self.assertEqual(it["payload"]["row_count"], 2)
+        self.assertEqual([r["source_id"] for r in it["payload"]["rows"]],
+                         ["excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"])
+        self.assertEqual(it["payload"]["file_sha"], self.FILE_SHA)
+        self.assertEqual(it["payload"]["aggregate"], "excel_file")
+        # 幂等
+        self.assertEqual(seed_verification_pending(self.cfg, self.store), 0)
+
+    def test_legacy_row_items_replaced(self):
+        """旧版逐行 pending 项被文件级项取代（自动清理）。"""
+        self.store.add_item("verification_pending", "excel:登记表:Sheet1:1", {"title": "旧行项"})
+        seed_verification_pending(self.cfg, self.store)
+        refs = {i["item_ref"] for i in self.store.list_items(category="verification_pending")}
+        self.assertNotIn("excel:登记表:Sheet1:1", refs)  # 旧逐行项已清
+        self.assertTrue(any(r.startswith("excelfile:") for r in refs))
+
+    def test_approve_applies_to_all_rows(self):
+        seed_verification_pending(self.cfg, self.store)
+        it = self._file_item()
+        r = review_verification(self.cfg, self.store, it["id"], "approved", "alice",
+                                result={"verification": "expert"})
+        self.assertEqual(r["rows_count"], 2)
+        self.assertEqual(r["rows_verified"], 2)
+        conn = sqlite3.connect(self.kb)
+        for sid in ("excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"):
+            extra = json.loads(
+                conn.execute("SELECT extra FROM docs WHERE source_id=?", (sid,)).fetchone()[0])
+            self.assertEqual(extra["verification"], "expert")  # 整表生效
+            ov = get_doc_verification_conn(conn, sid)
+            self.assertEqual(ov["verification"], "expert")
+            self.assertEqual(ov["content_sha"], self.FILE_SHA)  # 内容指纹入覆盖层
+        conn.close()
+        # 认证后再 seed 不再入队（同内容）
+        self.assertEqual(seed_verification_pending(self.cfg, self.store), 0)
+
+    def test_suspected_clears_all_rows(self):
+        seed_verification_pending(self.cfg, self.store)
+        it = self._file_item()
+        review_verification(self.cfg, self.store, it["id"], "suspected", "alice")
+        conn = sqlite3.connect(self.kb)
+        for sid in ("excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"):
+            self.assertIsNone(get_doc_verification_conn(conn, sid)["verification"])
+        conn.close()
+
+    def test_content_change_requeues(self):
+        """表格内容变更 → 旧认证失效（覆盖层清、docs 回 canonical）→ 新指纹重新入队。"""
+        seed_verification_pending(self.cfg, self.store)
+        it = self._file_item()
+        review_verification(self.cfg, self.store, it["id"], "approved", "alice")
+        # 文件被编辑（sha 变）重新入库；未升级的库生效值仍是旧覆盖层的 tested
+        conn = sqlite3.connect(self.kb)
+        new_sha = "c" * 64
+        for sid in ("excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"):
+            extra = json.loads(
+                conn.execute("SELECT extra FROM docs WHERE source_id=?", (sid,)).fetchone()[0])
+            extra["asset"]["sha256"] = new_sha
+            extra["verification"] = "tested"
+            conn.execute("UPDATE docs SET extra=? WHERE source_id=?",
+                         (json.dumps(extra, ensure_ascii=False), sid))
+        conn.commit()
+        conn.close()
+        n = seed_verification_pending(self.cfg, self.store)
+        self.assertEqual(n, 1)  # 新 sha → 新文件级项
+        refs = {i["item_ref"] for i in self.store.list_items(category="verification_pending")}
+        self.assertIn(f"excelfile:登记表:{new_sha[:8]}", refs)
+        conn = sqlite3.connect(self.kb)
+        extra = json.loads(conn.execute(
+            "SELECT extra FROM docs WHERE source_id='excel:登记表:Sheet1:1'").fetchone()[0])
+        conn.close()
+        self.assertEqual(extra["verification"], "unverified")  # 旧认证已失效
+        ov = get_doc_verification_conn(sqlite3.connect(self.kb), "excel:登记表:Sheet1:1")
+        self.assertIsNone(ov["verification"])
+
+    def test_mark_deleted_and_undo_whole_file(self):
+        seed_verification_pending(self.cfg, self.store)
+        it = self._file_item()
+        self.assertTrue(self.store.mark_deleted(it["id"], "alice", self.kb, note="整表废弃"))
+        conn = sqlite3.connect(self.kb)
+        for sid in ("excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"):
+            self.assertIsNone(conn.execute("SELECT source_id FROM docs WHERE source_id=?",
+                                           (sid,)).fetchone())
+        conn.close()
+        self.assertTrue(self.store.undo_delete(it["id"], self.kb))
+        conn = sqlite3.connect(self.kb)
+        for sid in ("excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"):
+            self.assertIsNotNone(conn.execute("SELECT source_id FROM docs WHERE source_id=?",
+                                              (sid,)).fetchone())
+        conn.close()
+        self.assertEqual(self.store.get_item(it["id"])["status"], "pending")
 
 
 class TestApiConfigs(unittest.TestCase):

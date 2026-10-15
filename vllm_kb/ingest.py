@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS doc_tags (
 );
 -- 文档级验证状态覆盖层（人工补标，kb.sqlite3）：
 --   verification = 人工补标结果（tested/expert）；**无行 = 沿用 canonical 自带值**。
+--   content_sha = 认证时的内容指纹（docs.extra.asset.sha256）——内容变更后旧认证
+--   不适用：合并时指纹不符则跳过（effective_overlay），seed 清过期覆盖层重新入队。
 --   为什么必须独立存：本函数是 INSERT OR REPLACE，直接改 docs.extra 会被下次构建
 --   用 canonical（verification=unverified）覆盖回去，人工认证就白做了。
 --   ingest 读本表并把结果并进 docs.extra.verification 与 w_rel（见 _effective_doc）。
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS doc_verification (
   source_id TEXT PRIMARY KEY,
   verification TEXT NOT NULL,
   canonical_verification TEXT,
+  content_sha TEXT,
   reviewer TEXT,
   updated_at TEXT
 );
@@ -273,11 +276,22 @@ def ingest_docs(
     # 标签词典词注册进 jieba（复合标签如"超时排查"不被拆散；jieba 未装时无副作用）
     register_words([e.name for e in TagRegistry.load(cfg).entries])
     # 人工标签覆盖层（doc_tags：excluded/manual）——最终标签 = (auto − excluded) ∪ manual
-    from .review import load_doc_tags_conn, load_doc_verification_conn, upsert_auto_snapshot_conn
+    from .review import (
+        effective_overlay,
+        load_doc_tags_conn,
+        load_doc_verification_map_conn,
+        upsert_auto_snapshot_conn,
+    )
 
     overlay = load_doc_tags_conn(conn)
-    # 人工补标覆盖层（doc_verification）：**优先于 canonical 自带值**
-    verif_overlay = load_doc_verification_conn(conn)
+    # 人工补标覆盖层（doc_verification）：**优先于 canonical 自带值**；
+    # 内容指纹不符（文档变更后未重新审核）→ 视为无覆盖，按 canonical 入库，
+    # 由 seed_verification_pending 清过期覆盖层并重新生成审核项（内容变更重审）。
+    verif_overlay = load_doc_verification_map_conn(conn)
+
+    def _overlay_verification(doc) -> Optional[str]:
+        return effective_overlay(verif_overlay.get(doc.source_id),
+                                 (doc.extra or {}).get("asset", {}).get("sha256"))
     stats = {"docs": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0, "meta_refresh": 0, "skipped_empty": 0}
 
     total = len(docs)
@@ -366,7 +380,7 @@ def ingest_docs(
         existing[sid] = (mh, eh)
     plan = {"embed": 0, "skip": 0, "refresh": 0}
     for doc in docs:
-        eh, mh = _hashes(_effective_doc(doc, verif_overlay.get(doc.source_id)))
+        eh, mh = _hashes(_effective_doc(doc, _overlay_verification(doc)))
         stored = existing.get(doc.source_id)
         if stored:
             sm, se = stored
@@ -390,7 +404,7 @@ def ingest_docs(
         processed += 1
         try:
             # 人工补标优先：后续 hashes/rel/写库全部用合并后的对象（不改调用方的 canonical）
-            doc = _effective_doc(doc, verif_overlay.get(doc.source_id))
+            doc = _effective_doc(doc, _overlay_verification(doc))
             eh, mh = _hashes(doc)
             stored = existing.get(doc.source_id)
             if stored:
