@@ -71,6 +71,12 @@
       "enabled": false
     },
     {
+      "id": "webpages",
+      "type": "html",
+      "path": "data/imports/html",
+      "enabled": false
+    },
+    {
       "id": "images",
       "type": "image",
       "ocr_provider": "ask",

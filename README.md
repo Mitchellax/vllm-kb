@@ -42,6 +42,9 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   每行独立 chunk 且带 sheet 作 section）、
   Word 文档（标题样式/大纲级别→章节、列表、表格→结构化 JSON、内嵌图片→内容寻址资产 + OCR、
   超链接→`[文字](url)`；复用同一套分块/标签/图/审核链路）、
+  HTML 网页（浏览器另存为的 .html/.htm：trafilatura 正文去噪 + 表格收割进图 +
+  图片收割补回 + saved-from-url 保留原始 URL + GBK 编码兜底；只认本地文件不联网抓取，
+  见 USAGE §2.6）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；
    **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列）；
    **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
@@ -645,13 +648,13 @@ embedding 服务不可用时 `search`/`signature` 自动降级为全文检索（
 | 1 | 全量采集 + 版本日历 | ✅ 完成 |
 | 2 | 图 + 向量双存储（Kùzu，修复链路/手册定义） | ✅ 核心完成（Issue/PR/Release/Doc/Interface/Tag + FIXES/MERGED_IN/MENTIONS/DOCUMENTS/CORROBORATES/TAGGED_WITH）；多来源（PDF/MD/Word/Excel/OCR/审核工作台）✅；Evidence 互证 ✅；等价合并 🔲 |
 | 3 | MCP Server 封装（任意 MCP 客户端接入） | 🔲 规划 |
-| 4 | wiki/文档通用 adapter（word/html 等） | 🚧 部分完成（**word 已接入**：标题样式/大纲级别→章节、列表、表格→JSON、内嵌图片→内容寻址资产+OCR 复用、超链接→`[文字](url)`；excel 已提前完成：schema-free 导入 ✅；html 🔲） |
+| 4 | wiki/文档通用 adapter（word/html 等） | ✅ 完成（**word**：标题样式/大纲级别→章节、列表、表格→JSON、内嵌图片→内容寻址资产+OCR 复用、超链接→`[文字](url)`；**excel**：schema-free 导入（提前完成）；**html**：trafilatura 正文 + 表格/图片收割进图 + saved-from-url + 编码兜底，见 USAGE §2.6） |
 | 5 | 评估集 + 置信度参数调优（真实故障案例） | 🔲 规划 |
 
 ## 🧪 测试
 
 ```bash
-python -m unittest discover tests    # 453 个测试（含文档-命令一致性核验、API 无路径泄漏审计）
+python -m unittest discover tests    # 1116 个测试（含文档-命令一致性核验、API 无路径泄漏审计）
 ```
 
 ## 📄 文档

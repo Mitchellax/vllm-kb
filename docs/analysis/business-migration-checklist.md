@@ -34,7 +34,7 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | 0 | 开发环境核心（检索 + 图） | ✅ 完成 |
-| 1 | 数据能进库：解析层 adapter + canonical 扩展 | 🚧 大部分（pdf/md/word/excel 可入库、canonical 扩展落地；html 待、业务数据导入待，见 A1/A3） |
+| 1 | 数据能进库：解析层 adapter + canonical 扩展 | 🚧 五类来源全接入（pdf/md/word/excel/html 可入库、canonical 扩展落地；真实业务数据导入待，见 A1/A3） |
 | 2 | 质量可治理：审核工作台 + 置信度融合 | 🚧 闭环已实测生效（≥1 条端到端；各类别全量闭环与业务复验待，见 A4/A5/D3） |
 | 3 | 图片类：签名导向 OCR | 🚧 框架完成（paddle 实测待，见 A2） |
 | 4 | 跨来源关系：图 Evidence/EQUIVALENT_TO 边 | 🚧 部分（Evidence 互证 CORROBORATES ✅；EQUIVALENT_TO 待，见 A6） |
@@ -49,7 +49,7 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 
 | # | 项 | 说明 | 验证点 | 状态 |
 |---|---|---|---|---|
-| A1 | 解析层 adapter | `PdfSource`（PyMuPDF 文字层 + 表格→Markdown/JSON）/ `MarkdownSource`（标题提取 + 全文）/ `ExcelSource`（**schema-free**：任意 sheet/列序逐行拼接入库，每行一条文档 `excel:{文件}:{sheet}:{行}`）；Word 已接入（`WordSource`：标题样式/大纲级别→章节、列表、表格→Markdown+JSON、内嵌图片→资产+OCR、超链接→`[文字](url)`，单测 `tests/test_word_source.py`）；HTML 待实现（`HtmlSource`） | 1 份接口指南 PDF → md + tables.json；1 份 Word 案例 → 标题层级保留（✅ 单测覆盖，真实业务 Word 待导入） | 🚧 PDF/Markdown/Excel/Word ✅，HTML 🔲 |
+| A1 | 解析层 adapter | `PdfSource`（PyMuPDF 文字层 + 表格→Markdown/JSON）/ `MarkdownSource`（标题提取 + 全文）/ `ExcelSource`（**schema-free**：任意 sheet/列序逐行拼接入库，每行一条文档 `excel:{文件}:{sheet}:{行}`）；Word 已接入（`WordSource`：标题样式/大纲级别→章节、列表、表格→Markdown+JSON、内嵌图片→资产+OCR、超链接→`[文字](url)`，单测 `tests/test_word_source.py`）；HTML 已接入（`HtmlSource`：trafilatura 正文去噪 + 表格/图片收割进图 + saved-from-url 保留原始 URL + GBK 编码兜底，单测 `tests/test_html_source.py`，见 USAGE §2.6） | 1 份接口指南 PDF → md + tables.json；1 份 Word 案例 → 标题层级保留（✅ 单测覆盖，真实业务 Word 待导入） | 🚧 PDF/Markdown/Excel/Word/HTML 五类来源全接入（✅），真实业务数据批量导入待 |
 | A2 | 图片链路 | `ImageSource` + 签名导向 OCR：**预留 API**（`ocr_provider: api`，POST {base}/ocr 协议）+ 本地 paddle；**无 API 时交互询问本地/跳过**（ask 默认，非 tty 自动跳过）；md 图片自动收集重写资产路径 + evidence；sha256 幂等 | 10 张真实截图签名召回率（**业务环境用 paddle 标定 B/C 阈值**）；OCR API 服务对接 | 🚧 框架 ✅（ask/api/paddle/none 决策 + 收集/重写/产物/幂等），paddle 实测 🔲 |
 | A3 | canonical 扩展落地 | `extra.asset/quality/verification/evidence` 字段 + 验证状态默认规则（官方手册=expert / 案例标题解析 待审核·审核通过·待修改 / 表格=低优先级按 open issue / wiki=unverified 待补标） | 混合来源 canonical 行数 + 质量字段完整性 | 🚧 asset/quality/verification/evidence ✅（检索结果透传 verification）；案例标题解析：标题含"待审核/待修改"→ 审核队列 case_title_flag ✅（`review.seed_case_title_flags`）；标题"审核通过"→ tested 的自动提权**未实现**（升级统一走审核台 doc_verification 覆盖层，见 A5）；混合来源字段完整性待业务数据复核 |
 | A4 | 置信度融合 | `verification_factor`（expert 0.95 / tested 0.85 / unverified 0.5，可配置）并入 `w_rel`（max 下限提升）；向量路径 meta 补全 verification | 手册检索 w_rel 0.4→0.95（✅ 实测）；样例置信度分解可见 verification | ✅ 完成 |

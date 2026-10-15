@@ -221,7 +221,8 @@ class WordSource(BaseSource):   type = "word"   # 对外案例
 class HtmlSource(BaseSource):   type = "html"   # 网页案例（trafilatura 正文抽取）
 class ImageSource(BaseSource):  type = "image"  # 截图/拍照：pull=复制进 assets，canonicalize=签名导向 OCR
 # markdown / excel ✅ 已实现（MarkdownSource / ExcelSource：schema-free 逐行拼接入库）；
-# word / html 待业务环境（WordSource / HtmlSource）
+# word / html 已实现（WordSource / HtmlSource：HtmlSource = trafilatura 正文去噪
+# + 表格/图片收割进图 + saved-from-url，见 sources.py 与 USAGE §2.6）
 ```
 
 每个 adapter 实现 `pull()`（原始资产落 `data/raw/{source_id}/` 或直接 `data/assets/`）+ `canonicalize()`，
@@ -294,7 +295,7 @@ GET  /stats                          # 各类别待办量（工作台概览）
 
 | 里程碑 | 内容 | 验证点 |
 |---|---|---|
-| M1 资产+解析层 | `assets/`/`parsed/` 布局落地；**PdfSource / MarkdownSource / ExcelSource / WordSource 已实现**（表格→Markdown/JSON、验证状态默认规则）；HtmlSource 待实现 | PDF 手册 → md + tables.json（✅）；Word 案例 → 标题层级（✅，`tests/test_word_source.py` 单测覆盖） |
+| M1 资产+解析层 | `assets/`/`parsed/` 布局落地；**PdfSource / MarkdownSource / ExcelSource / WordSource / HtmlSource 已实现**（表格→Markdown/JSON、验证状态默认规则；HtmlSource = trafilatura 正文去噪 + 表格/图片收割 + saved-from-url，`tests/test_html_source.py`） | PDF 手册 → md + tables.json（✅）；Word 案例 → 标题层级（✅，`tests/test_word_source.py` 单测覆盖）；HTML 网页 → 无导航噪音 + 表格进图（✅，`tests/test_html_source.py`） |
 | M2 图片链路 | ImageSource + 签名导向 OCR（provider 可插拔：paddle / none 占位；md 图片自动收集重写资产路径 + evidence；sha256 幂等） | OCR 产物 + 签名提取（✅ 框架）；10 张真实截图召回率标定 B/C 阈值（🔲 业务环境 paddle 实测） |
 | M3 canonical 扩展 | §7 schema 落地，质量元数据入库，`--recanonicalize` 兼容 | 混合来源 canonical 行数 + 质量字段完整性 |
 | M3.5 审核工作台 | §10 review.sqlite3 + review_ui.py（队列/详情/标注/统计 + **API 配置中心**：embedding/OCR/GitHub 状态脱敏展示、embedding 连通测试） | 各类别各 1 条走完 pending→confirmed 闭环（✅ 框架 + 补标闭环端到端实测：doc_verification 覆盖层即时生效、--rebuild 保留，不回写 canonical） |

@@ -721,7 +721,45 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 
 **验证**：`python -m unittest tests.test_word_source -v`
 
-> HTML 适配在业务环境阶段开发（Word 已接入，见 §2.5）。
+### 2.6 HTML 网页导入（.html/.htm）—— 完整实操
+
+**适用**：浏览器"另存为"保存的网页（对外案例页 / 内部 wiki 文章页 / 故障复盘帖）。
+**只认本地文件，不联网抓取**（远程图片只留占位不下载）。
+
+```json
+{"id": "webpages", "type": "html", "path": "data/imports/html", "enabled": true}
+```
+
+**引擎分工**（`vllm_kb/html_convert.py`，混合：lxml 收割 + trafilatura 正文）：
+
+- **表格收割先于正文抽取**：内容表（≥2×2 或有 th/caption）→ 结构化 rows 落
+  `data/parsed/html/{asset_id}.tables.json`（建图抽错误码消费），正文以 pipe table
+  统一渲染补回（渲染与 pdf/word 同一实现）；布局表（<2×2 且无 th/caption）丢弃，
+  整表文字 ≥80 字符视为"套壳正文"（单格代码框）展开成段落保留；丢弃/展开计数进
+  `quality`；
+- **正文**：trafilatura（`output_format="markdown"`，自带去噪，适配文章页）；抽取
+  失败/过短 → `baseline` 全文兜底；未安装 → lxml 全文兜底（表格收割不受影响）。
+  nav/aside/footer 与 script/style 先于引擎整棵移除——小页面会触发 trafilatura 的
+  召回兜底把导航噪音留进正文，script 文本否则会被 baseline 当正文捞回来；
+- **图片**：收割后按文档序补回（trafilatura 实测会把纯图段落整段丢弃），src 原样
+  保留 → 与 markdown 来源同一通路：本地相对路径以网页所在目录为基准、`data:URI`
+  落资产（内容寻址 + OCR）、远程只留占位；
+- **链接**：只渲染 http/https/mailto 目标，相对路径 / `file://` 剥掉只留文字
+  （与 Word 超链接同一安全规则：正文与 canonical 不含任何服务器路径）；
+- **原始 URL**：浏览器"另存为"残留的 `<!-- saved from url=(NNNN)… -->` 注释 →
+  `docs.url`（无注释则留空）；
+- **编码**：BOM → meta charset → utf-8 → gb18030 → replace（内网 GBK 保存页免转码）；
+- **verification=unverified**：与 markdown/word 统一路径（审核台补标）；脱敏默认启用
+  （`config.sanitize.sources` 默认含 `html`）；解析中间产物缓存
+  `data/parsed/html/{asset_id}.extract.json`（schema 位，二次构建不重解析）。
+
+**已知边界**：
+
+- trafilatura 正文不含 markdown 标题（h1-h6 抽成普通行）→ chunk 无 section（chunking
+  有段落级兜底切块，检索粒度略粗）；
+- `.mht/.mhtml/.url` 不支持 → 跳过并提示在浏览器里另存为「网页，仅 HTML」。
+
+**验证**：`python -m unittest tests.test_html_source tests.test_html_convert -v`
 
 ## 3. 启动检索服务
 
