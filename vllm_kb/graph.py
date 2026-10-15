@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Optional
 
 import kuzu
 
+from .doc_kinds import BY_TYPE
 from .graph_rels import (
     extract_doc_relations,
     load_release_calendars,
@@ -138,17 +139,21 @@ def _extract_doc_interfaces(doc: dict) -> set[str]:
 
 
 def _extract_doc_table_codes(doc: dict, parsed_root: Path) -> set[str]:
-    """从文档的 parsed 表格产物（data/parsed/pdf/<asset_id>.tables.json）提取错误码。
+    """从文档的 parsed 表格产物（data/parsed/<asset_sub>/<asset_id>.tables.json）提取错误码。
 
     接口指南的错误码表 → ErrorCode 节点 + DOCUMENTS 边（"这个错误码在哪个手册定义"）。
-    无表格产物时返回空集。parsed 产物以 asset_id 命名（不暴露文件名/路径）。
+    子目录按 doc_kinds 的 asset_sub 寻径（pdf/word/html 各自落各的 parsed 产物）——
+    原先硬编码 pdf，word/html 的表格产物会被静默漏掉。无表格产物时返回空集。
+    parsed 产物以 asset_id 命名（不暴露文件名/路径）。
     """
     codes: set[str] = set()
     asset = (doc.get("extra") or {}).get("asset") or {}
     asset_id = str(asset.get("asset_id", ""))
     if not asset_id:
         return codes
-    p = parsed_root / "pdf" / f"{asset_id}.tables.json"
+    kind = BY_TYPE.get(str(doc.get("source_type", "")))
+    sub = kind.asset_sub if kind is not None else "pdf"
+    p = parsed_root / sub / f"{asset_id}.tables.json"
     if not p.exists():
         return codes
     try:

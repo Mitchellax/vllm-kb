@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vllm_kb.graph import GraphBuilder
+from vllm_kb.graph import GraphBuilder, _extract_doc_table_codes
 from vllm_kb.graph_rels import (
     ReleaseInfo,
     extract_doc_relations,
@@ -117,6 +117,35 @@ def write_parsed(tmp: Path) -> Path:
 
 
 class TestExtractRules(unittest.TestCase):
+    def test_doc_table_codes_kind_aware_parsed_path(self):
+        """表格产物寻径按 doc_kinds.asset_sub（pdf/word/html 各自落各的）——
+        原先硬编码 pdf，word/html 的错误码表静默不被消费。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for sub, aid in (("pdf", "aaaa"), ("word", "bbbb"), ("html", "cccc")):
+                d = root / "parsed" / sub
+                d.mkdir(parents=True)
+                (d / f"{aid}.tables.json").write_text(json.dumps({
+                    "source": f"{sub}:{aid}",
+                    "tables": [{"rows": [["错误码", "含义"], ["561001", "dispatch failed"]]}],
+                }, ensure_ascii=False), encoding="utf-8")
+
+            def doc(st: str, aid: str) -> dict:
+                return {"source_type": st, "extra": {"asset": {"asset_id": aid}}}
+
+            parsed = root / "parsed"
+            self.assertEqual(_extract_doc_table_codes(doc("doc_pdf", "aaaa"), parsed),
+                             {"561001"})
+            self.assertEqual(_extract_doc_table_codes(doc("doc_word", "bbbb"), parsed),
+                             {"561001"})
+            self.assertEqual(_extract_doc_table_codes(doc("doc_html", "cccc"), parsed),
+                             {"561001"})
+            # 未知来源类型回退 pdf 子目录（旧行为保持）；无 asset_id → 空
+            self.assertEqual(_extract_doc_table_codes(doc("doc_other", "aaaa"), parsed),
+                             {"561001"})
+            self.assertEqual(_extract_doc_table_codes({"source_type": "doc_pdf"}, parsed),
+                             set())
+
     def test_fix_refs_same_repo(self):
         self.assertEqual(
             extract_fix_refs("Fixes #10700 and closes #1", "vllm-project/vllm-ascend"),
