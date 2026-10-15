@@ -280,6 +280,46 @@ class ReviewUiApiTest(unittest.TestCase):
         it = self.client.get("/api/item/1").json()
         self.assertEqual(it["status"], "pending")
 
+    def test_doc_preview(self):
+        """补标详情的正文预览：返回正文；未知文档 404（审核人先看到内容再判定）。"""
+        seed_kb_doc(self.cfg_path, "md:doc1")
+        r = self.client.get("/api/doc-preview", params={"source_id": "md:doc1"})
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["source_id"], "md:doc1")
+        self.assertIn("body", d)
+        self.assertEqual(r.status_code, 200)
+        r2 = self.client.get("/api/doc-preview", params={"source_id": "md:ghost"})
+        self.assertEqual(r2.status_code, 404)
+
+    def test_file_level_review_flow_http(self):
+        """表格文件级审核（HTTP 层）：seed 聚合 → 认证一次 → 整表生效。"""
+        seed_kb_doc(self.cfg_path, "excel:t:Sheet1:1", source_type="doc_excel")
+        seed_kb_doc(self.cfg_path, "excel:t:Sheet1:2", source_type="doc_excel")
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore, default_review_path, seed_verification_pending
+
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        store = ReviewStore(default_review_path(cfg))
+        seed_verification_pending(cfg, store)
+        fitems = [i for i in store.list_items(category="verification_pending")
+                  if i["item_ref"].startswith("excelfile:")]
+        self.assertEqual(len(fitems), 1)
+        self.assertEqual(fitems[0]["payload"]["row_count"], 2)
+        r = self.client.post(f"/api/item/{fitems[0]['id']}/review", json={
+            "action": "approved", "reviewer": "alice", "result": {"verification": "expert"}})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["rows_verified"], 2)
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        try:
+            for sid in ("excel:t:Sheet1:1", "excel:t:Sheet1:2"):
+                extra = json.loads(conn.execute(
+                    "SELECT extra FROM docs WHERE source_id=?", (sid,)).fetchone()[0])
+                self.assertEqual(extra["verification"], "expert")
+        finally:
+            conn.close()
+        store.close()
+
     def test_configs_list_redacted(self):
         cs = self.client.get("/api/configs").json()
         by_name = {c["name"]: c for c in cs}

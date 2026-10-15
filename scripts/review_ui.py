@@ -3,9 +3,17 @@
 功能：
 1. **审核队列**：6 类人工确认项（verification_pending / case_title_flag / ocr_mismatch /
    low_confidence_ocr / equivalence_candidate / table_join_candidate）统一入口；
-   详情页可预览原图（assets 静态服务）+ 提交标注（确认/拒绝/修改 + 备注）；
+   详情页可预览原图（assets 静态服务）+ 补标项正文预览（/api/doc-preview）+ 提交标注
+   （确认/拒绝/修改 + 备注）；**表格项按文件粒度**（一次认证整表生效，内容变更自动重审）；
 2. **API 配置中心**：集中展示 embedding / OCR / GitHub 等 API 配置状态（key 脱敏），
    embedding 支持连通性测试。
+
+样式对齐 DSH 默认设计语言（近黑主色/三级标签灰/10% 细边框/12px 圆角/暗色跟随系统）。
+
+TODO（暂缓，人工成本优化）：标签打标与 tag_candidate 候选处理的人工成本偏高——
+候选按词聚合已做，仍需逐条人工判断。待设计更优流程（规则化自动采纳、批量打标、
+按主题聚合视图）后再动，见「标签管理」「文档管理」页内 TODO 横幅与
+docs/analysis/business-migration-checklist.md。
 
 用法：
     pip install fastapi uvicorn
@@ -29,31 +37,101 @@ _HTML = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>vllm-kb 审核工作台</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:0;background:#f5f6f8;color:#222}
-header{background:#1f2937;color:#fff;padding:10px 20px;display:flex;gap:24px;align-items:center}
-header a{color:#9ca3af;text-decoration:none;cursor:pointer;font-size:14px}
-header a.active{color:#fff;font-weight:600}
-main{padding:20px;max-width:1100px;margin:0 auto}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:14px;margin-bottom:14px}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;margin-right:6px}
-.badge.pending{background:#fef3c7;color:#92400e}.badge.approved{background:#d1fae5;color:#065f46}
-.badge.suspected{background:#ede9fe;color:#5b21b6}.badge.deleted{background:#fee2e2;color:#991b1b}
+/* 设计 token 对齐 DSH 默认样式（DeepSeek 设计语言）：
+   近黑主色 #0f1115、三级标签灰阶、10% 细边框、12px 圆角、系统字体栈 + 抗锯齿；
+   状态色低饱和（tinted badge），暗色跟随系统。 */
+:root{
+  --rv-bg:#ffffff; --rv-bg-2:#f7f8f9; --rv-panel:#ffffff;
+  --rv-label-1:#0f1115; --rv-label-2:#61666b; --rv-label-3:#81858c;
+  --rv-border:rgb(0 0 0 / 10%); --rv-border-strong:rgb(0 0 0 / 18%);
+  --rv-brand:#0f1115; --rv-brand-contrast:#ffffff;
+  --rv-accent:#4d6bfe; --rv-hover:#f2f3f5; --rv-active:#ebecef;
+  --rv-green:#0a8f5b; --rv-green-bg:#e6f4ec;
+  --rv-amber:#9a6b00; --rv-amber-bg:#faf1dc;
+  --rv-violet:#6d4fd4; --rv-violet-bg:#efebfa;
+  --rv-red:#c0392f; --rv-red-bg:#fdeceb;
+  --rv-radius:12px; --rv-radius-s:8px;
+  --rv-shadow:0 1px 2px rgb(15 17 21 / 4%);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --rv-bg:#151517; --rv-bg-2:#1d1d20; --rv-panel:#1d1d20;
+    --rv-label-1:#f9fafb; --rv-label-2:#cfd3d6; --rv-label-3:#adb2b8;
+    --rv-border:rgb(255 255 255 / 12%); --rv-border-strong:rgb(255 255 255 / 22%);
+    --rv-brand:#f9fafb; --rv-brand-contrast:#0f1115;
+    --rv-accent:#7a90ff; --rv-hover:#26262a; --rv-active:#2e2e33;
+    --rv-green:#4ecb8f; --rv-green-bg:#17301f;
+    --rv-amber:#e3b341; --rv-amber-bg:#332a14;
+    --rv-violet:#a794ee; --rv-violet-bg:#241f38;
+    --rv-red:#ef7b72; --rv-red-bg:#3a1c19;
+    --rv-shadow:none;
+  }
+}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Helvetica Neue",Helvetica,Arial,sans-serif;
+  margin:0;background:var(--rv-bg);color:var(--rv-label-1);font-size:14px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+header{position:sticky;top:0;z-index:10;background:var(--rv-panel);border-bottom:1px solid var(--rv-border);
+  padding:0 24px;display:flex;gap:20px;align-items:center;height:52px}
+header strong{font-size:15px;letter-spacing:.2px;margin-right:8px}
+header a{color:var(--rv-label-2);text-decoration:none;cursor:pointer;font-size:13.5px;padding:4px 2px;border-bottom:2px solid transparent}
+header a.active{color:var(--rv-label-1);font-weight:600;border-bottom-color:var(--rv-label-1)}
+header a:hover{color:var(--rv-label-1)}
+main{padding:24px;max-width:1080px;margin:0 auto}
+h3{font-size:16px;font-weight:600;margin:18px 0 12px}
+h4{font-size:14px;font-weight:600;margin:12px 0 8px}
+.card{background:var(--rv-panel);border:1px solid var(--rv-border);border-radius:var(--rv-radius);
+  padding:16px;margin-bottom:12px;box-shadow:var(--rv-shadow)}
+.card.subtle{background:var(--rv-bg-2)}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;margin-right:6px;
+  background:var(--rv-bg-2);color:var(--rv-label-2);border:1px solid var(--rv-border);vertical-align:1px}
+.badge.pending{background:var(--rv-amber-bg);color:var(--rv-amber);border-color:transparent}
+.badge.approved{background:var(--rv-green-bg);color:var(--rv-green);border-color:transparent}
+.badge.suspected{background:var(--rv-violet-bg);color:var(--rv-violet);border-color:transparent}
+.badge.deleted{background:var(--rv-red-bg);color:var(--rv-red);border-color:transparent}
+button{background:var(--rv-panel);color:var(--rv-label-1);border:1px solid var(--rv-border-strong);
+  border-radius:var(--rv-radius-s);padding:6px 14px;cursor:pointer;font-size:13px;transition:background .12s}
+button:hover{background:var(--rv-hover)}
+button.primary{background:var(--rv-brand);color:var(--rv-brand-contrast);border-color:transparent;font-weight:500}
+button.primary:hover{opacity:.88;background:var(--rv-brand)}
+button.ok{background:var(--rv-green);color:#fff;border-color:transparent}
+button.ok:hover{opacity:.88;background:var(--rv-green)}
+button.danger{background:transparent;color:var(--rv-red);border-color:var(--rv-red)}
+button.danger:hover{background:var(--rv-red-bg)}
+button.sm{padding:2px 8px;font-size:12px}
+input,select,textarea{padding:6px 9px;border:1px solid var(--rv-border-strong);border-radius:var(--rv-radius-s);
+  font-size:13px;background:var(--rv-panel);color:var(--rv-label-1);font-family:inherit}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--rv-accent);outline-offset:-1px;border-color:var(--rv-accent)}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #f0f0f0}
-button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px}
-button.sec{background:#6b7280}button.ok{background:#059669}button.danger{background:#dc2626}
-input,select,textarea{padding:6px;border:1px solid #d1d5db;border-radius:6px;font-size:13px}
-pre{background:#111827;color:#e5e7eb;padding:10px;border-radius:6px;overflow:auto;font-size:12px}
-.mono{font-family:ui-monospace,monospace;font-size:12px}
-.item{display:flex;justify-content:space-between;gap:10px;cursor:pointer;padding:8px;border-radius:6px}
-.item:hover{background:#f3f4f6}
-.muted{color:#6b7280;font-size:12px}
-.tagb{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin:2px 4px 2px 0;cursor:pointer;border:1px solid transparent}
-.tagb.domain{background:#dbeafe;color:#1e40af}.tagb.purpose{background:#dcfce7;color:#166534}
-.tagb.auto{border-style:dashed}.tagb.manual{background:#fef3c7;color:#92400e}
-.tagb.excluded{background:#fee2e2;color:#991b1b;text-decoration:line-through}
-.tagb.reg{background:#f3f4f6;color:#374151;cursor:default}
-.warn{color:#b45309;font-size:12px}
+th{text-align:left;padding:7px 8px;border-bottom:1px solid var(--rv-border-strong);color:var(--rv-label-3);font-weight:500;font-size:12px}
+td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--rv-border)}
+tr:hover td{background:var(--rv-hover)}
+pre{background:var(--rv-bg-2);border:1px solid var(--rv-border);color:var(--rv-label-1);
+  padding:12px;border-radius:var(--rv-radius-s);overflow:auto;font-size:12px;line-height:1.5}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.item{display:flex;justify-content:space-between;gap:10px;cursor:pointer;padding:10px 12px;border-radius:var(--rv-radius-s);
+  border:1px solid transparent}
+.item:hover{background:var(--rv-hover)}
+.item.selected{border-color:var(--rv-border-strong);background:var(--rv-active)}
+.muted{color:var(--rv-label-3);font-size:12px}
+.tagb{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;margin:2px 4px 2px 0;cursor:pointer;border:1px solid var(--rv-border)}
+.tagb.domain{background:var(--rv-violet-bg);color:var(--rv-violet);border-color:transparent}
+.tagb.purpose{background:var(--rv-green-bg);color:var(--rv-green);border-color:transparent}
+.tagb.auto{border-style:dashed}
+.tagb.manual{background:var(--rv-amber-bg);color:var(--rv-amber);border-color:transparent}
+.tagb.excluded{background:var(--rv-red-bg);color:var(--rv-red);text-decoration:line-through}
+.tagb.reg{background:var(--rv-bg-2);color:var(--rv-label-2);cursor:default}
+.warn{color:var(--rv-amber);font-size:12px}
+.todo{background:var(--rv-amber-bg);color:var(--rv-amber);border:1px dashed var(--rv-amber);
+  border-radius:var(--rv-radius-s);padding:10px 14px;font-size:12.5px;margin-bottom:12px}
+.statgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.statcard{background:var(--rv-panel);border:1px solid var(--rv-border);border-radius:var(--rv-radius);
+  padding:14px 16px;box-shadow:var(--rv-shadow)}
+.statcard b{font-size:13.5px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.divider{border:0;border-top:1px solid var(--rv-border);margin:14px 0}
+#toast{position:fixed;top:64px;right:24px;background:var(--rv-brand);color:var(--rv-brand-contrast);
+  padding:9px 16px;border-radius:var(--rv-radius-s);display:none;z-index:99;font-size:13px;box-shadow:0 4px 16px rgb(0 0 0 / 18%)}
 </style></head><body>
 <header><strong>vllm-kb 审核工作台</strong>
 <a id="nav-stats" class="active" onclick="tab('stats')">概览</a>
@@ -61,7 +139,7 @@ pre{background:#111827;color:#e5e7eb;padding:10px;border-radius:6px;overflow:aut
 <a id="nav-docs" onclick="tab('docs')">文档管理</a>
 <a id="nav-tags" onclick="tab('tags')">标签管理</a>
 <a id="nav-configs" onclick="tab('configs')">API 配置</a><a id="nav-gaps" onclick="tab('gaps')">知识缺口</a></header>
-<div id="toast" style="position:fixed;top:12px;right:20px;background:#111827;color:#fff;padding:8px 14px;border-radius:6px;display:none;z-index:99;font-size:13px"></div>
+<div id="toast"></div>
 <main>
 <div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-tags" style="display:none"></div><div id="view-configs" style="display:none"></div><div id="view-gaps" style="display:none"></div>
 </main>
@@ -75,42 +153,62 @@ async function loadGaps(){let gs=[];try{gs=await j('/api/gaps')}catch(e){$('#vie
 const byType={hard_gap:'强签名零命中',soft_gap:'命中无结论',quality_gap:'弱签名零命中'};
 $('#view-gaps').innerHTML=`<h3>知识缺口（${gs.length} 个，行为遥测推断——同签名跨会话反复查无果）</h3>`+gs.map(g=>`<div class="card"><b>${esc(byType[g.gap_type]||g.gap_type)}</b> <span class="badge pending">sessions=${g.session_count}</span> <span class="muted">${esc(g.component||'')}</span><table><tr><th>签名</th><td class="mono">${esc((g.signature_text||'').slice(0,120))}</td></tr><tr><th>样例查询</th><td class="mono">${esc((g.sample_queries||[]).join(' | ').slice(0,200))}</td></tr><tr><th>平均命中</th><td>${g.avg_result_count}</td></tr><tr><th>首现/末现</th><td class="muted">${esc((g.first_seen||'').slice(0,16))} ~ ${esc((g.last_seen||'').slice(0,16))}</td></tr></table></div>`).join('')||'<div class="card muted">暂无缺口</div>'}
 async function loadStats(){const s=await j('/api/stats');const cats=Object.entries(s).sort((a,b)=>b[1].pending-a[1].pending);
-let tagCard='';try{const td=await j('/api/tag-dict');tagCard=`<div class="card"><b>标签词典</b> 领域类 ${td.stats.domain} 个 · 作用类 ${td.stats.purpose} 个 · 已打标文档 ${td.stats.tagged_docs} 篇</div>`}catch(e){}
-$('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pending,0)} 待办 / ${cats.reduce((a,[k,v])=>a+v.suspected,0)} 存疑）</h3>`+tagCard+cats.map(([k,v])=>`<div class="card"><b>${esc(k)}</b> <span class="badge pending">待办 ${v.pending}</span>${v.suspected?`<span class="badge suspected">存疑 ${v.suspected}</span>`:''} <span class="muted">共 ${v.total}</span></div>`).join('')||'<div class="card">暂无审核项（导入文档后自动补单）</div>'}
+let tagCard='';try{const td=await j('/api/tag-dict');tagCard=`<div class="statcard"><b>标签词典</b><br><span class="muted">领域类 ${td.stats.domain} 个 · 作用类 ${td.stats.purpose} 个 · 已打标文档 ${td.stats.tagged_docs} 篇</span></div>`}catch(e){}
+$('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pending,0)} 待办 / ${cats.reduce((a,[k,v])=>a+v.suspected,0)} 存疑）</h3>`
++(tagCard||'')+`<div class="statgrid">`+(cats.map(([k,v])=>`<div class="statcard"><b>${esc(k)}</b> <span class="badge pending">待办 ${v.pending}</span>${v.suspected?`<span class="badge suspected">存疑 ${v.suspected}</span>`:''} <span class="muted">共 ${v.total}</span></div>`).join('')||'<div class="card">暂无审核项（导入文档后自动补单）</div>')+`</div>`}
 async function loadQueue(cat=''){const q=await j('/api/queue'+(cat?'?category='+cat:''));
 const del=await j('/api/queue?status=deleted&limit=100');
 const opts=(await (async()=>{const r=await fetch('/api/categories');return r.ok?await r.json():[]})());
-$('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后）</span></div>`+q.map(i=>`<div class="item" onclick="showItem(${i.id})"><div><span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc((i.payload||{}).title||i.item_ref)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`).join('')||'<div class="card muted">队列为空</div>'
-+`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid #dc2626"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
+const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.rows||[]).length>1)?` <span class="badge approved">${p.row_count||(p.rows||[]).length} 行</span>`:''};
+$('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span></div>`
++q.map(i=>`<div class="item" onclick="showItem(${i.id})"><div><span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc((i.payload||{}).title||i.item_ref)}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`).join('')||'<div class="card muted">队列为空</div>'
++`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid var(--rv-red)"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
 <div class="muted mono">${esc((i.payload||{}).asset&&(i.payload.asset.path)||'')}</div>
-<button class="ok" onclick="undoDelete(${i.id})">↩ 撤回（恢复记录并重新入队）</button> <span class="muted">删除人: ${esc(i.reviewer||'')} ${(i.reviewed_at||'').slice(0,16)}</span></div>`).join('')||''}
+<div class="actions"><button class="ok" onclick="undoDelete(${i.id})">↩ 撤回（恢复记录并重新入队）</button> <span class="muted">删除人: ${esc(i.reviewer||'')} ${(i.reviewed_at||'').slice(0,16)}</span></div></div>`).join('')||''}
 async function showItem(id){const i=await j('/api/item/'+id);const p=i.payload||{};
-$('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 返回队列</button><h3>#${i.id} ${esc(i.category)} <span class="badge ${i.status}">${i.status}</span></h3>
+const rows=p.rows||[];
+const isFile=i.category==='verification_pending'&&(p.aggregate==='excel_file'||rows.length>1);
+let fileHead='';
+if(isFile){fileHead=` <span class="badge approved">${p.row_count||rows.length} 行 · 文件粒度</span>
+<p class="muted">认证/存疑<b>整体应用到该文件全部 ${p.row_count||rows.length} 行</b>，不逐行审；表格内容变更后会自动重新进入本队列（内容指纹 <span class="mono">file_sha=${esc((p.file_sha||'').slice(0,16))||'无'}</span>）。</p>`}
+let docPrev='';
+if(i.category==='verification_pending'){const sid=isFile?((rows[0]||{}).source_id||''):(p.source_id||i.item_ref);
+ if(sid){try{const d=await j('/api/doc-preview?source_id='+encodeURIComponent(sid));
+  docPrev=`<h4>内容预览${isFile?'（该文件首行文档；body 含各 sheet 全表内容）':''}</h4><pre style="max-height:340px">${esc(d.body||'（无正文）')}</pre>${d.truncated?'<div class="muted">内容过长已截断</div>':''}`}
+ catch(e){docPrev=`<p class="muted">内容预览不可用：${esc(e.message)}</p>`}}}
+$('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 返回队列</button><h3>#${i.id} ${esc(i.category)} <span class="badge ${i.status}">${i.status}</span>${fileHead}</h3>
 <p><b>item_ref:</b> <span class="mono">${esc(i.item_ref)}</span></p>
 ${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（提及文档 <b>${p.doc_count||1}</b> 篇：${esc((p.docs||[p]).map(d=>d.title||d.source_id||'').slice(0,5).join('、')||'')}${(p.doc_count||1)>5?' …':''}）</p>`:''}
 ${i.category==='low_confidence_ocr'?`<p><b>图片:</b> <span class="mono">${esc((p.sha256||'').slice(0,16)||p.asset_id||'')}</span>
   ${p.asset_path?`<span class="muted mono">· ${esc(p.asset_path)}</span>`:'<span class="muted">（未注册到 asset_registry，无预览）</span>'}
-  <br><img src="/${esc(p.asset_path||'')}" alt="原图" style="max-width:100%;max-height:320px;border:1px solid #d1d5db;border-radius:4px;margin:4px 0" onerror="this.style.display='none'">
+  <br><img src="/${esc(p.asset_path||'')}" alt="原图" style="max-width:100%;max-height:320px;border:1px solid var(--rv-border);border-radius:8px;margin:4px 0" onerror="this.style.display='none'">
   原因: <b>${esc(p.reason||'')}</b>（置信度 ${p.confidence===null||p.confidence===undefined?'无':p.confidence}，来源 ${esc(p.confidence_source||'')}${p.anomaly?`，自报异常 ${esc(p.anomaly)}`:''}）
  ${(p.signatures||[]).length?`<br><b>OCR 签名线索:</b> ${esc((p.signatures||[]).map(s=>(s.kind||'')+':'+(s.text||'')).join('、'))}`:'<br><span class="muted">无签名线索</span>'}
  <br><span class="muted">该图 OCR 文本<b>未进正文</b>（低置信或自报异常），本项只是待核对清单：✓ 认证即忽略，存疑则重新排队。</span></p>`:''}
-<pre>${esc(JSON.stringify(p,null,2))}</pre>
+${isFile?`<h4>文件内行清单（展示前 ${Math.min(rows.length,100)} 行）</h4><table><tr><th>source_id</th><th>标题</th></tr>${rows.slice(0,100).map(r=>`<tr><td class="mono">${esc(r.source_id)}</td><td>${esc(r.title||'')}</td></tr>`).join('')}</table>`:''}
+${docPrev}
+<h4>原始 payload</h4><pre>${esc(JSON.stringify(p,null,2))}</pre>
 <h4>审核（只做判定，不修改原始内容）</h4><input id="rev" placeholder="审核人（必填）" style="width:180px" oninput="saveReviewer(this.value)">
-<textarea id="rvnote" rows="2" style="width:100%" placeholder="备注（可选）"></textarea><br><br>
+<textarea id="rvnote" rows="2" style="width:100%" placeholder="备注（可选）"></textarea>
+<div class="actions">
+${i.category==='verification_pending'?`认证级别: <select id="verlevel"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option></select>`:''}
 ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
-<button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button><br><br>`:''}
-<button class="ok" onclick="review(${i.id},'approved')">✓ 认证</button>
+<button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button>`:''}
+<button class="primary" onclick="review(${i.id},'approved')">✓ 认证${isFile?`（全部 ${p.row_count||rows.length} 行）`:''}</button>
 <button onclick="review(${i.id},'suspected')">？ 存疑（重新排队靠后）</button>
-${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除（只删数据库记录，原始文件手动删）</button>`}
-<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条）、low_confidence_ocr 按图片 sha256 聚合，两者 item_ref 不是文档 id，故不提供删除按钮（忽略请用 ✓ 认证）</span></div>`
+${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除${isFile?'（整表）':''}</button>`}
+</div>
+<span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条）、low_confidence_ocr 按图片 sha256 聚合，两者 item_ref 不是文档 id，故不提供删除按钮（忽略请用 ✓ 认证）${isFile?'；表格项删除=整表全部行，可在待删除列表撤回':''}</span></div>`
 $('#rev').value=loadReviewer()}
 async function adoptCandidate(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
-async function review(id,action){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}let result={note:document.getElementById('rvnote').value};try{result=JSON.parse(result.note||'{}')}catch(e){}
+async function review(id,action){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
+const result={note:(document.getElementById('rvnote')||{}).value||''};
+const vl=document.getElementById('verlevel');if(vl)result.verification=vl.value;  // 补标项认证级别（tested/expert）
 await j('/api/item/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reviewer,result})});loadQueue()}
 async function deleteDoc(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
-if(!confirm('标记删除：只删除数据库记录，原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
-await j('/api/item/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,note:document.getElementById('rvnote').value})});loadQueue()}
+if(!confirm('标记删除：只删除数据库记录（表格项=整表全部行），原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
+await j('/api/item/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,note:(document.getElementById('rvnote')||{}).value||''})});loadQueue()}
 async function undoDelete(id){if(!confirm('撤回删除：恢复数据库记录并重新加入队列？'))return;await j('/api/item/'+id+'/undo',{method:'POST'});loadQueue()}
 async function loadDocs(){const ds=await j('/api/external-docs?limit=500');
 let td={};try{const t=await j('/api/tag-dict');t.groups.domain.forEach(x=>td[x.name]='domain');t.groups.purpose.forEach(x=>td[x.name]='purpose')}catch(e){}
@@ -119,15 +217,17 @@ const q=s=>esc(String(s||'')).replace(/'/g,"\\'");
 const tagB=(sid,t,cls,act,mark)=>`<span class="tagb ${cls} ${tierOf(t)}" onclick="tagEdit('${q(sid)}','${act}','${q(t)}')">${esc(t)} ${mark}</span>`;
 const groupRow=(list,cls,act,mark,sid)=>list.length?`<div style="margin-top:4px"><span class="muted">${cls==='excluded'?'已排除':cls==='manual'?'人工':'自动'}:</span> ${list.map(t=>tagB(sid,t,cls,act,mark)).join('')}</div>`:'';
 $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
-<div class="card muted">删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>`+ds.map(d=>{const t=d.tags||{};
-return `<div class="card" style="border-left:3px solid ${d.duplicate?'#b45309':'#d1d5db'}"><div><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:''}</div>
+<div class="card subtle">删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
+<div class="todo"><b>TODO（暂缓）</b>：逐篇打标/逐条处理候选标签的人工成本偏高。待设计更优流程后再动——候选方向：规则化自动采纳（词典近义/高频强候选免审）、文档管理页批量操作（多选打标/排除）、按主题聚合的打标视图。当前保持现状。</div>`
++ds.map(d=>{const t=d.tags||{};
+return `<div class="card" style="border-left:3px solid ${d.duplicate?'var(--rv-amber)':'var(--rv-border)'}"><div><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:''}</div>
 <div class="mono muted">${esc(d.source_id)}${d.asset_path?` · ${esc(d.asset_path)}`:''}</div>
 ${groupRow(t.auto||[],'auto','exclude','✕',d.source_id)}
 ${groupRow(t.excluded||[],'excluded','restore','↺',d.source_id)}
 ${groupRow(t.manual||[],'manual','remove','✕',d.source_id)}
-<div style="margin-top:6px"><input id="newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}" placeholder="添加标签" style="width:180px"><button onclick="tagAdd('${q(d.source_id)}',document.getElementById('newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}').value)">添加</button>
+<div style="margin-top:6px"><input id="newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}" placeholder="添加标签" style="width:180px"><button class="sm" onclick="tagAdd('${q(d.source_id)}',document.getElementById('newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}').value)">添加</button>
 <span class="muted">最终: ${(t.final||[]).map(esc).join(' · ')||'（无标签）'}</span></div>
-<div style="margin-top:4px"><button class="danger" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`}).join('')||'<div class="card muted">无外源文档</div>'}
+<div class="actions"><button class="danger sm" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`}).join('')||'<div class="card muted">无外源文档</div>'}
 async function tagEdit(sid,action,tag){const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;
 if(reviewer!==loadReviewer())saveReviewer(reviewer);
 try{await j('/api/docs/tags/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,action,tag,reviewer})});loadDocs();toast('✓ 已更新标签')}catch(e){toast('✗ '+e.message)}}
@@ -136,9 +236,10 @@ async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文�
 try{await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();toast('✓ 已删除（本地文件保留）')}
 catch(e){toast('✗ 删除失败: '+e.message)}}
 async function loadTagDict(){const t=await j('/api/tag-dict');
-const groupHtml=(g,title)=>`<h4 style="margin:10px 0 4px">${title}（${g.length}）</h4><div class="card">${g.map(x=>`<span class="tagb reg">${esc(x.name)} (${x.docs}篇)</span> <button style="padding:2px 8px" onclick="tagDictForm('${esc(x.name).replace(/'/g,"\\'")}')">编辑</button>`).join('')||'（空）'}</div>`;
+const groupHtml=(g,title)=>`<h4 style="margin:10px 0 4px">${title}（${g.length}）</h4><div class="card">${g.map(x=>`<span class="tagb reg">${esc(x.name)} (${x.docs}篇)</span> <button class="sm" onclick="tagDictForm('${esc(x.name).replace(/'/g,"\\'")}')">编辑</button>`).join('')||'（空）'}</div>`;
 $('#view-tags').innerHTML=`<h3>标签词典（config.json tags.registry，全局唯一事实源）</h3>
-<div class="card muted">两级分类：领域类=这是什么领域的知识（过滤/圈定范围）；作用类=文档能帮我做什么（能力匹配）。新增/改名/改 tier 同步 config.json；<b>不热插图</b>——运行 build_graph.py 重建图后入图（Kùzu 单写者约束）。</div>
+<div class="todo"><b>TODO（暂缓）</b>：标签打标与候选处理的人工成本偏高（候选按词聚合已做，仍需逐条人工判断）。待设计更优流程/交互后再优化——候选方向见「文档管理」页 TODO。当前保持现状。</div>
+<div class="card subtle">两级分类：领域类=这是什么领域的知识（过滤/圈定范围）；作用类=文档能帮我做什么（能力匹配）。新增/改名/改 tier 同步 config.json；<b>不热插图</b>——运行 build_graph.py 重建图后入图（Kùzu 单写者约束）。</div>
 ${groupHtml(t.groups.domain||[],'主题/领域类 (domain)')}
 ${groupHtml(t.groups.purpose||[],'具体作用类 (purpose)')}
 <div class="card"><b>新增标签</b> <input id="newtag-name" placeholder="标签名" style="width:180px"> tier: <select id="newtag-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
@@ -146,7 +247,7 @@ ${groupHtml(t.groups.purpose||[],'具体作用类 (purpose)')}
 async function tagDictAdd(){const name=document.getElementById('newtag-name').value.trim();if(!name){alert('输入标签名');return}
 try{await j('/api/tag-dict/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,tier:document.getElementById('newtag-tier').value||null})});loadTagDict();toast('✓ 已加入词典（重建图后入图）')}catch(e){toast('✗ '+e.message)}}
 function tagDictForm(name){const old=document.getElementById('tdform');if(old)old.remove();
-const div=document.createElement('div');div.id='tdform';div.className='card';div.style.background='#f9fafb';
+const div=document.createElement('div');div.id='tdform';div.className='card subtle';
 div.innerHTML=`<b>编辑: ${esc(name)}</b><br>新名: <input id="td-new" placeholder="${esc(name)}" style="width:140px">
 tier: <select id="td-tier"><option value="">不变</option><option value="domain">领域</option><option value="purpose">作用</option></select>
 <button class="ok" onclick="tagDictRename('${esc(name).replace(/'/g,"\\'")}')">改名</button>
@@ -172,7 +273,7 @@ function fillCache(cs){window._cfgCache={};cs.forEach(c=>window._cfgCache[c.name
 async function editConfig(name){const old=document.getElementById('form-'+name);if(old)old.remove();
 try{fillCache(await j('/api/configs'))}catch(e){} // 打开时拉最新配置，避免缓存/时序回填旧值
 const c=CFG_FIELDS[name];const cur=window._cfgCache[name]||{};const html=c.map(([k,t,opts])=>`<div style="margin:4px 0"><label>${esc(k)}: </label>${t==='select'?`<select id="f-${k}">${opts.map(o=>`<option ${(cur[k]||'')===o?'selected':''}>${esc(o)}</option>`).join('')}</select>`:`<input id="f-${k}" type="${t}" placeholder="${t==='password'?'(留空不改)':'...'}" style="width:340px" ${cur[k]&&t!=='password'?`value="${esc(cur[k])}"`:''}>`}</div>`).join('');
-document.getElementById('cfg-'+name).insertAdjacentHTML('beforeend',`<div class="card" style="background:#f9fafb" id="form-${name}">${html}<br><button class="ok" onclick="saveConfig('${name}')">保存</button> <button onclick="document.getElementById('form-${name}').remove()">取消</button></div>`)}
+document.getElementById('cfg-'+name).insertAdjacentHTML('beforeend',`<div class="card subtle" id="form-${name}">${html}<br><button class="ok" onclick="saveConfig('${name}')">保存</button> <button onclick="document.getElementById('form-${name}').remove()">取消</button></div>`)}
 async function saveConfig(name){const fields={};CFG_FIELDS[name].forEach(([k])=>{const el=document.getElementById('f-'+k);if(el)fields[k]=el.value});
 try{await j('/api/configs/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,fields})});
 document.getElementById('form-'+name).remove();await loadConfigs();toast('✓ 已保存（状态已刷新）')}
@@ -373,6 +474,39 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         if it is None:
             raise HTTPException(404, "审核项不存在")
         return it
+
+    @app.get("/api/doc-preview")
+    def doc_preview(source_id: str, limit: int = 3000):
+        """文档正文预览（审核详情用）：chunks 按 seq 拼装截断返回——审核人先看到内容再判定。
+
+        只读、不落审计；表格文件项预览首行文档（body 含各 sheet 全表内容）。
+        docs 表**不存正文**（正文在 chunks_fts.text，chunks_meta.seq 定序）。
+        库不存在/无该文档/表结构不全时降级为空正文（不 500，前端显示降级提示）。
+        """
+        import sqlite3
+
+        kb = cfg.resolve(cfg.storage.sqlite_path)
+        if not kb.exists():
+            return {"source_id": source_id, "title": "", "body": "", "truncated": False}
+        conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
+        try:
+            try:
+                row = conn.execute("SELECT title FROM docs WHERE source_id=?",
+                                   (source_id,)).fetchone()
+                texts = [r[0] for r in conn.execute(
+                    "SELECT f.text FROM chunks_meta m JOIN chunks_fts f "
+                    "ON f.chunk_id = m.chunk_id WHERE m.doc_id=? ORDER BY m.seq",
+                    (source_id,)).fetchall()]
+            except sqlite3.OperationalError:
+                return {"source_id": source_id, "title": "", "body": "", "truncated": False}
+        finally:
+            conn.close()
+        if row is None:
+            raise HTTPException(404, f"文档不存在: {source_id}")
+        body = "\n\n".join(t for t in texts if t)
+        n = max(200, min(int(limit), 20000))
+        return {"source_id": source_id, "title": row[0] or "",
+                "body": body[:n], "truncated": len(body) > n}
 
     @app.post("/api/item/{item_id}/review")
     def review(item_id: int, body: dict):
