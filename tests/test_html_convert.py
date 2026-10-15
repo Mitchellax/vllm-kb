@@ -134,6 +134,9 @@ class TestHtmlToMarkdown(unittest.TestCase):
         self.assertNotIn("saved from url", res.body)      # 注释不进正文
         self.assertNotIn("layout-only-cell", res.body)    # 布局表碎片不进正文
         self.assertNotIn("inner", res.body.split("错误码表")[0])  # 嵌套表碎片不进正文
+        # 图片收割补回（trafilatura 会丢纯图段落）：src 原样保留交 _resolve_images
+        self.assertIn("![](./img/a.png)", res.body)
+        self.assertIn("![](https://example.com/x.png)", res.body)
 
     def test_extract_none_falls_back_to_baseline(self):
         with mock.patch("trafilatura.extract", return_value=None), \

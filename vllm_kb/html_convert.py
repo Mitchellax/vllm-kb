@@ -9,15 +9,18 @@
   * 布局表（<2×2 且无 th/caption）：整表文字 ≥80 字符视为"套壳正文"（常见单格代码框）
     → 原地展开成 `<p>`（文字保留、结构降级）；否则整体丢弃（导航/菜单碎片），丢弃数
     进 quality 元数据不静默；
+- **图片同样先收割后补回**：`//img` 按文档序收集 (src, alt) 并原地移除（先于表格收割，
+  表格内的截图也不丢）→ 正文末尾按 markdown 图片语法补回，资产化/占位/OCR 统一走
+  `BaseSource._resolve_images`——**trafilatura 实测会把纯图段落整段丢弃**，不收割必丢图；
 - **正文**：trafilatura.extract(output_format="markdown", include_images/links,
   include_formatting)——自带去噪，适配对外案例 / wiki 文章页。已知边界（实测）：
   正文不含 markdown 标题（h1-h6 抽成普通行）→ doc_html 的 chunk 无 section
   （markdown 切分器无锚点，chunking 有段落级兜底切块，检索粒度略粗）；
-- **页面骨架修剪**：nav/aside/footer 在抽取前整棵移除（小页面会触发 trafilatura
-  的召回兜底、把导航噪音留进正文，修剪先于引擎）；
+- **页面骨架修剪**：script/style 与 nav/aside/footer 在抽取前整棵移除（小页面会触发
+  trafilatura 的召回兜底、把导航噪音留进正文，修剪先于引擎；script 文本否则会被
+  baseline 当正文捞回来）；
 - **图片**：src 原样保留（相对路径 / file:// / data:URI / 远程 URL），资产化/占位
-  统一走 `BaseSource._resolve_images`——本模块不做任何文件写入；
-- **链接**：只保留 http/https/mailto 目标（与 WordSource 超链接同一安全规则），
+  统一走 `BaseSource._resolve_images`——本模块不做任何文件写入。- **链接**：只保留 http/https/mailto 目标（与 WordSource 超链接同一安全规则），
   相对路径 / file:// 目标剥掉只留链接文字——"正文不含服务器路径"对任意输入成立。
 
 编码（内网保存页常见 GB2312/GBK）：BOM → meta charset 声明 → utf-8 严格试解 →
@@ -182,6 +185,33 @@ def _harvest_tables(tree) -> tuple[list[dict], int, int]:
     return tables, layout_dropped, unwrapped
 
 
+def _harvest_images(tree) -> list[tuple[str, str]]:
+    """收割 `//img` → [(src, alt)]（文档序）并原地移除。
+
+    **trafilatura 实测会把纯图段落整段丢弃**——图片与表格同策略：先收割、抽取后按
+    markdown 图片语法补回。先于表格收割调用（表格内的截图也要收）；无 src 的装饰图跳过。
+    """
+    out: list[tuple[str, str]] = []
+    for img in tree.xpath("//img"):
+        src = (img.get("src") or "").strip()
+        if not src:
+            continue
+        alt = " ".join((img.get("alt") or "").split())
+        out.append((src, alt))
+        parent = img.getparent()
+        if parent is not None:
+            img.drop_tree()
+    return out
+
+
+def _append_images(body: str, images: list[tuple[str, str]]) -> str:
+    """把收割的图片按文档序补回正文（markdown 图片语法；dest 交 _resolve_images 处理）。"""
+    if not images:
+        return body
+    lines = [f"![{alt}]({src})" if alt else f"![]({src})" for src, alt in images]
+    return (body.rstrip() + "\n\n" if body.strip() else "") + "\n".join(lines)
+
+
 def _sanitize_links(md: str) -> str:
     """行内链接安全化：只留 http/https/mailto 目标，其余剥掉只留文字（图片不动）。"""
     def _repl(m: "re.Match[str]") -> str:
@@ -205,10 +235,15 @@ def _page_title(tree) -> str:
 
 
 def _blocks_to_text(tree) -> str:
-    """lxml 全文兜底：去 script/style 后 text_content（无结构，保文字可检索）。"""
+    """lxml 全文兜底：去 script/style 后 text_content（无结构，保文字可检索）。
+
+    只取 `//body`——`<title>` 不算正文（整树 text_content 会把标题文本捞进来，
+    纯脚本页会凭空产出一篇只有标题的"文档"）。
+    """
     for bad in tree.xpath("//script|//style"):
         bad.drop_tree()
-    lines = [ln.strip() for ln in tree.text_content().splitlines()]
+    roots = tree.xpath("//body") or [tree]
+    lines = [ln.strip() for ln in roots[0].text_content().splitlines()]
     return "\n".join(ln for ln in lines if ln)
 
 
@@ -265,6 +300,7 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
             warnings.append("lxml 未安装——stdlib 粗提取（无去噪/无表格），建议 pip install trafilatura")
 
     tables: list[dict] = []
+    images: list[tuple[str, str]] = []
     layout_dropped = 0
     unwrapped = 0
     body = ""
@@ -273,9 +309,12 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
 
     if tree is not None:
         extractor = "lxml_fallback"
-        tables, layout_dropped, unwrapped = _harvest_tables(tree)
+        for bad in tree.xpath("//script|//style"):
+            bad.drop_tree()
         for bad in tree.xpath(_CHROME_XPATH):
             bad.drop_tree()
+        images = _harvest_images(tree)
+        tables, layout_dropped, unwrapped = _harvest_tables(tree)
         trafilatura = _import_trafilatura()
         if trafilatura is not None:
             main = None
@@ -310,6 +349,7 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
         body = _strip_html_fallback(text)
 
     body = _sanitize_links(body or "")
+    body = _append_images(body, images)
     body = _append_tables(body, tables)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     return ConvertResult(
