@@ -348,12 +348,25 @@ python scripts/build_companion_matrix.py         # 全部脚本自动走业务�
 
 ### 2.3 业务来源导入（PDF 手册 / Markdown 文档）—— 完整实操
 
-**步骤 1：放置文件**
+**步骤 1：放置文件（图片随文档一起本地化）**
 
 ```
-data/imports/pdf/    ← 放 PDF 手册（操作手册/接口指南：硬件排查命令、错误码参考）
-data/imports/md/     ← 放 Markdown（案例/架构说明/经验总结）
+data/imports/pdf/          ← 放 PDF 手册（操作手册/接口指南：硬件排查命令、错误码参考）
+data/imports/md/           ← 放 Markdown（案例/架构说明/经验总结）
+├── HCCL超时排查.md
+├── GLM5.1-PD分离复盘.md
+└── images/                ← 建议图片与文档同放 imports（子目录按案例/主题组织）
+    └── hccl-timeout/
+        ├── 01-报错截图.png
+        └── 02-npu-smi输出.png
 ```
+
+**图片本地化原则**（数据源接入时完成）：文档引用的截图在接入时就存进导入目录
+（png/jpg/webp/gif），md 里用**相对路径**引用（`![报错](images/hccl-timeout/01-报错截图.png)`，
+以 md 所在目录为基准，子目录任意）——入库时自动资产化进 `data/assets/images/`
+（内容寻址 + OCR 注入）。**远程图链不下载**：引用 `http(s)://…` 的图入库时只留
+`[图片]` 占位并记 remote evidence，图不进库——所以"把图片放进导入目录"是接入动作，
+不是构建动作。
 
 **步骤 2：启用对应 source**（`config.json` 的 `sources`，改 `enabled: true`；`path` 可指向其他目录）
 
@@ -730,6 +743,24 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 {"id": "webpages", "type": "html", "path": "data/imports/html", "enabled": true}
 ```
 
+**建议目录结构（图片在数据源接入时本地化）**：
+
+```
+data/imports/html/
+├── GLM5.1-PD分离案例.html        ← 浏览器"另存为"，建议选「网页，全部」
+├── GLM5.1-PD分离案例_files/      ← 「网页，全部」会顺手生成的图片目录
+│   ├── 01-报错截图.png
+│   └── 02-npu-smi输出.png
+└── （也可自整理：assets/<案例名>/…，src 相对路径任意组织）
+```
+
+页面里的 `<img src="./GLM5.1-PD分离案例_files/01-报错截图.png">` 原样保留，
+canonicalize 以**网页所在目录**为基准解析 → 资产化 + OCR（`data:URI` 内嵌图同样落
+资产）。**远程图链不下载**（与 markdown 同一原则：图片本地化是数据源接入时的事）：
+引用 `http(s)://…` 的图入库时安全降级为 `[图片]` 占位 + remote evidence，图不进库。
+实操建议：浏览器另存选「网页，全部」（图随页面落本地、src 自动变相对路径）；
+「仅 HTML」会把图全部留在远程（只剩占位）——需要图的页面请把截图补进导入目录。
+
 **引擎分工**（`vllm_kb/html_convert.py`，混合：lxml 收割 + trafilatura 正文）：
 
 - **表格收割先于正文抽取**：内容表（≥2×2 或有 th/caption）→ 结构化 rows 落
@@ -758,6 +789,10 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - trafilatura 正文不含 markdown 标题（h1-h6 抽成普通行）→ chunk 无 section（chunking
   有段落级兜底切块，检索粒度略粗）；
 - `.mht/.mhtml/.url` 不支持 → 跳过并提示在浏览器里另存为「网页，仅 HTML」。
+  **是否值得做 .mht 转换取决于存量**：MHTML 是 MIME 容器（stdlib `email` 可解析——
+  取 text/html part 喂现有引擎、图片 part 落地后替换 CID 引用，纯本地、工程量中等）；
+  若业务环境盘点出大量 .mht 且**原页面已下线**（无法重新另存）再立项，存量少或页面
+  还在，提示另存即可。
 
 **验证**：`python -m unittest tests.test_html_source tests.test_html_convert -v`
 
