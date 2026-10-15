@@ -108,7 +108,8 @@ canonical 仍统一单文件，仅扩展字段（§7）。
 > 是**来源形态**维度；维度 B 是**验证状态**维度。**已实现（A4）**：verification 作为
 > `w_rel` 的**下限提升**（`w_rel = max(规则值, verification_factor)`，expert 0.95 / tested 0.85 /
 > unverified 0.5，可配置）——官方手册 status=open→0.4 提升到 0.95；已实现"向量路径 meta 补全
-> verification"。具体融合公式（乘法/加权）留待 Phase 5 用真实故障案例标定。
+> verification"。融合公式已随 A4 定型实现（即上式 max 下限提升）；
+> 仅剩参数标定留待 Phase 5 用真实故障案例校准。
 
 #### 各来源验证状态默认规则（先入库，后续审核补标）
 
@@ -123,8 +124,13 @@ canonical 仍统一单文件，仅扩展字段（§7）。
 | 工程师中间记录 | `unverified` | 自由文本，Tier 2 抽取 + 入审核队列；专家复核后升级 |
 | 截图/拍照（Evidence） | 随所属文档 | 本身不单独评级；图文互证不一致 → 入审核队列（ocr_mismatch） |
 
+> 实现状态注记：标题解析目前只落"待审核/待修改"→ 审核队列（case_title_flag，
+> `review.seed_case_title_flags`）；"审核通过"→ tested 的自动提权未实现——升级统一走
+> 审核台 doc_verification 覆盖层（见迁移清单 A3/A5）。
+
 > 设计决策：**先入库、后补标**——避免"等审核完才能用"的阻塞；未验证内容以低权重参与检索，
-> 审核升级后权重自动提升（重跑 `--recanonicalize` 或审核回写即生效）。
+> 审核升级后权重自动提升（审核台回写 `doc_verification` 覆盖层**即时生效**，无需 recanonicalize；
+> canonical 由 adapter 再生、不回写，覆盖层不被重新入库冲掉，`--rebuild` 亦保留）。
 
 ### 组合矩阵（两个维度正交生效）
 
@@ -288,10 +294,10 @@ GET  /stats                          # 各类别待办量（工作台概览）
 
 | 里程碑 | 内容 | 验证点 |
 |---|---|---|
-| M1 资产+解析层 | `assets/`/`parsed/` 布局落地；**PdfSource / MarkdownSource 已实现**（表格→Markdown/JSON、验证状态默认规则）；WordSource/HtmlSource 待业务环境 | PDF 手册 → md + tables.json（✅）；Word 案例 → 标题层级（🔲） |
+| M1 资产+解析层 | `assets/`/`parsed/` 布局落地；**PdfSource / MarkdownSource / ExcelSource / WordSource 已实现**（表格→Markdown/JSON、验证状态默认规则）；HtmlSource 待实现 | PDF 手册 → md + tables.json（✅）；Word 案例 → 标题层级（✅，`tests/test_word_source.py` 单测覆盖） |
 | M2 图片链路 | ImageSource + 签名导向 OCR（provider 可插拔：paddle / none 占位；md 图片自动收集重写资产路径 + evidence；sha256 幂等） | OCR 产物 + 签名提取（✅ 框架）；10 张真实截图召回率标定 B/C 阈值（🔲 业务环境 paddle 实测） |
 | M3 canonical 扩展 | §7 schema 落地，质量元数据入库，`--recanonicalize` 兼容 | 混合来源 canonical 行数 + 质量字段完整性 |
-| M3.5 审核工作台 | §10 review.sqlite3 + review_ui.py（队列/详情/标注/统计 + **API 配置中心**：embedding/OCR/GitHub 状态脱敏展示、embedding 连通测试） | 各类别各 1 条走完 pending→confirmed 闭环（✅ 框架；回写热更新 🔲） |
+| M3.5 审核工作台 | §10 review.sqlite3 + review_ui.py（队列/详情/标注/统计 + **API 配置中心**：embedding/OCR/GitHub 状态脱敏展示、embedding 连通测试） | 各类别各 1 条走完 pending→confirmed 闭环（✅ 框架 + 补标闭环端到端实测：doc_verification 覆盖层即时生效、--rebuild 保留，不回写 canonical） |
 | M4 图节点/边 | `Evidence` 节点 + OCR_EXTRACTS/BELONGS_TO/CORROBORATES 边 | 图文互证命中示例（正文↔OCR 一致/不一致各 1 例） |
 
 ## 12. 待讨论事项（Open Questions）
@@ -299,5 +305,7 @@ GET  /stats                          # 各类别待办量（工作台概览）
 1. **OCR 阈值**：B/C 档阈值 0.85 是默认值，待 M2 用真实截图数据标定；
 2. **图文互证不一致的默认动作**：V1 入审核队列（ocr_mismatch）已定；"待确认期间是否参与检索"待定
    （建议：不一致项仅以正文为准，OCR 边挂起）；
-3. **审核升级的生效方式**：V1 定为审核回写 + 重跑 recanonicalize；是否需要"热更新"（不重跑即生效）待评估；
+3. **审核升级的生效方式**——**已定并落地**：不走 recanonicalize，人工认证写入
+   `doc_verification` 覆盖层，检索侧即时生效、不被重新入库冲掉（`--rebuild` 亦保留），
+   canonical 由 adapter 再生、不回写；
 4. **图片降权升级**：§6 的升级路径（专家认证提权）何时启动，取决于 M2 的召回率数据与业务侧对高保密来源的依赖度。

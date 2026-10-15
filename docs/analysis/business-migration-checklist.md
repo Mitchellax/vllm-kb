@@ -8,7 +8,8 @@
 > 采集、解析、入库、验证；开发环境的 GitHub 知识库（66,124 canonical + 41GB LanceDB + 71,389 节点图）
 > 作为**初始数据**打包迁移。
 >
-> 前置设计文档：[Phase 2 数据布局](phase2-data-model.md)（轨道 A 完成 / 轨道 B 待实施）、
+> 前置设计文档：[Phase 2 数据布局](phase2-data-model.md)（轨道 A 完成 / 轨道 B 大部分完成——
+> pdf/md/word/excel 与 OCR 框架已落地，html 与 EQUIVALENT_TO 待）、
 > [总体建设方案](vllm-knowledge-base-plan.md)。
 
 ---
@@ -33,12 +34,12 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | 0 | 开发环境核心（检索 + 图） | ✅ 完成 |
-| 1 | 数据能进库：解析层 adapter + canonical 扩展 | 🔲 待办 |
-| 2 | 质量可治理：审核工作台 + 置信度融合 | 🔲 待办 |
-| 3 | 图片类：签名导向 OCR | 🔲 待办 |
-| 4 | 跨来源关系：图 Evidence/EQUIVALENT_TO 边 | 🔲 待办 |
-| 5 | 部署运维：打包/服务/embedding/更新流程 | 🔲 部分（见 B1） |
-| 6 | 标定验证：OCR 阈值 + 置信度参数 + 业务复验 | 🔲 待办 |
+| 1 | 数据能进库：解析层 adapter + canonical 扩展 | 🚧 大部分（pdf/md/word/excel 可入库、canonical 扩展落地；html 待、业务数据导入待，见 A1/A3） |
+| 2 | 质量可治理：审核工作台 + 置信度融合 | 🚧 闭环已实测生效（≥1 条端到端；各类别全量闭环与业务复验待，见 A4/A5/D3） |
+| 3 | 图片类：签名导向 OCR | 🚧 框架完成（paddle 实测待，见 A2） |
+| 4 | 跨来源关系：图 Evidence/EQUIVALENT_TO 边 | 🚧 部分（Evidence 互证 CORROBORATES ✅；EQUIVALENT_TO 待，见 A6） |
+| 5 | 部署运维：打包/服务/embedding/更新流程 | 🚧 部分（B1/B3 ✅、B2 定案；B4 迁移与 B5 离线打包待业务环境） |
+| 6 | 标定验证：OCR 阈值 + 置信度参数 + 业务复验 | 🔲 待办（依赖业务数据积累） |
 
 ---
 
@@ -48,12 +49,12 @@ Phase 2 图（Kùzu）                    部署：serve_api + review_ui
 
 | # | 项 | 说明 | 验证点 | 状态 |
 |---|---|---|---|---|
-| A1 | 解析层 adapter | `PdfSource`（PyMuPDF 文字层 + 表格→Markdown/JSON）/ `MarkdownSource`（标题提取 + 全文）/ `ExcelSource`（**schema-free**：任意 sheet/列序逐行拼接入库，每行一条文档 `excel:{文件}:{sheet}:{行}`）；Word/HTML 待业务环境 | 1 份接口指南 PDF → md + tables.json；1 份 Word 案例 → 标题层级保留 | 🚧 PDF/Markdown/Excel ✅，Word/HTML 🔲 |
+| A1 | 解析层 adapter | `PdfSource`（PyMuPDF 文字层 + 表格→Markdown/JSON）/ `MarkdownSource`（标题提取 + 全文）/ `ExcelSource`（**schema-free**：任意 sheet/列序逐行拼接入库，每行一条文档 `excel:{文件}:{sheet}:{行}`）；Word 已接入（`WordSource`：标题样式/大纲级别→章节、列表、表格→Markdown+JSON、内嵌图片→资产+OCR、超链接→`[文字](url)`，单测 `tests/test_word_source.py`）；HTML 待实现（`HtmlSource`） | 1 份接口指南 PDF → md + tables.json；1 份 Word 案例 → 标题层级保留（✅ 单测覆盖，真实业务 Word 待导入） | 🚧 PDF/Markdown/Excel/Word ✅，HTML 🔲 |
 | A2 | 图片链路 | `ImageSource` + 签名导向 OCR：**预留 API**（`ocr_provider: api`，POST {base}/ocr 协议）+ 本地 paddle；**无 API 时交互询问本地/跳过**（ask 默认，非 tty 自动跳过）；md 图片自动收集重写资产路径 + evidence；sha256 幂等 | 10 张真实截图签名召回率（**业务环境用 paddle 标定 B/C 阈值**）；OCR API 服务对接 | 🚧 框架 ✅（ask/api/paddle/none 决策 + 收集/重写/产物/幂等），paddle 实测 🔲 |
-| A3 | canonical 扩展落地 | `extra.asset/quality/verification/evidence` 字段 + 验证状态默认规则（官方手册=expert / 案例标题解析 待审核·审核通过·待修改 / 表格=低优先级按 open issue / wiki=unverified 待补标） | 混合来源 canonical 行数 + 质量字段完整性 | 🚧 asset/quality/verification/evidence ✅（检索结果透传 verification），案例标题解析 🔲 |
+| A3 | canonical 扩展落地 | `extra.asset/quality/verification/evidence` 字段 + 验证状态默认规则（官方手册=expert / 案例标题解析 待审核·审核通过·待修改 / 表格=低优先级按 open issue / wiki=unverified 待补标） | 混合来源 canonical 行数 + 质量字段完整性 | 🚧 asset/quality/verification/evidence ✅（检索结果透传 verification）；案例标题解析：标题含"待审核/待修改"→ 审核队列 case_title_flag ✅（`review.seed_case_title_flags`）；标题"审核通过"→ tested 的自动提权**未实现**（升级统一走审核台 doc_verification 覆盖层，见 A5）；混合来源字段完整性待业务数据复核 |
 | A4 | 置信度融合 | `verification_factor`（expert 0.95 / tested 0.85 / unverified 0.5，可配置）并入 `w_rel`（max 下限提升）；向量路径 meta 补全 verification | 手册检索 w_rel 0.4→0.95（✅ 实测）；样例置信度分解可见 verification | ✅ 完成 |
-| A5 | 审核工作台 | `review.sqlite3` + `review_ui.py`（6 类审核项、原图 assets 预览、标注回写）+ **API 配置中心**（embedding/OCR/GitHub 配置状态，key 脱敏，embedding 连通测试） | 各类别各 1 条走完 pending→confirmed 闭环 | ✅ 框架（UI + store + seed 幂等 + 配置中心）；审核结果回写 canonical 热更新 🔲 |
-| A6 | 图扩展 | `Doc` 通用节点 + `DOCUMENTS` 边（手册表格 → ErrorCode；**手册"命令格式"段 → Interface 节点**，工具.子命令级如 hccn_tool.bandwidth）；`Evidence`/OCR 边与 EQUIVALENT_TO 待业务环境 | 手册表格错误码 + 44 个 Interface（Atlas HCCN 实测）；`graph doc pdf:<手册>` 显示 documents | 🚧 手册→ErrorCode + Interface ✅，Evidence/EQUIVALENT_TO 🔲 |
+| A5 | 审核工作台 | `review.sqlite3` + `review_ui.py`（6 类审核项、原图 assets 预览、标注回写）+ **API 配置中心**（embedding/OCR/GitHub 配置状态，key 脱敏，embedding 连通测试） | 各类别各 1 条走完 pending→confirmed 闭环 | ✅ 框架（UI + store + seed 幂等 + 配置中心）；补标闭环已端到端实测——认证写入 `doc_verification` 覆盖层即时生效、`--rebuild` 保留（原"回写 canonical 热更新"项**被覆盖层方案取代**：canonical 由 adapter 再生、不回写，见 §6 [x]）；"各类别各 1 条"全量闭环待业务数据 |
+| A6 | 图扩展 | `Doc` 通用节点 + `DOCUMENTS` 边（手册表格 → ErrorCode；**手册"命令格式"段 → Interface 节点**，工具.子命令级如 hccn_tool.bandwidth）；Evidence 互证已落地（CORROBORATES 边 + `graph evidence`）；OCR 专项边（OCR_EXTRACTS/BELONGS_TO）与 EQUIVALENT_TO 待实施（审核队列预留 equivalence_candidate 类别，发现逻辑未实现） | 手册表格错误码 + 44 个 Interface（Atlas HCCN 实测）；`graph doc pdf:<手册>` 显示 documents | 🚧 手册→ErrorCode + Interface ✅，Evidence 互证（CORROBORATES）✅，OCR 专项边/EQUIVALENT_TO 🔲 |
 | A7 | 文档级标签 | **两级分类**（主题/领域 domain + 具体作用 purpose）：确定性提取（文件名+内部标题，词典 `config.tags.registry` 驱动）+ 审核页治理（自动排除/恢复、人工添加、词典新增/改名/改 tier 同步 config）+ **图 Tag 节点/TAGGED_WITH 边**（registry 全量节点）+ **skill 能力发现**（`tags` 目录、`context` 问题→标签匹配，agent 先发现"有哪些文档可提供知识"如 HCCL 超时→命中领域×作用）；**资产路径不进库**（asset_id + API 出口白名单） | npu-smi 命令参考 PDF 提取 [npu-smi/Atlas/命令参考] 命中 + `context "HCCL 超时"` 返回文档线索；`graph tags` 可查 | ✅ 框架（tagging/ingest/graph/review/api/skill）；词典与候选质量待业务数据标定 |
 
 ### B. 部署/运维
