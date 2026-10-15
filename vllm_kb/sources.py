@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from .config import PROJECT_ROOT, SourceCfg
 from .doc_kinds import BY_SOURCE, DocKind
+# 表格渲染全库唯一实现在 html_convert（html 来源主用；pdf/word 别名引用，调用点不变）
+from .html_convert import table_to_markdown as _table_to_markdown
 from .models import KbDocument
 from .source_files import DiscoverSpec, Discovery, discover
 from .tagging import (
@@ -777,19 +779,6 @@ class PdfSource(BaseSource):
                 "tag_candidates": [{"name": c.name, "tier": c.tier} for c in cands],
             },
         )
-
-
-def _table_to_markdown(rows: list[list]) -> str:
-    """二维表 → Markdown 表格（第一行作表头；列数取最长行并补齐）。"""
-    if not rows:
-        return ""
-    width = max(len(r) for r in rows)
-    norm = [r + [""] * (width - len(r)) for r in rows]
-    lines = ["| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in norm[0]) + " |"]
-    lines.append("|" + "---|" * width)
-    for r in norm[1:]:
-        lines.append("| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in r) + " |")
-    return "\n".join(lines)
 
 
 # ---------------- Word（.docx）解析辅助 ----------------
