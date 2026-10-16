@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from .config import AppConfig
 from .embed import EmbeddingClient
@@ -33,6 +34,41 @@ from .ingest import ingest_docs
 from .models import KbDocument
 from .sources import BaseSource, GithubSource, build_sources
 from .vectorstore import build_vector_store
+
+
+def _attach_rel_dirs(src: BaseSource, docs: list[KbDocument]) -> None:
+    """给文件来源文档附加 `extra.rel_dir`（imports **第一层子目录**，审核台文件夹分组用）。
+
+    - 仅 imports 下的文件有归属：`a/b/c.md` → "a"，根级文件 → ""（UI 显示"(根)"）；
+      资产层回退文件与网络来源（GitHub 等）不附加——分组视图显示"(未分组)"；
+    - **管理员侧专用元数据**：检索出口 `_sanitize_extra` 白名单不透出（目录名可能含
+      客户/项目名，与 source_id 不可读指纹是同一安全约束）；
+    - 单点生效（collect_docs 汇聚处），不侵入各 canonicalize 实现；重扫发现层只是
+      文件枚举（微秒级），且**不复用 discover()**——避免重复打印 stray 诊断；
+    - rel_dir 落 canonical 后 meta_hash 变化、embed_hash 不变 → 走 meta_refresh
+      （不重嵌入），与标签候选刷新同一安全路径。
+    """
+    kind = getattr(src, "kind", None)
+    import_dir = getattr(src, "import_dir", None)
+    # 类型守卫（Mock 来源/网络来源没有真 Path 的 import_dir 或没有 kind.patterns 元组）
+    if (not isinstance(import_dir, Path) or not docs
+            or not isinstance(getattr(kind, "patterns", None), tuple)):
+        return
+    from .source_files import DiscoverSpec, rel_dirs_by_sid
+
+    mapping = rel_dirs_by_sid(DiscoverSpec(
+        patterns=kind.patterns, import_path=import_dir,
+        assets_dir=src.resolve(f"data/assets/{kind.asset_sub}"),
+        sid_prefix=kind.sid_prefix))
+    if not mapping:
+        return
+    n = 0
+    for d in docs:
+        first = mapping.get(d.source_id)
+        if first is not None:
+            d.extra["rel_dir"] = first
+            n += 1
+    print(f"[build] 来源 {src.id} ({src.type}) 目录分组 {n}/{len(docs)} 篇")
 
 
 def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
@@ -54,6 +90,8 @@ def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
                     n = src.pull()
                 print(f"[build] 来源 {src.id} ({src.type}) 拉取新增 {n} 条")
             docs = src.canonicalize()
+            if docs:
+                _attach_rel_dirs(src, docs)
             print(f"[build] 来源 {src.id} ({src.type}) canonical {len(docs)} 条")
             all_docs.extend(docs)
         except NotImplementedError as e:
@@ -147,6 +185,8 @@ def process_source(src: BaseSource, cfg: AppConfig, pull: bool, limit: int | Non
             n = src.pull()
         print(f"[build] 来源 {src.id} ({src.type}) 拉取新增 {n} 条")
     docs = src.canonicalize()
+    if docs:
+        _attach_rel_dirs(src, docs)
     print(f"[build] 来源 {src.id} ({src.type}) canonical {len(docs)} 条")
     if not docs:
         return {"pulled": 0, "docs": 0}

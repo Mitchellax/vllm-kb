@@ -12,7 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vllm_kb.source_files import DiscoverSpec, SourceFile, discover, latest_versions, path_tag
+from vllm_kb.source_files import (DiscoverSpec, SourceFile, discover,
+                                  latest_versions, path_tag, rel_dirs_by_sid)
 
 
 def spec(tmp: Path, *, patterns=("*.md",), import_path=None, sid_prefix="md",
@@ -204,6 +205,58 @@ class TestSourceFileSid(unittest.TestCase):
         self.assertEqual(path_tag("a/b.md"), path_tag("a\\b.md"))
         self.assertEqual(len(path_tag("x")), 8)
         self.assertNotEqual(path_tag("sub_a/same.md"), path_tag("sub_b/same.md"))
+
+
+class TestRelDirsBySid(unittest.TestCase):
+    """rel_dir = imports **第一层子目录**（审核台文件夹分组的数据源）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_first_level_dir_root_and_missing(self):
+        s = spec(self.root)
+        write(self.root / "data" / "imports" / "md" / "故障" / "a.md")
+        write(self.root / "data" / "imports" / "md" / "根文件.md")
+        m = rel_dirs_by_sid(s)
+        self.assertEqual(m["md:a"], "故障")
+        self.assertEqual(m["md:根文件"], "")
+
+    def test_deep_nesting_collapses_to_first_level(self):
+        write(self.root / "data" / "imports" / "md" / "x" / "y" / "deep.md")
+        m = rel_dirs_by_sid(spec(self.root))
+        self.assertEqual(m["md:deep"], "x")
+
+    def test_assets_fallback_files_not_mapped(self):
+        """回退资产层的文件（imports 缺失）没有目录归属——分组视图显示"未分组"。"""
+        write(self.root / "data" / "assets" / "md" / "a.md")
+        s = DiscoverSpec(patterns=("*.md",), import_path=self.root / "nope",
+                         assets_dir=self.root / "data" / "assets" / "md",
+                         sid_prefix="md", label="Markdown", log_prefix="[t]")
+        self.assertEqual(rel_dirs_by_sid(s), {})
+
+    def test_duplicate_sids_match_discover(self):
+        """重名消歧文件的 sid（带 --sha8）必须与 discover/canonicalize 的一致，
+        否则映射对不上、文档分错组。"""
+        write(self.root / "data" / "imports" / "md" / "sub_a" / "same.md")
+        write(self.root / "data" / "imports" / "md" / "sub_b" / "same.md")
+        m = rel_dirs_by_sid(spec(self.root))
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d = discover(spec(self.root))
+        sids = {f.sid("md", self.root / "data" / "imports" / "md",
+                      self.root / "data" / "assets" / "md") for f in d.files}
+        self.assertEqual(set(m), sids)
+        self.assertEqual(sorted(m.values()), ["sub_a", "sub_b"])
+
+    def test_empty_when_no_files(self):
+        self.assertEqual(rel_dirs_by_sid(spec(self.root)), {})
 
 
 if __name__ == "__main__":

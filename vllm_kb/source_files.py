@@ -147,6 +147,25 @@ def _scan_imports(spec: DiscoverSpec) -> list[Path]:
     return out
 
 
+def rel_dirs_by_sid(spec: DiscoverSpec) -> dict[str, str]:
+    """sid → imports **第一层子目录**（仅 from_imports 文件；根级文件为 ""）。
+
+    供 pipeline 给文档 extra 附加 `rel_dir`（审核台文件夹分组视图；检索出口
+    `_sanitize_extra` 白名单不透出——目录名可能含客户/项目名，与 sid 指纹同一
+    安全约束）。**不复用 discover()**：那会重复打印 stray 诊断，这里只做纯扫描。
+    资产层回退文件不在 imports 下，天然不进映射（分组视图显示"未分组"）。
+    """
+    imports = _scan_imports(spec)
+    if not imports:
+        return {}
+    out: dict[str, str] = {}
+    for f in _with_duplicates(imports, True, spec):
+        rel = f.rel_key(spec.import_path)
+        out[f.sid(spec.sid_prefix, spec.import_path, spec.assets_dir)] = (
+            rel.split("/", 1)[0] if "/" in rel else "")
+    return out
+
+
 def discover(spec: DiscoverSpec) -> Discovery:
     """发现待处理文件：**导入路径优先**，为空则回退资产层扁平副本（按版本族收敛）。
 

@@ -466,6 +466,7 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
 
     返回 {source_id, source_type, title, component, url, verification,
     asset_id, asset_path（管理员侧 rel_path，经 asset_registry）,
+    rel_dir（imports 第一层子目录，文件夹分组；根级 ""，回退/网络来源缺失）,
     tags: {auto, excluded, manual, final}, duplicate（同 stem 重名告警）}。
     """
     from .tagging import merge_final
@@ -526,6 +527,7 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
             "verification_reviewer": (verif_overlay.get(sid) or (None, None))[1],
             "asset_id": asset_id,
             "asset_path": rel_path,
+            "rel_dir": str(ex.get("rel_dir", "") or ""),
             "tags": {"auto": auto, "excluded": ov.get("excluded", []),
                      "manual": ov.get("manual", []), "final": final},
             "duplicate": stems.get(stem, 0) > 1,
