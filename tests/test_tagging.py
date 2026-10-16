@@ -8,6 +8,7 @@ from vllm_kb.config import AppConfig
 from vllm_kb.tagging import (
     TIER_DOMAIN,
     TIER_PURPOSE,
+    DeviceGlossary,
     TagEntry,
     TagRegistry,
     extract_tags,
@@ -186,6 +187,91 @@ class TestMergeFinal(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(merge_final([], [], []), [])
         self.assertEqual(merge_final(None, None, None), [])
+
+
+class TestDeviceGlossary(unittest.TestCase):
+    """设备词表：机型/芯片别名归一 + 机器→芯片单向（芯片绝不反推机型）。
+
+    领域事实（2026-10 确认）：A2/A3 是 Atlas 机型不是版本号，硬件构造差距很大需独立
+    打标；800I A2/800T A2 本质同机归一为 A2；300I A2 与 800I A2 同用 910B 芯片但拓扑
+    差异巨大——所以 910B 文本绝不能自动打 A2 标。
+    """
+
+    DEVICES = [
+        {"name": "A2", "tier": "domain", "kind": "machine",
+         "aliases": ["800I A2", "800T A2", "Atlas 800I A2"], "uses_chips": ["910B"],
+         "note": "800I/800T 规格细微差异本质同机；300I A2 同芯片但拓扑差异巨大，勿混"},
+        {"name": "A3", "tier": "domain", "kind": "machine", "aliases": ["800I A3"]},
+        {"name": "300I A2", "tier": "domain", "kind": "machine", "uses_chips": ["910B"]},
+        {"name": "910B", "tier": "domain", "kind": "chip", "aliases": ["910B4_1"]},
+    ]
+
+    def _registry(self, devices=None):
+        import types
+
+        from vllm_kb.config import TagCfg
+
+        return TagRegistry.load(types.SimpleNamespace(
+            tags=TagCfg(registry=[], devices=self.DEVICES if devices is None else devices)))
+
+    def test_alias_canonicalization_and_auto_registry(self):
+        reg = self._registry()
+        names = [e.name for e in reg.match("Atlas 800I A2 组网配置指南")]
+        self.assertIn("A2", names)              # 别名 → canonical 设备标签
+        self.assertNotIn("800I A2", names)      # 别名本身不是标签
+        self.assertTrue(reg.contains("A2"))     # 设备 name 自动入词典（registry 未显式声明）
+        self.assertTrue(reg.contains("910B"))
+
+    def test_chip_does_not_infer_machine(self):
+        """方向性铁律：910B4_1 芯片文本 → 只打 910B，绝不反推 A2/300I A2。"""
+        names = [e.name for e in self._registry().match("910B4_1 芯片故障排查")]
+        self.assertIn("910B", names)
+        self.assertNotIn("A2", names)
+        self.assertNotIn("300I A2", names)
+
+    def test_long_alias_hit_no_duplicate_canonical(self):
+        names = [e.name for e in self._registry().match("800I A2")]
+        self.assertEqual(names.count("A2"), 1)
+
+    def test_validation_warnings(self):
+        raw = [{"name": "A2", "aliases": ["x"]},
+               {"name": "B", "aliases": ["x"]},           # 别名冲突（先入先得）
+               {"name": "C", "uses_chips": ["未定义芯片"]},  # 引用未定义
+               {"name": "D", "kind": "router"},           # kind 非法 → machine
+               "junk",                                     # 非 dict
+               {"aliases": ["no-name"]}]                   # 缺 name
+        g = DeviceGlossary._from_raw(raw)
+        self.assertEqual(len(g.warnings), 5)
+        self.assertEqual([e.name for e in g.entries], ["A2", "B", "C", "D"])
+        self.assertEqual(g.entries[3].kind, "machine")
+
+    def test_device_words_exempt_from_noise_filter(self):
+        """A3 是机型词（词表命中即标签），不被候选降噪过滤；别名组成 token 也不进候选。"""
+        reg = self._registry()
+        matched, cands = extract_tags("Atlas 800I A3 故障案例", [], registry=reg)
+        self.assertIn("A3", [e.name for e in matched])
+        cand_names = [c.name for c in cands]
+        self.assertNotIn("A3", cand_names)
+        self.assertNotIn("800I", cand_names)   # 别名 "800I A3" 的组成 token 已归一
+
+
+class TestCandidateNoiseFilter(unittest.TestCase):
+    """候选降噪（2026-10）：真实积压里 for/纯数字类无检索价值——发端过滤而非采纳端。"""
+
+    def test_default_stopwords_pure_numbers_filtered(self):
+        _, cands = extract_tags("for of and 123 Config 456", [], registry=TagRegistry())
+        names = {c.name for c in cands}
+        self.assertNotIn("for", names)
+        self.assertNotIn("of", names)
+        self.assertNotIn("and", names)
+        self.assertNotIn("123", names)      # 纯数字
+        self.assertNotIn("456", names)
+        self.assertIn("Config", names)      # 正常词保留
+
+    def test_cfg_stopwords_still_mergeable(self):
+        _, cands = extract_tags("foo config bar", [], registry=TagRegistry(),
+                                stopwords=["config"])
+        self.assertNotIn("config", {c.name for c in cands})
 
 
 if __name__ == "__main__":

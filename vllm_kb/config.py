@@ -230,6 +230,7 @@ class TagCfg(BaseModel):
     """
 
     registry: list[Any] = Field(default_factory=list)  # {"name","tier"} 或裸字符串（tier 启发式）
+    devices: list[Any] = Field(default_factory=list)  # 设备词表：机型/芯片别名归一 + uses_chips 单向关系
     stopwords: list[str] = Field(default_factory=list)
     min_len: int = 2
     heading_max_chars: int = 12
