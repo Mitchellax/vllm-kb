@@ -37,16 +37,21 @@ from .vectorstore import build_vector_store
 
 
 def _attach_rel_dirs(src: BaseSource, docs: list[KbDocument]) -> None:
-    """给文件来源文档附加 `extra.rel_dir`（imports **第一层子目录**，审核台文件夹分组用）。
+    """给文件来源文档附加 `extra.rel_src`（来源 id）与 `extra.rel_dir`（imports 第一层子目录）。
 
-    - 仅 imports 下的文件有归属：`a/b/c.md` → "a"，根级文件 → ""（UI 显示"(根)"）；
-      资产层回退文件与网络来源（GitHub 等）不附加——分组视图显示"(未分组)"；
+    审核台文件夹分组用；组名在 UI 侧组合为 `来源id\\子目录`（如 `pdf\\support官方文档`），
+    根级文件显示来源 id（如 `pdf`）——**不同导入来源天然区分**（同子目录名的两个来源
+    不会混在一组）。
+
+    - rel_src：**该来源全部文档**都标记（含资产层回退件——分组显示"来源id（资产回退）"，
+      不再与网络来源混在"未分组"里）；
+    - rel_dir：仅 imports 下的文件有（根级 ""，深层折叠到第一层）；资产回退/网络来源没有；
     - **管理员侧专用元数据**：检索出口 `_sanitize_extra` 白名单不透出（目录名可能含
       客户/项目名，与 source_id 不可读指纹是同一安全约束）；
-    - 单点生效（collect_docs 汇聚处），不侵入各 canonicalize 实现；重扫发现层只是
-      文件枚举（微秒级），且**不复用 discover()**——避免重复打印 stray 诊断；
-    - rel_dir 落 canonical 后 meta_hash 变化、embed_hash 不变 → 走 meta_refresh
-      （不重嵌入），与标签候选刷新同一安全路径。
+    - 单点生效（两个汇聚处调用），不侵入各 canonicalize 实现；重扫发现层只是文件枚举
+      （微秒级），且**不复用 discover()**——避免重复打印 stray 诊断；
+    - 落 canonical 后 meta_hash 变化、embed_hash 不变 → 走 meta_refresh（不重嵌入），
+      与标签候选刷新同一安全路径。
     """
     kind = getattr(src, "kind", None)
     import_dir = getattr(src, "import_dir", None)
@@ -60,15 +65,14 @@ def _attach_rel_dirs(src: BaseSource, docs: list[KbDocument]) -> None:
         patterns=kind.patterns, import_path=import_dir,
         assets_dir=src.resolve(f"data/assets/{kind.asset_sub}"),
         sid_prefix=kind.sid_prefix))
-    if not mapping:
-        return
     n = 0
     for d in docs:
+        d.extra["rel_src"] = src.id
         first = mapping.get(d.source_id)
         if first is not None:
             d.extra["rel_dir"] = first
             n += 1
-    print(f"[build] 来源 {src.id} ({src.type}) 目录分组 {n}/{len(docs)} 篇")
+    print(f"[build] 来源 {src.id} ({src.type}) 目录分组 {n}/{len(docs)} 篇（来源标记全量）")
 
 
 def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,

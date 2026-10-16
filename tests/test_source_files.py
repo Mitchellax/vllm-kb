@@ -259,5 +259,54 @@ class TestRelDirsBySid(unittest.TestCase):
         self.assertEqual(rel_dirs_by_sid(spec(self.root)), {})
 
 
+class TestAttachRelDirs(unittest.TestCase):
+    """pipeline._attach_rel_dirs：rel_src（来源 id）全量标记 + rel_dir 仅 imports 文件。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _src(self, sid="md1"):
+        import types
+
+        from vllm_kb.doc_kinds import BY_SOURCE
+
+        return types.SimpleNamespace(
+            id=sid, type="markdown", kind=BY_SOURCE["markdown"],
+            import_dir=self.root / "data" / "imports" / "md",
+            resolve=lambda p: Path(p))
+
+    def test_rel_src_all_docs_and_rel_dir_imports_only(self):
+        import types
+
+        from vllm_kb.pipeline import _attach_rel_dirs
+
+        write(self.root / "data" / "imports" / "md" / "故障" / "a.md")
+        write(self.root / "data" / "imports" / "md" / "root.md")
+        docs = [types.SimpleNamespace(source_id="md:a", extra={}),
+                types.SimpleNamespace(source_id="md:root", extra={}),
+                types.SimpleNamespace(source_id="md:fallback", extra={})]
+        _attach_rel_dirs(self._src("md1"), docs)
+        self.assertEqual(docs[0].extra["rel_src"], "md1")
+        self.assertEqual(docs[0].extra["rel_dir"], "故障")
+        self.assertEqual(docs[1].extra["rel_dir"], "")   # 根级 → 空串（UI 显示来源 id）
+        # 不在 imports 里的（资产回退件）：有来源标记、无 rel_dir（UI 显示"来源id（资产回退）"）
+        self.assertEqual(docs[2].extra["rel_src"], "md1")
+        self.assertNotIn("rel_dir", docs[2].extra)
+
+    def test_mock_source_skipped(self):
+        import types
+        from unittest import mock
+
+        from vllm_kb.pipeline import _attach_rel_dirs
+
+        doc = types.SimpleNamespace(source_id="x", extra={})
+        _attach_rel_dirs(mock.MagicMock(), [doc])
+        self.assertEqual(doc.extra, {}, "Mock/网络来源不得被写入分组元数据")
+
+
 if __name__ == "__main__":
     unittest.main()

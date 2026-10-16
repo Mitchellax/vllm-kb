@@ -640,24 +640,33 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         self.assertEqual(ver, "tested")
 
     def test_external_docs_rel_dir_passthrough(self):
-        """目录分组元数据：extra.rel_dir 透出到管理员侧列表（检索出口白名单不透出）。"""
+        """目录分组元数据：extra.rel_src/rel_dir 透出到管理员侧列表（检索出口白名单不透出）。"""
         from vllm_kb.config import AppConfig
         from vllm_kb.ingest import _connect
 
         cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
         conn = _connect(cfg.resolve(cfg.storage.sqlite_path))
-        conn.execute(
+        conn.executemany(
             "INSERT OR REPLACE INTO docs (source_id, source_type, title, status, reliability, extra) "
             "VALUES (?,?,?,?,?,?)",
-            ("md:组内", "doc_markdown", "组内文档", "open", 0.5,
-             json.dumps({"verification": "unverified", "rel_dir": "故障"},
-                        ensure_ascii=False)))
+            [("md:组内", "doc_markdown", "组内文档", "open", 0.5,
+              json.dumps({"verification": "unverified", "rel_src": "md1", "rel_dir": "故障"},
+                         ensure_ascii=False)),
+             ("md:回退", "doc_markdown", "回退文档", "open", 0.5,
+              json.dumps({"verification": "unverified", "rel_src": "md1"},
+                         ensure_ascii=False)),
+             ("md:裸", "doc_markdown", "无分组文档", "open", 0.5,
+              json.dumps({"verification": "unverified"}, ensure_ascii=False))])
         conn.commit()
         conn.close()
         r = self.client.get("/api/external-docs")
         self.assertEqual(r.status_code, 200)
-        row = next(d for d in r.json() if d["source_id"] == "md:组内")
-        self.assertEqual(row["rel_dir"], "故障")
+        rows = {d["source_id"]: d for d in r.json()}
+        self.assertEqual(rows["md:组内"]["rel_src"], "md1")
+        self.assertEqual(rows["md:组内"]["rel_dir"], "故障")
+        self.assertEqual(rows["md:回退"]["rel_src"], "md1")
+        self.assertIsNone(rows["md:回退"]["rel_dir"])   # 资产回退件：无目录归属
+        self.assertIsNone(rows["md:裸"]["rel_src"])     # 网络来源/旧数据：两者皆缺
 
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""

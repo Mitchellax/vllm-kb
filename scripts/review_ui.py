@@ -240,14 +240,18 @@ ${groupRow(t.manual||[],'manual','remove','✕',d.source_id)}
 <div style="margin-top:6px"><input id="${inp}" placeholder="添加标签" style="width:180px"><button class="sm" onclick="tagAdd('${q(d.source_id)}',document.getElementById('${inp}').value)">添加</button>
 <span class="muted">最终: ${(t.final||[]).map(esc).join(' · ')||'（无标签）'}</span></div>
 <div class="actions"><button class="danger sm" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`};
-// 按 imports 第一层子目录分组：(根)=imports 根文件；(未分组)=资产层回退/无目录信息（网络来源等）
-const groups={};ds.forEach(d=>{const k=('rel_dir' in d)?(d.rel_dir||'(根)'):'(未分组)';(groups[k]=groups[k]||[]).push(d)});
-const rank=k=>k==='(根)'?0:(k==='(未分组)'?2:1);
+// 按 imports 第一层子目录分组，组名带来源 id 前缀区分不同导入来源：
+// 组名=来源id\子目录（pdf\support官方文档）；根级=来源id（pdf）；资产回退件=来源id（资产回退）；网络来源=(未分组)
+const groupKey=d=>{const src=d.rel_src;if(src==null)return '(未分组)';
+ if(d.rel_dir==null)return `${src}（资产回退）`;
+ return d.rel_dir?`${src}\\${d.rel_dir}`:src};
+const groups={};ds.forEach(d=>{const k=groupKey(d);(groups[k]=groups[k]||[]).push(d)});
+const rank=k=>k==='(未分组)'?2:1;
 const keys=Object.keys(groups).sort((a,b)=>rank(a)-rank(b)||a.localeCompare(b,'zh'));
 const groupHtml=keys.map(k=>{const g=groups[k];
 return `<details open style="margin-bottom:10px"><summary style="cursor:pointer;font-weight:600;padding:4px 0">📁 ${esc(k)}（${g.length}）<input type="checkbox" style="margin-left:8px" onclick="event.stopPropagation();docGroupToggle(this,this.checked)" title="全选本组"></summary><div style="padding-left:2px">${g.map(docCard).join('')}</div></details>`}).join('');
 $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
-<div class="card subtle">按 <b>imports 第一层子目录</b> 分组：📁(根)=imports 根级文件、📁(未分组)=资产层回退或无目录信息。勾选多篇（或整组）后用批量栏操作。删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
+<div class="card subtle">按 <b>imports 第一层子目录</b> 分组，组名 = <b>来源id\\子目录</b>（根级 = 来源 id）——不同导入来源即使子目录同名也各自成组；📁来源id（资产回退）= imports 缺失时从资产层副本收录的文档；(未分组) = 网络来源。勾选多篇（或整组）后用批量栏操作。删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
 <div id="docbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="docbatch-n">0</span> 篇</b> <button class="primary sm" onclick="docBatchTagModal()">🏷 批量标签</button> <button class="danger sm" onclick="docBatchDelete()">🗑 批量删除</button> <span class="muted">批量标签支持 添加/删除人工、排除/恢复自动</span></div>
 <div class="todo"><b>TODO（暂缓）</b>：规则化自动采纳（词典近义/高频强候选免审）与按主题聚合的打标视图仍待设计——<b>批量操作已上线</b>（多选/按目录：打标、排除、恢复、删除）。</div>`
 +(keys.length?groupHtml:'<div class="card muted">无外源文档</div>')}
