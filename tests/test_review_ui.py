@@ -563,5 +563,110 @@ class ReviewUiHtmlAudit(unittest.TestCase):
                 os.environ.pop("VLLM_KB_DATA_ROOT", None)
 
 
+class ReviewUiBatchApiTest(ReviewUiApiTest):
+    """批量操作端点：逐项独立生效、部分失败返回明细（不跨文档整体回滚）。"""
+
+    def _seed_two_docs(self, **kw):
+        seed_kb_doc(self.cfg_path, "md:a1", **kw)
+        seed_kb_doc(self.cfg_path, "md:a2", **kw)
+
+    def test_docs_tags_batch_partial_success(self):
+        from vllm_kb.config import AppConfig
+        import sqlite3
+
+        self._seed_two_docs()
+        r = self.client.post("/api/docs/tags/batch", json={
+            "source_ids": ["md:a1", "md:a2", "md:ghost"],
+            "action": "add", "tag": "排故手册", "reviewer": "张三"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["updated"], 2)
+        self.assertEqual([f["source_id"] for f in body["failed"]], ["md:ghost"])
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        manual = dict(conn.execute("SELECT source_id, manual FROM doc_tags").fetchall())
+        conn.close()
+        self.assertEqual(json.loads(manual["md:a1"]), ["排故手册"])
+        self.assertEqual(json.loads(manual["md:a2"]), ["排故手册"])
+
+    def test_docs_tags_batch_requires_reviewer_and_ids(self):
+        self.assertEqual(self.client.post("/api/docs/tags/batch", json={
+            "source_ids": ["md:a1"], "action": "add", "tag": "x",
+            "reviewer": ""}).status_code, 400)
+        self.assertEqual(self.client.post("/api/docs/tags/batch", json={
+            "source_ids": [], "action": "add", "tag": "x",
+            "reviewer": "r"}).status_code, 400)
+
+    def test_external_docs_delete_batch(self):
+        from vllm_kb.config import AppConfig
+        import sqlite3
+
+        self._seed_two_docs()
+        r = self.client.post("/api/external-docs/delete-batch",
+                             json={"source_ids": ["md:a1", "md:a2", "md:ghost"]})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["deleted"], 2)
+        self.assertEqual([f["source_id"] for f in body["failed"]], ["md:ghost"])
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        n = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 0)
+
+    def test_items_review_batch_verification(self):
+        """补标项批量认证：写覆盖层并立即刷新 docs.extra.verification（w_rel 生效前提）。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore, default_review_path
+        import sqlite3
+
+        seed_kb_doc(self.cfg_path, "md:doc1", verification="unverified")
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        store = ReviewStore(default_review_path(cfg))
+        store.add_item("verification_pending", "md:doc1", {"title": "待审核文档"})
+        item = store.list_items(category="verification_pending")[0]
+        store.close()
+        r = self.client.post("/api/items/review-batch", json={
+            "item_ids": [item["id"], 999999], "action": "approved",
+            "reviewer": "李四", "result": {"verification": "tested"}})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["reviewed"], 1)
+        self.assertEqual([f["item_id"] for f in body["failed"]], [999999])
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        ver = json.loads(conn.execute(
+            "SELECT extra FROM docs WHERE source_id='md:doc1'").fetchone()[0])["verification"]
+        conn.close()
+        self.assertEqual(ver, "tested")
+
+    def test_external_docs_rel_dir_passthrough(self):
+        """目录分组元数据：extra.rel_dir 透出到管理员侧列表（检索出口白名单不透出）。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.ingest import _connect
+
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        conn = _connect(cfg.resolve(cfg.storage.sqlite_path))
+        conn.execute(
+            "INSERT OR REPLACE INTO docs (source_id, source_type, title, status, reliability, extra) "
+            "VALUES (?,?,?,?,?,?)",
+            ("md:组内", "doc_markdown", "组内文档", "open", 0.5,
+             json.dumps({"verification": "unverified", "rel_dir": "故障"},
+                        ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+        r = self.client.get("/api/external-docs")
+        self.assertEqual(r.status_code, 200)
+        row = next(d for d in r.json() if d["source_id"] == "md:组内")
+        self.assertEqual(row["rel_dir"], "故障")
+
+    def test_page_html_batch_tokens(self):
+        """批量操作 UI 入口与分组结构必须在页面里。"""
+        html = self.client.get("/").text
+        for token in ("docBatchTagModal", "docBatchTagApply", "docBatchDelete",
+                      "docGroupToggle", "queueBatchReview", "docbatch", "queuebatch",
+                      "docs/tags/batch", "external-docs/delete-batch", "items/review-batch"):
+            self.assertIn(token, html, f"页面缺少 {token}")
+
+
 if __name__ == "__main__":
     unittest.main()

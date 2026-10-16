@@ -174,7 +174,9 @@ const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.
 // 曾把候选词压住——四篇 Atlas A3 手册的候选在列表里全显示成同一个产品名）；其余类别用文档标题
 const itemTitle=i=>{const p=i.payload||{};return i.category==='tag_candidate'?(p.candidate||i.item_ref):(p.title||i.item_ref)};
 $('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span></div>`
-+q.map(i=>`<div class="item" onclick="showItem(${i.id})"><div><span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`).join('')||'<div class="card muted">队列为空</div>'
++`<div id="queuebatch" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuebatch-n">0</span> 项补标</b> 认证级别: <select id="qb-level"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option></select> <button class="primary sm" onclick="queueBatchReview()">✓ 批量认证</button></div>`
++q.map(i=>{const chk=(i.category==='verification_pending'&&i.status==='pending')?`<input type="checkbox" class="qchk" data-id="${i.id}" onclick="event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量认证"> `:'';
+return `<div class="item" onclick="showItem(${i.id})"><div>${chk}<span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`}).join('')||'<div class="card muted">队列为空</div>'
 +`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid var(--rv-red)"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
 <div class="muted mono">${esc((i.payload||{}).asset&&(i.payload.asset.path)||'')}</div>
 <div class="actions"><button class="ok" onclick="undoDelete(${i.id})">↩ 撤回（恢复记录并重新入队）</button> <span class="muted">删除人: ${esc(i.reviewer||'')} ${(i.reviewed_at||'').slice(0,16)}</span></div></div>`).join('')||''}
@@ -229,18 +231,26 @@ const tierOf=n=>td[n]||'domain';
 const q=s=>esc(String(s||'')).replace(/'/g,"\\'");
 const tagB=(sid,t,cls,act,mark)=>`<span class="tagb ${cls} ${tierOf(t)}" onclick="tagEdit('${q(sid)}','${act}','${q(t)}')">${esc(t)} ${mark}</span>`;
 const groupRow=(list,cls,act,mark,sid)=>list.length?`<div style="margin-top:4px"><span class="muted">${cls==='excluded'?'已排除':cls==='manual'?'人工':'自动'}:</span> ${list.map(t=>tagB(sid,t,cls,act,mark)).join('')}</div>`:'';
-$('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
-<div class="card subtle">删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
-<div class="todo"><b>TODO（暂缓）</b>：逐篇打标/逐条处理候选标签的人工成本偏高。待设计更优流程后再动——候选方向：规则化自动采纳（词典近义/高频强候选免审）、文档管理页批量操作（多选打标/排除）、按主题聚合的打标视图。当前保持现状。</div>`
-+ds.map(d=>{const t=d.tags||{};
-return `<div class="card" style="border-left:3px solid ${d.duplicate?'var(--rv-amber)':'var(--rv-border)'}"><div><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:''}</div>
+const docCard=d=>{const t=d.tags||{};const inp='newtag-'+q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_');
+return `<div class="card" style="border-left:3px solid ${d.duplicate?'var(--rv-amber)':'var(--rv-border)'}"><div><input type="checkbox" class="dchk" data-sid="${q(d.source_id)}" onchange="docSelChanged()" style="margin-right:6px" title="勾选后批量操作"><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:''}</div>
 <div class="mono muted">${esc(d.source_id)}${d.asset_path?` · ${esc(d.asset_path)}`:''}</div>
 ${groupRow(t.auto||[],'auto','exclude','✕',d.source_id)}
 ${groupRow(t.excluded||[],'excluded','restore','↺',d.source_id)}
 ${groupRow(t.manual||[],'manual','remove','✕',d.source_id)}
-<div style="margin-top:6px"><input id="newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}" placeholder="添加标签" style="width:180px"><button class="sm" onclick="tagAdd('${q(d.source_id)}',document.getElementById('newtag-${q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_')}').value)">添加</button>
+<div style="margin-top:6px"><input id="${inp}" placeholder="添加标签" style="width:180px"><button class="sm" onclick="tagAdd('${q(d.source_id)}',document.getElementById('${inp}').value)">添加</button>
 <span class="muted">最终: ${(t.final||[]).map(esc).join(' · ')||'（无标签）'}</span></div>
-<div class="actions"><button class="danger sm" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`}).join('')||'<div class="card muted">无外源文档</div>'}
+<div class="actions"><button class="danger sm" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`};
+// 按 imports 第一层子目录分组：(根)=imports 根文件；(未分组)=资产层回退/无目录信息（网络来源等）
+const groups={};ds.forEach(d=>{const k=('rel_dir' in d)?(d.rel_dir||'(根)'):'(未分组)';(groups[k]=groups[k]||[]).push(d)});
+const rank=k=>k==='(根)'?0:(k==='(未分组)'?2:1);
+const keys=Object.keys(groups).sort((a,b)=>rank(a)-rank(b)||a.localeCompare(b,'zh'));
+const groupHtml=keys.map(k=>{const g=groups[k];
+return `<details open style="margin-bottom:10px"><summary style="cursor:pointer;font-weight:600;padding:4px 0">📁 ${esc(k)}（${g.length}）<input type="checkbox" style="margin-left:8px" onclick="event.stopPropagation();docGroupToggle(this,this.checked)" title="全选本组"></summary><div style="padding-left:2px">${g.map(docCard).join('')}</div></details>`}).join('');
+$('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
+<div class="card subtle">按 <b>imports 第一层子目录</b> 分组：📁(根)=imports 根级文件、📁(未分组)=资产层回退或无目录信息。勾选多篇（或整组）后用批量栏操作。删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
+<div id="docbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="docbatch-n">0</span> 篇</b> <button class="primary sm" onclick="docBatchTagModal()">🏷 批量标签</button> <button class="danger sm" onclick="docBatchDelete()">🗑 批量删除</button> <span class="muted">批量标签支持 添加/删除人工、排除/恢复自动</span></div>
+<div class="todo"><b>TODO（暂缓）</b>：规则化自动采纳（词典近义/高频强候选免审）与按主题聚合的打标视图仍待设计——<b>批量操作已上线</b>（多选/按目录：打标、排除、恢复、删除）。</div>`
++(keys.length?groupHtml:'<div class="card muted">无外源文档</div>')}
 async function tagEdit(sid,action,tag){const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;
 if(reviewer!==loadReviewer())saveReviewer(reviewer);
 try{await j('/api/docs/tags/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,action,tag,reviewer})});loadDocs();toast('✓ 已更新标签')}catch(e){toast('✗ '+e.message)}}
@@ -262,6 +272,37 @@ try{await j('/api/tag-dict/add',{method:'POST',headers:{'Content-Type':'applicat
 function openModal(html){document.getElementById('modal-card').innerHTML=html;document.getElementById('modal').hidden=false}
 function closeModal(){document.getElementById('modal').hidden=true;document.querySelectorAll('.tagb.editing').forEach(x=>x.classList.remove('editing'))}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()})
+// ---------------- 批量操作（文档管理 + 审核队列补标认证） ----------------
+function docCheckedSids(){return Array.from(document.querySelectorAll('#view-docs .dchk:checked')).map(x=>x.dataset.sid)}
+function docSelChanged(){const n=docCheckedSids().length;const bar=document.getElementById('docbatch');if(bar)bar.style.display=n?'block':'none';const c=document.getElementById('docbatch-n');if(c)c.textContent=n}
+function docGroupToggle(cb,checked){const grp=cb.closest('details');if(grp)grp.querySelectorAll('.dchk').forEach(x=>{x.checked=checked});docSelChanged()}
+async function docBatchTagModal(){const sids=docCheckedSids();if(!sids.length){toast('先勾选文档');return}
+openModal(`<h4>批量标签（已选 ${sids.length} 篇）</h4>
+<div class="row"><label>审核人</label><input id="bt-rev" value="${esc(loadReviewer()||'')}" style="flex:1"></div>
+<div class="row"><label>动作</label><select id="bt-action" style="flex:1"><option value="add">添加人工标签</option><option value="remove">删除人工标签</option><option value="exclude">排除自动标签</option><option value="restore">恢复自动标签（按标签名）</option></select></div>
+<div class="row"><label>标签</label><input id="bt-tag" placeholder="标签名" style="flex:1"></div>
+<div class="actions"><button class="primary" onclick="docBatchTagApply()">应用到 ${sids.length} 篇</button><button onclick="closeModal()">取消</button></div>
+<div class="muted" style="margin-top:10px">逐篇独立生效并记审计（reviewer）；部分失败会在结果里逐条列出。</div>`);
+setTimeout(()=>{const i=document.getElementById('bt-tag');if(i)i.focus()},0)}
+async function docBatchTagApply(){const sids=docCheckedSids();const action=(document.getElementById('bt-action')||{}).value||'add';
+const tag=((document.getElementById('bt-tag')||{}).value||'').trim();const reviewer=((document.getElementById('bt-rev')||{}).value||'').trim();
+if(!tag){alert('输入标签名');return}
+if(!reviewer){alert('填写审核人');return}
+saveReviewer(reviewer);
+try{const r=await j('/api/docs/tags/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids,action,tag,reviewer})});
+closeModal();loadDocs();toast(`✓ ${r.updated}/${sids.length} 篇已更新${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
+async function docBatchDelete(){const sids=docCheckedSids();if(!sids.length){toast('先勾选文档');return}
+if(!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？`))return
+const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
+try{const r=await j('/api/external-docs/delete-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids})});
+loadDocs();toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
+function queueCheckedIds(){return Array.from(document.querySelectorAll('#view-queue .qchk:checked')).map(x=>+x.dataset.id)}
+function queueSelChanged(){const n=queueCheckedIds().length;const bar=document.getElementById('queuebatch');if(bar)bar.style.display=n?'block':'none';const c=document.getElementById('queuebatch-n');if(c)c.textContent=n}
+async function queueBatchReview(){const ids=queueCheckedIds();if(!ids.length){toast('先勾选补标项');return}
+const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
+const level=((document.getElementById('qb-level')||{}).value)||'tested';
+try{const r=await j('/api/items/review-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids,action:'approved',reviewer,result:{verification:level}})});
+loadQueue();toast(`✓ 已认证 ${r.reviewed}/${ids.length} 项${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 function tagDictForm(name,el){document.querySelectorAll('.tagb.editing').forEach(x=>x.classList.remove('editing'));
 if(el)el.classList.add('editing');  // 列表里正在编辑的芯片高亮，与对话框呼应
 const q=esc(name).replace(/'/g,"\\'");
@@ -480,6 +521,78 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             raise HTTPException(404, str(e))
         return {"ok": True, "note": f"已从数据库删除 {source_id}（{r['chunks_deleted']} 个 chunk，本地文件保留）"}
 
+    @app.post("/api/docs/tags/batch")
+    def docs_tags_batch(body: dict):
+        """批量标签编辑（文档管理多选/按目录全选）：逐篇复用单文档逻辑，记明细成败。
+
+        不做跨文档整体事务——单文档内 doc_tags+docs.tags 已是原子；部分成功返回
+        {updated, failed:[{source_id,error}]}，前端提示"N 成功 / M 失败"。
+        reviewer 必填（审计一致性）；上限 200 篇防误操作放大。
+        """
+        from vllm_kb.review import update_doc_tags
+
+        action = (body.get("action") or "").strip()
+        tag = (body.get("tag") or "").strip()
+        reviewer = (body.get("reviewer") or "").strip()
+        ids = [s.strip() for s in (body.get("source_ids") or []) if s and s.strip()]
+        if not ids or not reviewer:
+            raise HTTPException(400, "source_ids/reviewer 必填")
+        if len(ids) > 200:
+            raise HTTPException(400, "一次最多 200 篇")
+        import sqlite3
+
+        kb = cfg.resolve(cfg.storage.sqlite_path)
+        # 存在性预检：update_doc_tags 对不存在的 sid 会静默创建孤儿覆盖层
+        # （单文档 UI 入口只列真实文档所以无感；批量必须先验，否则成功数虚高）
+        conn = sqlite3.connect(str(kb))
+        try:
+            existing = {r[0] for r in conn.execute(
+                f"SELECT source_id FROM docs WHERE source_id IN ({','.join('?' * len(ids))})",
+                ids).fetchall()}
+        finally:
+            conn.close()
+        updated, failed = 0, [{"source_id": s, "error": "kb.sqlite3 中不存在"}
+                              for s in ids if s not in existing]
+        for sid in ids:
+            if sid not in existing:
+                continue
+            try:
+                update_doc_tags(kb, sid, action, tag, reviewer, config_path=_config_path)
+                updated += 1
+            except ValueError as e:
+                failed.append({"source_id": sid, "error": str(e)})
+            except Exception as e:
+                failed.append({"source_id": sid, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "updated": updated, "failed": failed}
+
+    @app.post("/api/external-docs/delete-batch")
+    def external_docs_delete_batch(body: dict):
+        """批量删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量，
+        本地文件不动）。向量 store **只建一次**（逐篇重建是主要浪费）。"""
+        from vllm_kb.review import delete_external_doc
+        from vllm_kb.vectorstore import build_vector_store
+
+        ids = [s.strip() for s in (body.get("source_ids") or []) if s and s.strip()]
+        if not ids:
+            raise HTTPException(400, "source_ids 必填")
+        if len(ids) > 200:
+            raise HTTPException(400, "一次最多 200 篇")
+        kb_path = cfg.resolve(cfg.storage.sqlite_path)
+        try:
+            vector_store = build_vector_store(cfg)
+        except Exception:
+            vector_store = None
+        deleted, failed = 0, []
+        for sid in ids:
+            try:
+                delete_external_doc(kb_path, sid, vector_store=vector_store)
+                deleted += 1
+            except ValueError as e:
+                failed.append({"source_id": sid, "error": str(e)})
+            except Exception as e:
+                failed.append({"source_id": sid, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "deleted": deleted, "failed": failed}
+
     @app.get("/api/stats")
     def stats():
         return store.stats()
@@ -557,6 +670,47 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         if not ok:
             raise HTTPException(404, "审核项不存在")
         return {"ok": True}
+
+    @app.post("/api/items/review-batch")
+    def items_review_batch(body: dict):
+        """批量审核（审核队列多选）：补标项走 review_verification（写覆盖层+立即刷新
+        docs.extra.verification，否则 w_rel 仍停在 unverified 0.5），其余走 store.review。
+        逐项记成败不整体回滚；reviewer 必填；上限 200 项。"""
+        action = body.get("action", "")
+        reviewer = (body.get("reviewer") or "").strip()
+        raw_ids = body.get("item_ids") or []
+        item_ids = []
+        for x in raw_ids:
+            try:
+                item_ids.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if not item_ids or not reviewer:
+            raise HTTPException(400, "item_ids/reviewer 必填")
+        if len(item_ids) > 200:
+            raise HTTPException(400, "一次最多 200 项")
+        reviewed, failed = 0, []
+        for iid in item_ids:
+            try:
+                it = store.get_item(iid)
+                if it is None:
+                    failed.append({"item_id": iid, "error": "审核项不存在"})
+                    continue
+                if it["category"] == "verification_pending":
+                    from vllm_kb.review import review_verification
+
+                    review_verification(cfg, store, iid, action, reviewer,
+                                        result=body.get("result"))
+                else:
+                    if not store.review(iid, action, reviewer, result=body.get("result")):
+                        failed.append({"item_id": iid, "error": "审核项不存在"})
+                        continue
+                reviewed += 1
+            except ValueError as e:
+                failed.append({"item_id": iid, "error": str(e)})
+            except Exception as e:
+                failed.append({"item_id": iid, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "reviewed": reviewed, "failed": failed}
 
     @app.post("/api/item/{item_id}/delete")
     def delete_doc(item_id: int, body: dict):
