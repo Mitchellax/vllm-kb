@@ -112,6 +112,7 @@ class TestCalendarNoDataLoss(unittest.TestCase):
             for i in range(100)
         ]
         resp = mock.MagicMock()
+        resp.status_code = 200
         resp.json.return_value = page1
         session = mock.MagicMock()
         session.get.side_effect = [resp, OSError("boom")]
@@ -120,6 +121,51 @@ class TestCalendarNoDataLoss(unittest.TestCase):
                 brc.fetch_releases("vllm-project/vllm-ascend")
         self.assertEqual(cm.exception.page, 2)
         self.assertEqual(len(cm.exception.partial), 100)
+
+    def test_fetch_403_rate_limit_dict_body_raises_cal_error_not_attributeerror(self):
+        """实测第二坑（2026-10-16 deploy）：共享代理出口 IP 撞 GitHub 限流 →
+        HTTP 403 + JSON dict 体被当正常批次，遍历 dict 得到字符串 key、
+        rel.get 裸 AttributeError 炸穿。非 200 必须转成 CalendarFetchError 优雅降级。"""
+        resp = mock.MagicMock()
+        resp.status_code = 403
+        resp.text = '{"message": "API rate limit exceeded for 203.0.113.7.", "documentation_url": "x"}'
+        session = mock.MagicMock()
+        session.get.return_value = resp
+        with mock.patch("vllm_kb.net.get_session", return_value=session):
+            with self.assertRaises(brc.CalendarFetchError) as cm:
+                brc.fetch_releases("vllm-project/vllm-ascend")
+        self.assertEqual(cm.exception.page, 1)
+        self.assertIn("403", str(cm.exception))
+        self.assertIn("rate limit", str(cm.exception))
+
+    def test_fetch_non_list_json_body_raises(self):
+        """200 但 body 是 dict（网关错误页/镜像异常）同样算拉取失败，不裸崩。"""
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"message": "unexpected gateway body"}
+        session = mock.MagicMock()
+        session.get.return_value = resp
+        with mock.patch("vllm_kb.net.get_session", return_value=session):
+            with self.assertRaises(brc.CalendarFetchError) as cm:
+                brc.fetch_releases("vllm-project/vllm")
+        self.assertIn("不是 release 列表", str(cm.exception))
+
+    def test_token_header_official_base_only(self):
+        """token 只随官方 api.github.com 附加——镜像前缀（第三方）绝不泄凭证。"""
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [{"tag_name": "v1.0", "published_at": "2026-01-01T00:00:00Z",
+                                   "prerelease": False}]
+        session = mock.MagicMock()
+        session.get.return_value = resp
+        with mock.patch("vllm_kb.net.get_session", return_value=session):
+            brc.fetch_releases("vllm-project/vllm", token="tok-123")
+            official_headers = session.get.call_args.kwargs["headers"]
+            self.assertEqual(official_headers["Authorization"], "Bearer tok-123")
+            brc.fetch_releases("vllm-project/vllm", gbase="http://mirror.local/api/v3",
+                               token="tok-123")
+            mirror_headers = session.get.call_args.kwargs["headers"]
+            self.assertNotIn("Authorization", mirror_headers)
 
     def test_write_refuses_empty_over_existing(self):
         before = self._before()

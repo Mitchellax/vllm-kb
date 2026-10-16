@@ -58,7 +58,21 @@ class CalendarWriteRefused(RuntimeError):
     """写盘会丢数据（新结果为空而现有日历非空）→ 拒绝覆盖。"""
 
 
-def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.github.com") -> list[dict]:
+def _github_token(cfg: AppConfig) -> str:
+    """GitHub token（未认证 60 次/小时/IP，**共享代理出口 IP 极易被限流**；带 token 5000/h）。
+
+    取 github 来源配置的 token_env 指向的环境变量（config 加载时已自动注入）。
+    """
+    import os
+
+    for sc in cfg.effective_sources():
+        if sc.type == "github":
+            return os.environ.get(sc.get("token_env", "GITHUB_TOKEN"), "") or ""
+    return os.environ.get("GITHUB_TOKEN", "")
+
+
+def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.github.com",
+                   token: str = "") -> list[dict]:
     """GitHub Releases API 全量拉取（分页）。返回 [{tag, date, prerelease}...] 按日期降序。
 
     走 **requests**（get_session：代理掐 TLS 自动直连兜底）——**不用 urllib**：实测
@@ -66,35 +80,48 @@ def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.
     掐断（api.github.com 的 vllm-ascend releases 路径 7/7 `EOF occurred in violation
     of protocol`，代理与直连全灭、加重试也无解；requests 同 URL 稳定 200）。
 
+    **任何非 200 / 非 release 列表形状的响应都算拉取失败**（实测第二坑：共享代理出口
+    IP 撞 GitHub 限流，403 + JSON dict 体被当成正常批次，遍历 dict 得到字符串 key、
+    `rel.get` 裸 AttributeError 炸穿——状态码/形状必须显式校验）。
+    token 仅在走官方 api.github.com 时附加（**不向镜像前缀泄凭证**）。
+
     任何一页失败都抛 CalendarFetchError（带已抓到的部分），**不返回残缺列表**：
     部分结果若落盘，会让日历比原来更小（旧版本文档的 tag->日期映射丢失），
     且与"真失败"无法区分。宁可保留上一版完整日历，下次再拉。
     """
     from vllm_kb.net import get_session, parse_json
 
+    headers = dict(_UA)
+    if token and gbase.rstrip("/") == "https://api.github.com":
+        headers["Authorization"] = f"Bearer {token}"
     s = get_session(insecure)
     releases: list[dict] = []
     page = 1
     while True:
         url = f"{gbase.rstrip('/')}/repos/{repo}/releases?per_page=100&page={page}"
         try:
-            r = s.get(url, timeout=30, headers=_UA)
+            r = s.get(url, timeout=30, headers=headers)
+            if r.status_code != 200:
+                snippet = (r.text or "").strip().replace("\n", " ")[:160]
+                raise RuntimeError(f"HTTP {r.status_code}: {snippet or '<空响应体>'}")
             batch = parse_json(r, f"{repo} releases page {page}")
+            if not isinstance(batch, list) or any(not isinstance(x, dict) for x in batch):
+                raise RuntimeError(f"响应不是 release 列表（限流/错误体?）：{str(batch)[:160]}")
+            if not batch:
+                break
+            for rel in batch:
+                if rel.get("tag_name") and rel.get("published_at"):
+                    releases.append({
+                        "tag": rel["tag_name"],
+                        "date": rel["published_at"],
+                        "prerelease": bool(rel.get("prerelease")),
+                    })
+            if len(batch) < 100:
+                break
+            page += 1
         except Exception as e:
             print(f"[warn] {repo} releases 拉取失败（page {page}）: {e}")
             raise CalendarFetchError(repo, page, e, releases) from e
-        if not batch:
-            break
-        for rel in batch:
-            if rel.get("tag_name") and rel.get("published_at"):
-                releases.append({
-                    "tag": rel["tag_name"],
-                    "date": rel["published_at"],
-                    "prerelease": bool(rel.get("prerelease")),
-                })
-        if len(batch) < 100:
-            break
-        page += 1
     # 按日期降序
     releases.sort(key=lambda r: r["date"], reverse=True)
     return releases
@@ -116,8 +143,9 @@ def classify_version(tag: str) -> str:
     return "release"
 
 
-def build_calendar(repo: str, insecure: bool = False, gbase: str = "https://api.github.com") -> dict:
-    releases = fetch_releases(repo, insecure=insecure, gbase=gbase)
+def build_calendar(repo: str, insecure: bool = False, gbase: str = "https://api.github.com",
+                   token: str = "") -> dict:
+    releases = fetch_releases(repo, insecure=insecure, gbase=gbase, token=token)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo": repo,
@@ -198,10 +226,13 @@ def main() -> None:
         repos = [args.repo or cfg.code.repo]
 
     failed: list[str] = []
+    token = _github_token(cfg)
+    if token:
+        print("[calendar] 已附加 GitHub token（限流 5000/h）")
     for repo in repos:
         print(f"[calendar] 拉取 {repo} releases ...", flush=True)
         try:
-            cal = build_calendar(repo, insecure=insecure, gbase=gbase)
+            cal = build_calendar(repo, insecure=insecure, gbase=gbase, token=token)
         except CalendarFetchError as e:
             print(f"[warn] {repo}: {e}；**保留上一版日历不覆盖**", flush=True)
             failed.append(repo)
