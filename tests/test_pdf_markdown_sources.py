@@ -74,7 +74,7 @@ class TestMarkdownSource(unittest.TestCase):
         d = docs[0]
         self.assertEqual(d.source_type, "doc_markdown")
         self.assertTrue(d.source_id.startswith("md:"))
-        self.assertEqual(d.title, "GLM5.1 崩溃三板斧")  # 首个 # 标题
+        self.assertEqual(d.title, "glm5_1三板斧")  # 标题策略：文件名 stem 优先（_stem_title）
         self.assertIn("mega_moe_max_tokens", d.body)
         self.assertEqual(d.extra["verification"], "unverified")
         self.assertEqual(d.extra["asset"]["format"], "markdown")

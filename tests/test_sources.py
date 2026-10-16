@@ -1,4 +1,4 @@
-"""数据源抽象层测试：注册表、构建、禁用、未实现来源、旧配置折叠。"""
+"""数据源抽象层测试：注册表、构建、禁用、未实现来源、旧配置折叠、标题策略。"""
 import unittest
 from pathlib import Path
 
@@ -8,11 +8,41 @@ from vllm_kb.sources import (
     ExcelSource,
     GithubSource,
     MarkdownSource,
+    _stem_title,
     build_sources,
     create_source,
     register_source,
 )
 from vllm_kb.models import KbDocument
+
+
+class TestStemTitle(unittest.TestCase):
+    """标题策略（2026 定版）：原始文件名 stem 优先，无意义名回退解析提取标题。"""
+
+    def test_meaningful_stem_wins(self):
+        # 华为手册：封面/元数据只有产品名，文件名含版本线+手册名+期号——信息量严格更高
+        self.assertEqual(
+            _stem_title("Atlas A3 中心推理和训练硬件 26.1.x npu-smi 命令参考 02",
+                        "Atlas A3 中心推理和训练硬件"),
+            "Atlas A3 中心推理和训练硬件 26.1.x npu-smi 命令参考 02")
+
+    def test_numeric_stem_falls_back(self):
+        self.assertEqual(_stem_title("12345", "封面产品名"), "封面产品名")
+
+    def test_hex_hash_stem_falls_back(self):
+        self.assertEqual(_stem_title("0f8fad5bd988", "Extracted Title"), "Extracted Title")
+        self.assertEqual(_stem_title("0f8fad5b-d988-4099", "Extracted Title"), "Extracted Title")
+
+    def test_short_or_empty_stem_falls_back(self):
+        self.assertEqual(_stem_title("ab", "Extracted"), "Extracted")
+        self.assertEqual(_stem_title("", "Extracted"), "Extracted")
+        self.assertEqual(_stem_title("  ", ""), "")
+
+    def test_fallback_chain_ends_at_stem(self):
+        self.assertEqual(_stem_title("12345", ""), "12345")
+        self.assertEqual(_stem_title("", ""), "")
+        # 提取标题为空白字符串时同样回退
+        self.assertEqual(_stem_title("安装指南", "   "), "安装指南")
 
 
 class TestSources(unittest.TestCase):

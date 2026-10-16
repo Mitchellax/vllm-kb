@@ -73,6 +73,29 @@ def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
     return (rel, sha, stype, size)
 
 
+# stem 无意义形态：纯数字 / 纯十六进制（hash、uuid 片段）/ 纯符号——爬虫批量下载件常见
+_JUNK_STEM_RE = re.compile(r"^(?:[0-9a-fA-F\-_]+|[0-9]+|\W+)$")
+
+
+def _stem_title(stem: str, extracted: str) -> str:
+    """文档标题策略（2026 定版）：**原始文件名 stem 优先**。
+
+    文件型来源的文件名由工程师/官方下载命名（含产品/版本线/手册名/期号），
+    信息量高于解析提取的标题——如华为手册 PDF 封面/元数据只有产品名
+    （"Atlas A3 中心推理和训练硬件"），多篇手册互相重名；而文件名
+    "… 26.1.x npu-smi 命令参考 02" 天然消歧。source_id 本就用 stem 构造，
+    标题与 sid 一致后 UI/图/skill 展示统一。
+
+    stem 为无意义名（纯数字 / 纯十六进制 hash / 纯符号 / 过短）时回退解析器
+    提取的标题（如爬虫件的 html <title>），两者皆空再回退 stem。
+    """
+    s = (stem or "").strip()
+    e = (extracted or "").strip()
+    if s and len(s) >= 4 and not _JUNK_STEM_RE.fullmatch(s):
+        return s
+    return e or s
+
+
 def _discover_for(src: "BaseSource", kind: DocKind, import_path: Path) -> Discovery:
     """按**文档种类声明**做文件发现——文件型来源的唯一入口。
 
@@ -495,7 +518,7 @@ class MarkdownSource(BaseSource):
                 if paths:
                     collector.setdefault("paths", set()).update(paths)
             title_raw = self._title_re.search(text)
-            title = title_raw.group(1).strip() if title_raw else stem
+            title = _stem_title(stem, title_raw.group(1) if title_raw else "")
             sha = _sha256(p)
             asset_id = sha[:16]
             sid = f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir())
@@ -756,7 +779,7 @@ class PdfSource(BaseSource):
         `.<sha12>` 历史副本时会不同，直接用它会造出"新文档"。
         """
         body = str(parsed.get("body") or "")
-        title = str(parsed.get("first_text") or "").strip() or stem
+        title = _stem_title(stem, str(parsed.get("first_text") or ""))
         tags, cands = extract_tags(stem, headings_from_pdf(body), registry=registry)
         # tables.json 由 _parse_pdf 首次解析时写入；缓存命中时文件已存在，rel 引用直接构造
         tables_rel = [f"parsed/pdf/{asset_id}.tables.json"] if parsed.get("tables") else []
@@ -1526,7 +1549,7 @@ class WordSource(BaseSource):
             doc = self._doc_from_extract(
                 p, sha, sha[:16], parsed, registry,
                 sid=f.sid(self.kind.sid_prefix, self.import_dir, self._assets_dir()),
-                evidence=evidence, injects=injects)
+                stem=stem, evidence=evidence, injects=injects)
             if sanitize_on:
                 ips, paths = collect_sanitize_hits(doc.body, keep_paths, keep_ips)
                 if ips:
@@ -1787,19 +1810,22 @@ class WordSource(BaseSource):
         return out
 
     def _doc_from_extract(self, p: Path, sha: str, asset_id: str, parsed: dict,
-                          registry: TagRegistry, *, sid: str,
+                          registry: TagRegistry, *, sid: str, stem: str,
                           evidence: Optional[list[dict]] = None,
                           injects: Optional[list[str]] = None) -> KbDocument:
         """用解析中间产物构造 KbDocument（确定性提取，毫秒级，每次运行重算）。
 
         缓存命中与首次解析共用本函数——标签/元数据/OCR 注入始终以最新规则执行，
         解析器与 OCR 阈值升级都不受缓存影响。
+
+        `stem` 是发现层给出的**族名**（文档身份来源）；回退模式收敛副本的 p.stem
+        会带 .sha12 后缀，标题/标签一律用族名（与 PdfSource 一致）。
         """
         body = self._apply_ocr_injections(str(parsed.get("body") or ""), parsed, injects or [])
-        title = (str(parsed.get("first_heading") or "").strip()
-                 or str(parsed.get("first_text") or "").strip() or p.stem)
+        title = _stem_title(stem, str(parsed.get("first_heading") or "").strip()
+                            or str(parsed.get("first_text") or "").strip())
         # 正文标题已渲染为 Markdown `#`，标题结构与标签提取与 markdown 同源
-        tags, cands = extract_tags(p.stem, headings_from_markdown(body), registry=registry)
+        tags, cands = extract_tags(stem, headings_from_markdown(body), registry=registry)
         tables_rel = [f"parsed/word/{asset_id}.tables.json"] if parsed.get("tables_data") else []
         imgs = parsed.get("images") or []
         n_body = sum(1 for e in imgs if e.get("in_body"))
@@ -2015,7 +2041,7 @@ class HtmlSource(BaseSource):
                 source_type=self.kind.source_type,
                 source_id=sid,
                 url=str(parsed.get("source_url") or ""),
-                title=str(parsed.get("title") or stem),
+                title=_stem_title(stem, str(parsed.get("title") or "")),
                 body=body,
                 created_at=None,
                 component="",
