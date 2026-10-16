@@ -94,8 +94,11 @@ class TestCalendarNoDataLoss(unittest.TestCase):
         return json.loads(self.path.read_text(encoding="utf-8"))
 
     def test_fetch_raises_on_first_page_failure(self):
-        with mock.patch("vllm_kb.net.get_opener") as opener:
-            opener.return_value.open.side_effect = OSError("proxy closed TLS tunnel")
+        # 拉取走 requests（get_session，代理掐 TLS 自动直连兜底）；mock 掉 session 验证
+        # fetch_releases 对拉取失败的"不返回残缺列表"契约
+        session = mock.MagicMock()
+        session.get.side_effect = OSError("proxy closed TLS tunnel")
+        with mock.patch("vllm_kb.net.get_session", return_value=session):
             with self.assertRaises(brc.CalendarFetchError) as cm:
                 brc.fetch_releases("vllm-project/vllm-ascend")
         self.assertEqual(cm.exception.page, 1)
@@ -109,11 +112,10 @@ class TestCalendarNoDataLoss(unittest.TestCase):
             for i in range(100)
         ]
         resp = mock.MagicMock()
-        resp.read.return_value = json.dumps(page1).encode()
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = lambda *a: None
-        with mock.patch("vllm_kb.net.get_opener") as opener:
-            opener.return_value.open.side_effect = [resp, OSError("boom")]
+        resp.json.return_value = page1
+        session = mock.MagicMock()
+        session.get.side_effect = [resp, OSError("boom")]
+        with mock.patch("vllm_kb.net.get_session", return_value=session):
             with self.assertRaises(brc.CalendarFetchError) as cm:
                 brc.fetch_releases("vllm-project/vllm-ascend")
         self.assertEqual(cm.exception.page, 2)

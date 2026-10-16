@@ -140,6 +140,11 @@ def get_opener(insecure: bool):
     """返回 urllib opener（insecure 时 CERT_NONE，不校验证书）。
 
     证书上下文统一走 ssl_context（系统 CA 为空时自动兜底 certifi，见其文档）。
+    **注意**：urllib 的 TLS ClientHello 在部分网络环境会被按指纹掐断（实测
+    api.github.com 的 vllm-ascend 路径 7/7 `EOF occurred in violation of protocol`，
+    requests 同 URL 稳定 200，代理与直连、加重试均无解）——**GitHub/quay 拉取
+    一律优先走 get_session（requests）**，本函数只留给无法用 requests 的场景
+    （如大文件流式下载 codeload.github.com）。
     """
     import urllib.request
 

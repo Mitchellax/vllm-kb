@@ -50,16 +50,22 @@ def _insecure_from_env() -> bool:
 
 
 def list_tags(repo: str, insecure: bool = False, api_base: str = DEFAULT_API_BASE) -> list[str]:
-    """GitHub REST 列出全部 tag（无 git 依赖）。api_base 可换业务侧 API 镜像。"""
+    """GitHub REST 列出全部 tag（无 git 依赖）。api_base 可换业务侧 API 镜像。
+
+    走 requests（get_session：代理掐 TLS 自动直连兜底）——**不用 urllib**：实测同一台
+    机器上 urllib/OpenSSL 的 TLS ClientHello 被环境按指纹掐断（api.github.com 的
+    vllm-ascend 路径 7/7 EOF，requests 同 URL 稳定 200），重试救不了。
+    """
+    from vllm_kb.net import get_session, parse_json
+
     tags: list[str] = []
     page = 1
-    opener = _opener(insecure)
+    s = get_session(insecure)
     while True:
         url = f"{api_base.rstrip('/')}/repos/{repo}/tags?per_page=100&page={page}"
-        req = urllib.request.Request(url, headers={"User-Agent": "vllm-kb"})
         try:
-            with opener.open(req, timeout=30) as r:
-                batch = json.loads(r.read().decode("utf-8"))
+            r = s.get(url, timeout=30, headers={"User-Agent": "vllm-kb"})
+            batch = parse_json(r, f"{repo} tags page {page}")
         except Exception as e:
             print(f"[warn] 列 tag 失败（page {page}）: {e}")
             break

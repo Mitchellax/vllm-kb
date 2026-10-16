@@ -28,7 +28,6 @@
 import argparse
 import json
 import sys
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,21 +61,25 @@ class CalendarWriteRefused(RuntimeError):
 def fetch_releases(repo: str, insecure: bool = False, gbase: str = "https://api.github.com") -> list[dict]:
     """GitHub Releases API 全量拉取（分页）。返回 [{tag, date, prerelease}...] 按日期降序。
 
+    走 **requests**（get_session：代理掐 TLS 自动直连兜底）——**不用 urllib**：实测
+    （2026-10-16 deploy）同一台机器上 urllib/OpenSSL 的 TLS ClientHello 被环境按指纹
+    掐断（api.github.com 的 vllm-ascend releases 路径 7/7 `EOF occurred in violation
+    of protocol`，代理与直连全灭、加重试也无解；requests 同 URL 稳定 200）。
+
     任何一页失败都抛 CalendarFetchError（带已抓到的部分），**不返回残缺列表**：
     部分结果若落盘，会让日历比原来更小（旧版本文档的 tag->日期映射丢失），
     且与"真失败"无法区分。宁可保留上一版完整日历，下次再拉。
     """
-    from vllm_kb.net import get_opener
+    from vllm_kb.net import get_session, parse_json
 
-    opener = get_opener(insecure)
+    s = get_session(insecure)
     releases: list[dict] = []
     page = 1
     while True:
         url = f"{gbase.rstrip('/')}/repos/{repo}/releases?per_page=100&page={page}"
         try:
-            req = urllib.request.Request(url, headers=_UA)
-            with opener.open(req, timeout=30) as r:
-                batch = json.loads(r.read().decode("utf-8"))
+            r = s.get(url, timeout=30, headers=_UA)
+            batch = parse_json(r, f"{repo} releases page {page}")
         except Exception as e:
             print(f"[warn] {repo} releases 拉取失败（page {page}）: {e}")
             raise CalendarFetchError(repo, page, e, releases) from e
