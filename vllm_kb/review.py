@@ -1516,10 +1516,24 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
     docs = [d["source_id"] for d in (payload.get("docs") or []) if d.get("source_id")]
     if not docs and source_id:
         docs = [source_id]
+    # 存在性过滤：候选的 docs 是入库时快照，源文档可能已从 kb 删除——不过滤会给
+    # 不存在的 sid 写孤儿 doc_tags 覆盖层（doc_tags 按 source_id 无外键）。
     kb = cfg.resolve(cfg.storage.sqlite_path)
+    existing: set[str] = set()
+    if docs and Path(kb).exists():
+        conn = sqlite3.connect(str(kb))
+        try:
+            qmarks = ",".join("?" * len(docs))
+            existing = {r[0] for r in conn.execute(
+                f"SELECT source_id FROM docs WHERE source_id IN ({qmarks})", docs).fetchall()}
+        finally:
+            conn.close()
+    missing = [s for s in docs if s not in existing]
     conn = sqlite3.connect(str(kb))
     try:
         for sid in docs:
+            if sid not in existing:
+                continue
             ov = get_doc_tags_conn(conn, sid)
             manual = list(ov["manual"])
             if name not in manual:
@@ -1530,9 +1544,67 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
         conn.close()
     store.review(item_id, "approved", reviewer,
                  result={"action": "adopt", "tag": name, "tier": entry.tier,
-                         "docs_count": len(docs)})
+                         "docs_count": len(existing),
+                         **({"docs_missing": missing} if missing else {})})
     return {"ok": True, "tag": name, "tier": entry.tier, "source_id": source_id,
-            "docs_count": len(docs)}
+            "docs_count": len(existing), "docs_missing": len(missing)}
+
+
+def prune_tag_candidates_for_doc(review_db: str | Path, source_id: str) -> dict:
+    """删除文档后修剪 pending tag_candidate 项的**悬空引用**（用户确认缺口 2026-10）。
+
+    此前链路：磁盘文件删除 → kb 记录不自动删（防误删清库，设计如此）→ 人工删 kb 记录后
+    队列项不级联清理 → payload.docs 悬空引用残留；全部提及文档删光的项永久滞留 pending
+    （seed_tag_candidates 幂等：item_ref 已存在不重建也不清理）→ 采纳时给不存在的 sid
+    写孤儿 doc_tags。
+
+    修剪规则（只动 pending 项；已审项是历史记录不改）：
+    - payload.docs 移除该 source_id（doc_count 同步减）；
+    - 修剪后快照为空 → 项自动标记 approved（= 忽略，result 记原因）——词典不受影响，
+      若其他文档日后重新提及，seed 会因 item_ref 已存在而…… 不，approved 后 add_item
+      幂等也不会重建；极端场景（删光后又想采纳）走文档管理页人工添加即可。
+    返回 {"pruned": 引用修剪的项数, "auto_ignored": 自动忽略的项数}。
+    """
+    conn = sqlite3.connect(str(review_db))
+    n_pruned = n_ignored = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, payload FROM review_items "
+            "WHERE category='tag_candidate' AND status='pending'").fetchall()
+        for iid, raw in rows:
+            try:
+                p = json.loads(raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            docs = [d for d in (p.get("docs") or []) if isinstance(d, dict)]
+            hit = any(d.get("source_id") == source_id for d in docs)
+            if not hit:
+                # 旧单文档格式（payload.source_id，无 docs）兼容
+                if p.get("source_id") != source_id:
+                    continue
+                docs = [{"source_id": source_id}]
+                hit = True
+            new_docs = [d for d in docs if d.get("source_id") != source_id]
+            p["docs"] = new_docs
+            p["doc_count"] = max(0, int(p.get("doc_count") or len(docs)) - 1)
+            if new_docs:
+                conn.execute("UPDATE review_items SET payload=? WHERE id=?",
+                             (json.dumps(p, ensure_ascii=False), iid))
+                n_pruned += 1
+            else:
+                conn.execute(
+                    "UPDATE review_items SET status='approved', reviewed_at=?, reviewer=?, "
+                    "result=?, payload=? WHERE id=?",
+                    (_now(), "system",
+                     json.dumps({"action": "auto-ignore",
+                                 "reason": f"提及文档已删除（{source_id}），无剩余提及文档"},
+                                ensure_ascii=False),
+                     json.dumps(p, ensure_ascii=False), iid))
+                n_ignored += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return {"pruned": n_pruned, "auto_ignored": n_ignored}
 
 
 def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:

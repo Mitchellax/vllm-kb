@@ -736,6 +736,67 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         self.assertEqual(self.client.post("/api/tag-dict/batch", json={
             "names": ["x"], "action": "bogus"}).status_code, 400)
 
+    def test_delete_prunes_candidate_refs_and_auto_ignores_when_empty(self):
+        """用户确认的缺口：删除文档后，未采纳候选的悬空引用要修剪；全部提及文档
+        删光的候选自动忽略（此前永久滞留 pending，采纳会给不存在的 sid 写孤儿覆盖层）。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore, default_review_path
+        import sqlite3
+
+        seed_kb_doc(self.cfg_path, "md:del1")
+        seed_kb_doc(self.cfg_path, "md:keep")
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        store = ReviewStore(default_review_path(cfg))
+        store.add_item("tag_candidate", "tag:RoCE组网", {
+            "candidate": "RoCE组网", "suggested_tier": "domain", "doc_count": 2,
+            "docs": [{"source_id": "md:del1"}, {"source_id": "md:keep"}]})
+        item = store.list_items(category="tag_candidate")[0]
+        store.close()
+        # 删其一 → 引用修剪、项仍 pending
+        self.client.post("/api/external-docs/delete", json={"source_id": "md:del1"})
+        store = ReviewStore(default_review_path(cfg))
+        it = store.get_item(item["id"])
+        store.close()
+        self.assertEqual(it["status"], "pending")
+        self.assertEqual([d["source_id"] for d in it["payload"]["docs"]], ["md:keep"])
+        self.assertEqual(it["payload"]["doc_count"], 1)
+        # 删最后一个 → 自动忽略（approved + 原因）
+        self.client.post("/api/external-docs/delete", json={"source_id": "md:keep"})
+        store = ReviewStore(default_review_path(cfg))
+        it2 = store.get_item(item["id"])
+        store.close()
+        self.assertEqual(it2["status"], "approved")
+        res = it2["result"]
+        res = json.loads(res) if isinstance(res, str) else res
+        self.assertIn("无剩余提及文档", res["reason"])
+
+    def test_adopt_stale_candidate_no_orphan_overlay(self):
+        """采纳 docs 全部悬空的候选：词典照入（词有价值），但不给不存在的 sid 写覆盖层。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore, default_review_path
+        import sqlite3
+
+        seed_kb_doc(self.cfg_path, "md:other")  # 建 doc_tags 表 + 提供一个真实文档
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        store = ReviewStore(default_review_path(cfg))
+        store.add_item("tag_candidate", "tag:悬空词", {
+            "candidate": "悬空词", "suggested_tier": "domain", "doc_count": 1,
+            "docs": [{"source_id": "md:ghost"}]})
+        item = store.list_items(category="tag_candidate")[0]
+        store.close()
+        r = self.client.post("/api/tag-candidates/batch", json={
+            "item_ids": [item["id"]], "action": "adopt", "reviewer": "赵六"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["done"], 1)
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        rows = conn.execute("SELECT source_id, manual FROM doc_tags").fetchall()
+        conn.close()
+        self.assertEqual(rows, [], "悬空 sid 不得产生孤儿 doc_tags 覆盖层")
+        cfg_data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        reg_names = [x["name"] if isinstance(x, dict) else x
+                     for x in cfg_data["tags"]["registry"]]
+        self.assertIn("悬空词", reg_names)
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text

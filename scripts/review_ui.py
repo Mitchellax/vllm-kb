@@ -614,8 +614,9 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     @app.post("/api/external-docs/delete")
     def external_doc_delete(body: dict):
         """彻底删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量），
-        本地资产文件不动；下次增量入库时文件仍在本地则重新入库。"""
-        from vllm_kb.review import delete_external_doc
+        本地资产文件不动；下次增量入库时文件仍在本地则重新入库。
+        删除后联动修剪 tag_candidate 队列里的悬空引用（快照空则自动忽略该候选）。"""
+        from vllm_kb.review import delete_external_doc, prune_tag_candidates_for_doc
         from vllm_kb.vectorstore import build_vector_store
 
         source_id = (body.get("source_id") or "").strip()
@@ -631,7 +632,9 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             r = delete_external_doc(kb_path, source_id, vector_store=vector_store)
         except ValueError as e:
             raise HTTPException(404, str(e))
-        return {"ok": True, "note": f"已从数据库删除 {source_id}（{r['chunks_deleted']} 个 chunk，本地文件保留）"}
+        cleaned = prune_tag_candidates_for_doc(default_review_path(cfg), source_id)
+        return {"ok": True, "candidates_cleaned": cleaned,
+                "note": f"已从数据库删除 {source_id}（{r['chunks_deleted']} 个 chunk，本地文件保留）"}
 
     @app.post("/api/docs/tags/batch")
     def docs_tags_batch(body: dict):
@@ -680,8 +683,9 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     @app.post("/api/external-docs/delete-batch")
     def external_docs_delete_batch(body: dict):
         """批量删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量，
-        本地文件不动）。向量 store **只建一次**（逐篇重建是主要浪费）。"""
-        from vllm_kb.review import delete_external_doc
+        本地文件不动）。向量 store **只建一次**（逐篇重建是主要浪费）。
+        删除后联动修剪 tag_candidate 悬空引用（逐篇）。"""
+        from vllm_kb.review import delete_external_doc, prune_tag_candidates_for_doc
         from vllm_kb.vectorstore import build_vector_store
 
         ids = [s.strip() for s in (body.get("source_ids") or []) if s and s.strip()]
@@ -694,16 +698,21 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             vector_store = build_vector_store(cfg)
         except Exception:
             vector_store = None
+        review_db = default_review_path(cfg)
         deleted, failed = 0, []
+        cleaned = {"pruned": 0, "auto_ignored": 0}
         for sid in ids:
             try:
                 delete_external_doc(kb_path, sid, vector_store=vector_store)
                 deleted += 1
+                c = prune_tag_candidates_for_doc(review_db, sid)
+                cleaned["pruned"] += c["pruned"]
+                cleaned["auto_ignored"] += c["auto_ignored"]
             except ValueError as e:
                 failed.append({"source_id": sid, "error": str(e)})
             except Exception as e:
                 failed.append({"source_id": sid, "error": f"{type(e).__name__}: {e}"})
-        return {"ok": True, "deleted": deleted, "failed": failed}
+        return {"ok": True, "deleted": deleted, "failed": failed, "candidates_cleaned": cleaned}
 
     @app.get("/api/stats")
     def stats():
