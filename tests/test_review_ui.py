@@ -668,12 +668,51 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         self.assertIsNone(rows["md:回退"]["rel_dir"])   # 资产回退件：无目录归属
         self.assertIsNone(rows["md:裸"]["rel_src"])     # 网络来源/旧数据：两者皆缺
 
+    def test_tag_candidates_batch_adopt_and_ignore(self):
+        """候选批量分拣：采纳=入词典+提及文档打标；忽略=改状态不改数据；非 pending 进 failed。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore, default_review_path
+        import sqlite3
+
+        seed_kb_doc(self.cfg_path, "md:cand1")
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        store = ReviewStore(default_review_path(cfg))
+        store.add_item("tag_candidate", "tag:配置pip源",
+                       {"candidate": "配置pip源", "suggested_tier": "purpose", "doc_count": 1,
+                        "docs": [{"source_id": "md:cand1"}]})
+        store.add_item("tag_candidate", "tag:RoCE组网",
+                       {"candidate": "RoCE组网", "suggested_tier": "domain", "doc_count": 2})
+        items = store.list_items(category="tag_candidate")
+        store.close()
+        ids = [i["id"] for i in items]
+        # 忽略一条 + 采纳一条
+        r = self.client.post("/api/tag-candidates/batch", json={
+            "item_ids": ids, "action": "adopt", "reviewer": "王五"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["done"], 2)
+        # 词典已入 + 文档已打标
+        conn = sqlite3.connect(cfg.resolve(cfg.storage.sqlite_path))
+        manual = dict(conn.execute("SELECT source_id, manual FROM doc_tags").fetchall())
+        conn.close()
+        self.assertIn("配置pip源", json.loads(manual.get("md:cand1", "[]")))
+        cfg_data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        reg_names = [x["name"] if isinstance(x, dict) else x
+                     for x in cfg_data["tags"]["registry"]]
+        self.assertIn("配置pip源", reg_names)
+        # 再分拣 → 全部非 pending → failed
+        r2 = self.client.post("/api/tag-candidates/batch", json={
+            "item_ids": ids, "action": "ignore", "reviewer": "王五"})
+        self.assertEqual(r2.json()["done"], 0)
+        self.assertEqual(len(r2.json()["failed"]), 2)
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text
         for token in ("docBatchTagModal", "docBatchTagApply", "docBatchDelete",
-                      "docGroupToggle", "queueBatchReview", "docbatch", "queuebatch",
-                      "docs/tags/batch", "external-docs/delete-batch", "items/review-batch"):
+                      "docGroupToggle", "queueBatchReview", "queueBatchCandidates",
+                      "docbatch", "queuebatch", "queuecand",
+                      "docs/tags/batch", "external-docs/delete-batch", "items/review-batch",
+                      "tag-candidates/batch"):
             self.assertIn(token, html, f"页面缺少 {token}")
 
 

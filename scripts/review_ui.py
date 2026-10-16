@@ -175,7 +175,9 @@ const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.
 const itemTitle=i=>{const p=i.payload||{};return i.category==='tag_candidate'?(p.candidate||i.item_ref):(p.title||i.item_ref)};
 $('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span></div>`
 +`<div id="queuebatch" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuebatch-n">0</span> 项补标</b> 认证级别: <select id="qb-level"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option></select> <button class="primary sm" onclick="queueBatchReview()">✓ 批量认证</button></div>`
-+q.map(i=>{const chk=(i.category==='verification_pending'&&i.status==='pending')?`<input type="checkbox" class="qchk" data-id="${i.id}" onclick="event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量认证"> `:'';
++`<div id="queuecand" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuecand-n">0</span> 条候选</b> tier（仅采纳可覆盖）: <select id="qc-tier"><option value="">用各候选建议</option><option value="domain">领域</option><option value="purpose">作用</option></select> <button class="primary sm" onclick="queueBatchCandidates('adopt')">✓ 批量采纳</button> <button class="sm" onclick="queueBatchCandidates('ignore')">忽略所选</button> <span class="muted">采纳=入词典+全部提及文档打标；忽略=不再出现（不改任何数据）</span></div>`
++q.map(i=>{const pending=i.status==='pending';
+const chk=(pending&&(i.category==='verification_pending'||i.category==='tag_candidate'))?`<input type="checkbox" class="${i.category==='tag_candidate'?'cchk':'qchk'}" data-id="${i.id}" onclick="event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量操作"> `:'';
 return `<div class="item" onclick="showItem(${i.id})"><div>${chk}<span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`}).join('')||'<div class="card muted">队列为空</div>'
 +`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid var(--rv-red)"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
 <div class="muted mono">${esc((i.payload||{}).asset&&(i.payload.asset.path)||'')}</div>
@@ -300,13 +302,20 @@ if(!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+
 const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
 try{const r=await j('/api/external-docs/delete-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids})});
 loadDocs();toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
-function queueCheckedIds(){return Array.from(document.querySelectorAll('#view-queue .qchk:checked')).map(x=>+x.dataset.id)}
-function queueSelChanged(){const n=queueCheckedIds().length;const bar=document.getElementById('queuebatch');if(bar)bar.style.display=n?'block':'none';const c=document.getElementById('queuebatch-n');if(c)c.textContent=n}
-async function queueBatchReview(){const ids=queueCheckedIds();if(!ids.length){toast('先勾选补标项');return}
+function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel)).map(x=>+x.dataset.id)}
+function queueSelChanged(){const vn=queueCheckedIds('#view-queue .qchk').length,cn=queueCheckedIds('#view-queue .cchk').length;
+const vb=document.getElementById('queuebatch');if(vb)vb.style.display=vn?'block':'none';const vc=document.getElementById('queuebatch-n');if(vc)vc.textContent=vn;
+const cb=document.getElementById('queuecand');if(cb)cb.style.display=cn?'block':'none';const cc=document.getElementById('queuecand-n');if(cc)cc.textContent=cn}
+async function queueBatchReview(){const ids=queueCheckedIds('#view-queue .qchk');if(!ids.length){toast('先勾选补标项');return}
 const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
 const level=((document.getElementById('qb-level')||{}).value)||'tested';
 try{const r=await j('/api/items/review-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids,action:'approved',reviewer,result:{verification:level}})});
 loadQueue();toast(`✓ 已认证 ${r.reviewed}/${ids.length} 项${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
+async function queueBatchCandidates(action){const ids=queueCheckedIds('#view-queue .cchk');if(!ids.length){toast('先勾选候选');return}
+const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
+const tier=action==='adopt'?(((document.getElementById('qc-tier')||{}).value)||null):null;
+try{const r=await j('/api/tag-candidates/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids,action,reviewer,tier})});
+loadQueue();toast(`✓ ${action==='adopt'?'已采纳':'已忽略'} ${r.done}/${ids.length} 条${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 function tagDictForm(name,el){document.querySelectorAll('.tagb.editing').forEach(x=>x.classList.remove('editing'));
 if(el)el.classList.add('editing');  // 列表里正在编辑的芯片高亮，与对话框呼应
 const q=esc(name).replace(/'/g,"\\'");
@@ -502,6 +511,52 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"ok": True, **r}
+
+    @app.post("/api/tag-candidates/batch")
+    def tag_candidates_batch(body: dict):
+        """候选批量分拣（消化积压）：adopt=采纳（入词典+全部提及文档打标）| ignore=忽略。
+
+        逐项独立生效记审计；仅 pending 项可分拣（已审项报进 failed 明细）；
+        tier 仅 adopt 时可整批覆盖（缺省用各候选建议 tier）。
+        """
+        from vllm_kb.review import adopt_tag_candidate
+
+        action = (body.get("action") or "").strip()
+        reviewer = (body.get("reviewer") or "").strip()
+        tier = body.get("tier") or None
+        item_ids = []
+        for x in (body.get("item_ids") or []):
+            try:
+                item_ids.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if action not in ("adopt", "ignore"):
+            raise HTTPException(400, "action 须为 adopt|ignore")
+        if not item_ids or not reviewer:
+            raise HTTPException(400, "item_ids/reviewer 必填")
+        if len(item_ids) > 200:
+            raise HTTPException(400, "一次最多 200 项")
+        done, failed = 0, []
+        for iid in item_ids:
+            try:
+                it = store.get_item(iid)
+                if it is None or it["category"] != "tag_candidate":
+                    failed.append({"item_id": iid, "error": "候选项不存在"})
+                    continue
+                if it["status"] != "pending":
+                    failed.append({"item_id": iid, "error": f"状态 {it['status']} 非 pending"})
+                    continue
+                if action == "adopt":
+                    adopt_tag_candidate(cfg, store, iid, reviewer, tier=tier,
+                                        config_path=_config_path)
+                else:
+                    store.review(iid, "approved", reviewer)
+                done += 1
+            except ValueError as e:
+                failed.append({"item_id": iid, "error": str(e)})
+            except Exception as e:
+                failed.append({"item_id": iid, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "done": done, "failed": failed}
 
     @app.post("/api/external-docs/delete")
     def external_doc_delete(body: dict):
