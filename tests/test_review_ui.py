@@ -466,6 +466,25 @@ class ReviewUiHtmlAudit(unittest.TestCase):
         src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
         self.assertIn("config_path=_config_path", src)
 
+    def test_tag_dict_edit_uses_modal(self):
+        """标签管理的编辑框必须是模态对话框（此前 appendChild 到页面末尾、.card subtle
+        样式与列表卡片相同——唯一正在编辑项看上去只是又一个列表项）。"""
+        src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
+        self.assertIn('id="modal"', src)      # 模态容器存在
+        self.assertIn("function openModal(", src)
+        self.assertIn("function closeModal(", src)
+        fn = src[src.index("function tagDictForm"):src.index("async function tagDictRename")]
+        self.assertIn("openModal(", fn)
+        self.assertNotIn("appendChild(", fn)  # 不再插进页面流
+        self.assertIn("classList.add('editing')", fn)  # 被编辑芯片高亮
+        # 三个动作成功后都必须关闭对话框
+        import re as _re
+
+        for fname in ("tagDictRename", "tagDictTier", "tagDictDelete"):
+            m = _re.search(rf"async function {fname}\([\s\S]*?\nasync function", src)
+            self.assertIsNotNone(m, fname)
+            self.assertIn("closeModal()", m.group(0), fname)
+
     def test_queue_list_shows_candidate_for_tag_items(self):
         """队列列表：tag_candidate 条目必须显示候选词本身。
 

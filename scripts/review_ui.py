@@ -132,6 +132,15 @@ pre{background:var(--rv-bg-2);border:1px solid var(--rv-border);color:var(--rv-l
 .divider{border:0;border-top:1px solid var(--rv-border);margin:14px 0}
 #toast{position:fixed;top:64px;right:24px;background:var(--rv-brand);color:var(--rv-brand-contrast);
   padding:9px 16px;border-radius:var(--rv-radius-s);display:none;z-index:99;font-size:13px;box-shadow:0 4px 16px rgb(0 0 0 / 18%)}
+#modal{position:fixed;inset:0;background:rgb(15 17 21 / 40%);display:flex;align-items:center;justify-content:center;z-index:98}
+#modal[hidden]{display:none}
+#modal-card{background:var(--rv-panel);border:1px solid var(--rv-border);border-radius:var(--rv-radius);
+  box-shadow:0 8px 32px rgb(0 0 0 / 22%);padding:18px 20px;min-width:340px;max-width:560px}
+#modal-card h4{margin:0 0 10px;font-size:14.5px}
+#modal-card .row{margin:8px 0;display:flex;align-items:center;gap:8px}
+#modal-card .row label{width:64px;color:var(--rv-label-2);font-size:12.5px;flex:none}
+#modal-card .actions{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}
+.tagb.editing{outline:2px solid var(--rv-accent);outline-offset:1px}
 </style></head><body>
 <header><strong>vllm-kb 审核工作台</strong>
 <a id="nav-stats" class="active" onclick="tab('stats')">概览</a>
@@ -140,6 +149,7 @@ pre{background:var(--rv-bg-2);border:1px solid var(--rv-border);color:var(--rv-l
 <a id="nav-tags" onclick="tab('tags')">标签管理</a>
 <a id="nav-configs" onclick="tab('configs')">API 配置</a><a id="nav-gaps" onclick="tab('gaps')">知识缺口</a></header>
 <div id="toast"></div>
+<div id="modal" hidden onclick="if(event.target===this)closeModal()"><div id="modal-card"></div></div>
 <main>
 <div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-tags" style="display:none"></div><div id="view-configs" style="display:none"></div><div id="view-gaps" style="display:none"></div>
 </main>
@@ -239,7 +249,7 @@ async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文�
 try{await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();toast('✓ 已删除（本地文件保留）')}
 catch(e){toast('✗ 删除失败: '+e.message)}}
 async function loadTagDict(){const t=await j('/api/tag-dict');
-const groupHtml=(g,title)=>`<h4 style="margin:10px 0 4px">${title}（${g.length}）</h4><div class="card">${g.map(x=>`<span class="tagb reg">${esc(x.name)} (${x.docs}篇)</span> <button class="sm" onclick="tagDictForm('${esc(x.name).replace(/'/g,"\\'")}')">编辑</button>`).join('')||'（空）'}</div>`;
+const groupHtml=(g,title)=>`<h4 style="margin:10px 0 4px">${title}（${g.length}）</h4><div class="card">${g.map(x=>`<span class="tagb reg">${esc(x.name)} (${x.docs}篇)</span> <button class="sm" onclick="tagDictForm('${esc(x.name).replace(/'/g,"\\'")}', this)">编辑</button>`).join('')||'（空）'}</div>`;
 $('#view-tags').innerHTML=`<h3>标签词典（config.json tags.registry，全局唯一事实源）</h3>
 <div class="todo"><b>TODO（暂缓）</b>：标签打标与候选处理的人工成本偏高（候选按词聚合已做，仍需逐条人工判断）。待设计更优流程/交互后再优化——候选方向见「文档管理」页 TODO。当前保持现状。</div>
 <div class="card subtle">两级分类：领域类=这是什么领域的知识（过滤/圈定范围）；作用类=文档能帮我做什么（能力匹配）。新增/改名/改 tier 同步 config.json；<b>不热插图</b>——运行 build_graph.py 重建图后入图（Kùzu 单写者约束）。</div>
@@ -249,20 +259,28 @@ ${groupHtml(t.groups.purpose||[],'具体作用类 (purpose)')}
 <button class="ok" onclick="tagDictAdd()">加入词典</button></div>`}
 async function tagDictAdd(){const name=document.getElementById('newtag-name').value.trim();if(!name){alert('输入标签名');return}
 try{await j('/api/tag-dict/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,tier:document.getElementById('newtag-tier').value||null})});loadTagDict();toast('✓ 已加入词典（重建图后入图）')}catch(e){toast('✗ '+e.message)}}
-function tagDictForm(name){const old=document.getElementById('tdform');if(old)old.remove();
-const div=document.createElement('div');div.id='tdform';div.className='card subtle';
-div.innerHTML=`<b>编辑: ${esc(name)}</b><br>新名: <input id="td-new" placeholder="${esc(name)}" style="width:140px">
-tier: <select id="td-tier"><option value="">不变</option><option value="domain">领域</option><option value="purpose">作用</option></select>
-<button class="ok" onclick="tagDictRename('${esc(name).replace(/'/g,"\\'")}')">改名</button>
-<button onclick="tagDictTier('${esc(name).replace(/'/g,"\\'")}')">改 tier</button>
-<button class="danger" onclick="tagDictDelete('${esc(name).replace(/'/g,"\\'")}')">删除</button>`;
-document.getElementById('view-tags').appendChild(div)}
+function openModal(html){document.getElementById('modal-card').innerHTML=html;document.getElementById('modal').hidden=false}
+function closeModal(){document.getElementById('modal').hidden=true;document.querySelectorAll('.tagb.editing').forEach(x=>x.classList.remove('editing'))}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()})
+function tagDictForm(name,el){document.querySelectorAll('.tagb.editing').forEach(x=>x.classList.remove('editing'));
+if(el)el.classList.add('editing');  // 列表里正在编辑的芯片高亮，与对话框呼应
+const q=esc(name).replace(/'/g,"\\'");
+openModal(`<h4>编辑标签</h4>
+<div class="row"><label>当前名</label><span class="tagb reg">${esc(name)}</span></div>
+<div class="row"><label>新名</label><input id="td-new" placeholder="留空 = 不改名" style="flex:1"></div>
+<div class="row"><label>tier</label><select id="td-tier"><option value="">不变</option><option value="domain">领域 (domain)</option><option value="purpose">作用 (purpose)</option></select></div>
+<div class="actions"><button class="primary" onclick="tagDictRename('${q}')">改名</button>
+<button onclick="tagDictTier('${q}')">改 tier</button>
+<button class="danger" onclick="tagDictDelete('${q}')">删除</button>
+<button onclick="closeModal()">取消</button></div>
+<div class="muted" style="margin-top:10px">改名=全库替换（docs.tags / doc_tags / config 同步）；不热插图——build_graph.py 重建后入图。删除只移出词典，已打标文档保留该标签。</div>`);
+setTimeout(()=>{const i=document.getElementById('td-new');if(i)i.focus()},0)}
 async function tagDictRename(name){const nv=document.getElementById('td-new').value.trim();if(!nv){alert('输入新名');return}
-try{const r=await j('/api/tag-dict/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:name,new:nv})});loadTagDict();toast(`✓ 已改名（${r.docs_updated} 篇受影响）`)}catch(e){toast('✗ '+e.message)}}
+try{const r=await j('/api/tag-dict/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:name,new:nv})});closeModal();loadTagDict();toast(`✓ 已改名（${r.docs_updated} 篇受影响）`)}catch(e){toast('✗ '+e.message)}}
 async function tagDictTier(name){const tv=document.getElementById('td-tier').value;if(!tv){alert('选择 tier');return}
-try{await j('/api/tag-dict/tier',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,tier:tv})});loadTagDict();toast('✓ tier 已更新（全局生效）')}catch(e){toast('✗ '+e.message)}}
+try{await j('/api/tag-dict/tier',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,tier:tv})});closeModal();loadTagDict();toast('✓ tier 已更新（全局生效）')}catch(e){toast('✗ '+e.message)}}
 async function tagDictDelete(name){if(!confirm(`从词典删除 ${name}？只移出词典，已打标文档上的该标签保留。`))return
-try{await j('/api/tag-dict/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});loadTagDict();toast('✓ 已移出词典')}catch(e){toast('✗ '+e.message)}}
+try{await j('/api/tag-dict/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});closeModal();loadTagDict();toast('✓ 已移出词典')}catch(e){toast('✗ '+e.message)}}
 async function loadConfigs(){const cs=await j('/api/configs');fillCache(cs);
 $('#view-configs').innerHTML=`<h3>API 配置中心（key 脱敏；可编辑）</h3>`+cs.map(c=>`<div class="card" id="cfg-${esc(c.name)}"><b>${esc(c.name)}</b> <span class="badge ${c.status==='configured'?'confirmed':'pending'}">${c.status}</span>
 <table><tr><th>provider</th><td>${esc(c.provider)}</td></tr>${c.mode&&c.mode!=='custom'?`<tr><th>mode</th><td>${esc(c.mode)}</td></tr>`:''}${c.model?`<tr><th>model</th><td class="mono">${esc(c.model)}</td></tr>`:''}<tr><th>base_url</th><td class="mono">${esc(c.base_url)}</td></tr><tr><th>key</th><td>${c.key_configured?'已配置':'未配置'}</td></tr><tr><th>说明</th><td class="muted">${esc(c.note||'')}</td></tr></table>
