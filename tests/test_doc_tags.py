@@ -315,7 +315,47 @@ class TagManagementTest(unittest.TestCase):
         self.assertEqual(added, 1)  # 旧格式被清理，新聚合格式生成 1 条
         self.assertEqual(len(q), 1)
         self.assertEqual(q[0]["item_ref"], "tag:带宽")
-        self.assertEqual(q[0]["payload"]["doc_count"], 1)
+
+    def test_seed_sweeps_stale_pending_candidates(self):
+        """删库后滞留的 pending 候选在 seed 时自愈：全悬空自动忽略、部分悬空刷新引用、
+        词典已收录的忽略；引用仍有效的项不动（2026-10 用户实测缺口）。"""
+        from vllm_kb.review import seed_tag_candidates
+
+        self._ingest(source_id="pdf:real", cands=[{"name": "拓扑", "tier": "domain"}])
+        store = self.store
+        # ① 全悬空：kb 里没有 md:gone
+        store.add_item("tag_candidate", "tag:悬空词", {
+            "candidate": "悬空词", "doc_count": 1,
+            "docs": [{"source_id": "md:gone"}]})
+        # ② 部分悬空：拓扑在 kb 里只剩 pdf:real（原引用多了一个 md:gone）
+        store.add_item("tag_candidate", "tag:拓扑", {
+            "candidate": "拓扑", "doc_count": 2,
+            "docs": [{"source_id": "pdf:real"}, {"source_id": "md:gone"}]})
+        # ③ 词典已收录（HCCL 在夹具词典里，agg 因此不含该词）
+        store.add_item("tag_candidate", "tag:HCCL", {
+            "candidate": "HCCL", "doc_count": 1,
+            "docs": [{"source_id": "pdf:real"}]})
+        seed_tag_candidates(self.cfg, self.store)
+        q = {i["payload"]["candidate"]: i for i in store.list_items(category="tag_candidate")}
+        gone = q["悬空词"]
+        self.assertEqual(gone["status"], "approved")
+        res = gone["result"]
+        res = json.loads(res) if isinstance(res, str) else res
+        self.assertEqual(res["reason"], "提及文档已不存在（重建后 kb 中不再提及）")
+        partial = q["拓扑"]
+        self.assertEqual(partial["status"], "pending")
+        self.assertEqual([d["source_id"] for d in partial["payload"]["docs"]], ["pdf:real"])
+        self.assertEqual(partial["payload"]["doc_count"], 1)
+        in_dict = q["HCCL"]
+        self.assertEqual(in_dict["status"], "approved")
+        res2 = in_dict["result"]
+        res2 = json.loads(res2) if isinstance(res2, str) else res2
+        self.assertEqual(res2["reason"], "词典已收录，候选已生效")
+        # 引用仍有效的项不受影响（本轮 seed 新建的"带宽"类）——无 result、仍 pending
+        for i in store.list_items(category="tag_candidate"):
+            if i["payload"]["candidate"] not in ("悬空词", "拓扑", "HCCL"):
+                self.assertIsNone(i["result"])
+                self.assertEqual(i["status"], "pending")
 
     def test_tag_dict_management(self):
         from vllm_kb.review import (

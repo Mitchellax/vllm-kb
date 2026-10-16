@@ -330,6 +330,17 @@ class ReviewStore:
             "result": json.loads(r[8]) if r[8] else None,
         }
 
+    def update_payload(self, item_id: int, payload: dict) -> bool:
+        """覆盖审核项 payload（seed 队列校正用；不影响状态/审计字段）。"""
+        conn = self._connect()
+        try:
+            cur = conn.execute("UPDATE review_items SET payload=? WHERE id=?",
+                               (json.dumps(payload, ensure_ascii=False), int(item_id)))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def review(self, item_id: int, action: str, reviewer: str,
                result: Optional[dict] = None) -> bool:
         """提交标注（**不改原始内容**）：action ∈ approved（认证）| suspected（存疑）。
@@ -1486,7 +1497,47 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
             # adopt/showItem 的 docs||[payload] 回退里，新条目一律有 docs。
         }):
             added += 1
+    # 以 kb 现状校正 pending 队列（2026-10 用户实测缺口）：任何删库路径（审核台删除/
+    # canonical 删行 + rebuild/换库）之后，kb 里文档没了但队列项会永久滞留 pending——
+    # 全悬空自动忽略、部分悬空刷新引用，下次 seed（审核台启动）自动自愈。
+    ignored, refreshed = _sweep_tag_candidates(store, agg, registry)
+    if ignored or refreshed:
+        print(f"[candidates] 队列校正: 自动忽略 {ignored} 条（提及文档已不存在/词典已收录）、"
+              f"刷新 {refreshed} 条的引用", flush=True)
     return added
+
+
+def _sweep_tag_candidates(store: "ReviewStore", agg: dict[str, dict],
+                          registry: "TagRegistry") -> tuple[int, int]:
+    """以 kb 现状校正 pending tag_candidate 队列。只动 pending（已审项是历史记录）。
+
+    - 词已无任何 kb 文档提及（agg 无此词）→ 自动忽略（approved，result 记原因）；
+    - 词已在词典（人工加过，agg 因此不含）→ 自动忽略（词已生效，候选无意义）；
+    - 词仍在 kb 但提及文档变了 → payload.docs/doc_count 刷新为现状（引用修正）。
+    返回 (auto_ignored, refreshed)。
+    """
+    ignored = refreshed = 0
+    for it in store.list_items(category="tag_candidate", status="pending"):
+        p = it["payload"] or {}
+        name = p.get("candidate", "")
+        if not name:
+            continue
+        fresh = agg.get(name)
+        if fresh is None:
+            reason = ("词典已收录，候选已生效" if registry.contains(name)
+                      else "提及文档已不存在（重建后 kb 中不再提及）")
+            store.review(it["id"], "approved", "system",
+                         result={"action": "auto-ignore", "reason": reason})
+            ignored += 1
+            continue
+        docs = [{"source_id": s, "title": t} for s, t in fresh["docs"][:20]]
+        cur_ids = [d.get("source_id") for d in (p.get("docs") or [])]
+        if cur_ids != [d["source_id"] for d in docs]:
+            p["docs"] = docs
+            p["doc_count"] = len(fresh["docs"])
+            store.update_payload(it["id"], p)
+            refreshed += 1
+    return ignored, refreshed
 
 
 def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,

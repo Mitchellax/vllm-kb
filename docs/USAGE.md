@@ -498,7 +498,7 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 | kb 四层（docs/chunks_fts/chunks_meta/向量） | 增量构建不动（静默偏离）；**`--rebuild` 后真正删除** |
 | Kùzu 图 | `build_graph.py` 重建后节点消失 |
 | doc_tags / doc_verification 覆盖层 | `--rebuild` **先备份后全量恢复**——指向已消失文档的**孤儿行残留**（无害：该 sid 不存在则不被读取；同 sid 重新入库时人工标签/认证**自动恢复生效**——这是特性：删库重灌不丢人工成果） |
-| tag_candidate 队列 | **不受影响**（review.sqlite3 独立于 kb 与 rebuild）→ 引用悬空；采纳端有存在性防御（悬空 sid 跳过、词典照入、`docs_missing` 记审计），但队列项会滞留 pending——**走路径 ③ 删除才能联动清理** |
+| tag_candidate 队列 | **不受影响但会在下次 seed（审核台启动）时自动校正**（2026-10）：全悬空候选自动忽略（result 记原因）、部分悬空刷新引用、词典已收录的忽略——任何删库路径后队列自愈 |
 | 资产层副本 / asset_registry | 保留（孤儿映射，无害；重新入库时幂等复用） |
 | 词典 / 设备词表 | 无关（config 级事实源） |
 
@@ -509,7 +509,7 @@ python skills/vllm-kb/client.py health   # chunks 数与预期一致
 | kb 四层 | **立即删除** |
 | 磁盘源文件 | **不动**——⚠ imports 文件还在时，下次增量入库**会重新进来**（同 sid；doc_tags/doc_verification 覆盖层残留会被复用，人工标签/认证自动恢复） |
 | canonical 行 | **保留** → `--rebuild` 复活（同路径 ① 的后果） |
-| tag_candidate 队列 | **联动修剪**（2026-10 新增）：pending 项引用移除该 sid；全部提及文档删光的候选自动忽略（result 记原因） |
+| tag_candidate 队列 | **联动修剪**（2026-10 新增）：pending 项引用移除该 sid；全部提及文档删光的候选自动忽略（result 记原因）；即便走了旧版本/其他路径漏清，下次 seed（审核台启动）也会自动校正 |
 | doc_tags / doc_verification 覆盖层 | 残留（孤儿，无害；同 sid 重进时恢复生效） |
 | 资产层副本 / asset_registry / 词典 | 保留 |
 
