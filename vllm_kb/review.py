@@ -1457,9 +1457,9 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
             "suggested_tier": info["tier"],
             "doc_count": len(docs),
             "docs": [{"source_id": s, "title": t} for s, t in docs[:20]],  # 展示用，截断
-            # 兼容旧单文档展示：首个文档的 title/source_id
-            "source_id": docs[0][0],
-            "title": docs[0][1],
+            # 注意：不再写首文档 source_id/title 兼容字段——曾把列表标题"压"成首文档标题
+            #（多手册同产品名时 4 个不同候选全显示同一个名字）；旧条目的兼容读取在
+            # adopt/showItem 的 docs||[payload] 回退里，新条目一律有 docs。
         }):
             added += 1
     return added

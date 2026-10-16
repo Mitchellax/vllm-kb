@@ -466,6 +466,70 @@ class ReviewUiHtmlAudit(unittest.TestCase):
         src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
         self.assertIn("config_path=_config_path", src)
 
+    def test_queue_list_shows_candidate_for_tag_items(self):
+        """队列列表：tag_candidate 条目必须显示候选词本身。
+
+        此前列表裸用 payload.title——那是"兼容旧单文档"的首文档标题，多手册同产品名时
+        （4 篇 Atlas A3 手册）四个不同候选在列表里全显示成同一个产品名。
+        """
+        src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
+        self.assertIn("const itemTitle=", src)
+        fn = src[src.index("const itemTitle="):src.index("async function showItem")]
+        self.assertIn("category==='tag_candidate'", fn)
+        self.assertIn("p.candidate||i.item_ref", fn)
+        # 队列 pending 列表必须走 itemTitle，不允许裸拼 payload.title（待删除列表不受限——
+        # 只含文档类条目）
+        qmap = src[src.index("+q.map(i=>"):src.index("待实际删除")]
+        self.assertIn("itemTitle(i)", qmap)
+        self.assertNotIn("(i.payload||{}).title||i.item_ref", qmap)
+
+    def test_seed_tag_candidate_payload_has_no_legacy_title(self):
+        """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）。"""
+        import json as _json
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
+        from vllm_kb.config import AppConfig
+        from vllm_kb.ingest import _connect
+        from vllm_kb.review import ReviewStore, default_review_path, seed_tag_candidates
+
+        with _tempfile.TemporaryDirectory() as td:
+            root = _Path(td)
+            cfg_path = root / "config.json"
+            cfg_path.write_text(_json.dumps({
+                "embedding": {"provider": "echo", "model": "echo"},
+                "sources": [{"id": "images", "type": "image", "ocr_provider": "ask",
+                             "ocr_api_base": "", "enabled": True}],
+                "storage": {"sqlite_path": "data/kb.sqlite3",
+                            "canonical_file": "data/raw/canonical.jsonl"},
+            }, ensure_ascii=False), encoding="utf-8")
+            os.environ["VLLM_KB_DATA_ROOT"] = str(root / "data_root")
+            try:
+                (root / "data_root").mkdir()
+                cfg = AppConfig.load(str(cfg_path), require_keys=False)
+                conn = _connect(cfg.resolve(cfg.storage.sqlite_path))
+                conn.execute(
+                    "INSERT OR REPLACE INTO docs (source_id, source_type, title, status, extra) "
+                    "VALUES (?,?,?,?,?)",
+                    ("pdf:某手册 26.1.x 命令参考 02", "doc_pdf", "某产品名", "open",
+                     _json.dumps({"tag_candidates": [{"name": "某候选", "tier": "purpose"}]},
+                                 ensure_ascii=False)),
+                )
+                conn.commit()
+                conn.close()
+                store = ReviewStore(default_review_path(cfg))
+                seed_tag_candidates(cfg, store)
+                items = [i for i in store.list_items(category="tag_candidate")
+                         if i["item_ref"] == "tag:某候选"]
+                self.assertEqual(len(items), 1)
+                p = items[0]["payload"]
+                self.assertEqual(p["candidate"], "某候选")
+                self.assertNotIn("title", p)
+                self.assertNotIn("source_id", p)
+                store.close()
+            finally:
+                os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
 
 if __name__ == "__main__":
     unittest.main()

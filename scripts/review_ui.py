@@ -160,8 +160,11 @@ async function loadQueue(cat=''){const q=await j('/api/queue'+(cat?'?category='+
 const del=await j('/api/queue?status=deleted&limit=100');
 const opts=(await (async()=>{const r=await fetch('/api/categories');return r.ok?await r.json():[]})());
 const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.rows||[]).length>1)?` <span class="badge approved">${p.row_count||(p.rows||[]).length} 行</span>`:''};
+// 列表条目标题：tag_candidate 显示候选词本身（payload.title 是"兼容旧单文档"的首文档标题，
+// 曾把候选词压住——四篇 Atlas A3 手册的候选在列表里全显示成同一个产品名）；其余类别用文档标题
+const itemTitle=i=>{const p=i.payload||{};return i.category==='tag_candidate'?(p.candidate||i.item_ref):(p.title||i.item_ref)};
 $('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span></div>`
-+q.map(i=>`<div class="item" onclick="showItem(${i.id})"><div><span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc((i.payload||{}).title||i.item_ref)}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`).join('')||'<div class="card muted">队列为空</div>'
++q.map(i=>`<div class="item" onclick="showItem(${i.id})"><div><span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`).join('')||'<div class="card muted">队列为空</div>'
 +`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid var(--rv-red)"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
 <div class="muted mono">${esc((i.payload||{}).asset&&(i.payload.asset.path)||'')}</div>
 <div class="actions"><button class="ok" onclick="undoDelete(${i.id})">↩ 撤回（恢复记录并重新入队）</button> <span class="muted">删除人: ${esc(i.reviewer||'')} ${(i.reviewed_at||'').slice(0,16)}</span></div></div>`).join('')||''}
