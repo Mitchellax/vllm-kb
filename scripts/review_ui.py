@@ -257,27 +257,45 @@ $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/
 <div id="docbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="docbatch-n">0</span> 篇</b> <button class="primary sm" onclick="docBatchTagModal()">🏷 批量标签</button> <button class="danger sm" onclick="docBatchDelete()">🗑 批量删除</button> <span class="muted">批量标签支持 添加/删除人工、排除/恢复自动</span></div>
 <div class="todo"><b>TODO（暂缓）</b>：规则化自动采纳（词典近义/高频强候选免审）与按主题聚合的打标视图仍待设计——<b>批量操作已上线</b>（多选/按目录：打标、排除、恢复、删除）。</div>`
 +(keys.length?groupHtml:'<div class="card muted">无外源文档</div>')}
-async function tagEdit(sid,action,tag){const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;
-if(reviewer!==loadReviewer())saveReviewer(reviewer);
+async function tagEdit(sid,action,tag){const reviewer=requireReviewer();if(!reviewer)return;
 try{await j('/api/docs/tags/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,action,tag,reviewer})});loadDocs();toast('✓ 已更新标签')}catch(e){toast('✗ '+e.message)}}
 function tagAdd(sid,t){if(!t||!t.trim())return;tagEdit(sid,'add',t.trim())}
 async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？'))return
 try{await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();toast('✓ 已删除（本地文件保留）')}
 catch(e){toast('✗ 删除失败: '+e.message)}}
 async function loadTagDict(){const t=await j('/api/tag-dict');
-const groupHtml=(g,title)=>`<h4 style="margin:10px 0 4px">${title}（${g.length}）</h4><div class="card">${g.map(x=>`<span class="tagb reg">${esc(x.name)} (${x.docs}篇)</span> <button class="sm" onclick="tagDictForm('${esc(x.name).replace(/'/g,"\\'")}', this)">编辑</button>`).join('')||'（空）'}</div>`;
+const q=x=>esc(String(x||'')).replace(/'/g,"\\'");
+const groupHtml=(g,title)=>`<details open style="margin-bottom:8px"><summary style="cursor:pointer;font-weight:600;padding:4px 0">${title}（${g.length}）<input type="checkbox" style="margin-left:8px" onclick="event.stopPropagation();tdGroupToggle(this,this.checked)" title="全选本组"></summary><div class="card">${g.map(x=>{const n=q(x.name);
+return `<div style="margin:3px 0"><input type="checkbox" class="tchk" data-name="${esc(x.name)}" onchange="tdSelChanged()" style="margin-right:6px" title="勾选后批量操作"><span class="tagb reg">${esc(x.name)} (${x.docs}篇)</span> <button class="sm" onclick="tagDictToggleTier('${n}','${title.includes('domain')?'domain':'purpose'}')" title="点击在领域/作用间切换（1 击，全局生效）">${title.includes('domain')?'domain':'purpose'}</button> <button class="sm" onclick="tagDictForm('${n}', this)">编辑</button></div>`}).join('')||'（空）'}</div></details>`;
 $('#view-tags').innerHTML=`<h3>标签词典（config.json tags.registry，全局唯一事实源）</h3>
-<div class="todo"><b>TODO（暂缓）</b>：标签打标与候选处理的人工成本偏高（候选按词聚合已做，仍需逐条人工判断）。待设计更优流程/交互后再优化——候选方向见「文档管理」页 TODO。当前保持现状。</div>
-<div class="card subtle">两级分类：领域类=这是什么领域的知识（过滤/圈定范围）；作用类=文档能帮我做什么（能力匹配）。新增/改名/改 tier 同步 config.json；<b>不热插图</b>——运行 build_graph.py 重建图后入图（Kùzu 单写者约束）。</div>
+<div class="todo"><b>TODO（暂缓）</b>：仅剩"按主题聚合的打标视图"——候选批量分拣、设备词表、发端降噪、词典批量操作均已上线（见「文档管理」页与下方批量栏）。</div>
+<div class="card subtle">两级分类：领域类=这是什么领域的知识（过滤/圈定范围）；作用类=文档能帮我做什么（能力匹配）。tier 徽标<b>点击即切换</b>（1 击）；勾选多个后用批量栏<b>批量移出/批量改 tier</b>。新增/改名/改 tier 同步 config.json；<b>不热插图</b>——运行 build_graph.py 重建图后入图（Kùzu 单写者约束）。</div>
+<div id="tagdictbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="tagdictbatch-n">0</span> 个</b> <button class="danger sm" onclick="tagDictBatchDelete()">🗑 批量移出词典</button> <span class="muted">改为</span> <button class="sm" onclick="tagDictBatchTier('domain')">领域</button> <button class="sm" onclick="tagDictBatchTier('purpose')">作用</button> <span class="muted">移出不动已打标文档；改 tier 全局生效</span></div>
 ${groupHtml(t.groups.domain||[],'主题/领域类 (domain)')}
 ${groupHtml(t.groups.purpose||[],'具体作用类 (purpose)')}
 <div class="card"><b>新增标签</b> <input id="newtag-name" placeholder="标签名" style="width:180px"> tier: <select id="newtag-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
 <button class="ok" onclick="tagDictAdd()">加入词典</button></div>`}
 async function tagDictAdd(){const name=document.getElementById('newtag-name').value.trim();if(!name){alert('输入标签名');return}
 try{await j('/api/tag-dict/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,tier:document.getElementById('newtag-tier').value||null})});loadTagDict();toast('✓ 已加入词典（重建图后入图）')}catch(e){toast('✗ '+e.message)}}
+// ---------------- 词典批量操作 + 行内 tier 切换 ----------------
+function tdCheckedNames(){return Array.from(document.querySelectorAll('#view-tags .tchk:checked')).map(x=>x.dataset.name)}
+function tdSelChanged(){const n=tdCheckedNames().length;const bar=document.getElementById('tagdictbatch');if(bar)bar.style.display=n?'block':'none';const c=document.getElementById('tagdictbatch-n');if(c)c.textContent=n}
+function tdGroupToggle(cb,checked){const grp=cb.closest('details');if(grp)grp.querySelectorAll('.tchk').forEach(x=>{x.checked=checked});tdSelChanged()}
+async function tagDictToggleTier(name,current){const to=current==='domain'?'purpose':'domain';
+try{await j('/api/tag-dict/tier',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,tier:to})});loadTagDict();toast(`✓ ${name} → ${to==='domain'?'领域':'作用'}类`)}catch(e){toast('✗ '+e.message)}}
+async function tagDictBatchDelete(){const names=tdCheckedNames();if(!names.length){toast('先勾选标签');return}
+if(!confirm(`从词典移出选中的 ${names.length} 个标签？只移出词典，已打标文档上的该标签保留。确认？`))return;
+try{const r=await j('/api/tag-dict/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names,action:'delete'})});
+loadTagDict();toast(`✓ 已移出 ${r.done}/${names.length} 个${r.failed.length?`（首例: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
+async function tagDictBatchTier(tier){const names=tdCheckedNames();if(!names.length){toast('先勾选标签');return}
+if(!confirm(`把选中的 ${names.length} 个标签改为 ${tier==='domain'?'领域':'作用'}类？全局生效。确认？`))return;
+try{const r=await j('/api/tag-dict/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names,action:'tier',tier})});
+loadTagDict();toast(`✓ 已改 ${r.done}/${names.length} 个${r.failed.length?`（首例: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 function openModal(html){document.getElementById('modal-card').innerHTML=html;document.getElementById('modal').hidden=false}
 function closeModal(){document.getElementById('modal').hidden=true;document.querySelectorAll('.tagb.editing').forEach(x=>x.classList.remove('editing'))}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()})
+// 审核人缓存直用：填过一次全站不再询问（消灭每次点标签操作都弹 prompt 的摩擦）
+function requireReviewer(){let r=loadReviewer();if(!r){r=(prompt('审核人（首次填写后自动记住，之后不再询问）','')||'').trim();if(r)saveReviewer(r)}return r}
 // ---------------- 批量操作（文档管理 + 审核队列补标认证） ----------------
 function docCheckedSids(){return Array.from(document.querySelectorAll('#view-docs .dchk:checked')).map(x=>x.dataset.sid)}
 function docSelChanged(){const n=docCheckedSids().length;const bar=document.getElementById('docbatch');if(bar)bar.style.display=n?'block':'none';const c=document.getElementById('docbatch-n');if(c)c.textContent=n}
@@ -299,7 +317,7 @@ try{const r=await j('/api/docs/tags/batch',{method:'POST',headers:{'Content-Type
 closeModal();loadDocs();toast(`✓ ${r.updated}/${sids.length} 篇已更新${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 async function docBatchDelete(){const sids=docCheckedSids();if(!sids.length){toast('先勾选文档');return}
 if(!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？`))return
-const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
+const reviewer=requireReviewer();if(!reviewer)return;
 try{const r=await j('/api/external-docs/delete-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids})});
 loadDocs();toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel)).map(x=>+x.dataset.id)}
@@ -307,12 +325,12 @@ function queueSelChanged(){const vn=queueCheckedIds('#view-queue .qchk').length,
 const vb=document.getElementById('queuebatch');if(vb)vb.style.display=vn?'block':'none';const vc=document.getElementById('queuebatch-n');if(vc)vc.textContent=vn;
 const cb=document.getElementById('queuecand');if(cb)cb.style.display=cn?'block':'none';const cc=document.getElementById('queuecand-n');if(cc)cc.textContent=cn}
 async function queueBatchReview(){const ids=queueCheckedIds('#view-queue .qchk');if(!ids.length){toast('先勾选补标项');return}
-const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
+const reviewer=requireReviewer();if(!reviewer)return;
 const level=((document.getElementById('qb-level')||{}).value)||'tested';
 try{const r=await j('/api/items/review-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids,action:'approved',reviewer,result:{verification:level}})});
 loadQueue();toast(`✓ 已认证 ${r.reviewed}/${ids.length} 项${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 async function queueBatchCandidates(action){const ids=queueCheckedIds('#view-queue .cchk');if(!ids.length){toast('先勾选候选');return}
-const reviewer=prompt('审核人（必填）',loadReviewer());if(!reviewer)return;saveReviewer(reviewer);
+const reviewer=requireReviewer();if(!reviewer)return;
 const tier=action==='adopt'?(((document.getElementById('qc-tier')||{}).value)||null):null;
 try{const r=await j('/api/tag-candidates/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids,action,reviewer,tier})});
 loadQueue();toast(`✓ ${action==='adopt'?'已采纳':'已忽略'} ${r.done}/${ids.length} 条${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
@@ -496,6 +514,41 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"ok": True, **r}
+
+    @app.post("/api/tag-dict/batch")
+    def tag_dict_batch(body: dict):
+        """词典批量操作：delete=批量移出（已打标文档上的标签保留）| tier=批量改层级（全局生效）。
+
+        逐项独立生效；不存在/非法项进 failed 明细。词典级操作不涉及文档审计
+        （与单条 delete/tier 端点一致，不要求 reviewer）。
+        """
+        from vllm_kb.review import delete_tag, set_tag_tier
+
+        action = (body.get("action") or "").strip()
+        names = [s.strip() for s in (body.get("names") or []) if s and s.strip()]
+        tier = (body.get("tier") or "").strip()
+        if action not in ("delete", "tier"):
+            raise HTTPException(400, "action 须为 delete|tier")
+        if not names:
+            raise HTTPException(400, "names 必填")
+        if action == "tier" and tier not in ("domain", "purpose"):
+            raise HTTPException(400, "tier 须为 domain|purpose")
+        if len(names) > 200:
+            raise HTTPException(400, "一次最多 200 个")
+        done, failed = 0, []
+        for name in names:
+            try:
+                ok = (delete_tag(cfg, name, config_path=_config_path) if action == "delete"
+                      else set_tag_tier(cfg, name, tier, config_path=_config_path))
+                if not ok:
+                    failed.append({"name": name, "error": "词典中不存在"})
+                    continue
+                done += 1
+            except ValueError as e:
+                failed.append({"name": name, "error": str(e)})
+            except Exception as e:
+                failed.append({"name": name, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "done": done, "failed": failed}
 
     @app.post("/api/tag-candidate/{item_id}/adopt")
     def tag_candidate_adopt(item_id: int, body: dict):

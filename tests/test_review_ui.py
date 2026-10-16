@@ -705,14 +705,47 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         self.assertEqual(r2.json()["done"], 0)
         self.assertEqual(len(r2.json()["failed"]), 2)
 
+    def test_tag_dict_batch(self):
+        """词典批量操作：批量移出（不存在进 failed）+ 批量改 tier（全局生效）。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.tagging import TagRegistry
+
+        cfg_data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        cfg_data.setdefault("tags", {})["registry"] = [
+            {"name": "HCCL", "tier": "domain"}, {"name": "组网", "tier": "domain"},
+            {"name": "超时排查", "tier": "purpose"}]
+        self.cfg_path.write_text(json.dumps(cfg_data, ensure_ascii=False), encoding="utf-8")
+        # 批量改 tier：domain → purpose
+        r = self.client.post("/api/tag-dict/batch", json={
+            "names": ["HCCL", "组网", "ghost"], "action": "tier", "tier": "purpose"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["done"], 2)
+        self.assertEqual([f["name"] for f in r.json()["failed"]], ["ghost"])
+        reg = {e.name: e.tier for e in TagRegistry.load_from_config_file(self.cfg_path).entries}
+        self.assertEqual(reg["HCCL"], "purpose")
+        self.assertEqual(reg["组网"], "purpose")
+        # 批量移出
+        r2 = self.client.post("/api/tag-dict/batch", json={
+            "names": ["HCCL", "ghost"], "action": "delete"})
+        self.assertEqual(r2.json()["done"], 1)
+        self.assertEqual([f["name"] for f in r2.json()["failed"]], ["ghost"])
+        reg2 = TagRegistry.load_from_config_file(self.cfg_path)
+        self.assertFalse(reg2.contains("HCCL"))
+        self.assertTrue(reg2.contains("组网"))
+        # 非法 action
+        self.assertEqual(self.client.post("/api/tag-dict/batch", json={
+            "names": ["x"], "action": "bogus"}).status_code, 400)
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text
         for token in ("docBatchTagModal", "docBatchTagApply", "docBatchDelete",
                       "docGroupToggle", "queueBatchReview", "queueBatchCandidates",
                       "docbatch", "queuebatch", "queuecand",
+                      "tdGroupToggle", "tagDictToggleTier", "tagDictBatchDelete",
+                      "tagDictBatchTier", "tagdictbatch", "requireReviewer",
                       "docs/tags/batch", "external-docs/delete-batch", "items/review-batch",
-                      "tag-candidates/batch"):
+                      "tag-candidates/batch", "tag-dict/batch"):
             self.assertIn(token, html, f"页面缺少 {token}")
 
 
