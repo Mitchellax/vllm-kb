@@ -895,7 +895,9 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
 2. **审核队列（按词聚合）**：审核工作台自动补单时 `seed_tag_candidates` 扫描全部文档的
    `extra.tag_candidates`，**按候选词聚合**成一条审核项（`item_ref = tag:{name}`，payload 含
    提及文档数 + 文档列表 + 建议 tier；词典已收录的词不生成）——同词多文档只审一次，
-   **审一次 = 全部提及文档生效**；
+   **审一次 = 全部提及文档生效**；候选名聚合前按词典同款 `normalize_tag` 规范化
+   （CJK↔拉丁边界空格剥离）——存量 extras 里的"配置pip 源/配置pip源"式变体在补单时即收敛，
+   无需等重建；
 3. **采纳（adopt）**：① 候选词写入 `config.json` 的 `tags.registry`（tier 取审核下拉选择或启发式，
    全库词典生效）；② 对聚合记录的全部提及文档写人工标签（`doc_tags.manual`），并按
    `final = (自动 − 排除) ∪ 人工` 同步 `docs.tags`——**检索侧立即生效**；③ 审核项标记 approved，

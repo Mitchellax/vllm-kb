@@ -266,6 +266,23 @@ class ReviewStore:
         finally:
             conn.close()
 
+    def clear_category(self, category: str) -> int:
+        """清空某类审核项（**全状态**，含已处理历史）——供"提取规则升级后重播"用。
+
+        典型场景：候选名规范化/标题策略等**生成侧规则**变更后，存量项的 payload 是
+        旧规则快照（seed 对已存在 item_ref 不更新），清空重补单才能拿到新 payload。
+        仅接受已知类别，防误删。返回删除条数。
+        """
+        if category not in CATEGORIES:
+            raise ValueError(f"未知审核类别: {category}（支持 {CATEGORIES}）")
+        conn = self._connect()
+        try:
+            cur = conn.execute("DELETE FROM review_items WHERE category=?", (category,))
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
     def list_items(self, category: Optional[str] = None, status: Optional[str] = None,
                    limit: int = 50, offset: int = 0) -> list[dict]:
         """审核队列：未审核（pending）优先、存疑（suspected）其次，已处理最后。"""
@@ -1419,7 +1436,7 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
     兼容升级：旧版按 (source_id::name) 生成，升级后自动清理旧格式残留（其词已收录/忽略的
     不重建，未处理的按新聚合格式重建）。
     """
-    from .tagging import TagRegistry
+    from .tagging import TagRegistry, normalize_tag
 
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
@@ -1439,7 +1456,10 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
                 continue
             cands = ex.get("tag_candidates") or []
             for c in cands:
-                name = c.get("name") if isinstance(c, dict) else str(c)
+                # 候选名按词典同款规范化（normalize_tag，CJK↔拉丁边界空格剥离）：
+                # 存量 extras 是上次构建的快照，"配置pip 源"/"配置pip源" 两个变体
+                # 在此收敛为同一聚合键，无需等重建。规范化后为空（纯符号）的跳过。
+                name = normalize_tag(c.get("name") if isinstance(c, dict) else str(c))
                 if not name or registry.contains(name):
                     continue
                 tier = c.get("tier") if isinstance(c, dict) else None

@@ -484,7 +484,8 @@ class ReviewUiHtmlAudit(unittest.TestCase):
         self.assertNotIn("(i.payload||{}).title||i.item_ref", qmap)
 
     def test_seed_tag_candidate_payload_has_no_legacy_title(self):
-        """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）。"""
+        """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）；
+        候选名聚合前过 normalize_tag——存量 extras 的空格变体收敛为同一聚合键。"""
         import json as _json
         import tempfile as _tempfile
         from pathlib import Path as _Path
@@ -508,24 +509,36 @@ class ReviewUiHtmlAudit(unittest.TestCase):
                 (root / "data_root").mkdir()
                 cfg = AppConfig.load(str(cfg_path), require_keys=False)
                 conn = _connect(cfg.resolve(cfg.storage.sqlite_path))
-                conn.execute(
-                    "INSERT OR REPLACE INTO docs (source_id, source_type, title, status, extra) "
-                    "VALUES (?,?,?,?,?)",
-                    ("pdf:某手册 26.1.x 命令参考 02", "doc_pdf", "某产品名", "open",
-                     _json.dumps({"tag_candidates": [{"name": "某候选", "tier": "purpose"}]},
-                                 ensure_ascii=False)),
-                )
+                # 两篇文档携带同一候选的空格变体（上次构建的 extras 快照常态）
+                for i, (sid, name) in enumerate([
+                    ("pdf:某手册A 26.1.x 命令参考 02", "配置pip 源"),
+                    ("pdf:某手册B 26.1.x 命令参考 01", "配置pip源"),
+                ]):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO docs (source_id, source_type, title, status, extra) "
+                        "VALUES (?,?,?,?,?)",
+                        (sid, "doc_pdf", f"某产品名{i}", "open",
+                         _json.dumps({"tag_candidates": [{"name": name, "tier": "purpose"}]},
+                                     ensure_ascii=False)),
+                    )
                 conn.commit()
                 conn.close()
                 store = ReviewStore(default_review_path(cfg))
                 seed_tag_candidates(cfg, store)
-                items = [i for i in store.list_items(category="tag_candidate")
-                         if i["item_ref"] == "tag:某候选"]
-                self.assertEqual(len(items), 1)
-                p = items[0]["payload"]
-                self.assertEqual(p["candidate"], "某候选")
+                items = store.list_items(category="tag_candidate")
+                self.assertEqual(len(items), 1)  # 变体收敛 → 单条
+                it = items[0]
+                self.assertEqual(it["item_ref"], "tag:配置pip源")
+                p = it["payload"]
+                self.assertEqual(p["candidate"], "配置pip源")
+                self.assertEqual(p["doc_count"], 2)
                 self.assertNotIn("title", p)
                 self.assertNotIn("source_id", p)
+                # clear_category：提取规则升级后重播用（全状态删除 + 类别校验）
+                self.assertEqual(store.clear_category("tag_candidate"), 1)
+                self.assertEqual(store.list_items(category="tag_candidate"), [])
+                with self.assertRaises(ValueError):
+                    store.clear_category("bogus")
                 store.close()
             finally:
                 os.environ.pop("VLLM_KB_DATA_ROOT", None)
