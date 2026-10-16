@@ -31,6 +31,19 @@ class TestNormalize(unittest.TestCase):
         self.assertEqual(normalize_tag(""), "")
         self.assertEqual(normalize_tag("   "), "")
 
+    def test_cjk_latin_boundary_space_stripped(self):
+        """PDF/Word 标题里 CJK↔拉丁边界空格不稳定——剥离后变体收敛为同一候选词。"""
+        self.assertEqual(normalize_tag("配置pip 源"), "配置pip源")
+        self.assertEqual(normalize_tag("配置 pip源"), "配置pip源")
+        self.assertEqual(normalize_tag("升级NPU 驱动"), "升级NPU驱动")
+        self.assertEqual(normalize_tag("通过apt-get 升级"), "通过apt-get升级")
+        self.assertEqual(normalize_tag("查询NPU 的详细信息"), "查询NPU的详细信息")
+
+    def test_cjk_cjk_space_kept(self):
+        """纯 CJK 间/纯拉丁间的空格不属于不稳定边界，保留。"""
+        self.assertEqual(normalize_tag("方式二 构建容器镜像"), "方式二 构建容器镜像")
+        self.assertEqual(normalize_tag("foo bar"), "foo bar")
+
 
 class TestTierHeuristic(unittest.TestCase):
     def test_purpose_signal_words(self):
@@ -145,6 +158,15 @@ class TestExtractTags(unittest.TestCase):
         self.assertNotIn("a", names)
         self.assertNotIn("b", names)
         self.assertIn("cd", names)
+
+    def test_space_variant_headings_collapse(self):
+        """同一标题的空格变体（不同手册/版本的 PDF 抽取差异）收敛为一个候选词——
+        审核队列不再出现 '配置pip源'/'配置pip 源' 两条。"""
+        _, cands = extract_tags("doc", ["配置pip源", "配置pip 源", "升级NPU 驱动"])
+        names = [c.name for c in cands]
+        self.assertEqual(names.count("配置pip源"), 1)
+        self.assertNotIn("配置pip 源", names)
+        self.assertIn("升级NPU驱动", names)
 
 
 class TestMergeFinal(unittest.TestCase):

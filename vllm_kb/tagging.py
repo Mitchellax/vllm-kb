@@ -60,9 +60,17 @@ class TagEntry:
 
 
 def normalize_tag(name: str) -> str:
-    """标签规范化：去首尾空白/包裹符号，内部空白归一，截断超长。"""
+    """标签规范化：去首尾空白/包裹符号，内部空白归一，CJK↔拉丁边界空格剥离，截断超长。
+
+    CJK↔拉丁边界空格剥离的原因：PDF/Word 标题里该空格不稳定（"配置pip 源"/"配置pip源"、
+    "升级NPU 驱动"/"升级NPU驱动" 会生成两个候选词、占两个队列项）——归一后变体收敛，
+    词典命中同步稳定（词典条目加载时同样过本函数）。纯 CJK 间/纯拉丁间的空格保留
+    （"方式二 构建容器镜像" 不受影响）。
+    """
     name = (name or "").strip().strip("\"'`*#").strip()
     name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"(?<=[\u4e00-\u9fff]) (?=[A-Za-z0-9])|(?<=[A-Za-z0-9]) (?=[\u4e00-\u9fff])",
+                  "", name)
     if len(name) > 64:
         name = name[:64]
     return name
