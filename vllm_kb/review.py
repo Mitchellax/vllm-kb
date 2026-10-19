@@ -1816,14 +1816,44 @@ def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
     return added
 
 
+def sweep_stale_verification_pending(store: "ReviewStore", kb_path: str | Path) -> int:
+    """verification_pending 兜底 sweep（2026-10 用户实测缺口）：引用文档已从 kb 删除的
+    pending 补标项自动忽略——此前 _sweep_tag_candidates 只覆盖 tag_candidate。
+
+    item_ref = 文档 source_id（单冒号形态）；表格等文件级聚合项（excelfile: 前缀/
+    多冒号 item_ref）不动。每次 seed（审核台启动）执行。返回自动忽略条数。
+    """
+    conn = sqlite3.connect(f"file:{Path(kb_path).as_posix()}?mode=ro", uri=True)
+    try:
+        kb_docs = {r[0] for r in conn.execute("SELECT source_id FROM docs").fetchall()}
+    finally:
+        conn.close()
+    ignored = 0
+    for it in store.list_items(category="verification_pending", status="pending"):
+        ref = it["item_ref"]
+        if ref.count(":") != 1 or ref in kb_docs:
+            continue  # 非 doc sid 形态（表格/文件级聚合项）或文档仍在库
+        store.review(it["id"], "approved", "system",
+                     result={"action": "auto-ignore", "reason": "引用文档已删除（kb 中不存在）"})
+        ignored += 1
+    return ignored
+
+
 def seed_all(cfg: "AppConfig", store: ReviewStore) -> dict[str, int]:
     """运行全部 seed（幂等），返回各 seed 新增数。"""
-    return {
+    out = {
         "verification_pending": seed_verification_pending(cfg, store),
         "case_title_flag": seed_case_title_flags(cfg, store),
         "low_confidence_ocr": seed_low_confidence_ocr(cfg, store),
         "tag_candidate": seed_tag_candidates(cfg, store),
     }
+    # 引用文档已删除的 pending 补标项自动忽略（verification_pending 侧的队列自愈）
+    swept = sweep_stale_verification_pending(store, cfg.resolve(cfg.storage.sqlite_path))
+    if swept:
+        print(f"[seed] verification_pending 队列校正: 自动忽略 {swept} 条（引用文档已删除）",
+              flush=True)
+    out["verification_pending_swept"] = swept
+    return out
 
 
 # ---------------- API 配置中心（key 脱敏） ----------------

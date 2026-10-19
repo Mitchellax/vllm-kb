@@ -394,6 +394,23 @@ class TagManagementTest(unittest.TestCase):
         self.store.untombstone(["pdf:a"])
         self.assertEqual(load_tombstones(default_review_path(self.cfg)), {"pdf:b"})
 
+    def test_sweep_stale_verification_pending(self):
+        """引用已删文档的 pending 补标项在 sweep 时自动忽略；在库文档/表格项不动
+        （此前只 sweep tag_candidate——verification_pending 侧漏了）。"""
+        from vllm_kb.review import sweep_stale_verification_pending
+
+        self._ingest(source_id="pdf:alive", tags=["x"])
+        store = self.store
+        store.add_item("verification_pending", "pdf:alive", {})             # 在库 → 不动
+        store.add_item("verification_pending", "pdf:gone", {})              # 已删 → 忽略
+        store.add_item("verification_pending", "excelfile:f:abc12345", {})  # 表格项 → 不动
+        swept = sweep_stale_verification_pending(store, self.kb)
+        self.assertEqual(swept, 1)
+        q = {i["item_ref"]: i for i in store.list_items(category="verification_pending")}
+        self.assertEqual(q["pdf:alive"]["status"], "pending")
+        self.assertEqual(q["pdf:gone"]["status"], "approved")
+        self.assertEqual(q["excelfile:f:abc12345"]["status"], "pending")
+
     def test_tag_dict_management(self):
         from vllm_kb.review import (
             add_tag_to_registry,
