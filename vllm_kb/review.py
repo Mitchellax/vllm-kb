@@ -126,7 +126,7 @@ def _read_doc_row(kb_path: str | Path, source_id: str) -> Optional[dict]:
 
 
 def _delete_doc_row(kb_path: str | Path, source_id: str) -> None:
-    conn = sqlite3.connect(str(kb_path))
+    conn = sqlite3.connect(str(kb_path), timeout=15)
     try:
         conn.execute("DELETE FROM docs WHERE source_id=?", (source_id,))
         conn.commit()
@@ -140,7 +140,7 @@ def _delete_doc_chunks(kb_path: str | Path, source_id: str) -> None:
     FTS 是 contentless 表（text 在 chunks_fts_content），chunks_fts 只存索引，
     直接 DELETE FROM chunks_fts 即可；chunks_meta 单独删。
     """
-    conn = sqlite3.connect(str(kb_path))
+    conn = sqlite3.connect(str(kb_path), timeout=15)
     try:
         ids = [r[0] for r in conn.execute(
             "SELECT chunk_id FROM chunks_meta WHERE doc_id=?", (source_id,)).fetchall()]
@@ -472,8 +472,12 @@ _EXTERNAL_SOURCE_TYPES = EXTERNAL_DOC_TYPES
 
 
 def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = None,
-                       limit: int = 200, offset: int = 0) -> list[dict]:
+                       limit: int = 200, offset: int = 0,
+                       q: Optional[str] = None) -> list[dict]:
     """列出 kb.sqlite3 中的外源文档（source_type 在 `_EXTERNAL_SOURCE_TYPES` 内）。
+
+    q：子串过滤 source_id/title（大小写不敏感，LIKE 转义）——73k+ 文档远超单页窗口，
+    没有搜索时用户只能看到排序前 500 条，删除后窗口"补位"极易误读为删除失败（2026-10）。
 
     返回 {source_id, source_type, title, component, url, verification,
     asset_id, asset_path（管理员侧 rel_path，经 asset_registry）,
@@ -485,11 +489,17 @@ def list_external_docs(kb_path: str | Path, review_db: Optional[str | Path] = No
 
     conn = sqlite3.connect(str(kb_path))
     try:
+        where = f"source_type IN ({','.join('?' * len(_EXTERNAL_SOURCE_TYPES))})"
+        params: list = [*_EXTERNAL_SOURCE_TYPES]
+        if q and q.strip():
+            like = f"%{_like_escape(q.strip())}%"
+            where += " AND (source_id LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\')"
+            params += [like, like]
         rows = conn.execute(
             f"""SELECT source_id, source_type, title, component, url, extra
-                FROM docs WHERE source_type IN ({','.join('?' * len(_EXTERNAL_SOURCE_TYPES))})
+                FROM docs WHERE {where}
                 ORDER BY source_type, source_id LIMIT ? OFFSET ?""",
-            (*_EXTERNAL_SOURCE_TYPES, int(limit), int(offset)),
+            (*params, int(limit), int(offset)),
         ).fetchall()
         overlay = load_doc_tags_conn(conn)
         # 人工补标覆盖层：verification 本身已在 extra（ingest 合并后的生效值），
@@ -723,6 +733,11 @@ def _ensure_doc_verification(conn: sqlite3.Connection) -> None:
             # 内容指纹：认证时文档的内容 sha256。内容变更后旧认证不适用
             # （seed 清过期覆盖层重新入队；ingest 合并时跳过不匹配的覆盖——见 effective_overlay）
             conn.execute("ALTER TABLE doc_verification ADD COLUMN content_sha TEXT")
+
+
+def _like_escape(s: str) -> str:
+    """LIKE 通配符转义（配合 ESCAPE '\\'，防用户输入 %/_ 全表扫）。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:

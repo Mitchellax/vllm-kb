@@ -797,6 +797,42 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
                      for x in cfg_data["tags"]["registry"]]
         self.assertIn("悬空词", reg_names)
 
+    def test_batch_delete_list_consistency_and_still_present(self):
+        """用户报告的前端/库 gap 回归护栏：批量删除后列表必须立即反映；响应带
+        still_present 服务端真值校验；对已不存在的 sid 报'不存在'进 failed。"""
+        for i in range(4):
+            seed_kb_doc(self.cfg_path, f"md:del{i}")
+        before = {d["source_id"] for d in
+                  self.client.get("/api/external-docs?limit=500").json()}
+        self.assertTrue({f"md:del{i}" for i in range(4)} <= before)
+        r = self.client.post("/api/external-docs/delete-batch", json={
+            "source_ids": [f"md:del{i}" for i in range(4)]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["deleted"], 4)
+        self.assertEqual(r.json()["still_present"], [])
+        after = {d["source_id"] for d in
+                 self.client.get("/api/external-docs?limit=500").json()}
+        self.assertFalse({f"md:del{i}" for i in range(4)} & after)
+        # 再删一次 → 全部"不存在"进 failed、still_present 为空
+        r2 = self.client.post("/api/external-docs/delete-batch", json={
+            "source_ids": [f"md:del{i}" for i in range(4)]})
+        self.assertEqual(r2.json()["deleted"], 0)
+        self.assertEqual(len(r2.json()["failed"]), 4)
+        self.assertIn("不存在", r2.json()["failed"][0]["error"])
+        self.assertEqual(r2.json()["still_present"], [])
+
+    def test_external_docs_search(self):
+        """q 参数：source_id/title 子串过滤（LIKE 转义 %/_）。"""
+        seed_kb_doc(self.cfg_path, "md:alpha_report")
+        seed_kb_doc(self.cfg_path, "md:beta_guide")
+        r = self.client.get("/api/external-docs?limit=500&q=alpha")
+        names = {d["source_id"] for d in r.json()}
+        self.assertIn("md:alpha_report", names)
+        self.assertNotIn("md:beta_guide", names)
+        # 通配符按字面处理（100% 不等于 100 加通配）
+        r2 = self.client.get("/api/external-docs?limit=500&q=%")
+        self.assertEqual(len(r2.json()), 0)
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text

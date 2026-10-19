@@ -24,6 +24,7 @@ docs/analysis/business-migration-checklist.md。
 """
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional
@@ -227,7 +228,10 @@ async function deleteDoc(id){const reviewer=document.getElementById('rev').value
 if(!confirm('标记删除：只删除数据库记录（表格项=整表全部行），原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
 await j('/api/item/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,note:(document.getElementById('rvnote')||{}).value||''})});loadQueue()}
 async function undoDelete(id){if(!confirm('撤回删除：恢复数据库记录并重新加入队列？'))return;await j('/api/item/'+id+'/undo',{method:'POST'});loadQueue()}
-async function loadDocs(){const ds=await j('/api/external-docs?limit=500');
+let docQuery='';
+function clearDocSearch(){docQuery='';loadDocs()}
+async function loadDocs(){const inp=document.getElementById('docsearch');if(inp)docQuery=inp.value;
+const ds=await j('/api/external-docs?limit=500'+(docQuery?`&q=${encodeURIComponent(docQuery)}`:''));
 let td={};try{const t=await j('/api/tag-dict');t.groups.domain.forEach(x=>td[x.name]='domain');t.groups.purpose.forEach(x=>td[x.name]='purpose')}catch(e){}
 const tierOf=n=>td[n]||'domain';
 const q=s=>esc(String(s||'')).replace(/'/g,"\\'");
@@ -252,8 +256,9 @@ const rank=k=>k==='(未分组)'?2:1;
 const keys=Object.keys(groups).sort((a,b)=>rank(a)-rank(b)||a.localeCompare(b,'zh'));
 const groupHtml=keys.map(k=>{const g=groups[k];
 return `<details open style="margin-bottom:10px"><summary style="cursor:pointer;font-weight:600;padding:4px 0">📁 ${esc(k)}（${g.length}）<input type="checkbox" style="margin-left:8px" onclick="event.stopPropagation();docGroupToggle(this,this.checked)" title="全选本组"></summary><div style="padding-left:2px">${g.map(docCard).join('')}</div></details>`}).join('');
-$('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等，共 ${ds.length} 条）</h3>
+$('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等${docQuery?`，搜索"${esc(docQuery)}"命中`:`，本页 ${ds.length} 条`}）</h3>
 <div class="card subtle">按 <b>imports 第一层子目录</b> 分组，组名 = <b>来源id\\子目录</b>（根级 = 来源 id）——不同导入来源即使子目录同名也各自成组；📁来源id（资产回退）= imports 缺失时从资产层副本收录的文档；(未分组) = 网络来源。勾选多篇（或整组）后用批量栏操作。删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
+<div class="card">🔍 <input id="docsearch" value="${esc(docQuery)}" placeholder="搜索 source_id / 标题（子串，回车执行）" style="width:300px" onkeydown="if(event.key==='Enter')loadDocs()"> <button class="sm" onclick="loadDocs()">搜索</button> ${docQuery?'<button class="sm" onclick="clearDocSearch()">清空</button>':''} <span class="muted">库内文档远超单页窗口（本页最多 500 条、按 id 排序），删除后后面的文档会补位——<b>定位文档请用搜索</b></span></div>
 <div id="docbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="docbatch-n">0</span> 篇</b> <button class="primary sm" onclick="docBatchTagModal()">🏷 批量标签</button> <button class="danger sm" onclick="docBatchDelete()">🗑 批量删除</button> <span class="muted">批量标签支持 添加/删除人工、排除/恢复自动</span></div>
 <div class="todo"><b>TODO（暂缓）</b>：规则化自动采纳（词典近义/高频强候选免审）与按主题聚合的打标视图仍待设计——<b>批量操作已上线</b>（多选/按目录：打标、排除、恢复、删除）。</div>`
 +(keys.length?groupHtml:'<div class="card muted">无外源文档</div>')}
@@ -315,11 +320,14 @@ if(!reviewer){alert('填写审核人');return}
 saveReviewer(reviewer);
 try{const r=await j('/api/docs/tags/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids,action,tag,reviewer})});
 closeModal();loadDocs();toast(`✓ ${r.updated}/${sids.length} 篇已更新${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
-async function docBatchDelete(){const sids=docCheckedSids();if(!sids.length){toast('先勾选文档');return}
-if(!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？`))return
+async function docBatchDelete(retrySids){const sids=retrySids||docCheckedSids();if(!sids.length){toast('先勾选文档');return}
+if(!retrySids&&!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？`))return
 const reviewer=requireReviewer();if(!reviewer)return;
 try{const r=await j('/api/external-docs/delete-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids})});
-loadDocs();toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
+loadDocs();closeModal();
+const problems=[...r.failed.map(f=>`${f.source_id}：${f.error}`),...(r.still_present||[]).map(s=>`${s}：删除后仍存在于库（服务端校验）`)];
+if(problems.length){openModal(`<h4>⚠ 删除未完全成功（${r.deleted}/${sids.length} 篇已删）</h4><div class="card">${problems.map(p=>`<div class="mono" style="margin:2px 0">${esc(p)}</div>`).join('')}</div><div class="muted">失败的条目可重试；"仍存在于库"说明删除未落库（如库被占用），重试通常可解。</div><div class="actions"><button class="danger sm" onclick="docBatchDelete(${JSON.stringify([...r.failed.map(f=>f.source_id),...(r.still_present||[])]).replace(/"/g,'&quot;')})">↻ 重试剩余 ${r.failed.length+(r.still_present||[]).length} 篇</button> <button class="sm" onclick="closeModal()">关闭</button></div>`)}
+else{toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇${r.candidates_cleaned&&r.candidates_cleaned.auto_ignored?`，联动忽略 ${r.candidates_cleaned.auto_ignored} 条候选`:''}`)}}catch(e){toast('✗ '+e.message)}}
 function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel)).map(x=>+x.dataset.id)}
 function queueSelChanged(){const vn=queueCheckedIds('#view-queue .qchk').length,cn=queueCheckedIds('#view-queue .cchk').length;
 const vb=document.getElementById('queuebatch');if(vb)vb.style.display=vn?'block':'none';const vc=document.getElementById('queuebatch-n');if(vc)vc.textContent=vn;
@@ -417,12 +425,13 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         return CATEGORIES
 
     @app.get("/api/external-docs")
-    def external_docs(limit: int = 200, offset: int = 0):
-        """外源文档列表（含标签视图/资产映射/重名告警；排除 GitHub 采集来源）。"""
+    def external_docs(limit: int = 200, offset: int = 0, q: str = ""):
+        """外源文档列表（含标签视图/资产映射/重名告警；排除 GitHub 采集来源）。
+        q：source_id/title 子串过滤——73k+ 文档远超单页窗口，必须可搜。"""
         from vllm_kb.review import list_external_docs
         return list_external_docs(cfg.resolve(cfg.storage.sqlite_path),
                                   review_db=default_review_path(cfg),
-                                  limit=min(limit, 500), offset=offset)
+                                  limit=min(limit, 500), offset=offset, q=q)
 
     # ---------------- 文档级标签（两层分类：主题/领域 domain、具体作用 purpose） ----------------
 
@@ -712,7 +721,21 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
                 failed.append({"source_id": sid, "error": str(e)})
             except Exception as e:
                 failed.append({"source_id": sid, "error": f"{type(e).__name__}: {e}"})
-        return {"ok": True, "deleted": deleted, "failed": failed, "candidates_cleaned": cleaned}
+        # 服务端真值校验（2026-10 用户报告前端/库 gap）：循环结束后回查库，
+        # 报告"声称已删但仍存在"的 sid——前端据此持久告警，不再依赖瞬时 toast。
+        still_present: list[str] = []
+        if deleted:
+            conn = sqlite3.connect(str(kb_path))
+            try:
+                qmarks = ",".join("?" * len(ids))
+                want = set(ids)
+                still_present = [r[0] for r in conn.execute(
+                    f"SELECT source_id FROM docs WHERE source_id IN ({qmarks})", ids).fetchall()
+                    if r[0] in want]
+            finally:
+                conn.close()
+        return {"ok": True, "deleted": deleted, "failed": failed,
+                "still_present": still_present, "candidates_cleaned": cleaned}
 
     @app.get("/api/stats")
     def stats():
