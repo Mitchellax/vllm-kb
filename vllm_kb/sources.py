@@ -2094,7 +2094,8 @@ class HtmlSource(BaseSource):
             # 审计分类是打标的主要信号源。
             meta = parsed.get("meta") or {}
             _seen = {t.name for t in tags} | {c.name for c in cands}
-            for cat in (meta.get("x-categories") or "").split(","):
+            # 分隔符：实测页面用 | 分隔，兼容中英文逗号/顿号/分号
+            for cat in re.split(r"[,，|;；、]", meta.get("x-categories") or ""):
                 cat = cat.strip()
                 if not cat or cat in _seen:
                     continue

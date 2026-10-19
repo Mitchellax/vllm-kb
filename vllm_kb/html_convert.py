@@ -238,44 +238,54 @@ def _harvest_images(tree) -> list[tuple[str, str]]:
     return out
 
 
-def _img_markdown(images: list[tuple[str, str]], i: int) -> str:
-    src, alt = images[i]
-    return f"![{alt}]({src})" if alt else f"![]({src})"
-
-
 def _inline_tokens(body: str, images: list[tuple[str, str]],
                    tables: list[dict]) -> str:
     """占位 token → 原位还原：图片还原 markdown 语法、内容表还原 pipe table。
 
     表格单元格里的图片占位一并还原（后续 _resolve_images 会统一资产化/OCR）。
-    正文引擎丢掉整个占位段落时（罕见）退化为**文末补回**（旧策略），保证资产不丢。
+    **文末兜底**：正文引擎把占位段落整段丢弃时（纯图段落中招，token 不在抽取
+    原文里）→ 缺席的图/表按文档序文末补回（旧策略），保证资产不丢、图表不缺席。
+    判断基准是**替换前**的抽取原文——在场 token 此时已被原位还原，不能再看替换后的 body。
     """
+    def _img_md(i: int) -> str:
+        src, alt = images[i]
+        return f"![{alt}]({src})" if alt else f"![]({src})"
+
     def _cell(c: str) -> str:
         for j in range(len(images)):
-            c = c.replace(_IMG_TOKEN.format(i=j), _img_markdown(images, j))
+            c = c.replace(_IMG_TOKEN.format(i=j), _img_md(j))
         return c
 
+    def _tbl_md(t: dict) -> str:
+        rows = [[_cell(c) for c in row] for row in t["rows"]]
+        return ((f"**{t['caption']}**\n\n" if t.get("caption") else "")
+                + table_to_markdown(rows))
+
+    extracted = body  # 抽取原文：占位是否被引擎整段丢弃以此为准
     for i in range(len(images)):
         tok = _IMG_TOKEN.format(i=i)
         if tok in body:
-            body = body.replace(tok, _img_markdown(images, i))
-    for t in tables:
-        tok = _TBL_TOKEN.format(i=t["index"])
-        if tok not in body:
-            continue
-        rows = [[_cell(c) for c in row] for row in t["rows"]]
-        block = (f"**{t['caption']}**\n\n" if t.get("caption") else "") \
-            + table_to_markdown(rows)
-        body = body.replace(tok, "\n\n" + block + "\n\n")
-    leftovers = [_img_markdown(images, i) for i in range(len(images))
-                 if _IMG_TOKEN.format(i=i) in body]
+            body = body.replace(tok, _img_md(i))
     for t in tables:
         tok = _TBL_TOKEN.format(i=t["index"])
         if tok in body:
-            leftovers.append((f"**{t['caption']}**\n\n" if t.get("caption") else "")
-                             + table_to_markdown(t["rows"]))
-    if leftovers:
-        body = (body.rstrip() + "\n\n" if body.strip() else "") + "\n\n".join(leftovers)
+            body = body.replace(tok, "\n\n" + _tbl_md(t) + "\n\n")
+
+    def _img_missing(i: int) -> bool:
+        tok = _IMG_TOKEN.format(i=i)
+        if tok in extracted:
+            return False
+        # 只在"存活表格"的单元格里出现的占位不算缺席（已随 pipe table 原位还原）
+        return not any(tok in c
+                       for t in tables
+                       if _TBL_TOKEN.format(i=t["index"]) in extracted
+                       for row in t["rows"] for c in row)
+
+    missing = [_img_md(i) for i in range(len(images)) if _img_missing(i)]
+    missing += [_tbl_md(t) for t in tables
+                if _TBL_TOKEN.format(i=t["index"]) not in extracted]
+    if missing:
+        body = (body.rstrip() + "\n\n" if body.strip() else "") + "\n\n".join(missing)
     return body
 
 

@@ -254,6 +254,22 @@ class TestAuditedMeta(HtmlSourceCase):
         self.assertEqual(d.extra["meta"]["x-created"], "上月发布")
 
 
+    def test_categories_pipe_separator(self):
+        """实测页面用 | 分隔 categories——按逗号拆分会整串变成一个候选。"""
+        (self.imports / "page.html").write_text(page_html().replace(
+            '<meta charset="utf-8">',
+            '<meta charset="utf-8">\n'
+            '<meta name="x-categories" content="组网|升级,部署">'), encoding="utf-8")
+        img = self.imports / "img"
+        img.mkdir()
+        (img / "a.png").write_bytes(base64.b64decode(_PNG_B64))
+        self.src.pull()
+        d = self.src.canonicalize()[0]
+        cands = {c["name"] for c in d.extra["tag_candidates"]}
+        self.assertEqual({"组网", "升级", "部署"} & cands, {"组网", "升级", "部署"})
+        self.assertNotIn("组网|升级", cands)               # 不再整串成候选
+
+
 class TestCategoriesToTags(HtmlSourceCase):
     def setUp(self):
         super().setUp()

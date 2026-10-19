@@ -231,6 +231,38 @@ class TestInlinePosition(unittest.TestCase):
         self.assertIn("![](./cell.png)", res.body)
         self.assertIn("| ![](./cell.png) | 现场截图 |", res.body)
 
+    def test_dropped_token_falls_back_to_append(self):
+        """正文引擎把纯图段落（连 token 一起）整段丢弃 → 图/表**文末兜底补回**。
+
+        实测事故：兜底条件曾写反（只补'token 还在'的——替换后永假），缺席的
+        图表无声消失。判断基准必须是替换前的抽取原文。
+        """
+        doc = ("""<html><head><title>t</title></head><body>
+<p>开头段落内容足够长。</p>
+<p><img src="./lost.png"></p>
+<table><tr><th>k</th><th>v</th></tr><tr><td>a</td><td>b</td></tr></table>
+<p>结尾段落内容足够长。</p>
+</body></html>""")
+        canned = "开头段落内容足够长。\n\n结尾段落内容足够长。"  # 引擎输出：图与表全丢
+        with mock.patch("trafilatura.extract", return_value=canned):
+            res = html_to_markdown(doc.encode("utf-8"))
+        self.assertIn("![](./lost.png)", res.body)      # 兜底补回，资产不丢
+        self.assertIn("| k | v |", res.body)
+        self.assertNotIn("[[KBIMG:", res.body)          # token 不残留
+        self.assertNotIn("[[KBTBL:", res.body)
+
+    def test_dropped_token_inside_surviving_table_not_duplicated(self):
+        """只在存活表格单元格里的图不算缺席（已随 pipe table 原位还原），不重复文末补回。"""
+        doc = ("""<html><head><title>t</title></head><body>
+<p>说明段落内容足够长。</p>
+<table><tr><th>图</th><th>说明</th></tr><tr><td><img src="./cell.png"></td><td>截图</td></tr></table>
+<p>收尾段落内容足够长。</p>
+</body></html>""")
+        canned = "说明段落内容足够长。\n\n[[KBTBL:0]]\n\n收尾段落内容足够长。"  # 表在、图随行
+        with mock.patch("trafilatura.extract", return_value=canned):
+            res = html_to_markdown(doc.encode("utf-8"))
+        self.assertEqual(res.body.count("![](./cell.png)"), 1)  # 原位一次，不文末重复
+
     def test_attr_decorative_image_skipped_at_harvest(self):
         doc = ('<html><body><p>正文段落内容。</p>'
                '<img src="./t.gif" width="1" height="1">'
