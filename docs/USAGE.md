@@ -954,9 +954,12 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
     批量栏**批量移出词典 / 批量改 tier**（逐项独立生效，不存在项进 failed 明细）；
     **审核人填一次全站记忆**（requireReviewer：文档管理排除/恢复、批量删除/认证/采纳等
     所有操作不再重复弹窗——首次填写后自动记住）；
-  > **TODO（暂缓）**：打标与候选处理的人工成本已大幅下降——候选批量分拣、设备词表、
-  > 提取端降噪均已上线（见上）。剩余暂缓：**按主题聚合的打标视图**（目录分组已就绪，
-  > 可在组头给"该组高频缺失标签"建议），待积压消化后再评估。
+  > **TODO（暂缓）**：① 打标侧仅剩**按主题聚合的打标视图**（目录分组已就绪，
+  > 可在组头给"该组高频缺失标签"建议），待积压消化后再评估；② **人工治理数据备份**
+  > （2026-10 登记，配合审计来源接入的后置项）：`review.sqlite3`（审核操作/队列/墓碑）+
+  > kb 覆盖层（doc_tags/doc_verification——人工成果、canonical 里没有）+ asset_registry
+  > 的定期备份与恢复演练——issue 等可重拉，**不可再生的是人工治理数据**；
+  > ③ 审计驱动 git 来源接入（设计定稿未实施，见 `docs/DESIGN-audited-git-source.md`）。
 - **API 配置中心**：集中查看并**编辑** embedding / OCR / GitHub / code_graph 的配置——
   **非密钥字段**（provider/base_url/model/ocr_provider/ocr_api_mode/ocr_min_confidence 等）保存到 `config.json`；
   **密钥**（embedding key / OCR key / GitHub token）保存到 `data/secrets.local.json`
