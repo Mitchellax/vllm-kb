@@ -9,9 +9,12 @@
   * 布局表（<2×2 且无 th/caption）：整表文字 ≥80 字符视为"套壳正文"（常见单格代码框）
     → 原地展开成 `<p>`（文字保留、结构降级）；否则整体丢弃（导航/菜单碎片），丢弃数
     进 quality 元数据不静默；
-- **图片同样先收割后补回**：`//img` 按文档序收集 (src, alt) 并原地移除（先于表格收割，
-  表格内的截图也不丢）→ 正文末尾按 markdown 图片语法补回，资产化/占位/OCR 统一走
-  `BaseSource._resolve_images`——**trafilatura 实测会把纯图段落整段丢弃**，不收割必丢图；
+- **图片同样先收割后占位**：`//img` 按文档序收集 (src, alt) 并**原位替换为占位 token**
+  `[[KBIMG:i]]`（先于表格收割，表格内的截图也不丢）→ 正文抽取后**原位**还原为
+  markdown 图片语法（图文位置不再脱节；trafilatura 丢掉整个占位段落时退化为文末补回），
+  资产化/占位/OCR 统一走 `BaseSource._resolve_images`——**trafilatura 实测会把纯图段落
+  整段丢弃**，不收割必丢图；占位是**纯文本**，正文引擎不再丢弃它；
+  显式 `width/height ≤2px` 的装饰图（1x1 埋点 gif 等）收割时直接丢弃；
 - **正文**：trafilatura.extract(output_format="markdown", include_images/links,
   include_formatting)——自带去噪，适配对外案例 / wiki 文章页。已知边界（实测）：
   正文不含 markdown 标题（h1-h6 抽成普通行）→ doc_html 的 chunk 无 section
@@ -27,8 +30,12 @@
 gb18030 严格试解 → utf-8 errors=replace 兜底，返回实际使用的 charset 供 quality 元数据。
 （utf-8 必须排在 gb18030 之前——gb18030 硬解 utf-8 中文常"成功"出乱码。）
 
-原始 URL：浏览器"另存为"残留的 `<!-- saved from url=(NNNN)… -->` 注释 → 文档 url 字段
-（phase2 设计"保留 URL"；无则空）。
+原始 URL：审计元数据 `<meta name="x-source-url">` 优先，其次浏览器"另存为"残留的
+`<!-- saved from url=(NNNN)… -->` 注释 → 文档 url 字段（phase2 设计"保留 URL"；无则空）。
+
+审计元数据：`<meta name="x-*">`（x-created/x-updated/x-status/x-author/x-categories/
+x-expiry 等）整体收割进 `ConvertResult.meta` → HtmlSource 落 `extra["meta"]`——
+审计流程的元信息不再被丢弃。
 
 降级链（每级醒目 warning，调用方落 quality 元数据，不静默）：
   trafilatura 未安装 → lxml 全文兜底（无去噪，表格已收割不受影响）；
@@ -60,6 +67,11 @@ _LAYOUT_MIN_ROWS = 2        # 布局表启发式：行×列 < 2×2 且无 th/cap
 _LAYOUT_MIN_COLS = 2
 _UNWRAP_MIN_CHARS = 80      # 布局表文字达到此长度 → 展开 <p> 保留（单格代码框等）
 
+# 收割占位 token：纯文本（无括号配对歧义、不被 markdown 链接正则命中），
+# 抽取后原位还原为 markdown——正文引擎把纯文本带上来，位置即原文位置
+_IMG_TOKEN = "[[KBIMG:{i}]]"
+_TBL_TOKEN = "[[KBTBL:{i}]]"
+
 
 @dataclass
 class ConvertResult:
@@ -67,11 +79,12 @@ class ConvertResult:
     title: str
     tables: list[dict]           # 收割的内容表（tables.json 用；正文已按 pipe table 补回）
     charset: str
-    source_url: str              # "saved from url" 注释里的原始 URL（无则空）
+    source_url: str              # x-source-url meta 优先，其次 saved-from-url 注释
     extractor: str               # trafilatura | trafilatura_baseline | lxml_fallback | stdlib_fallback
     warnings: list[str] = field(default_factory=list)
     layout_tables_dropped: int = 0   # 丢弃的布局/碎片表数（进 quality 元数据）
     tables_unwrapped: int = 0        # 展开成段落的"套壳正文"表数
+    meta: dict = field(default_factory=dict)  # <meta name="x-*"> 审计元数据（extra["meta"]）
 
 
 def table_to_markdown(rows: list[list]) -> str:
@@ -153,28 +166,33 @@ def _classify_table(tab) -> tuple[Optional[dict], str]:
 
 
 def _harvest_tables(tree) -> tuple[list[dict], int, int]:
-    """收割内容表并**原地移除所有表**（含布局表），返回 (tables, layout_dropped, unwrapped)。
+    """收割内容表并**原位替换为占位 token**（布局/空表照旧移除）。
 
-    表格先于正文引擎收割/移除：内容表走单一渲染路径（见模块 docstring），
-    布局表的碎片文字不污染正文抽取。移除是原地的——tree 只在本函数内被改动一次。
+    内容表占位 `<p>[[KBTBL:i]]</p>`：正文引擎把 token 文本带上 → 抽取后还原为
+    pipe table（图文/表文位置保持原文位置）。返回 (tables, layout_dropped, unwrapped)。
     """
+    from lxml import html as lhtml
+
     tables: list[dict] = []
     layout_dropped = 0
     unwrapped = 0
     for tab in tree.xpath("//table[not(ancestor::table)]"):
         t, kind = _classify_table(tab)
+        parent = tab.getparent()
         if kind == "content":
             t["index"] = len(tables)
             tables.append(t)
-            tab.drop_tree()
+            if parent is not None:
+                p = lhtml.Element("p")
+                p.text = _TBL_TOKEN.format(i=t["index"])
+                parent.replace(tab, p)
+            else:
+                tab.drop_tree()
         elif kind == "empty":
             tab.drop_tree()
         else:  # layout
             text = " ".join(tab.text_content().split())
-            parent = tab.getparent()
             if len(text) >= _UNWRAP_MIN_CHARS and parent is not None:
-                from lxml import html as lhtml
-
                 p = lhtml.Element("p")
                 p.text = text
                 parent.replace(tab, p)
@@ -186,30 +204,93 @@ def _harvest_tables(tree) -> tuple[list[dict], int, int]:
 
 
 def _harvest_images(tree) -> list[tuple[str, str]]:
-    """收割 `//img` → [(src, alt)]（文档序）并原地移除。
+    """收割 `//img` → [(src, alt)]（文档序）并**原位替换为占位 token**。
 
-    **trafilatura 实测会把纯图段落整段丢弃**——图片与表格同策略：先收割、抽取后按
-    markdown 图片语法补回。先于表格收割调用（表格内的截图也要收）；无 src 的装饰图跳过。
+    **trafilatura 实测会把纯图段落整段丢弃**——占位是纯文本，正文引擎会把它带上来，
+    抽取后原位还原为 markdown 图片语法。先于表格收割调用（表格内的截图也要收）；
+    无 src 的装饰图跳过；显式 `width/height ≤2px` 的装饰图（1x1 埋点 gif/logo）直接丢弃。
     """
+    from lxml import html as lhtml
+
     out: list[tuple[str, str]] = []
     for img in tree.xpath("//img"):
         src = (img.get("src") or "").strip()
+        parent = img.getparent()
         if not src:
+            if parent is not None:
+                img.drop_tree()
+            continue
+        try:
+            w = int(str(img.get("width") or "").strip() or "0")
+            h = int(str(img.get("height") or "").strip() or "0")
+        except ValueError:
+            w = h = 0
+        if 0 < w <= 2 and 0 < h <= 2:
+            if parent is not None:
+                img.drop_tree()
             continue
         alt = " ".join((img.get("alt") or "").split())
         out.append((src, alt))
-        parent = img.getparent()
         if parent is not None:
-            img.drop_tree()
+            span = lhtml.Element("span")
+            span.text = _IMG_TOKEN.format(i=len(out) - 1)
+            parent.replace(img, span)
     return out
 
 
-def _append_images(body: str, images: list[tuple[str, str]]) -> str:
-    """把收割的图片按文档序补回正文（markdown 图片语法；dest 交 _resolve_images 处理）。"""
-    if not images:
-        return body
-    lines = [f"![{alt}]({src})" if alt else f"![]({src})" for src, alt in images]
-    return (body.rstrip() + "\n\n" if body.strip() else "") + "\n".join(lines)
+def _img_markdown(images: list[tuple[str, str]], i: int) -> str:
+    src, alt = images[i]
+    return f"![{alt}]({src})" if alt else f"![]({src})"
+
+
+def _inline_tokens(body: str, images: list[tuple[str, str]],
+                   tables: list[dict]) -> str:
+    """占位 token → 原位还原：图片还原 markdown 语法、内容表还原 pipe table。
+
+    表格单元格里的图片占位一并还原（后续 _resolve_images 会统一资产化/OCR）。
+    正文引擎丢掉整个占位段落时（罕见）退化为**文末补回**（旧策略），保证资产不丢。
+    """
+    def _cell(c: str) -> str:
+        for j in range(len(images)):
+            c = c.replace(_IMG_TOKEN.format(i=j), _img_markdown(images, j))
+        return c
+
+    for i in range(len(images)):
+        tok = _IMG_TOKEN.format(i=i)
+        if tok in body:
+            body = body.replace(tok, _img_markdown(images, i))
+    for t in tables:
+        tok = _TBL_TOKEN.format(i=t["index"])
+        if tok not in body:
+            continue
+        rows = [[_cell(c) for c in row] for row in t["rows"]]
+        block = (f"**{t['caption']}**\n\n" if t.get("caption") else "") \
+            + table_to_markdown(rows)
+        body = body.replace(tok, "\n\n" + block + "\n\n")
+    leftovers = [_img_markdown(images, i) for i in range(len(images))
+                 if _IMG_TOKEN.format(i=i) in body]
+    for t in tables:
+        tok = _TBL_TOKEN.format(i=t["index"])
+        if tok in body:
+            leftovers.append((f"**{t['caption']}**\n\n" if t.get("caption") else "")
+                             + table_to_markdown(t["rows"]))
+    if leftovers:
+        body = (body.rstrip() + "\n\n" if body.strip() else "") + "\n\n".join(leftovers)
+    return body
+
+
+def _extract_meta(tree) -> dict:
+    """收割 `<meta name="x-*">` 审计元数据（x-source-url/x-created/x-updated/x-status/
+    x-author/x-categories/x-expiry 等）→ ConvertResult.meta（HtmlSource 落 extra["meta"]）。
+    同名重复（多个 x-categories）→ 逗号连接。"""
+    out: dict[str, str] = {}
+    for m in tree.xpath('//meta[starts-with(translate(@name, "X", "x"), "x-")]'):
+        name = (m.get("name") or "").strip().lower()
+        content = " ".join((m.get("content") or "").split())
+        if not name or not content:
+            continue
+        out[name] = f"{out[name]}, {content}" if name in out else content
+    return out
 
 
 def _sanitize_links(md: str) -> str:
@@ -267,27 +348,12 @@ def _import_trafilatura():
         return None
 
 
-def _append_tables(body: str, tables: list[dict]) -> str:
-    """把收割的内容表按 pipe table 补回正文（表格块统一追加在正文末尾）。"""
-    if not tables:
-        return body
-    parts = []
-    for t in tables:
-        block = ""
-        if t.get("caption"):
-            block += f"**{t['caption']}**\n\n"
-        block += table_to_markdown(t["rows"])
-        parts.append(block)
-    return (body.rstrip() + "\n\n" if body.strip() else "") + "\n\n".join(parts)
-
-
 def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
     """HTML 字节 → ConvertResult（正文 markdown + 结构化表格 + 元数据）。
 
     纯函数：不做任何文件写入/资产落盘；图片资产化留给 BaseSource._resolve_images。
     """
     text, charset = decode_html(raw)
-    source_url = _saved_from_url(text)
     warnings: list[str] = []
 
     tree = None
@@ -303,6 +369,7 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
     images: list[tuple[str, str]] = []
     layout_dropped = 0
     unwrapped = 0
+    meta: dict = {}
     body = ""
     title = ""
     extractor = "stdlib_fallback"
@@ -313,6 +380,8 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
             bad.drop_tree()
         for bad in tree.xpath(_CHROME_XPATH):
             bad.drop_tree()
+        meta = _extract_meta(tree)
+        source_url = meta.get("x-source-url") or _saved_from_url(text)
         images = _harvest_images(tree)
         tables, layout_dropped, unwrapped = _harvest_tables(tree)
         trafilatura = _import_trafilatura()
@@ -347,10 +416,10 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
         title = _page_title(tree)
     else:
         body = _strip_html_fallback(text)
+        source_url = _saved_from_url(text)
 
     body = _sanitize_links(body or "")
-    body = _append_images(body, images)
-    body = _append_tables(body, tables)
+    body = _inline_tokens(body, images, tables)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     return ConvertResult(
         body=body,
@@ -362,4 +431,5 @@ def html_to_markdown(raw: bytes, *, fallback_title: str = "") -> ConvertResult:
         warnings=warnings,
         layout_tables_dropped=layout_dropped,
         tables_unwrapped=unwrapped,
+        meta=meta,
     )

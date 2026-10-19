@@ -176,5 +176,69 @@ class TestStripFallback(unittest.TestCase):
         self.assertNotIn("<", out)
 
 
+class TestMetaHarvest(unittest.TestCase):
+    def test_x_meta_collected_and_url_preferred(self):
+        doc = ("""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>案例A</title>
+<meta name="x-source-url" content="https://audit.example/articles/9">
+<meta name="x-created" content="2026-10-01">
+<meta name="x-updated" content="2026-10-20">
+<meta name="x-status" content="published">
+<meta name="x-author" content="张三">
+<meta name="x-categories" content="组网">
+<meta name="x-categories" content="升级">
+<meta name="x-expiry" content="2027-10-01">
+</head><body><p>正文内容足够长——PD 分离场景下 P 节点挂死排查记录，含报错与结论。</p></body></html>""")
+        res = html_to_markdown(doc.encode("utf-8"))
+        self.assertEqual(res.meta["x-source-url"], "https://audit.example/articles/9")
+        self.assertEqual(res.meta["x-author"], "张三")
+        self.assertEqual(res.meta["x-categories"], "组网, 升级")   # 同名重复连接
+        self.assertIn("x-expiry", res.meta)
+        self.assertEqual(res.source_url, "https://audit.example/articles/9")  # 优先于 saved-from
+
+    def test_no_x_meta_keeps_saved_from_url(self):
+        res = html_to_markdown(_page("utf-8"))
+        self.assertEqual(res.meta, {})
+        self.assertEqual(res.source_url, "https://wiki.example/case/1")
+
+
+class TestInlinePosition(unittest.TestCase):
+    def test_images_and_tables_inline_in_document_order(self):
+        """图文/表文不再脱节：收割占位在抽取后**原位**还原（开头→图→段→表→结尾）。"""
+        doc = """<html><head><title>t</title></head><body>
+<p>开头段落讲现象。</p>
+<p><img src="./img/mid.png"></p>
+<p>中间段落给分析。</p>
+<table><tr><th>k</th><th>v</th></tr><tr><td>a</td><td>b</td></tr></table>
+<p>结尾段落给结论。</p>
+</body></html>"""
+        res = html_to_markdown(doc.encode("utf-8"))
+        b = res.body
+        self.assertIn("![](./img/mid.png)", b)
+        self.assertIn("| k | v |", b)
+        self.assertLess(b.index("开头段落"), b.index("![](./img/mid.png)"))
+        self.assertLess(b.index("![](./img/mid.png)"), b.index("中间段落"))
+        self.assertLess(b.index("中间段落"), b.index("| k | v |"))
+        self.assertLess(b.index("| k | v |"), b.index("结尾段落"))
+
+    def test_image_inside_table_cell_inlined(self):
+        """表格单元格里的截图：占位随行还原为 markdown 图片（交 _resolve_images 资产化）。"""
+        doc = ('<html><body><p>说明段落。</p>'
+               '<table><tr><th>图</th><th>说明</th></tr>'
+               '<tr><td><img src="./cell.png"></td><td>现场截图</td></tr></table>'
+               '<p>收尾段落。</p></body></html>').encode("utf-8")
+        res = html_to_markdown(doc)
+        self.assertIn("![](./cell.png)", res.body)
+        self.assertIn("| ![](./cell.png) | 现场截图 |", res.body)
+
+    def test_attr_decorative_image_skipped_at_harvest(self):
+        doc = ('<html><body><p>正文段落内容。</p>'
+               '<img src="./t.gif" width="1" height="1">'
+               '<p><img src="./real.png" width="640" height="480"></p></body></html>')
+        res = html_to_markdown(doc.encode("utf-8"))
+        self.assertNotIn("t.gif", res.body)
+        self.assertIn("./real.png", res.body)
+
+
 if __name__ == "__main__":
     unittest.main()

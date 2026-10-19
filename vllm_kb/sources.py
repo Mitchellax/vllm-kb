@@ -55,6 +55,47 @@ if TYPE_CHECKING:  # 仅类型标注用，避免循环导入
 _BASE64_IMG_RE = re.compile(r"data:image/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)", re.I)
 _IMG_EXT = {"png": "png", "jpeg": "jpg", "jpg": "jpg", "webp": "webp", "gif": "gif"}
 
+_DECORATIVE_MAX_DIM = 2   # 图片最长边 ≤2px 视为装饰（1x1 埋点 gif/logo），不进正文/资产
+
+
+def _image_dimensions(data: bytes) -> Optional[tuple[int, int]]:
+    """从字节流解析图片像素尺寸（PNG/GIF/JPEG，零依赖）；无法识别返回 None（不过滤）。
+
+    html_convert 已按显式 width/height 属性过滤一层；这里按**文件内容**兜底——
+    无属性或 CSS 缩放的 1x1 装饰图也拦得住。webp 不解析（浏览器另存页装饰图
+    几乎都是 gif/png），宁可漏放不误杀。
+    """
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+            return (int.from_bytes(data[16:20], "big"),
+                    int.from_bytes(data[20:24], "big"))
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return (int.from_bytes(data[6:8], "little"),
+                    int.from_bytes(data[8:10], "little"))
+        if data[:2] == b"\xff\xd8":  # JPEG：扫 SOF 段取宽高
+            i = 2
+            n = len(data)
+            while i + 9 < n:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    return (int.from_bytes(data[i + 7:i + 9], "big"),
+                            int.from_bytes(data[i + 5:i + 7], "big"))
+                i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
+def _is_decorative_image(data: bytes) -> bool:
+    dims = _image_dimensions(data)
+    return bool(dims) and max(dims) <= _DECORATIVE_MAX_DIM
+
 
 def _sha256(p: Path) -> str:
     h = hashlib.sha256()
@@ -75,6 +116,9 @@ def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:
 
 # stem 无意义形态：纯数字 / 纯十六进制（hash、uuid 片段）/ 纯符号——爬虫批量下载件常见
 _JUNK_STEM_RE = re.compile(r"^(?:[0-9a-fA-F\-_]+|[0-9]+|\W+)$")
+# 泛化页名（page.html 统一文件名布局等）：stem 无信息量，标题回退解析器提取值
+_GENERIC_STEM_RE = re.compile(r"^(?:page|index|default|article|view|detail|main|home)$",
+                              re.IGNORECASE)
 
 
 def _stem_title(stem: str, extracted: str) -> str:
@@ -86,12 +130,14 @@ def _stem_title(stem: str, extracted: str) -> str:
     "… 26.1.x npu-smi 命令参考 02" 天然消歧。source_id 本就用 stem 构造，
     标题与 sid 一致后 UI/图/skill 展示统一。
 
-    stem 为无意义名（纯数字 / 纯十六进制 hash / 纯符号 / 过短）时回退解析器
-    提取的标题（如爬虫件的 html <title>），两者皆空再回退 stem。
+    stem 为无意义名（纯数字 / 纯十六进制 hash / 纯符号 / 过短）或**泛化页名**
+    （page/index/default/…——审计来源统一 page.html 布局，stem 全相同）时回退
+    解析器提取的标题（如爬虫件的 html <title>），两者皆空再回退 stem。
     """
     s = (stem or "").strip()
     e = (extracted or "").strip()
-    if s and len(s) >= 4 and not _JUNK_STEM_RE.fullmatch(s):
+    if (s and len(s) >= 4 and not _JUNK_STEM_RE.fullmatch(s)
+            and not _GENERIC_STEM_RE.fullmatch(s)):
         return s
     return e or s
 
@@ -278,6 +324,9 @@ class BaseSource(ABC):
                 except Exception:
                     evidence.append(ev)
                     return placeholder
+                if _is_decorative_image(data):  # 1x1 埋点/装饰图：不进正文/资产
+                    evidence.append({"kind": "decorative", "ocr": None})
+                    return ""
                 b64_sha = hashlib.sha256(data).hexdigest()
                 # 内容寻址命名：同图只落一份（跨文档自动去重），且不含文档文件名 → 同名文档也不撞
                 name = f"img_{b64_sha[:16]}.{ext}"
@@ -311,6 +360,12 @@ class BaseSource(ABC):
             if not p.is_file():   # 目录/不存在一律 unresolved（不记 source_ref，避免路径形态进库）
                 evidence.append(ev)
                 return placeholder
+            try:
+                if _is_decorative_image(p.read_bytes()):  # 内容级：1x1 埋点/装饰图
+                    evidence.append({"kind": "decorative", "ocr": None})
+                    return ""
+            except OSError:
+                pass  # 读取失败按正常图处理，后续资产化自会报错
             rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
             ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
             _reg(rel, sha, self.resolve(rel))
@@ -1893,7 +1948,8 @@ class HtmlSource(BaseSource):
     kind = BY_SOURCE["html"]
     # 本来源**不支持**、但用户很可能放进来的格式：只用于给出指向性提示
     _LEGACY_SUFFIXES = ("*.mht", "*.mhtml", "*.url", "*.webarchive")
-    _EXTRACT_SCHEMA = 1
+    # schema=2：html_convert 升级为"原位占位补回"（图文/表文位置=原文位置）+ x-* meta 收割
+    _EXTRACT_SCHEMA = 2
 
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
@@ -2018,6 +2074,8 @@ class HtmlSource(BaseSource):
                 "source_mode": "imports" if from_imports else "assets_fallback",
                 "images_unresolved": sum(1 for e in evidence
                                          if e.get("kind") == "unresolved"),
+                "images_decorative_skipped": sum(1 for e in evidence
+                                                 if e.get("kind") == "decorative"),
                 "layout_tables_dropped": int(parsed.get("layout_tables_dropped") or 0),
                 "tables_unwrapped": int(parsed.get("tables_unwrapped") or 0),
                 "cached": cached,
@@ -2037,6 +2095,8 @@ class HtmlSource(BaseSource):
             }
             if evidence:
                 extra["evidence"] = evidence
+            if parsed.get("meta"):
+                extra["meta"] = parsed["meta"]  # x-* 审计元数据（url/created/status/author…）
             docs.append(KbDocument(
                 source_type=self.kind.source_type,
                 source_id=sid,
@@ -2091,6 +2151,7 @@ class HtmlSource(BaseSource):
             "source_url": res.source_url,
             "extractor": res.extractor,
             "warnings": res.warnings,
+            "meta": dict(res.meta or {}),
             "layout_tables_dropped": res.layout_tables_dropped,
             "tables_unwrapped": res.tables_unwrapped,
         }

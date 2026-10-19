@@ -239,7 +239,8 @@ const q=s=>esc(String(s||'')).replace(/'/g,"\\'");
 const tagB=(sid,t,cls,act,mark)=>`<span class="tagb ${cls} ${tierOf(t)}" onclick="tagEdit('${q(sid)}','${act}','${q(t)}')">${esc(t)} ${mark}</span>`;
 const groupRow=(list,cls,act,mark,sid)=>list.length?`<div style="margin-top:4px"><span class="muted">${cls==='excluded'?'已排除':cls==='manual'?'人工':'自动'}:</span> ${list.map(t=>tagB(sid,t,cls,act,mark)).join('')}</div>`:'';
 const docCard=d=>{const t=d.tags||{};const inp='newtag-'+q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_');
-return `<div class="card" style="border-left:3px solid ${d.duplicate?'var(--rv-amber)':'var(--rv-border)'}"><div><input type="checkbox" class="dchk" data-sid="${q(d.source_id)}" onchange="docSelChanged()" style="margin-right:6px" title="勾选后批量操作"><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:''}</div>
+const dupPage=d.duplicate&&String(d.source_id).startsWith('html:page--');
+return `<div class="card" style="border-left:3px solid ${d.duplicate&&!dupPage?'var(--rv-amber)':'var(--rv-border)'}"><div><input type="checkbox" class="dchk" data-sid="${q(d.source_id)}" onchange="docSelChanged()" style="margin-right:6px" title="勾选后批量操作"><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${dupPage?`<span class="muted">统一 page.html 布局（按目录路径消歧，非重名冲突）</span>`:(d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:'')}</div>
 <div class="mono muted">${esc(d.source_id)}${d.asset_path?` · ${esc(d.asset_path)}`:''}</div>
 ${groupRow(t.auto||[],'auto','exclude','✕',d.source_id)}
 ${groupRow(t.excluded||[],'excluded','restore','↺',d.source_id)}
