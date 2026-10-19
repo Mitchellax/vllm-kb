@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS review_items (
     result TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_review_status ON review_items(status, category);
+CREATE TABLE IF NOT EXISTS deleted_docs (
+    source_id TEXT PRIMARY KEY,
+    deleted_at TEXT,
+    reviewer TEXT
+);
 """ + _ASSET_REGISTRY_DDL
 
 
@@ -341,6 +346,39 @@ class ReviewStore:
         finally:
             conn.close()
 
+    def tombstone(self, source_ids: list[str], reviewer: str = "review-ui") -> int:
+        """登记删除墓碑（deleted_docs）：审核台删除 = **一等删除**——任何构建路径
+        （增量/资产回退/GitHub 缓存/--rebuild）都不得复活这些 sid（ingest/upsert/
+        建图读取墓碑跳过）；撤回删除（undo_delete）解除。"""
+        ids = [s for s in source_ids if s]
+        if not ids:
+            return 0
+        conn = self._connect()
+        try:
+            now = _now()
+            conn.executemany(
+                "INSERT OR REPLACE INTO deleted_docs(source_id, deleted_at, reviewer) "
+                "VALUES(?,?,?)",
+                [(s, now, reviewer) for s in ids])
+            conn.commit()
+            return len(ids)
+        finally:
+            conn.close()
+
+    def untombstone(self, source_ids: list[str]) -> int:
+        """解除删除墓碑（撤回删除用）。"""
+        ids = [s for s in source_ids if s]
+        if not ids:
+            return 0
+        conn = self._connect()
+        try:
+            conn.executemany("DELETE FROM deleted_docs WHERE source_id=?",
+                             [(s,) for s in ids])
+            conn.commit()
+            return len(ids)
+        finally:
+            conn.close()
+
     def review(self, item_id: int, action: str, reviewer: str,
                result: Optional[dict] = None) -> bool:
         """提交标注（**不改原始内容**）：action ∈ approved（认证）| suspected（存疑）。
@@ -373,6 +411,7 @@ class ReviewStore:
         rows = [r.get("source_id") for r in ((it["payload"] or {}).get("rows") or [])
                 if isinstance(r, dict) and r.get("source_id")]
         payload = dict(it["payload"] or {})
+        deleted_sids: list[str] = []
         if rows:
             # 文件级：批量备份 + 删除（单行缺失不阻断——可能已被单独处理）
             doc_rows = []
@@ -384,6 +423,7 @@ class ReviewStore:
                 raise ValueError("文件内已无可删除的文档记录（可能已全部删除）")
             for d in doc_rows:
                 _delete_doc_row(kb_path, d["source_id"])
+            deleted_sids = [d["source_id"] for d in doc_rows]
             payload["doc_rows"] = doc_rows
             payload["asset"] = (doc_rows[0].get("extra") or {}).get("asset", {})
             payload["deleted_note"] = note
@@ -392,6 +432,7 @@ class ReviewStore:
             if doc_row is None:
                 raise ValueError(f"kb.sqlite3 中不存在 {it['item_ref']}（可能已删除）")
             _delete_doc_row(kb_path, it["item_ref"])
+            deleted_sids = [it["item_ref"]]
             payload["doc_row"] = doc_row
             payload["asset"] = (doc_row.get("extra") or {}).get("asset", {})
             payload["deleted_note"] = note
@@ -404,6 +445,8 @@ class ReviewStore:
                  json.dumps({"action": "deleted", "note": note}, ensure_ascii=False), int(item_id)),
             )
             conn.commit()
+            # 墓碑：删除的 sid 不得被任何构建路径复活（撤回时解除）
+            self.tombstone(deleted_sids, reviewer)
             return cur.rowcount > 0
         finally:
             conn.close()
@@ -434,6 +477,9 @@ class ReviewStore:
                 (json.dumps(payload, ensure_ascii=False), int(item_id)),
             )
             conn.commit()
+            # 解除墓碑：撤回 = 恢复复活资格
+            self.untombstone([d["source_id"] for d in doc_rows] if doc_rows
+                             else ([doc_row["source_id"]] if doc_row else []))
             return cur.rowcount > 0
         finally:
             conn.close()
@@ -461,6 +507,44 @@ def default_review_path(cfg: Optional["AppConfig"] = None) -> Path:
     if cfg is not None:
         return cfg.resolve(getattr(cfg.storage, "review_path", "data/review.sqlite3"))
     return Path("data/review.sqlite3")
+
+
+def record_tombstones(review_db: str | Path, source_ids: list[str],
+                      reviewer: str = "review-ui") -> None:
+    """登记删除墓碑（模块级便捷入口，端点用；Store.tombstone 同义，含建表）。"""
+    ids = [s for s in source_ids if s]
+    if not ids:
+        return
+    conn = sqlite3.connect(str(review_db))
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS deleted_docs (
+            source_id TEXT PRIMARY KEY, deleted_at TEXT, reviewer TEXT)""")
+        conn.executemany(
+            "INSERT OR REPLACE INTO deleted_docs(source_id, deleted_at, reviewer) VALUES(?,?,?)",
+            [(s, _now(), reviewer) for s in ids])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_tombstones(review_db: str | Path) -> set[str]:
+    """已删除文档墓碑集合（deleted_docs；表不存在/库缺失 → 空集）。
+
+    ingest / upsert_unified_canonical / 建图读取墓碑跳过已删 sid——审核台删除是一等
+    删除，资产层回退 / GitHub 采集缓存 / canonical 旧行都不得复活（2026-10 用户实测：
+    删文件 + 删记录后 --skip-pull 仍重新入库）。撤回删除（undo_delete）解除墓碑。
+    """
+    p = Path(review_db)
+    if not p.exists():
+        return set()
+    conn = sqlite3.connect(str(p))
+    try:
+        try:
+            return {r[0] for r in conn.execute("SELECT source_id FROM deleted_docs").fetchall()}
+        except sqlite3.OperationalError:
+            return set()  # 旧库尚无 deleted_docs 表
+    finally:
+        conn.close()
 
 
 # ---------------- 外源文档管理（审核工作台"文档管理"页签） ----------------

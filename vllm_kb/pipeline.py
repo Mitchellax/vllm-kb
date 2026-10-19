@@ -134,6 +134,16 @@ def upsert_unified_canonical(cfg: AppConfig, docs: list[KbDocument]) -> dict:
     """
     from .models import doc_to_json
 
+    # 删除墓碑：审核台删除的文档不再回流 canonical（否则 --rebuild 会从旧行复活）
+    from .review import default_review_path, load_tombstones
+    tombs = load_tombstones(default_review_path(cfg))
+    if tombs:
+        before = len(docs)
+        docs = [d for d in docs if d.source_id not in tombs]
+        if len(docs) < before:
+            print(f"[canonical] 跳过 {before - len(docs)} 篇已删除文档（墓碑，不入 canonical）",
+                  flush=True)
+
     path = cfg.resolve(cfg.storage.canonical_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing: dict[str, str] = {}  # source_id -> 行内容（保留原行序，新增追加末尾）

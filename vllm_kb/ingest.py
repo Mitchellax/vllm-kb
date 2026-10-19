@@ -272,6 +272,15 @@ def ingest_docs(
 ) -> dict:
     """入库（幂等 + 增量断点续传）。返回统计。"""
     sqlite_path = sqlite_path or cfg.resolve(cfg.storage.sqlite_path)
+    # 删除墓碑：审核台删除的 sid 任何构建路径不得复活（资产回退/GitHub 缓存/canonical
+    # 旧行都可能是"发现"来源）；撤回删除解除墓碑后即可重新入库。
+    from .review import default_review_path, load_tombstones
+    tombs = load_tombstones(default_review_path(cfg))
+    if tombs:
+        before = len(docs)
+        docs = [d for d in docs if d.source_id not in tombs]
+        if len(docs) < before:
+            print(f"[ingest] 跳过 {before - len(docs)} 篇已删除文档（墓碑）", flush=True)
     conn = _connect(sqlite_path)
     # 标签词典词注册进 jieba（复合标签如"超时排查"不被拆散；jieba 未装时无副作用）
     register_words([e.name for e in TagRegistry.load(cfg).entries])

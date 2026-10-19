@@ -357,6 +357,43 @@ class TagManagementTest(unittest.TestCase):
                 self.assertIsNone(i["result"])
                 self.assertEqual(i["status"], "pending")
 
+    def test_tombstone_prevents_reingest_and_undo_releases(self):
+        """删除墓碑（用户实测：删文件+删记录后 --skip-pull 仍重新入库——资产回退/
+        采集缓存都是"发现"来源）：删行+墓碑后，同 sid 再入库不得复活；撤回恢复后可入库。"""
+        from vllm_kb.review import default_review_path, load_tombstones
+
+        def _row():
+            conn = sqlite3.connect(self.kb)
+            try:
+                return conn.execute(
+                    "SELECT source_id FROM docs WHERE source_id='pdf:tomb'").fetchone()
+            finally:
+                conn.close()
+
+        self._ingest(source_id="pdf:tomb", tags=["x"])
+        self.store.add_item("verification_pending", "pdf:tomb", {})
+        item_id = self.store.list_items(category="verification_pending")[0]["id"]
+        # 队列删除：kb 行删除 + 墓碑登记
+        self.store.mark_deleted(item_id, "tester", self.kb)
+        self.assertIsNone(_row())
+        self.assertIn("pdf:tomb", load_tombstones(default_review_path(self.cfg)))
+        # 模拟重建"复活"：发现层再次产出同一 sid → 墓碑跳过，不重新入库
+        self._ingest(source_id="pdf:tomb", tags=["x"])
+        self.assertIsNone(_row(), "墓碑 sid 不得重新入库")
+        # 撤回：行恢复 + 墓碑解除 → 可重新入库（且幂等 upsert）
+        self.store.undo_delete(item_id, self.kb)
+        self.assertIsNotNone(_row())
+        self.assertNotIn("pdf:tomb", load_tombstones(default_review_path(self.cfg)))
+
+    def test_mark_deleted_tombstones_and_undo_releases(self):
+        """墓碑读写往返（Store 层）：tombstone/untombstone/load_tombstones 一致。"""
+        from vllm_kb.review import default_review_path, load_tombstones
+
+        self.store.tombstone(["pdf:a", "pdf:b"], "tester")
+        self.assertEqual(load_tombstones(default_review_path(self.cfg)), {"pdf:a", "pdf:b"})
+        self.store.untombstone(["pdf:a"])
+        self.assertEqual(load_tombstones(default_review_path(self.cfg)), {"pdf:b"})
+
     def test_tag_dict_management(self):
         from vllm_kb.review import (
             add_tag_to_registry,

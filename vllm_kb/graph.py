@@ -219,6 +219,7 @@ class GraphBuilder:
         parsed_root: Optional[str | os.PathLike] = None,
         kb_path: Optional[str | os.PathLike] = None,
         registry=None,
+        skip_sids: Optional[set[str]] = None,
     ) -> GraphStats:
         """遍历 canonical.jsonl 建图。limit>0 时只处理前 limit 条（试跑）。
 
@@ -226,6 +227,7 @@ class GraphBuilder:
         parsed_root: data/parsed 目录（None 时跳过文档表格 → ErrorCode 的 DOCUMENTS 提取）。
         kb_path: kb.sqlite3（含 doc_tags 覆盖层）；None 时无人工标签覆盖（仅自动标签）。
         registry: TagRegistry（config.tags.registry）——github 源标题标签提取 + 词典全量 Tag 节点。
+        skip_sids: 删除墓碑（审核台删除的 sid）——canonical 旧行不复活成图节点。
         """
         calendars = calendars if calendars is not None else load_release_calendars()
         canonical_path = Path(canonical_path)
@@ -279,6 +281,8 @@ class GraphBuilder:
                 try:
                     doc = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if skip_sids and doc.get("source_id") in skip_sids:
                     continue
                 self._ingest_doc(doc, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
                                  interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,

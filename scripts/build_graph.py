@@ -43,8 +43,13 @@ def main() -> None:
         # kb.sqlite3 提供人工标签覆盖层（doc_tags）；registry 提供词典全量 Tag 节点 + 标题标签提取
         kb_path = cfg.resolve(cfg.storage.sqlite_path)
         registry = TagRegistry.load(cfg)
+        # 删除墓碑：审核台删除的 sid 不复活成图节点（canonical 旧行仍在，此处过滤）
+        from vllm_kb.review import default_review_path, load_tombstones
+        tombs = load_tombstones(default_review_path(cfg))
+        if tombs:
+            print(f"[graph] 跳过 {len(tombs)} 个已删除文档（墓碑）")
         s = builder.build_from_canonical(canonical, limit=args.limit, parsed_root=parsed_root,
-                                         kb_path=kb_path, registry=registry)
+                                         kb_path=kb_path, registry=registry, skip_sids=tombs)
         print("[graph] 构建完成：")
         print(s.summary())
     finally:

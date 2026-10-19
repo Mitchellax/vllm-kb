@@ -833,6 +833,20 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         r2 = self.client.get("/api/external-docs?limit=500&q=%")
         self.assertEqual(len(r2.json()), 0)
 
+    def test_delete_writes_tombstone(self):
+        """审核台删除（单/批）登记墓碑——后续构建路径不得复活（一等删除）。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import default_review_path, load_tombstones
+
+        seed_kb_doc(self.cfg_path, "md:tomb1")
+        seed_kb_doc(self.cfg_path, "md:tomb2")
+        self.client.post("/api/external-docs/delete", json={"source_id": "md:tomb1"})
+        self.client.post("/api/external-docs/delete-batch",
+                         json={"source_ids": ["md:tomb2", "md:ghost"]})
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        self.assertEqual(load_tombstones(default_review_path(cfg)),
+                         {"md:tomb1", "md:tomb2", "md:ghost"})
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text

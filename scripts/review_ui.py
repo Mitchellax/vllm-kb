@@ -257,7 +257,7 @@ const keys=Object.keys(groups).sort((a,b)=>rank(a)-rank(b)||a.localeCompare(b,'z
 const groupHtml=keys.map(k=>{const g=groups[k];
 return `<details open style="margin-bottom:10px"><summary style="cursor:pointer;font-weight:600;padding:4px 0">📁 ${esc(k)}（${g.length}）<input type="checkbox" style="margin-left:8px" onclick="event.stopPropagation();docGroupToggle(this,this.checked)" title="全选本组"></summary><div style="padding-left:2px">${g.map(docCard).join('')}</div></details>`}).join('');
 $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/表格等${docQuery?`，搜索"${esc(docQuery)}"命中`:`，本页 ${ds.length} 条`}）</h3>
-<div class="card subtle">按 <b>imports 第一层子目录</b> 分组，组名 = <b>来源id\\子目录</b>（根级 = 来源 id）——不同导入来源即使子目录同名也各自成组；📁来源id（资产回退）= imports 缺失时从资产层副本收录的文档；(未分组) = 网络来源。勾选多篇（或整组）后用批量栏操作。删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；下次增量入库时文件仍在本地会重新入库，文档废弃请手动删除本地文件。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
+<div class="card subtle">按 <b>imports 第一层子目录</b> 分组，组名 = <b>来源id\\子目录</b>（根级 = 来源 id）——不同导入来源即使子目录同名也各自成组；📁来源id（资产回退）= imports 缺失时从资产层副本收录的文档；(未分组) = 网络来源。勾选多篇（或整组）后用批量栏操作。删除只动数据库（docs + chunks + 向量），<b>本地文件不动</b>；删除会登记<b>墓碑</b>——任何构建路径（增量/资产回退/--rebuild）都不再复活该文档，撤回删除（待实际删除列表）才解除。GitHub 采集文档不在此列。<br>标签：<b>虚线框=自动标签</b>（点 ✕ 排除）、<b>黄底=人工标签</b>、<b>红底删除线=已排除</b>（点 ↺ 恢复）。最终标签 = (自动 − 排除) ∪ 人工，与入库/建图一致。</div>
 <div class="card">🔍 <input id="docsearch" value="${esc(docQuery)}" placeholder="搜索 source_id / 标题（子串，回车执行）" style="width:300px" onkeydown="if(event.key==='Enter')loadDocs()"> <button class="sm" onclick="loadDocs()">搜索</button> ${docQuery?'<button class="sm" onclick="clearDocSearch()">清空</button>':''} <span class="muted">库内文档远超单页窗口（本页最多 500 条、按 id 排序），删除后后面的文档会补位——<b>定位文档请用搜索</b></span></div>
 <div id="docbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="docbatch-n">0</span> 篇</b> <button class="primary sm" onclick="docBatchTagModal()">🏷 批量标签</button> <button class="danger sm" onclick="docBatchDelete()">🗑 批量删除</button> <span class="muted">批量标签支持 添加/删除人工、排除/恢复自动</span></div>
 <div class="todo"><b>TODO（暂缓）</b>：规则化自动采纳（词典近义/高频强候选免审）与按主题聚合的打标视图仍待设计——<b>批量操作已上线</b>（多选/按目录：打标、排除、恢复、删除）。</div>`
@@ -625,7 +625,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         """彻底删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量），
         本地资产文件不动；下次增量入库时文件仍在本地则重新入库。
         删除后联动修剪 tag_candidate 队列里的悬空引用（快照空则自动忽略该候选）。"""
-        from vllm_kb.review import delete_external_doc, prune_tag_candidates_for_doc
+        from vllm_kb.review import (delete_external_doc, prune_tag_candidates_for_doc,
+                                    record_tombstones)
         from vllm_kb.vectorstore import build_vector_store
 
         source_id = (body.get("source_id") or "").strip()
@@ -641,7 +642,10 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             r = delete_external_doc(kb_path, source_id, vector_store=vector_store)
         except ValueError as e:
             raise HTTPException(404, str(e))
-        cleaned = prune_tag_candidates_for_doc(default_review_path(cfg), source_id)
+        review_db = default_review_path(cfg)
+        cleaned = prune_tag_candidates_for_doc(review_db, source_id)
+        # 墓碑：一等删除——增量/资产回退/--rebuild 都不再复活（撤回删除时解除）
+        record_tombstones(review_db, [source_id])
         return {"ok": True, "candidates_cleaned": cleaned,
                 "note": f"已从数据库删除 {source_id}（{r['chunks_deleted']} 个 chunk，本地文件保留）"}
 
@@ -694,7 +698,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         """批量删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量，
         本地文件不动）。向量 store **只建一次**（逐篇重建是主要浪费）。
         删除后联动修剪 tag_candidate 悬空引用（逐篇）。"""
-        from vllm_kb.review import delete_external_doc, prune_tag_candidates_for_doc
+        from vllm_kb.review import (delete_external_doc, prune_tag_candidates_for_doc,
+                                    record_tombstones)
         from vllm_kb.vectorstore import build_vector_store
 
         ids = [s.strip() for s in (body.get("source_ids") or []) if s and s.strip()]
@@ -721,6 +726,9 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
                 failed.append({"source_id": sid, "error": str(e)})
             except Exception as e:
                 failed.append({"source_id": sid, "error": f"{type(e).__name__}: {e}"})
+        # 墓碑：请求删除的 sid 全部登记（含"已不存在"的——防未来任何路径复活；
+        # 失败项可重试，重试成功后墓碑语义自然成立）
+        record_tombstones(review_db, ids)
         # 服务端真值校验（2026-10 用户报告前端/库 gap）：循环结束后回查库，
         # 报告"声称已删但仍存在"的 sid——前端据此持久告警，不再依赖瞬时 toast。
         still_present: list[str] = []
