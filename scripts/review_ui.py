@@ -329,7 +329,7 @@ loadDocs();closeModal();
 const problems=[...r.failed.map(f=>`${f.source_id}：${f.error}`),...(r.still_present||[]).map(s=>`${s}：删除后仍存在于库（服务端校验）`)];
 if(problems.length){openModal(`<h4>⚠ 删除未完全成功（${r.deleted}/${sids.length} 篇已删）</h4><div class="card">${problems.map(p=>`<div class="mono" style="margin:2px 0">${esc(p)}</div>`).join('')}</div><div class="muted">失败的条目可重试；"仍存在于库"说明删除未落库（如库被占用），重试通常可解。</div><div class="actions"><button class="danger sm" onclick="docBatchDelete(${JSON.stringify([...r.failed.map(f=>f.source_id),...(r.still_present||[])]).replace(/"/g,'&quot;')})">↻ 重试剩余 ${r.failed.length+(r.still_present||[]).length} 篇</button> <button class="sm" onclick="closeModal()">关闭</button></div>`)}
 else{toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇（墓碑已登记）${r.candidates_cleaned&&r.candidates_cleaned.auto_ignored?`，联动忽略 ${r.candidates_cleaned.auto_ignored} 条候选`:''}`)}}catch(e){toast('✗ '+e.message)}}
-function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel)).map(x=>+x.dataset.id)}
+function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel+':checked')).map(x=>+x.dataset.id)}
 function queueSelChanged(){const vn=queueCheckedIds('#view-queue .qchk').length,cn=queueCheckedIds('#view-queue .cchk').length;
 const vb=document.getElementById('queuebatch');if(vb)vb.style.display=vn?'block':'none';const vc=document.getElementById('queuebatch-n');if(vc)vc.textContent=vn;
 const cb=document.getElementById('queuecand');if(cb)cb.style.display=cn?'block':'none';const cc=document.getElementById('queuecand-n');if(cc)cc.textContent=cn}

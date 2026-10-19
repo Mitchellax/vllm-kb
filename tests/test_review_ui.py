@@ -856,7 +856,9 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
                       "tdGroupToggle", "tagDictToggleTier", "tagDictBatchDelete",
                       "tagDictBatchTier", "tagdictbatch", "requireReviewer",
                       "docs/tags/batch", "external-docs/delete-batch", "items/review-batch",
-                      "tag-candidates/batch", "tag-dict/batch"):
+                      "tag-candidates/batch", "tag-dict/batch",
+                      # 勾选计数必须带 :checked（漏掉会把整页渲染条数当已选——2026-10 误采 100 词事故）
+                      "querySelectorAll(sel+':checked')", ".dchk:checked", ".tchk:checked"):
             self.assertIn(token, html, f"页面缺少 {token}")
 
 
