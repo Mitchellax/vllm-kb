@@ -32,6 +32,7 @@ CATEGORIES = (
     "equivalence_candidate",  # 跨来源疑似同一问题（EQUIVALENT_TO 候选）
     "table_join_candidate",   # 表格行引用 GitHub 编号 join 候选
     "tag_candidate",          # 自动提取的未收录标签候选（采纳→入词典+打标；忽略不记录）
+    "source_withdraw",        # mirror 来源回撤自动删除（待实际删除列表可撤回；见 DESIGN-audited-git-source.md）
 )
 
 # 审核项状态机（审核人员无编辑权限，只有三类动作）：
@@ -525,6 +526,30 @@ def record_tombstones(review_db: str | Path, source_ids: list[str],
         conn.commit()
     finally:
         conn.close()
+
+
+def list_withdrawn(review_db: str | Path) -> list[dict]:
+    """已回撤文档（删除墓碑）列表——审核台"已回撤"痕迹视图的数据源。
+
+    返回 [{source_id, deleted_at, reviewer, undo_item_id}]；undo_item_id = 可撤回的
+    审核项 id（mirror 自动回撤生成；人工审核台删除无审核项 → None，不可从此处撤回）。
+    """
+    p = Path(review_db)
+    if not p.exists():
+        return []
+    conn = sqlite3.connect(str(p))
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT d.source_id, d.deleted_at, d.reviewer, MIN(i.id) FROM deleted_docs d "
+                "LEFT JOIN review_items i ON i.item_ref = d.source_id AND i.status='deleted' "
+                "GROUP BY d.source_id ORDER BY d.deleted_at DESC").fetchall()
+        except sqlite3.OperationalError:
+            return []  # 旧库尚无 deleted_docs 表
+    finally:
+        conn.close()
+    return [{"source_id": r[0], "deleted_at": r[1], "reviewer": r[2],
+             "undo_item_id": r[3]} for r in rows]
 
 
 def load_tombstones(review_db: str | Path) -> set[str]:

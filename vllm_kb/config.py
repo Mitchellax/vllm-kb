@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -72,6 +72,19 @@ class SourceCfg(BaseModel):
     id: str
     type: str  # github | markdown | excel | ...
     enabled: bool = True
+    # keep（默认）= 现有增量语义：发现层只增改不删，文件消失=静默偏离+stray 告警；
+    # mirror = 本地原始数据优先（审计驱动可信路径）：快照对账，连续 2 次构建缺席 →
+    # 自动 mark_deleted（备份 doc_row+四层删+墓碑+待实际删除审核项，可撤回）。
+    # 见 docs/DESIGN-audited-git-source.md。
+    deletion_policy: str = "keep"
+
+    @model_validator(mode="after")
+    def _check_deletion_policy(self):
+        if self.deletion_policy not in ("keep", "mirror"):
+            print(f"[warn] 来源 {self.id} deletion_policy={self.deletion_policy!r} 非法"
+                  f"（keep|mirror），按 keep 处理")
+            self.deletion_policy = "keep"
+        return self
 
     def get(self, key: str, default=None):
         return getattr(self, key, default)

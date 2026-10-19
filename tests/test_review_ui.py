@@ -847,6 +847,17 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         self.assertEqual(load_tombstones(default_review_path(cfg)),
                          {"md:tomb1", "md:tomb2", "md:ghost"})
 
+    def test_withdrawn_endpoint(self):
+        """已回撤痕迹视图：墓碑列表 + 可撤回审核项 id（人工删除无审核项 → None）。"""
+        seed_kb_doc(self.cfg_path, "md:wd1")
+        seed_kb_doc(self.cfg_path, "md:wd2")
+        self.client.post("/api/external-docs/delete", json={"source_id": "md:wd1"})
+        r = self.client.get("/api/withdrawn")
+        self.assertEqual(r.status_code, 200)
+        by_sid = {w["source_id"]: w for w in r.json()}
+        self.assertIn("md:wd1", by_sid)
+        self.assertIsNone(by_sid["md:wd1"]["undo_item_id"])
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text
@@ -858,7 +869,8 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
                       "docs/tags/batch", "external-docs/delete-batch", "items/review-batch",
                       "tag-candidates/batch", "tag-dict/batch",
                       # 勾选计数必须带 :checked（漏掉会把整页渲染条数当已选——2026-10 误采 100 词事故）
-                      "querySelectorAll(sel+':checked')", ".dchk:checked", ".tchk:checked"):
+                      "querySelectorAll(sel+':checked')", ".dchk:checked", ".tchk:checked",
+                      "undoWithdraw", "/api/withdrawn", "已回撤"):
             self.assertIn(token, html, f"页面缺少 {token}")
 
 

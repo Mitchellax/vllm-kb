@@ -96,6 +96,24 @@ def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
             docs = src.canonicalize()
             if docs:
                 _attach_rel_dirs(src, docs)
+            # mirror 来源对账（deletion_policy=mirror，本地原始数据优先，见
+            # docs/DESIGN-audited-git-source.md）：缺席→宽限→墓碑删除；复活→解除墓碑。
+            # keep 来源（默认）完全不经此路径。
+            if str(getattr(src.cfg, "deletion_policy", "keep") or "keep") == "mirror":
+                try:
+                    from .review import default_review_path
+                    from .source_sync import reconcile_mirror_source
+                    rr = reconcile_mirror_source(
+                        cfg, src.id, [d.source_id for d in docs],
+                        cfg.resolve(cfg.storage.sqlite_path), default_review_path(cfg))
+                    print(f"[sync:{src.id}] 对账: 回撤 {len(rr['withdrawn'])} · "
+                          f"宽限中 {len(rr['grace'])} · 解除墓碑 {len(rr['untombstoned'])}"
+                          + ("（首轮建快照）" if rr["first_round"] else ""), flush=True)
+                    if rr["withdrawn"]:
+                        print(f"[sync:{src.id}] 已回撤: {rr['withdrawn']}", flush=True)
+                except Exception as e:
+                    print(f"[warn] 来源 {src.id} 对账失败（不影响入库）: "
+                          f"{type(e).__name__}: {e}", flush=True)
             print(f"[build] 来源 {src.id} ({src.type}) canonical {len(docs)} 条")
             all_docs.extend(docs)
         except NotImplementedError as e:

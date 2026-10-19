@@ -232,6 +232,7 @@ let docQuery='';
 function clearDocSearch(){docQuery='';loadDocs()}
 async function loadDocs(){const inp=document.getElementById('docsearch');if(inp)docQuery=inp.value;
 const ds=await j('/api/external-docs?limit=500'+(docQuery?`&q=${encodeURIComponent(docQuery)}`:''));
+let wd=[];try{wd=await j('/api/withdrawn')}catch(e){}
 let td={};try{const t=await j('/api/tag-dict');t.groups.domain.forEach(x=>td[x.name]='domain');t.groups.purpose.forEach(x=>td[x.name]='purpose')}catch(e){}
 const tierOf=n=>td[n]||'domain';
 const q=s=>esc(String(s||'')).replace(/'/g,"\\'");
@@ -261,7 +262,8 @@ $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/
 <div class="card">🔍 <input id="docsearch" value="${esc(docQuery)}" placeholder="搜索 source_id / 标题（子串，回车执行）" style="width:300px" onkeydown="if(event.key==='Enter')loadDocs()"> <button class="sm" onclick="loadDocs()">搜索</button> ${docQuery?'<button class="sm" onclick="clearDocSearch()">清空</button>':''} <span class="muted">库内文档远超单页窗口（本页最多 500 条、按 id 排序），删除后后面的文档会补位——<b>定位文档请用搜索</b></span></div>
 <div id="docbatch" class="card" style="display:none;position:sticky;top:52px;z-index:5;border-left:3px solid var(--rv-accent)"><b>已选 <span id="docbatch-n">0</span> 篇</b> <button class="primary sm" onclick="docBatchTagModal()">🏷 批量标签</button> <button class="danger sm" onclick="docBatchDelete()">🗑 批量删除</button> <span class="muted">批量标签支持 添加/删除人工、排除/恢复自动</span></div>
 <div class="todo"><b>TODO（暂缓）</b>：规则化自动采纳（词典近义/高频强候选免审）与按主题聚合的打标视图仍待设计——<b>批量操作已上线</b>（多选/按目录：打标、排除、恢复、删除）。</div>`
-+(keys.length?groupHtml:'<div class="card muted">无外源文档</div>')}
++(keys.length?groupHtml:'<div class="card muted">无外源文档</div>')
++`<details style="margin-top:16px"><summary style="cursor:pointer;font-weight:600">📥 已回撤（${wd.length}）— 墓碑生效中，任何构建路径（增量/资产回退/--rebuild）都不复活；mirror 来源文件重新出现会自动解除</summary><div class="card">${wd.map(w=>`<div style="margin:3px 0"><span class="mono">${esc(w.source_id)}</span> <span class="muted">${esc((w.deleted_at||'').slice(0,16))} · ${esc(w.reviewer||'')}</span> ${w.undo_item_id?`<button class="sm" onclick="undoWithdraw(${w.undo_item_id})">↻ 撤回</button>`:''}</div>`).join('')||'<span class="muted">（无）</span>'}</div></details>`}
 async function tagEdit(sid,action,tag){const reviewer=requireReviewer();if(!reviewer)return;
 try{await j('/api/docs/tags/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,action,tag,reviewer})});loadDocs();toast('✓ 已更新标签')}catch(e){toast('✗ '+e.message)}}
 function tagAdd(sid,t){if(!t||!t.trim())return;tagEdit(sid,'add',t.trim())}
@@ -269,6 +271,7 @@ async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文�
 try{const r=await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();
 const cc=r.candidates_cleaned||{};toast(`✓ 已删除 + 登记墓碑（本地文件保留）${cc.auto_ignored?`，联动忽略 ${cc.auto_ignored} 条候选`:cc.pruned?`，修剪 ${cc.pruned} 条候选引用`:''}`)}
 catch(e){toast('✗ 删除失败: '+e.message)}}
+async function undoWithdraw(id){if(!confirm('撤回回撤：恢复数据库记录、解除墓碑（此后文档可重新入库）？'))return;try{await j('/api/item/'+id+'/undo',{method:'POST'});loadDocs();toast('✓ 已撤回（墓碑解除）')}catch(e){toast('✗ '+e.message)}}
 async function loadTagDict(){const t=await j('/api/tag-dict');
 const q=x=>esc(String(x||'')).replace(/'/g,"\\'");
 const groupHtml=(g,title)=>`<details open style="margin-bottom:8px"><summary style="cursor:pointer;font-weight:600;padding:4px 0">${title}（${g.length}）<input type="checkbox" style="margin-left:8px" onclick="event.stopPropagation();tdGroupToggle(this,this.checked)" title="全选本组"></summary><div class="card">${g.map(x=>{const n=q(x.name);
@@ -433,6 +436,12 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         return list_external_docs(cfg.resolve(cfg.storage.sqlite_path),
                                   review_db=default_review_path(cfg),
                                   limit=min(limit, 500), offset=offset, q=q)
+
+    @app.get("/api/withdrawn")
+    def withdrawn_list():
+        """已回撤文档（删除墓碑）——痕迹视图；mirror 自动回撤的条目可撤回恢复。"""
+        from vllm_kb.review import list_withdrawn
+        return list_withdrawn(default_review_path(cfg))
 
     # ---------------- 文档级标签（两层分类：主题/领域 domain、具体作用 purpose） ----------------
 
