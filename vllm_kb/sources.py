@@ -1952,7 +1952,8 @@ class HtmlSource(BaseSource):
     # 本来源**不支持**、但用户很可能放进来的格式：只用于给出指向性提示
     _LEGACY_SUFFIXES = ("*.mht", "*.mhtml", "*.url", "*.webarchive")
     # schema=2：html_convert 升级为"原位占位补回"（图文/表文位置=原文位置）+ x-* meta 收割
-    _EXTRACT_SCHEMA = 2
+    # schema=3：修复文末兜底条件写反（缺席 token 的图/表文末补回）+ x-categories 多分隔符
+    _EXTRACT_SCHEMA = 3
 
     def __init__(self, cfg: SourceCfg, project_root: Path = PROJECT_ROOT,
                  app_cfg: Optional["AppConfig"] = None):
