@@ -225,9 +225,9 @@ const result={note:(document.getElementById('rvnote')||{}).value||''};
 const vl=document.getElementById('verlevel');if(vl)result.verification=vl.value;  // 补标项认证级别（tested/expert）
 await j('/api/item/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reviewer,result})});loadQueue()}
 async function deleteDoc(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
-if(!confirm('标记删除：只删除数据库记录（表格项=整表全部行），原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
+if(!confirm('标记删除：删除数据库记录并登记墓碑（构建不再复活；表格项=整表全部行），原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
 await j('/api/item/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,note:(document.getElementById('rvnote')||{}).value||''})});loadQueue()}
-async function undoDelete(id){if(!confirm('撤回删除：恢复数据库记录并重新加入队列？'))return;await j('/api/item/'+id+'/undo',{method:'POST'});loadQueue()}
+async function undoDelete(id){if(!confirm('撤回删除：恢复数据库记录、解除墓碑（此后文档可重新入库）并重新加入队列？'))return;await j('/api/item/'+id+'/undo',{method:'POST'});loadQueue()}
 let docQuery='';
 function clearDocSearch(){docQuery='';loadDocs()}
 async function loadDocs(){const inp=document.getElementById('docsearch');if(inp)docQuery=inp.value;
@@ -265,8 +265,9 @@ $('#view-docs').innerHTML=`<h3>文档管理 — 外源文档（导入的 PDF/MD/
 async function tagEdit(sid,action,tag){const reviewer=requireReviewer();if(!reviewer)return;
 try{await j('/api/docs/tags/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,action,tag,reviewer})});loadDocs();toast('✓ 已更新标签')}catch(e){toast('✗ '+e.message)}}
 function tagAdd(sid,t){if(!t||!t.trim())return;tagEdit(sid,'add',t.trim())}
-async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？'))return
-try{await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();toast('✓ 已删除（本地文件保留）')}
+async function delExternalDoc(sid){if(!confirm('从数据库彻底删除该文档（docs+chunks+向量）？本地文件保留；将登记删除墓碑——任何构建路径（增量/资产回退/--rebuild）都不再复活它，撤回删除可恢复。确认？'))return
+try{const r=await j('/api/external-docs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid})});loadDocs();
+const cc=r.candidates_cleaned||{};toast(`✓ 已删除 + 登记墓碑（本地文件保留）${cc.auto_ignored?`，联动忽略 ${cc.auto_ignored} 条候选`:cc.pruned?`，修剪 ${cc.pruned} 条候选引用`:''}`)}
 catch(e){toast('✗ 删除失败: '+e.message)}}
 async function loadTagDict(){const t=await j('/api/tag-dict');
 const q=x=>esc(String(x||'')).replace(/'/g,"\\'");
@@ -321,13 +322,13 @@ saveReviewer(reviewer);
 try{const r=await j('/api/docs/tags/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids,action,tag,reviewer})});
 closeModal();loadDocs();toast(`✓ ${r.updated}/${sids.length} 篇已更新${r.failed.length?`（首例失败: ${r.failed[0].error}）`:''}`)}catch(e){toast('✗ '+e.message)}}
 async function docBatchDelete(retrySids){const sids=retrySids||docCheckedSids();if(!sids.length){toast('先勾选文档');return}
-if(!retrySids&&!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+向量）？本地文件保留，下次增量入库会重新入库。确认？`))return
+if(!retrySids&&!confirm(`从数据库删除选中的 ${sids.length} 篇文档（docs+chunks+向量）？本地文件保留；将登记删除墓碑——任何构建路径（增量/资产回退/--rebuild）都不再复活它们，撤回删除可恢复。确认？`))return
 const reviewer=requireReviewer();if(!reviewer)return;
 try{const r=await j('/api/external-docs/delete-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_ids:sids})});
 loadDocs();closeModal();
 const problems=[...r.failed.map(f=>`${f.source_id}：${f.error}`),...(r.still_present||[]).map(s=>`${s}：删除后仍存在于库（服务端校验）`)];
 if(problems.length){openModal(`<h4>⚠ 删除未完全成功（${r.deleted}/${sids.length} 篇已删）</h4><div class="card">${problems.map(p=>`<div class="mono" style="margin:2px 0">${esc(p)}</div>`).join('')}</div><div class="muted">失败的条目可重试；"仍存在于库"说明删除未落库（如库被占用），重试通常可解。</div><div class="actions"><button class="danger sm" onclick="docBatchDelete(${JSON.stringify([...r.failed.map(f=>f.source_id),...(r.still_present||[])]).replace(/"/g,'&quot;')})">↻ 重试剩余 ${r.failed.length+(r.still_present||[]).length} 篇</button> <button class="sm" onclick="closeModal()">关闭</button></div>`)}
-else{toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇${r.candidates_cleaned&&r.candidates_cleaned.auto_ignored?`，联动忽略 ${r.candidates_cleaned.auto_ignored} 条候选`:''}`)}}catch(e){toast('✗ '+e.message)}}
+else{toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇（墓碑已登记）${r.candidates_cleaned&&r.candidates_cleaned.auto_ignored?`，联动忽略 ${r.candidates_cleaned.auto_ignored} 条候选`:''}`)}}catch(e){toast('✗ '+e.message)}}
 function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel)).map(x=>+x.dataset.id)}
 function queueSelChanged(){const vn=queueCheckedIds('#view-queue .qchk').length,cn=queueCheckedIds('#view-queue .cchk').length;
 const vb=document.getElementById('queuebatch');if(vb)vb.style.display=vn?'block':'none';const vc=document.getElementById('queuebatch-n');if(vc)vc.textContent=vn;
@@ -623,7 +624,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     @app.post("/api/external-docs/delete")
     def external_doc_delete(body: dict):
         """彻底删除外源文档（数据库四层全删：docs + chunks_fts + chunks_meta + 向量），
-        本地资产文件不动；下次增量入库时文件仍在本地则重新入库。
+        本地资产文件不动；登记删除墓碑——任何构建路径（增量/资产回退/--rebuild）都
+        不再复活该 sid，撤回删除（待实际删除列表）解除。
         删除后联动修剪 tag_candidate 队列里的悬空引用（快照空则自动忽略该候选）。"""
         from vllm_kb.review import (delete_external_doc, prune_tag_candidates_for_doc,
                                     record_tombstones)
