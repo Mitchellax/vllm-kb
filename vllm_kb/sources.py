@@ -45,6 +45,7 @@ from .tagging import (
     extract_tags,
     headings_from_markdown,
     headings_from_pdf,
+    tier_for,
 )
 
 if TYPE_CHECKING:  # 仅类型标注用，避免循环导入
@@ -119,6 +120,8 @@ _JUNK_STEM_RE = re.compile(r"^(?:[0-9a-fA-F\-_]+|[0-9]+|\W+)$")
 # 泛化页名（page.html 统一文件名布局等）：stem 无信息量，标题回退解析器提取值
 _GENERIC_STEM_RE = re.compile(r"^(?:page|index|default|article|view|detail|main|home)$",
                               re.IGNORECASE)
+# 审计元数据日期门（x-created → docs.created_at）：ISO 日期前缀才透传，脏值不进时序列
+_X_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 def _stem_title(stem: str, extracted: str) -> str:
@@ -2085,6 +2088,21 @@ class HtmlSource(BaseSource):
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
             tags, cands = extract_tags(stem, headings_from_markdown(parsed["body"]),
                                        registry=registry)
+            # x-categories（审计侧人工分类）消费：词典命中 → 自动标签；未收录 → 强候选
+            # （tag_candidate 队列，采纳后全局进词典）——与 extract_tags 同一产出契约，
+            # 复用候选→采纳→词典全链。page.html 布局下文件名/标题信号薄，
+            # 审计分类是打标的主要信号源。
+            meta = parsed.get("meta") or {}
+            _seen = {t.name for t in tags} | {c.name for c in cands}
+            for cat in (meta.get("x-categories") or "").split(","):
+                cat = cat.strip()
+                if not cat or cat in _seen:
+                    continue
+                if registry.contains(cat):
+                    tags.append(TagEntry(name=cat, tier=registry.tier(cat)))
+                else:
+                    cands.append(TagEntry(name=cat, tier=tier_for(cat)))
+                _seen.add(cat)
             extra: dict[str, Any] = {
                 "asset": {"asset_id": asset_id, "sha256": sha, "format": "html"},
                 "quality": quality,
@@ -2103,7 +2121,8 @@ class HtmlSource(BaseSource):
                 url=str(parsed.get("source_url") or ""),
                 title=_stem_title(stem, str(parsed.get("title") or "")),
                 body=body,
-                created_at=None,
+                created_at=(meta["x-created"]
+                            if _X_DATE_RE.match(meta.get("x-created") or "") else None),
                 component="",
                 tags=[t.name for t in tags],
                 extra=extra,

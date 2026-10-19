@@ -838,6 +838,11 @@ canonicalize 以**网页所在目录**为基准解析 → 资产化 + OCR（`dat
   x-author/x-categories/x-expiry 等）整体收割进 `extra["meta"]`，不再丢弃；
   `docs.url` 优先取 x-source-url，其次浏览器"另存为"残留的
   `<!-- saved from url=(NNNN)… -->` 注释（无则留空）；
+  **消费**：x-categories → 打标管道（词典命中 → 自动标签；未收录 → tag_candidate
+  候选队列，采纳后全局进词典——审计侧人工分类是 page.html 布局的主要打标信号）；
+  x-created → `docs.created_at`（ISO 日期前缀校验，脏值留空；文档管理排序/遥测时序）；
+  x-updated/x-status/x-author/x-expiry 暂存 meta 待后续消费（status 驱动撤回、
+  expiry 过期治理是未来扩展项）；
 - **统一 page.html 布局**（审计来源每篇文章一个目录、文件名固定 page.html）：同名靠
   相对路径指纹消歧（`html:page--<sha8>`，内容改动下稳定，目录改名=删旧增新）；
   泛名 stem（page/index/default/…）不顶替 `<title>` 提取的真实标题；

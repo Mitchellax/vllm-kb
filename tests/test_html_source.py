@@ -3,6 +3,7 @@ data:URI 资产/远程占位）、缓存命中、缺依赖降级（lxml 跳过 /
 .mht 指向性提示、空正文跳过、路径不泄漏、x-* 审计元数据、page.html 统一文件名布局、
 装饰图（1x1）过滤。"""
 import base64
+import os
 import struct
 import sys
 import tempfile
@@ -229,6 +230,73 @@ class TestAuditedMeta(HtmlSourceCase):
         self.assertEqual(m["x-categories"], "组网, 升级")   # 同名重复 → 逗号连接
         for k in ("x-created", "x-updated", "x-status", "x-expiry"):
             self.assertIn(k, m)
+        # 空词典（app_cfg=None）→ categories 全部走强候选（词典命中分支见
+        # TestCategoriesToTags）
+        cands = {c["name"] for c in d.extra["tag_candidates"]}
+        self.assertIn("组网", cands)
+        self.assertIn("升级", cands)
+        self.assertNotIn("组网", d.tags)
+        # x-created → docs.created_at（ISO 日期透传，进时序列）
+        self.assertEqual(d.created_at, "2026-10-01")
+
+    def test_created_at_dirty_value_left_empty(self):
+        """x-created 非 ISO 日期前缀 → created_at 留空（脏值不进时序列，meta 原样保留）。"""
+        (self.imports / "page.html").write_text(page_html().replace(
+            '<meta charset="utf-8">',
+            '<meta charset="utf-8">\n<meta name="x-created" content="上月发布">'),
+            encoding="utf-8")
+        img = self.imports / "img"
+        img.mkdir()
+        (img / "a.png").write_bytes(base64.b64decode(_PNG_B64))
+        self.src.pull()
+        d = self.src.canonicalize()[0]
+        self.assertIsNone(d.created_at)
+        self.assertEqual(d.extra["meta"]["x-created"], "上月发布")
+
+
+class TestCategoriesToTags(HtmlSourceCase):
+    def setUp(self):
+        super().setUp()
+        # app_cfg 参与路径解析（resolve 会吃掉 "data/" 前缀改挂数据根）——
+        # 数据根钉到 tmp/data，使 data/imports/html 与 HtmlSourceCase 夹具重合
+        self._old_data_root = os.environ.get("VLLM_KB_DATA_ROOT")
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")
+
+    def tearDown(self):
+        if self._old_data_root is None:
+            os.environ.pop("VLLM_KB_DATA_ROOT", None)
+        else:
+            os.environ["VLLM_KB_DATA_ROOT"] = self._old_data_root
+        super().tearDown()
+
+    def test_registered_category_becomes_tag_others_candidate(self):
+        """x-categories 消费：词典命中 → 自动标签；未收录 → tag_candidate 强候选。"""
+        import json
+
+        cfg_path = self.root / "appcfg.json"
+        cfg_path.write_text(json.dumps({
+            "embedding": {"provider": "echo", "dimensions": 64},
+            "tags": {"registry": [{"name": "组网", "tier": "domain"}]},
+        }, ensure_ascii=False), encoding="utf-8")
+        from vllm_kb.config import AppConfig
+
+        app_cfg = AppConfig.load(str(cfg_path), require_keys=False)
+        src = HtmlSource(self.cfg, project_root=self.root, app_cfg=app_cfg)
+        (self.imports / "page.html").write_text(page_html().replace(
+            '<meta charset="utf-8">',
+            '<meta charset="utf-8">\n'
+            '<meta name="x-categories" content="组网">\n'
+            '<meta name="x-categories" content="升级">'), encoding="utf-8")
+        img = self.imports / "img"
+        img.mkdir()
+        (img / "a.png").write_bytes(base64.b64decode(_PNG_B64))
+        src.pull()
+        d = src.canonicalize()[0]
+        self.assertIn("组网", d.tags)                       # 词典命中 → 自动标签
+        self.assertNotIn("升级", d.tags)                    # 未收录不直接打标
+        cands = {c["name"] for c in d.extra["tag_candidates"]}
+        self.assertIn("升级", cands)                        # → 候选队列人工采纳
+        self.assertNotIn("组网", cands)
 
 
 class TestPageHtmlLayout(HtmlSourceCase):
