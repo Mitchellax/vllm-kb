@@ -60,7 +60,7 @@
 
 | 阶段 | 处理 | 产物 |
 |---|---|---|
-| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR，PR 带 head 三元组 `head_repo/head_branch/head_sha`——fork PR 的来源仓/分支/锁定 commit，与 fork 快照对齐）+ 评论；限流、重试、`data/checkpoints/{source_id}.json` 断点续传；raw 与 checkpoint 均记 `updated_at`，增量窗口内已拉条目远端更新（含 open→closed）自动重拉覆盖；`--numbers --force-numbers` 强制重拉单条 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/`）原始 JSON 快照（**事实源**，可重放） |
+| 1. 拉取 | `GithubSource.pull()`：REST/GraphQL（issues 含 PR，PR 带 head 三元组 `head_repo/head_branch/head_sha`——fork PR 的来源仓/分支/锁定 commit，与 fork 快照对齐）+ 评论 + **timeline**（`fetch_timeline`，REST 分页 per_page=100：`cross-referenced` 事件 = 页面 "Mentioned in" 区，REFERENCES 边数据源；`/events` 端点不含此类事件，必须走 `/timeline`）；限流、重试、`data/checkpoints/{source_id}.json` 断点续传；raw 与 checkpoint 均记 `updated_at`，增量窗口内已拉条目远端更新（含 open→closed）自动重拉覆盖；`--numbers --force-numbers` 强制重拉单条 | `data/raw/{source_id}/`（如 `data/raw/github`、`data/raw/vllm-ascend`，子目录 `issues/` `prs/` `comments/` `timeline/`）原始 JSON 快照（**事实源**，可重放） |
 | 2. 规范化 | `src.canonicalize()`：原始 JSON → 统一 `KbDocument`（source_id / title / body / 组件 / 版本区间 / status / extra） | 追加/upsert 到统一 `data/raw/canonical.jsonl`（按 source_id 幂等） |
 | 3. 入库 | `ingest_docs()`（见 2.6） | LanceDB 向量 + kb.sqlite3 |
 
@@ -258,7 +258,9 @@ Agent 侧 `client.py ocr <图片路径>`（本地只做 base64 编码）→ `POS
 输入：统一 `canonical.jsonl` + `data/parsed/`（手册表格→ErrorCode 节点）+ `kb.sqlite3`
 （`doc_tags` 人工标签覆盖层）+ `config.tags.registry`（词典 Tag 节点）。
 输出：`data/graph` —— Issue/PR/Release/Doc/Interface/Tag 节点 + FIXES / MERGED_IN / MENTIONS /
-DOCUMENTS / CORROBORATES / TAGGED_WITH 边。
+DOCUMENTS / CORROBORATES / TAGGED_WITH / **REFERENCES**（timeline `cross-referenced` 事件——
+PR 提及 issue 无 fixes 关键字、issue 互引等**非修复语义**关联；无 FIXES 边时（配置规避/
+使用错误结案）是 `graph chain` related 段的主要线索面）边。
 
 ### 2.6 落库细节（`ingest_docs`，幂等双哈希增量）
 

@@ -4,7 +4,7 @@
     "name": "vllm-kb",
     "data_root": "data"
   },
-  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列，每行 cell 拼接入库，见 vllm_kb/sources.py)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
+  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled/deletion_policy(keep|mirror，默认 keep：keep=增量语义不删，文件消失=静默偏离+stray 告警；mirror=本地原始数据优先，快照对账，连续 2 次构建缺席自动回撤（四层删+墓碑+待实际删除可撤回），首轮全量对账清历史滞留——前提同 kind 唯一来源，见 docs/DESIGN-audited-git-source.md)；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments/fetch_timeline(true=采集 issue timeline 的 cross-referenced 事件即页面 Mentioned in 区，建图 REFERENCES 关联边；存量回填跑一轮增量拉取即补采)。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列，每行 cell 拼接入库，见 vllm_kb/sources.py)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
   "sources": [
     {
       "id": "vllm-ascend",
@@ -16,6 +16,8 @@
       "issue_state": "all",
       "include_prs": true,
       "fetch_comments": true,
+      "fetch_timeline": true,
+      "deletion_policy": "keep",
       "enabled": true
     },
     {
@@ -32,6 +34,8 @@
       "sort": "created",
       "direction": "desc",
       "fetch_comments": true,
+      "fetch_timeline": true,
+      "deletion_policy": "keep",
       "request_timeout_seconds": 30,
       "max_retries": 3,
       "retry_backoff_seconds": 5,

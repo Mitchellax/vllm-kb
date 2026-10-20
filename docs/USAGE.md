@@ -1310,6 +1310,14 @@ python skills/vllm-kb/client.py graph tags HCCL
 python skills/vllm-kb/client.py graph evidence pdf:Atlas A3 中心推理和训练硬件 26.1.x npu-smi 命令参考 02
 ```
 
+**REFERENCES 关联边**（2026-10 新增）：github_pull 采集 issue timeline 的 `cross-referenced`
+事件（页面底部 "Mentioned in" 区）→ `extra.crossrefs` → 建图 REFERENCES 边（Issue/PR 四组合，
+双端在库才建）。语义是**提及/引用，非修复**：PR 正文提到 issue 但没写 fixes 关键字（如
+"tracked by #8938"）、issue 互引、上游仓引用等都入边。`graph chain` 输出 `related` 段——
+**无 fixes 边 ≠ 未解决**（配置规避/使用错误/讨论结案都可能），此时看 related：已合并
+（merged）的关联 PR 通常含修复或规避动作的线索。采集开关 `fetch_timeline`（默认开）；
+存量回填：跑一轮增量拉取即对旧数据补采 timeline（1 请求/issue，限流内）。
+
 **图内容说明**：Issue/PR/Release（修复链路）+ Operator/ErrorCode/Model/Version（签名实体）+
 **Doc**（PDF 手册/Markdown 等非 github 文档）+ **Interface**（手册"命令格式"段提取的工具.子命令，
 如 `hccn_tool.bandwidth`）+ **Tag**（文档级标签，两级分类）。文档经两条 `DOCUMENTS` 边入图：
