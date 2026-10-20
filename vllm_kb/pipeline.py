@@ -84,6 +84,14 @@ def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
     不中断流水线。
     """
     sources = build_sources(cfg)
+    # mirror 前提校验：sid 前缀按 kind 划分，同 kind 多来源时首轮存量对账无法区分
+    # 文档归属（会误把其他来源的存量文档计入缺席）——mirror 语义要求该 kind 唯一来源
+    _mirror_types = [s.cfg.type for s in sources
+                     if str(getattr(s.cfg, "deletion_policy", "keep") or "keep") == "mirror"]
+    _dup = sorted({t for t in _mirror_types if _mirror_types.count(t) > 1})
+    if _dup:
+        print(f"[warn] mirror 来源类型重复: {_dup}——mirror 语义要求该类型的导入路径唯一，"
+              f"否则存量对账会误计其他来源的文档，请改回 keep 或合并来源", flush=True)
     all_docs: list[KbDocument] = []
     for src in sources:
         try:
@@ -105,7 +113,8 @@ def collect_docs(cfg: AppConfig, pull: bool, limit: int | None,
                     from .source_sync import reconcile_mirror_source
                     rr = reconcile_mirror_source(
                         cfg, src.id, [d.source_id for d in docs],
-                        cfg.resolve(cfg.storage.sqlite_path), default_review_path(cfg))
+                        cfg.resolve(cfg.storage.sqlite_path), default_review_path(cfg),
+                        sid_prefix=src.kind.sid_prefix)
                     print(f"[sync:{src.id}] 对账: 回撤 {len(rr['withdrawn'])} · "
                           f"宽限中 {len(rr['grace'])} · 解除墓碑 {len(rr['untombstoned'])}"
                           + ("（首轮建快照）" if rr["first_round"] else ""), flush=True)

@@ -66,10 +66,11 @@ class SourceSyncTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def _reconcile(self, discovered):
+    def _reconcile(self, discovered, sid_prefix="md:"):
         from vllm_kb.source_sync import reconcile_mirror_source
 
-        return reconcile_mirror_source(self.cfg, "audited", discovered, self.kb, self.rdb)
+        return reconcile_mirror_source(self.cfg, "audited", discovered, self.kb,
+                                       self.rdb, sid_prefix=sid_prefix)
 
     def test_grace_then_withdraw_then_reappear(self):
         """首轮建快照不删除；缺席 1 次宽限；连续 2 次缺席 → 自动回撤（四层删+墓碑+
@@ -120,7 +121,35 @@ class SourceSyncTest(unittest.TestCase):
         self.assertTrue(r["first_round"])
         self.assertEqual(r["withdrawn"], [])
         self.assertIsNotNone(self._row("md:keepme"))
-        self.assertEqual(json.loads(sp.read_text(encoding="utf-8")), {})
+        # 首轮全量对账：keepme 在库但缺席 → 计宽限 1（次轮再缺席即回撤，本轮不删）
+        self.assertEqual(json.loads(sp.read_text(encoding="utf-8")), {"md:keepme": 1})
+
+    def test_first_round_seeds_historically_missing(self):
+        """开启 mirror 前源文件就已缺失的存量文档：首轮全量对账计入宽限，
+        次轮再缺席即自动回撤（四层删+墓碑）——历史滞留自愈。"""
+        from vllm_kb.review import load_tombstones
+
+        self._ingest("md:live")
+        self._ingest("md:ghost")
+        r0 = self._reconcile(["md:live"])   # 首轮：ghost 在库但缺席 → 宽限
+        self.assertTrue(r0["first_round"])
+        self.assertEqual(r0["grace"], ["md:ghost"])
+        self.assertIsNotNone(self._row("md:ghost"))
+        r1 = self._reconcile(["md:live"])   # 次轮：缺席第 2 次 → 回撤
+        self.assertEqual(r1["withdrawn"], ["md:ghost"])
+        self.assertIsNone(self._row("md:ghost"))
+        self.assertIn("md:ghost", load_tombstones(self.rdb))
+        self.assertIsNotNone(self._row("md:live"))
+
+    def test_first_round_scoped_to_kind_prefix(self):
+        """首轮存量对账按 sid 前缀圈定——其他 kind 的文档不进对账范围。"""
+        self._ingest("md:live")
+        self._ingest("pdf:other")
+        r0 = self._reconcile(["md:live"])
+        self.assertEqual(r0["grace"], [])        # pdf:other 不在 md: 范围
+        r1 = self._reconcile(["md:live"])
+        self.assertEqual(r1["withdrawn"], [])
+        self.assertIsNotNone(self._row("pdf:other"))
 
     def test_repeated_withdraw_idempotent(self):
         """同一 sid 反复回撤不炸（审核项幂等 + 墓碑 REPLACE）。"""
