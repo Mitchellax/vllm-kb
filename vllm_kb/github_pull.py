@@ -25,7 +25,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
@@ -95,6 +95,7 @@ class GithubPuller:
         self.sort = source.get("sort", "created")
         self.direction = source.get("direction", "desc")
         self.fetch_comments = source.get("fetch_comments", True)
+        self.fetch_timeline = bool(source.get("fetch_timeline", True))
         self.request_timeout_seconds = source.get("request_timeout_seconds", 30)
         self.max_retries = source.get("max_retries", 3)
         self.retry_backoff_seconds = source.get("retry_backoff_seconds", 5)
@@ -616,6 +617,13 @@ class GithubPuller:
                     comments_done = bool(rec and rec.get("comments")) or (
                         self.raw_dir / "comments" / f"{number}.json").exists()
                     if str(number) in known and (not self.fetch_comments or comments_done):
+                        # timeline 事后补采：开关打开且旧数据无 timeline raw → 仅补 timeline
+                        #（canonicalize 侧消费，下次 canonical 再生即得 REFERENCES 边）
+                        if self.fetch_timeline and not (
+                                self.raw_dir / "timeline" / f"{number}.json").exists():
+                            events = self._get_timeline(number)
+                            if events:
+                                self._save_raw("timeline", number, events)
                         skip_count += 1
                         continue
                 else:
@@ -642,9 +650,15 @@ class GithubPuller:
                 self._save_raw(kind, number, item)
                 if comments:
                     self._save_raw("comments", number, comments)
+                # timeline（cross-referenced 事件）：新拉或重拉的编号顺带采集/刷新
+                if self.fetch_timeline and (freshly_pulled or not comments_done):
+                    events = self._get_timeline(number)
+                    if events:
+                        self._save_raw("timeline", number, events)
                 cp["issues"][str(number)] = {
                     "fetched_at": _now_iso(),
                     "comments": comments_done or self.fetch_comments,
+                    "timeline": self.fetch_timeline,
                     "updated_at": node.get("updatedAt"),
                 }
                 if freshly_pulled:
@@ -794,9 +808,31 @@ class GithubPuller:
             params = None
         return all_comments
 
+    def _get_timeline(self, number: int) -> list[dict]:
+        """issue timeline（REST，分页 per_page=100）——cross-referenced 事件权威来源。
+
+        GitHub 页面 issue 底部的 "Mentioned in" 区即由此驱动；默认页只回 30 条，
+        必须显式 per_page=100 并翻页（实测 #8938 的 cross-ref 排在第一页之后）。
+        """
+        url = f"{self.base}/repos/{self.repo}/issues/{number}/timeline"
+        params = {"per_page": 100}
+        all_events: list[dict] = []
+        for _ in range(10):  # 100/页 × 10 = 1000 事件上限（防御性；正常 issue 远小于此）
+            r = self._get(url, params)
+            batch = parse_json(r, f"#{number} timeline 响应")
+            if not batch:
+                break
+            all_events.extend(batch)
+            if "next" not in r.links:
+                break
+            url = r.links["next"]["url"]
+            params = None
+        return all_events
+
     # ---------------- 规范化 ----------------
 
-    def _to_doc(self, item: dict, comments: list[dict]) -> KbDocument:
+    def _to_doc(self, item: dict, comments: list[dict],
+                crossrefs: Optional[list[dict]] = None) -> KbDocument:
         number = item["number"]
         labels = [l.get("name", "") for l in item.get("labels", []) if l.get("name")]
         raw_body = item.get("body") or ""
@@ -854,6 +890,10 @@ class GithubPuller:
                 extra["component_versions"] = component_versions
         if env_section:
             extra["environment"] = env_section
+        # 交叉引用（GitHub "Mentioned in" 区）：graph REFERENCES 边的数据源。
+        # 空列表不落 extra——canonical 内容指纹稳定，重拉无新引用时不产生 diff。
+        if crossrefs:
+            extra["crossrefs"] = crossrefs
 
         # source_id 带 repo 命名空间：不同仓库的 issue/PR 编号不冲突
         kind = "pr" if is_pr else "issue"
@@ -1007,7 +1047,12 @@ class GithubPuller:
             self._save_raw(kind, n, item)
             if comments:
                 self._save_raw("comments", n, comments)
+            if self.fetch_timeline:
+                events = self._get_timeline(n)
+                if events:
+                    self._save_raw("timeline", n, events)
             cp["issues"][sn] = {"fetched_at": _now_iso(), "comments": self.fetch_comments,
+                                "timeline": self.fetch_timeline,
                                 "updated_at": item.get("updated_at")}
             new += 1
             tag = "（强制重拉）" if force else ""
@@ -1020,6 +1065,39 @@ def _now_iso() -> str:
     import datetime
 
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _crossrefs_from_timeline(events: list[dict]) -> list[dict]:
+    """timeline 事件 → crossrefs（cross-referenced 的引用方 issue/PR 摘要）。
+
+    只收 `cross-referenced`（GitHub 追踪的交叉引用——PR 正文提到 issue 但没写
+    fixes 关键字、其他 issue/上游仓引用本 issue，即页面 "Mentioned in" 区）。
+    connected（手动关联）/ referenced（commit 引用）v1 不收。
+    事件形状（实测）：{"source": {"issue": {number, title, state, pull_request?,
+    repository: {full_name}}}, "event": "cross-referenced"}。同引用方去重。
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for e in events or []:
+        if (e.get("event") or "") != "cross-referenced":
+            continue
+        src = (e.get("source") or {}).get("issue") or {}
+        n = src.get("number")
+        repo = ((src.get("repository") or {}).get("full_name") or "")
+        if not n or not repo:
+            continue
+        k = (repo, int(n))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({
+            "repo": repo,
+            "number": int(n),
+            "is_pr": bool(src.get("pull_request")),
+            "title": src.get("title") or "",
+            "state": src.get("state") or "",
+        })
+    return out
 
 
 def load_canonical(path: str | Path) -> list[KbDocument]:
@@ -1058,6 +1136,14 @@ def recanonicalize(source: SourceCfg, project_root: Path = PROJECT_ROOT) -> list
             cp = raw / "comments" / f"{item['number']}.json"
             if cp.exists():
                 comments = json.loads(cp.read_text(encoding="utf-8"))
-            docs.append(puller._to_doc(item, comments))
+            crossrefs: list[dict] = []
+            tp = raw / "timeline" / f"{item['number']}.json"
+            if tp.exists():
+                try:
+                    crossrefs = _crossrefs_from_timeline(
+                        json.loads(tp.read_text(encoding="utf-8")))
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"[warn] timeline #{item['number']} 解析失败，忽略引用: {e}")
+            docs.append(puller._to_doc(item, comments, crossrefs=crossrefs))
     print(f"[github:{source.id}] recanonicalize 完成：{len(docs)} 条")
     return docs

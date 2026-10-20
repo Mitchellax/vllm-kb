@@ -541,6 +541,7 @@ class TestGithubConvert(unittest.TestCase):
 
             puller._graphql_request = fake_request
             puller._get_comments = lambda number: rest_calls.append(number) or []
+            puller._get_timeline = lambda number: []  # timeline 采集不在本测范围（避免触网）
             cp = {"issues": {}}
             g = {}
             new_count, refresh_count, skip_count = puller._collect_graphql(cp, g, kind="issues")
@@ -872,7 +873,7 @@ class TestPullIncremental(unittest.TestCase):
 
         src = make_source(token="fake-token",
                           raw_dir=f"{td}/raw", checkpoint_file=f"{td}/cp.json",
-                          fetch_comments=False)
+                          fetch_comments=False, fetch_timeline=False)
         puller = GithubPuller(src, PROJECT_ROOT)
         puller._save_checkpoint({
             "issues": {"1": {"fetched_at": "x", "comments": False}},
@@ -1178,6 +1179,7 @@ class TestPullIncremental(unittest.TestCase):
                                          "nodes": []}}
 
             puller._graphql_request = fake_request
+            puller._get_timeline = lambda number: []  # timeline 采集不在本测范围（避免触网）
             with redirect_stdout(StringIO()):
                 n = puller.pull(incremental=True)
             self.assertEqual(n, 1)
@@ -1303,7 +1305,7 @@ class TestPullMissing(unittest.TestCase):
 
         src = make_source(token="fake-token",
                           raw_dir=f"{td}/raw", checkpoint_file=f"{td}/cp.json",
-                          fetch_comments=False)
+                          fetch_comments=False, fetch_timeline=False)
         puller = GithubPuller(src, PROJECT_ROOT)
         puller._save_checkpoint({
             "issues": {"2": {"fetched_at": "x", "comments": False}},
@@ -1525,6 +1527,135 @@ class TestPullMissing(unittest.TestCase):
             self.assertEqual(item["updated_at"], "2026-06-03T00:00:00Z")
             cp2 = puller._load_checkpoint()
             self.assertEqual(cp2["issues"]["77"]["updated_at"], "2026-06-03T00:00:00Z")
+
+
+class TestTimelineCrossrefs(unittest.TestCase):
+    """timeline 采集：cross-referenced 事件 → extra.crossrefs（graph REFERENCES 边数据源）。
+
+    真实形状锚点（vllm-ascend#8938 实测）：
+    {"source": {"issue": {number, title, state, pull_request?, repository.full_name}},
+     "event": "cross-referenced"}——GitHub 页面 "Mentioned in" 区的数据源。
+    """
+
+    def setUp(self):
+        self.puller = GithubPuller(make_source(), PROJECT_ROOT)  # 仅构造，不发请求
+
+    @staticmethod
+    def _xref_event(number, repo="vllm-project/vllm-ascend", is_pr=True):
+        issue = {"number": number, "title": f"ref {number}", "state": "closed",
+                 "repository": {"full_name": repo}}
+        if is_pr:
+            issue["pull_request"] = {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"}
+        return {"event": "cross-referenced", "source": {"type": "issue", "issue": issue}}
+
+    def test_crossrefs_from_timeline_shape(self):
+        from vllm_kb.github_pull import _crossrefs_from_timeline
+
+        events = [
+            {"event": "labeled", "label": {"name": "bug"}},                # 忽略
+            {"event": "mentioned"},                                        # 忽略（@人）
+            {"event": "referenced", "commit_id": "a" * 40},                # 忽略（commit 引用）
+            self._xref_event(10260),                                       # PR 引用
+            self._xref_event(9001, is_pr=False),                           # issue 引用
+            self._xref_event(10260),                                       # 重复 → 去重
+        ]
+        self.assertEqual(_crossrefs_from_timeline(events), [
+            {"repo": "vllm-project/vllm-ascend", "number": 10260, "is_pr": True,
+             "title": "ref 10260", "state": "closed"},
+            {"repo": "vllm-project/vllm-ascend", "number": 9001, "is_pr": False,
+             "title": "ref 9001", "state": "closed"},
+        ])
+
+    def test_crossrefs_missing_repo_or_number_skipped(self):
+        from vllm_kb.github_pull import _crossrefs_from_timeline
+
+        events = [
+            {"event": "cross-referenced", "source": {"issue": {"number": 5}}},          # 无 repo
+            {"event": "cross-referenced", "source": {"issue": {"repository": {"full_name": "o/r"}}}},  # 无 number
+            {"event": "cross-referenced", "source": {}},                                 # 无 issue
+        ]
+        self.assertEqual(_crossrefs_from_timeline(events), [])
+        self.assertEqual(_crossrefs_from_timeline([]), [])
+
+    def test_to_doc_carries_crossrefs(self):
+        xrefs = [{"repo": "vllm-project/vllm-ascend", "number": 10260, "is_pr": True,
+                  "title": "[EPLB][Test] Change mooncake port", "state": "closed"}]
+        doc = self.puller._to_doc(make_item(number=8938, body="b"), [], crossrefs=xrefs)
+        self.assertEqual(doc.extra["crossrefs"], xrefs)
+        doc2 = self.puller._to_doc(make_item(number=8938, body="b"), [])
+        self.assertNotIn("crossrefs", doc2.extra)  # 空不落 extra——canonical 指纹稳定
+
+    def test_get_timeline_paginates(self):
+        """timeline 翻页：per_page=100 + Link next 追到尾页。
+
+        默认页只有 30 条——实测 #8938 的 cross-referenced 排在第一页之后，
+        不翻页就会漏采（本测试钉住这个回归）。
+        """
+        page1 = [{"event": "labeled"}] * 100
+        page2 = [self._xref_event(10260)]
+        seen = []
+
+        def fake_get(url, params=None):
+            seen.append((url, dict(params or {})))
+            if len(seen) == 1:
+                return type("R", (), {"json": lambda self: page1,
+                                      "links": {"next": {"url": "https://api.github.com/x?page=2"}}})()
+            return type("R", (), {"json": lambda self: page2, "links": {}})()
+
+        self.puller._get = fake_get
+        events = self.puller._get_timeline(8938)
+        self.assertEqual(len(events), 101)
+        self.assertIn("/timeline", seen[0][0])
+        self.assertEqual(seen[0][1].get("per_page"), 100)
+
+    def test_pull_single_saves_timeline_raw(self):
+        """REST 补拉：fetch_timeline 默认开启 → timeline/{n}.json 落盘。"""
+        import tempfile
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as td:
+            src = make_source(token="t", raw_dir=f"{td}/raw",
+                              checkpoint_file=f"{td}/cp.json", fetch_comments=False)
+            puller = GithubPuller(src, PROJECT_ROOT)
+            issue_data = {
+                "number": 8938, "title": "t", "body": "b", "state": "closed",
+                "created_at": "2026-05-07T00:00:00Z", "closed_at": "2026-07-21T00:00:00Z",
+                "html_url": "https://github.com/vllm-project/vllm/issues/8938",
+                "labels": [], "user": {"login": "z"},
+            }
+
+            def fake_get(url, params=None):
+                if "/timeline" in url:
+                    tl = [self._xref_event(10260)]  # 先取值：lambda 的 self 是 R 实例
+                    return type("R", (), {"json": lambda s: tl, "links": {}})()
+                return type("R", (), {"json": lambda s: issue_data, "links": {}})()
+
+            puller._get = fake_get
+            with redirect_stdout(StringIO()):
+                puller.pull(numbers=[8938])
+            tp = Path(td) / "raw" / "timeline" / "8938.json"
+            self.assertTrue(tp.exists())
+            events = json.loads(tp.read_text(encoding="utf-8"))
+            self.assertEqual(events[0]["event"], "cross-referenced")
+
+    def test_recanonicalize_consumes_timeline(self):
+        """canonical 再生：raw timeline 的 cross-referenced → doc.extra.crossrefs。"""
+        import tempfile
+
+        from vllm_kb.github_pull import recanonicalize
+
+        with tempfile.TemporaryDirectory() as td:
+            src = make_source(token="t", raw_dir=f"{td}/raw",
+                              checkpoint_file=f"{td}/cp.json", fetch_comments=False)
+            puller = GithubPuller(src, PROJECT_ROOT)
+            item = make_item(number=8938, body="b")
+            item["user"] = {"login": "z"}
+            puller._save_raw("issues", 8938, item)
+            puller._save_raw("timeline", 8938, [self._xref_event(10260)])
+            docs = recanonicalize(src, Path(td))
+            self.assertEqual(len(docs), 1)
+            self.assertEqual(docs[0].extra["crossrefs"][0]["number"], 10260)
 
 
 if __name__ == "__main__":

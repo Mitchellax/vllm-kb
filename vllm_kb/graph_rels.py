@@ -67,6 +67,9 @@ class GraphExtract:
     mentions: dict[str, set[str]] = field(default_factory=dict)  # kind -> 实体值集合
     merged_at: str = ""  # PR 用
     tags: list[str] = field(default_factory=list)  # 标题词典命中标签（github 源无 canonical tags 时用）
+    # 交叉引用（github_pull timeline 的 cross-referenced 事件）：
+    # [{repo, number, is_pr, title, state}]——REFERENCES 边数据源（非修复语义）
+    crossrefs: list[dict] = field(default_factory=list)
 
 
 def extract_fix_refs(text: str, repo: str) -> list[tuple[str, int]]:
@@ -201,15 +204,18 @@ def extract_doc_relations(
     signal_words: Optional[list] = None,
     title: str = "",
     registry=None,
+    extra: Optional[dict] = None,
 ) -> GraphExtract:
-    """一条 canonical 记录的完整关系抽取（FIXES + MENTIONS + 标题标签）。
+    """一条 canonical 记录的完整关系抽取（FIXES + REFERENCES + MENTIONS + 标题标签）。
 
     registry: TagRegistry（config.tags.registry）——提供时对标题做词典子串命中提取标签，
     供没有 canonical tags 的 github 源参考同一词典（"其他源建图时提取关键字同样需要参考"）。
+    extra: canonical extra——提供时提取 crossrefs（github_pull timeline 采集的交叉引用）。
     """
     from .tagging import extract_tags
 
     ex = GraphExtract(source_id=source_id, repo=repo, number=number, source_type=source_type)
+    ex.crossrefs = list((extra or {}).get("crossrefs") or [])
     # 标题标签（词典命中；source 侧已提取 canonical tags 的文档由建图时并集合并）
     if registry is not None and title:
         matched, _ = extract_tags("", [title], registry=registry)

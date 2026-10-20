@@ -354,5 +354,92 @@ class TestGraphBuildAndQuery(unittest.TestCase):
             b.close()
 
 
+class TestReferencesEdges(unittest.TestCase):
+    """REFERENCES 边（timeline cross-referenced → extra.crossrefs）：
+    提及/关联语义（非修复），无 FIXES 边时的线索面（#8938 实景：PR 正文
+    "tracked by issue #8938" 无 fixes 关键字 → 无 FIXES 边但有 REFERENCES 边）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        # issue 8938 被 PR 10260（同仓）与 issue 9001（同仓）提及；
+        # 跨仓 vllm#24999 与同仓 99999 未在库中 → 端点过滤后不建边
+        issue = {
+            "source_type": "github_issue",
+            "source_id": "github:vllm-project-vllm-ascend:issue:8938",
+            "url": "https://github.com/vllm-project/vllm-ascend/issues/8938",
+            "title": "ZMQ Address already in use",
+            "body": "kv_port conflict.",
+            "status": "closed",
+            "extra": {
+                "repo": "vllm-project/vllm-ascend", "github_number": 8938,
+                "crossrefs": [
+                    {"repo": "vllm-project/vllm-ascend", "number": 10260,
+                     "is_pr": True, "title": "[EPLB][Test] Change mooncake port",
+                     "state": "closed"},
+                    {"repo": "vllm-project/vllm-ascend", "number": 9001,
+                     "is_pr": False, "title": "dup report", "state": "open"},
+                    {"repo": "vllm-project/vllm", "number": 24999,
+                     "is_pr": True, "title": "upstream pr", "state": "merged"},
+                    {"repo": "vllm-project/vllm-ascend", "number": 99999,
+                     "is_pr": False, "title": "ghost", "state": "open"},
+                ],
+            },
+        }
+        pr = {
+            "source_type": "github_pr",
+            "source_id": "github:vllm-project-vllm-ascend:pr:10260",
+            "url": "https://github.com/vllm-project/vllm-ascend/pull/10260",
+            "title": "[EPLB][Test] Change mooncake port",
+            "body": "The port occupation issue is tracked by issue #8938.",
+            "status": "merged",
+            "extra": {"repo": "vllm-project/vllm-ascend", "github_number": 10260,
+                      "merged": True, "merged_at": "2026-06-10T09:13:30Z"},
+        }
+        p = Path(self.tmp.name) / "canonical.jsonl"
+        with p.open("w", encoding="utf-8") as f:
+            for doc in (issue, pr):
+                f.write(json.dumps(doc, ensure_ascii=True) + "\n")
+        self.canonical = p
+        self.builder = GraphBuilder(Path(self.tmp.name) / "graph")
+        self.builder.create_schema()
+        self.builder.build_from_canonical(self.canonical)
+
+    def tearDown(self):
+        self.builder.close()
+        self.tmp.cleanup()
+
+    def test_extract_doc_relations_crossrefs(self):
+        ex = extract_doc_relations(
+            "github:vllm-project-vllm-ascend:issue:8938",
+            "vllm-project/vllm-ascend", 8938, "github_issue", "b",
+            extra={"crossrefs": [{"repo": "r", "number": 1, "is_pr": True}]})
+        self.assertEqual(ex.crossrefs, [{"repo": "r", "number": 1, "is_pr": True}])
+        ex2 = extract_doc_relations("s", "r", 1, "github_issue", "b")  # 无 extra → 空
+        self.assertEqual(ex2.crossrefs, [])
+
+    def test_references_edges_and_filtering(self):
+        s = self.builder.stats()
+        # 3 条 crossrefs 中：10260（PR 在库）、9001（issue 不在库）、24999（跨仓不在库）、
+        # 99999（不在库）——只有 pr:10260 → issue:8938 双端在库
+        self.assertEqual(s.rels["REFERENCES"], 1)
+        rows = self.builder.query(
+            "MATCH (a)-[r:REFERENCES]->(b) RETURN a.id, b.id")
+        self.assertEqual(rows, [[
+            "github:vllm-project-vllm-ascend:pr:10260",
+            "github:vllm-project-vllm-ascend:issue:8938"]])
+
+    def test_chain_issue_related_without_fixes(self):
+        """无 FIXES 边：related 给出提及它的 PR + note 引导。"""
+        r = self.builder.chain_issue("github:vllm-project-vllm-ascend:issue:8938")
+        self.assertTrue(r["found"])
+        self.assertEqual(r["fixes"], [])
+        rel = r["related"]
+        self.assertEqual(len(rel), 1)
+        self.assertEqual(rel[0]["doc_id"], "github:vllm-project-vllm-ascend:pr:10260")
+        self.assertEqual(rel[0]["kind"], "pr")
+        self.assertEqual(rel[0]["status"], "merged")
+        self.assertIn("related", (r.get("note") or ""))
+
+
 if __name__ == "__main__":
     unittest.main()

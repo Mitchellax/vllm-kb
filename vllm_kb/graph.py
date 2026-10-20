@@ -69,6 +69,11 @@ _NODE_DDL = [
 
 _REL_DDL = [
     "CREATE REL TABLE FIXES(FROM PR TO Issue)",
+    # 交叉引用（REFERENCES）：github_pull timeline 的 cross-referenced 事件——
+    # PR 提及 issue（无 fixes 关键字）、issue 互引、上游仓引用等**非修复语义**关联。
+    # 无 FIXES 边时（配置规避/使用错误结案）这里是主要线索面。
+    "CREATE REL TABLE REFERENCES(FROM Issue TO Issue, FROM Issue TO PR, "
+    "FROM PR TO Issue, FROM PR TO PR)",
     "CREATE REL TABLE MERGED_IN(FROM PR TO Release)",
     "CREATE REL TABLE MENTIONS(FROM Issue TO Operator, FROM Issue TO ErrorCode, "
     "FROM Issue TO Model, FROM Issue TO Version, FROM PR TO Operator, FROM PR TO ErrorCode, "
@@ -179,7 +184,7 @@ class GraphStats:
         return (f"节点 {n}（Issue {self.nodes.get('Issue', 0)} / PR {self.nodes.get('PR', 0)} / "
                 f"Release {self.nodes.get('Release', 0)} / 实体 {n - self.nodes.get('Issue', 0) - self.nodes.get('PR', 0) - self.nodes.get('Release', 0)}），"
                 f"边 {r}（FIXES {self.rels.get('FIXES', 0)} / MERGED_IN {self.rels.get('MERGED_IN', 0)} / "
-                f"MENTIONS {self.rels.get('MENTIONS', 0)}）")
+                f"MENTIONS {self.rels.get('MENTIONS', 0)} / REFERENCES {self.rels.get('REFERENCES', 0)}）")
 
 
 class GraphBuilder:
@@ -198,8 +203,8 @@ class GraphBuilder:
     def create_schema(self, drop_existing: bool = False) -> None:
         if drop_existing:
             for name in ("CORROBORATES", "TAGGED_WITH", "DOCUMENTS", "MENTIONS", "MERGED_IN",
-                         "FIXES", "Tag", "Interface", "Version", "Model", "ErrorCode", "Operator",
-                         "Doc", "Release", "PR", "Issue"):
+                         "REFERENCES", "FIXES", "Tag", "Interface", "Version", "Model",
+                         "ErrorCode", "Operator", "Doc", "Release", "PR", "Issue"):
                 try:
                     self.conn.execute(f"DROP TABLE {name}")
                 except Exception:
@@ -260,6 +265,7 @@ class GraphBuilder:
         interface_vals: set[str] = set()
         tag_vals: dict[str, str] = {}  # tag 名 -> tier
         fixes_edges: set[tuple[str, str]] = set()      # (pr_id, issue_id)
+        ref_edges: set[tuple[str, str]] = set()        # REFERENCES (引用方_id, 被引用方_id)
         merged_edges: set[tuple[str, str]] = set()     # (pr_id, release_id)
         mention_edges: set[tuple[str, str, str]] = set()  # (doc_id, entity_kind, value)
         documents_edges: set[tuple[str, str, str]] = set()  # (doc_id, target_kind, target_id)
@@ -286,8 +292,8 @@ class GraphBuilder:
                     continue
                 self._ingest_doc(doc, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
                                  interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,
-                                 documents_edges, tagged_edges, doc_entities, calendars, parsed_root,
-                                 overlay, registry)
+                                 documents_edges, tagged_edges, doc_entities, ref_edges,
+                                 calendars, parsed_root, overlay, registry)
                 if i and i % step == 0:
                     elapsed = time.time() - start_ts
                     rate = (i + 1) / elapsed if elapsed > 0 else 0.0
@@ -304,8 +310,11 @@ class GraphBuilder:
         issue_ids = set(issue_rows)
         pr_ids = set(pr_rows)
         fixes_edges = {(a, b) for a, b in fixes_edges if a in pr_ids and b in issue_ids}
-        merged_edges = {(a, b) for a, b in merged_edges if a in pr_ids}
         doc_ids = issue_ids | pr_ids | set(doc_rows)
+        # REFERENCES 双端都必须在库中（引用方/被引用方未被拉取的编号跳过；
+        # _doc_id 含 kind 前缀，issue/pr 归属天然精确）
+        ref_edges = {(a, b) for a, b in ref_edges if a in doc_ids and b in doc_ids}
+        merged_edges = {(a, b) for a, b in merged_edges if a in pr_ids}
         mention_edges = {(a, k, v) for a, k, v in mention_edges if a in doc_ids}
         documents_edges = {
             (a, k, v) for a, k, v in documents_edges
@@ -333,14 +342,14 @@ class GraphBuilder:
             self._copy_nodes(tmp_path, issue_rows, pr_rows, doc_rows, release_rows,
                              entity_vals, interface_vals, tag_vals)
             self._copy_rels(tmp_path, fixes_edges, merged_edges, mention_edges, documents_edges,
-                            tagged_edges, corroborates_edges)
+                            tagged_edges, corroborates_edges, ref_edges, issue_ids, pr_ids)
         print(f"[graph] COPY 完成（{time.time() - copy_start:.0f}s）", flush=True)
 
         return self.stats()
 
     def _ingest_doc(self, doc: dict, issue_rows, pr_rows, doc_rows, release_rows, entity_vals,
                     interface_vals, tag_vals, fixes_edges, merged_edges, mention_edges,
-                    documents_edges, tagged_edges, doc_entities, calendars,
+                    documents_edges, tagged_edges, doc_entities, ref_edges, calendars,
                     parsed_root: Optional[Path] = None,
                     overlay: Optional[dict] = None, registry=None) -> None:
         from .tagging import merge_final
@@ -364,6 +373,7 @@ class GraphBuilder:
             version_span_max=vs.get("max"),
             title=title,
             registry=registry,
+            extra=extra,
         )
 
         # 文档级标签：自动 = canonical tags ∪ 标题词典命中（github 源），
@@ -384,6 +394,7 @@ class GraphBuilder:
             # 反向引用：PR(repo:n) -> 本 issue
             for trepo, n in ex.fixed_by:
                 fixes_edges.add((_doc_id(trepo, "pr", n), sid))
+            self._add_ref_edges(ex, sid, ref_edges)
         elif st == "github_pr":
             merged_at = extra.get("merged_at") or ""
             pr_rows[sid] = {
@@ -393,6 +404,7 @@ class GraphBuilder:
             # 正向引用：本 PR -> Issue(repo:n)
             for trepo, n in ex.fixes:
                 fixes_edges.add((sid, _doc_id(trepo, "issue", n)))
+            self._add_ref_edges(ex, sid, ref_edges)
             # MERGED_IN
             if merged_at and repo in calendars:
                 tag = map_merged_to_release(merged_at, calendars[repo])
@@ -439,6 +451,18 @@ class GraphBuilder:
             ents.update(final_tags)
             doc_entities[sid] = ents
 
+    def _add_ref_edges(self, ex, sid: str, ref_edges: set) -> None:
+        """crossrefs → REFERENCES 边：FROM 引用方（timeline 的 source）TO 本文档。
+
+        timeline 挂在被引用方（本文档），source 是引用方——方向即"谁提到了本 issue"。
+        """
+        for c in ex.crossrefs or []:
+            crepo = c.get("repo") or ""
+            cnum = c.get("number") or 0
+            if not crepo or not cnum:
+                continue
+            ref_edges.add((_doc_id(crepo, "pr" if c.get("is_pr") else "issue", int(cnum)), sid))
+
     # ---------- CSV + COPY ----------
 
     def _write_csv(self, tmp: Path, name: str, header: list[str], rows) -> str:
@@ -484,11 +508,27 @@ class GraphBuilder:
             self.conn.execute(f"COPY {table} FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
 
     def _copy_rels(self, tmp: Path, fixes_edges, merged_edges, mention_edges,
-                   documents_edges, tagged_edges, corroborates_edges) -> None:
+                   documents_edges, tagged_edges, corroborates_edges,
+                   ref_edges=None, issue_ids=None, pr_ids=None) -> None:
         if fixes_edges:
             p = self._write_csv(tmp, "FIXES.csv", ["PR_id", "Issue_id"], fixes_edges)
             print(f"[graph]   COPY FIXES（{len(fixes_edges)} 边）…", flush=True)
             self.conn.execute(f"COPY FIXES FROM '{p}' (HEADER=true, PARALLEL=FALSE)")
+        if ref_edges:
+            # REFERENCES 多 label：按 from/to 端点标签拆分（4 组合，同 MENTIONS 模式）。
+            # 已经过端点过滤，issue_ids/pr_ids 判定标签与库中节点一致。
+            by_pair: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            for a, b in ref_edges:
+                fa = "Issue" if a in issue_ids else "PR"
+                fb = "Issue" if b in issue_ids else "PR"
+                by_pair.setdefault((fa, fb), []).append((a, b))
+            print(f"[graph]   COPY REFERENCES（{len(ref_edges)} 边，{len(by_pair)} 端点组合）…",
+                  flush=True)
+            for (fa, fb), edges in sorted(by_pair.items()):
+                p = self._write_csv(tmp, f"REFERENCES_{fa[0]}{fb[0]}.csv",
+                                    ["From_id", "To_id"], edges)
+                self.conn.execute(
+                    f"COPY REFERENCES FROM '{p}' (HEADER=true, PARALLEL=FALSE, FROM='{fa}', TO='{fb}')")
         if merged_edges:
             p = self._write_csv(tmp, "MERGED_IN.csv", ["PR_id", "Release_id"], merged_edges)
             print(f"[graph]   COPY MERGED_IN（{len(merged_edges)} 边）…", flush=True)
@@ -584,9 +624,11 @@ class GraphBuilder:
             return False
 
     def chain_issue(self, issue_id: str) -> dict:
-        """核心链路：issue → 修复它的 PR → 落地 release。
+        """核心链路：issue → 修复它的 PR → 落地 release；外加 REFERENCES 关联面。
 
         回答"这问题是否已修复、修复在哪个版本提供"。PR 无 MERGED_IN = 修复合并但尚未发布。
+        `related`（REFERENCES 边，非修复语义）= 谁 mention 了本 issue / 本 issue 引用了谁——
+        **无 FIXES 边时（配置规避、使用错误、讨论中结案）的主要线索来源**。
         """
         head = self.query(
             "MATCH (i:Issue {id: $id}) RETURN i.title, i.repo, i.number, i.status, i.url, i.resolved_at",
@@ -608,6 +650,17 @@ class GraphBuilder:
             }
             for f in fixes
         ]
+        # REFERENCES 关联面（无向：进向"谁提到我" + 出向"我引用谁"）
+        related = self.query(
+            "MATCH (i:Issue {id: $id})-[r:REFERENCES]-(o) "
+            "RETURN label(o) AS otype, o.id, o.title, o.status, o.url LIMIT 20",
+            {"id": issue_id},
+        )
+        related_list = [
+            {"kind": _ENTITY_KIND_BY_TABLE.get(r[0], r[0].lower()), "doc_id": r[1],
+             "title": r[2], "status": r[3], "url": r[4]}
+            for r in related
+        ]
         return {
             "issue_id": issue_id,
             "found": True,
@@ -615,6 +668,9 @@ class GraphBuilder:
             "url": h[4], "resolved_at": h[5],
             "fixes": fix_list,
             "released": any(f["release_tag"] for f in fix_list),
+            "related": related_list,
+            "note": ("无 fixes 时看 related：REFERENCES 为提及/关联（非修复语义），"
+                     "已合并 PR 的关联通常含修复或规避动作的线索") if not fix_list else None,
         }
 
     def fixes_pr(self, pr_id: str) -> dict:
@@ -761,7 +817,8 @@ class GraphBuilder:
         s = GraphStats()
         for row in self.query("MATCH (n) RETURN label(n), count(*) ORDER BY count(*) DESC"):
             s.nodes[str(row[0])] = int(row[1])
-        for rel in ("FIXES", "MERGED_IN", "MENTIONS", "DOCUMENTS", "TAGGED_WITH", "CORROBORATES"):
+        for rel in ("FIXES", "MERGED_IN", "MENTIONS", "DOCUMENTS", "TAGGED_WITH",
+                    "CORROBORATES", "REFERENCES"):
             try:
                 s.rels[rel] = int(self.query(f"MATCH ()-[:{rel}]->() RETURN count(*)")[0][0])
             except Exception:
