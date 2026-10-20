@@ -11,14 +11,15 @@ from vllm_kb.sources import ExcelSource
 def make_xlsx(path: Path) -> None:
     """生成含 2 个 sheet、列数不同、含空行的测试 xlsx。
 
-    - Sheet1：3 列（问题/现象/结论），含 IP 与内部路径 cell；
-    - Sheet2：2 列（错误码/处理），验证"不知道格式"也能解析。
+    - Sheet1：表头（问题/现象/结论）+ 3 数据行，含 IP 与内部路径 cell；
+    - Sheet2：2 列单数据行（无表头结构——行数 <3，验证裸拼回退）。
     """
     import openpyxl
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Sheet1"
+    ws.append(["问题", "现象", "结论"])
     ws.append(["HCCL 超时", "节点 10.0.0.5 通信超时", "检查 /var/log/npu/ 日志"])
     ws.append(["内存不足", "OOM", "路径 /home/user/logs/oom.log 有记录"])
     ws.append([None, None, None])  # 空行应跳过
@@ -62,18 +63,21 @@ class TestExcelSource(unittest.TestCase):
         self.assertEqual(doc.title, "问题定位记录")
         self.assertEqual(doc.source_type, "doc_excel")
         self.assertEqual(doc.extra["verification"], "unverified")
-        # 每个 sheet 一个小节标题 + 行内容按列序拼接（自由文本）
+        # 每个 sheet 一个小节标题
         self.assertIn("## Sheet1", doc.body)
         self.assertIn("## 任意名", doc.body)
-        self.assertIn("HCCL 超时", doc.body)
-        self.assertIn("节点 10.0.0.5 通信超时", doc.body)
+        # 表头键值对：数据行自包含列语义
+        self.assertIn("[表头] 问题 现象 结论", doc.body)
+        self.assertIn("问题=内存不足 | 现象=OOM", doc.body)
+        self.assertIn("问题=HCCL 超时 | 现象=节点 10.0.0.5 通信超时", doc.body)
         self.assertIn("561000", doc.body)      # 变列（Sheet2 2 列）也解析
         self.assertIn("aclnn", doc.body)
-        # 空行不进正文（Sheet1 第 3 行）
+        # 空行不进正文（Sheet1 第 4 行）
         self.assertEqual(doc.body.count("\n\n## "), 1)   # 两个 sheet 之间只有一个分隔
         # 计数元数据（整体评估用；quality 出口整包透传）
         self.assertEqual(doc.extra["quality"]["sheets"], 2)
-        self.assertEqual(doc.extra["quality"]["rows"], 4)   # 3 + 1 个有效行
+        self.assertEqual(doc.extra["quality"]["rows"], 5)   # 4 + 1 个有效行
+        self.assertEqual(doc.extra["quality"]["sheets_skipped"], [])
         self.assertEqual(doc.extra["quality"]["source_mode"], "imports")
 
     def test_chunks_are_still_per_row_with_sheet_section(self):
@@ -84,11 +88,12 @@ class TestExcelSource(unittest.TestCase):
         doc = self.src.canonicalize()[0]
         chunks = chunk_doc(doc)
         texts = [c.text for c in chunks]
-        self.assertEqual(len(chunks), 4, texts)
+        self.assertEqual(len(chunks), 5, texts)
         self.assertEqual({c.section for c in chunks}, {"Sheet1", "任意名"})
         hit = next(c for c in chunks if "HCCL 超时" in c.text)
         self.assertEqual(hit.section, "Sheet1")
         self.assertTrue(hit.text.startswith("【Sheet1】"), hit.text)   # 标题注入正文
+        self.assertIn("问题=HCCL 超时", hit.text)   # 行 chunk 自包含列语义
         # 每行一个 chunk（不跨行合并成一大块）
         self.assertTrue(all("561000" not in c.text or c.section == "任意名" for c in chunks))
 
@@ -231,6 +236,171 @@ class TestExcelSource(unittest.TestCase):
             self.assertIn("/var/log/npu/", data["paths"])
         finally:
             os.environ.pop("VLLM_KB_DATA_ROOT", None)
+
+
+def _save_wb(wb, path: Path) -> None:
+    wb.save(str(path))
+
+
+def _make_multi_sheet_xlsx(path: Path) -> None:
+    """模拟真实多页业务 Excel：封面/前言/如何获取EventID/故障描述表/运维级别定义标准。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "封面"
+    ws.append(["A3 健康管理故障定义"])
+    ws.append(["版权所有 © 华为技术有限公司 2026。 保留一切权利。"])
+    ws2 = wb.create_sheet("前言")
+    ws2.append(["商标声明", "和其他华为商标均为华为技术有限公司的商标。"])
+    ws3 = wb.create_sheet("如何获取EventID")
+    ws3.append(["EventID 通过 BMC 命令行查询获取。"])
+    ws4 = wb.create_sheet("故障描述表")
+    ws4.append(["EventID", "故障名称", "处理建议"])
+    ws4.append(["0x220001", "内存ECC可纠正错误", "观察运行状态"])
+    ws4.append(["0x220002", "内存ECC不可纠正错误", "更换内存"])
+    ws5 = wb.create_sheet("运维级别定义标准")
+    ws5.append(["级别", "定义"])
+    ws5.append(["严重", "影响业务运行"])
+    _save_wb(wb, path)
+
+
+class TestBoilerplateSheets(unittest.TestCase):
+    """结构页过滤：封面/前言/目录/版权类 sheet 不进正文与标签（2026-10 业务实测）。
+
+    业务多页 Excel 的首个 sheet 常是封面（"版权所有 ©…"）——不滤则文档 body 开头
+    是版权样板，审核页标题观感受污染；sheet 名"封面/前言"也不该混进标签提取。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        imports = self.root / "data" / "imports" / "engineer"
+        imports.mkdir(parents=True)
+        _make_multi_sheet_xlsx(imports / "A3 健康管理故障定义.xlsx")
+        self.cfg = SourceCfg(id="engineer", type="excel",
+                             path="data/imports/engineer/A3 健康管理故障定义.xlsx",
+                             enabled=True)
+        self.src = ExcelSource(self.cfg, project_root=self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_boilerplate_sheets_filtered(self):
+        self.src.pull()
+        docs = self.src.canonicalize()
+        self.assertEqual(len(docs), 1)
+        doc = docs[0]
+        # 封面/前言不进正文：body 不含版权/商标样板，开头是第一个内容 sheet
+        self.assertNotIn("版权所有", doc.body)
+        self.assertNotIn("商标声明", doc.body)
+        self.assertTrue(doc.body.startswith("## 如何获取EventID"), doc.body[:80])
+        # 保留的 sheet 正常入库（表头键值对）
+        self.assertIn("## 故障描述表", doc.body)
+        self.assertIn("EventID=0x220001 | 故障名称=内存ECC可纠正错误", doc.body)
+        # 标签提取不含被滤 sheet 名
+        self.assertNotIn("封面", doc.tags)
+        self.assertNotIn("前言", doc.tags)
+        # quality 可观测：滤了哪些
+        q = doc.extra["quality"]
+        self.assertEqual(q["sheets"], 3)
+        self.assertEqual(q["sheets_skipped"], ["封面", "前言"])
+
+    def test_skip_sheets_config_extends_filter(self):
+        """config `skip_sheets`（正则数组）追加业务特有结构页名单。"""
+        cfg = SourceCfg(id="engineer", type="excel",
+                        path="data/imports/engineer/A3 健康管理故障定义.xlsx",
+                        skip_sheets=["^运维级别"], enabled=True)
+        src = ExcelSource(cfg, project_root=self.root)
+        src.pull()
+        doc = src.canonicalize()[0]
+        self.assertNotIn("## 运维级别定义标准", doc.body)
+        self.assertEqual(doc.extra["quality"]["sheets_skipped"],
+                         ["封面", "前言", "运维级别定义标准"])
+
+    def test_all_sheets_filtered_yields_no_doc(self):
+        """全部 sheet 都是结构页 → 不产生文档（与全空 sheet 同径）。"""
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "封面"
+        ws.append(["版权所有 © 某公司"])
+        p = self.root / "data" / "imports" / "engineer" / "只有封面.xlsx"
+        _save_wb(wb, p)
+        cfg = SourceCfg(id="engineer", type="excel",
+                        path="data/imports/engineer/只有封面.xlsx", enabled=True)
+        src = ExcelSource(cfg, project_root=self.root)
+        src.pull()
+        self.assertEqual(src.canonicalize(), [])
+
+
+class TestHeaderKv(unittest.TestCase):
+    """表头键值对 auto 判定边界：无表头结构回退裸拼（语义无损优先）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        imports = self.root / "data" / "imports" / "engineer"
+        imports.mkdir(parents=True)
+        self.imports = imports
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _doc_body(self, name: str) -> str:
+        cfg = SourceCfg(id="engineer", type="excel",
+                        path=f"data/imports/engineer/{name}", enabled=True)
+        src = ExcelSource(cfg, project_root=self.root)
+        src.pull()
+        docs = src.canonicalize()
+        self.assertEqual(len(docs), 1)
+        return docs[0].body
+
+    def test_few_rows_no_kv(self):
+        """非空行 <3：说明页形态 → 裸拼（首行不是表头）。"""
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "说明"
+        ws.append(["如何获取EventID"])
+        ws.append(["EventID 通过 BMC 命令行查询获取。"])
+        _save_wb(wb, self.imports / "说明.xlsx")
+        body = self._doc_body("说明.xlsx")
+        self.assertIn("如何获取EventID\nEventID 通过 BMC 命令行查询获取。", body)
+        self.assertNotIn("[表头]", body)
+        self.assertNotIn("=", body)
+
+    def test_long_first_row_no_kv(self):
+        """首行含长文本 cell（>30 字符）：是内容不是表头 → 裸拼。"""
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(["这是一段很长的说明文字" * 5, "b", "c"])
+        ws.append(["d", "e", "f"])
+        ws.append(["g", "h", "i"])
+        _save_wb(wb, self.imports / "长文.xlsx")
+        body = self._doc_body("长文.xlsx")
+        self.assertNotIn("[表头]", body)
+        self.assertIn("g h i", body)
+
+    def test_ragged_rows_kv_with_tail(self):
+        """数据行 cell 数超过表头：键值对截齐 + 多余 cell 裸值追加。"""
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(["a", "b"])
+        ws.append(["1", "2", "3"])
+        ws.append(["4", "5"])
+        _save_wb(wb, self.imports / "ragged.xlsx")
+        body = self._doc_body("ragged.xlsx")
+        self.assertIn("a=1 | b=2 | 3", body)
+        self.assertIn("a=4 | b=5", body)
 
 
 if __name__ == "__main__":

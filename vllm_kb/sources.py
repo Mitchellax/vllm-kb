@@ -1274,6 +1274,16 @@ class ImageSource(BaseSource):
         return []
 
 
+# Excel 结构页 sheet 名（封面/前言/目录/版权类）——不是知识内容：
+# 进正文会让 body 开头变成"版权所有 ©…"（审核页标题观感受污染）、sheet 名混进标签提取。
+# 精确词 + 可选尾随数字；业务特有名单用 config `skip_sheets`（正则数组）追加。
+_BOILERPLATE_SHEET_RE = re.compile(
+    r"^(?:封面|扉页|前言|序言|目录|版权|版权页|声明|声明页|修订记录|修订历史|文档信息|"
+    r"cover(?:\s*page)?|front\s*matter|preface|foreword|table\s+of\s+contents|toc|"
+    r"contents|copyright|revision(?:\s*history)?|document\s+info(?:rmation)?)\s*\d*\s*$",
+    re.IGNORECASE)
+
+
 class ExcelSource(BaseSource):
     """Excel 表格来源（工程师问题定位记录/已知问题登记表等，**格式未知**）。
 
@@ -1284,8 +1294,11 @@ class ExcelSource(BaseSource):
     **schema-free 设计（不写死任何列名/sheet 名/行号）**：
     - pull：把配置 path（文件或目录）下的 .xlsx/.xlsm 复制到资产层；
     - canonicalize：**一个文件一篇文档**（`source_id = excel:<文件名>`，与 md/word/pdf 同构）——
-      body 为 `## <sheet 名>` + 各非空行的 cell **按列序拼接**（不依赖表头/列语义）；
-      分块仍以"行"为单位（每个非空行是独立段落 → 独立 chunk，带 sheet 作 section），
+      body 为 `## <sheet 名>` + 各非空行；**结构页过滤**（封面/前言/目录/版权类 sheet 名
+      不进正文/标签，config `skip_sheets` 可追加业务名单）；
+      **表头键值对**（auto 判定）：sheet 非空行 ≥3 且首个非空行 ≥2 列、全为短标签（≤30 字符）
+      → 视为表头，数据行变 `列名=值 | 列名=值`（chunk 自包含列语义），否则按列序裸拼；
+      分块以"行"为单位（每个非空行是独立段落 → 独立 chunk，带 sheet 作 section），
       所以按文件聚合**不损失检索粒度**；
     - **为什么不再逐行一篇**：逐行的 `source_id` 只能靠位置（`文件:sheet:行`），中间插一行会让
       其后所有行身份平移，人工治理（标签/补标）**串到别的行**上；按文件聚合后身份稳定，
@@ -1390,33 +1403,58 @@ class ExcelSource(BaseSource):
                 continue
             parts: list[str] = []
             sheet_names: list[str] = []
+            sheets_skipped: list[str] = []
             n_rows = 0
+            skip_pats = [re.compile(str(p), re.IGNORECASE)
+                         for p in (self.cfg.get("skip_sheets") or [])]
             try:
                 for ws in wb.worksheets:
                     sheet = str(ws.title or "").strip() or "Sheet"
-                    sheet_names.append(sheet)
-                    rows: list[str] = []
+                    # 结构页过滤：封面/前言/目录/版权类 sheet 不是知识内容——
+                    # 不进正文（否则 body 开头是"版权所有 ©…"）、不进标签提取
+                    if _BOILERPLATE_SHEET_RE.match(sheet) or any(
+                            pat.match(sheet) for pat in skip_pats):
+                        sheets_skipped.append(sheet)
+                        continue
+                    rows_raw: list[list[str]] = []
                     for row in ws.iter_rows(values_only=True):
                         cells = [str(c).strip() for c in row
                                  if c is not None and str(c).strip()]
-                        if not cells:
-                            continue  # 空行跳过（不依赖行号语义）
-                        line = " ".join(cells)
-                        rows.append(line)
+                        if cells:
+                            rows_raw.append(cells)  # 空行跳过（不依赖行号语义）
+                    if not rows_raw:
+                        continue
+                    sheet_names.append(sheet)
+                    n_rows += len(rows_raw)
+                    # 表头键值对（auto 判定）：sheet 是"表头+数据行"结构（≥3 行、表头
+                    # ≥2 列且全为短标签）→ 数据行变 `列名=值 | 列名=值`，行 chunk 自包含
+                    # 列语义（"故障名称=xxx" 可直接搜）；说明页/无表头结构原样裸拼。
+                    header = rows_raw[0]
+                    use_kv = (len(rows_raw) >= 3 and len(header) >= 2
+                              and all(len(c) <= 30 for c in header))
+                    rows: list[str] = []
+                    if use_kv:
+                        rows.append("[表头] " + " ".join(header))
+                        for cells in rows_raw[1:]:
+                            pairs = [f"{header[i]}={v}" for i, v in enumerate(cells)
+                                     if i < len(header)]
+                            rows.append(" | ".join(pairs + cells[len(header):]))
+                    else:
+                        rows.extend(" ".join(cells) for cells in rows_raw)
+                    for line in rows:
                         if sanitize_on:
                             ips, paths = collect_sanitize_hits(line, keep_paths, keep_ips)
                             if ips:
                                 collector.setdefault("ips", set()).update(ips)
                             if paths:
                                 collector.setdefault("paths", set()).update(paths)
-                    if rows:
-                        n_rows += len(rows)
-                        parts.append(f"## {sheet}\n\n" + "\n".join(rows))
+                    parts.append(f"## {sheet}\n\n" + "\n".join(rows))
             finally:
                 wb.close()
             body = "\n\n".join(parts).strip()
             if not body:
-                print(f"[sources:{self.id}] 跳过 {p.name}：所有 sheet 均为空", flush=True)
+                print(f"[sources:{self.id}] 跳过 {p.name}：所有 sheet 均为空或为结构页",
+                      flush=True)
                 continue
             # 标签与 md/word 同构：文件名 + sheet 名（两级分类，见 tagging.py）
             tags, cands = extract_tags(stem, sheet_names, registry=registry)
@@ -1433,6 +1471,7 @@ class ExcelSource(BaseSource):
                     "asset": {"asset_id": asset_id, "sha256": sha, "format": "excel"},
                     "quality": {"text_source": "table", "parsed_with": "openpyxl",
                                 "sheets": len(sheet_names), "rows": n_rows,
+                                "sheets_skipped": sheets_skipped,
                                 # 回退模式（imports 缺失）→ 资产层扁平副本，无目录树
                                 "source_mode": "imports" if f.from_imports
                                                else "assets_fallback"},
