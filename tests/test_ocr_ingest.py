@@ -284,5 +284,101 @@ class TestSeedLowConfidenceOcr(unittest.TestCase):
         self.assertEqual(seed_low_confidence_ocr(self.cfg, store), 1)  # 同 sha 聚合一条
 
 
+class TestOcrPathConsistency(unittest.TestCase):
+    """未设 VLLM_KB_DATA_ROOT（AppConfig.resolve 走 PROJECT_ROOT 分支）时，资产化→OCR
+    的路径必须与**写盘位置**一致。
+
+    业务实测（2026-10，html 导入大量刷屏）：旧代码 `_ocr_artifact_for(self.resolve(rel))`
+    —— rel 形如 assets/images/x.png，未设 DATA_ROOT 时按 PROJECT_ROOT 拼接丢掉 data/
+    一层 → OCR 读 /proj/assets/…（写入在 /proj/data/assets/…）→ 每张图报"图片不存在"，
+    且 asset_registry 登记同样坏路径。设了 DATA_ROOT 的部署会剥 data/ 前缀恰好自洽，
+    本地未配 OCR 从未走到该行——既有测试全设 DATA_ROOT 故未暴露。
+
+    隔离手段：patch `config.PROJECT_ROOT` 到临时目录（未设 env 时 resolve 以它为根），
+    逐字复现业务环境的解析分支。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        md_dir = self.root / "data" / "imports" / "md"
+        md_dir.mkdir(parents=True)
+        make_png(md_dir / "shot.png")
+        (md_dir / "doc.md").write_text(
+            "# 报错记录\n\n截图: ![err](shot.png)\n", encoding="utf-8")
+        self._old_root = os.environ.pop("VLLM_KB_DATA_ROOT", None)   # 关键：未设
+        self.app_cfg = AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "storage": {"vector_backend": "python"},
+            "sources": [
+                {"id": "wiki", "type": "markdown", "path": "data/imports/md",
+                 "title_pattern": r"^#\s+(.+)", "enabled": True},
+                {"id": "images", "type": "image", "enabled": True,
+                 "ocr_provider": "api", "ocr_api_base": "http://127.0.0.1:9"},
+            ],
+        })
+
+    def tearDown(self):
+        if self._old_root is not None:
+            os.environ["VLLM_KB_DATA_ROOT"] = self._old_root
+        self.tmp.cleanup()
+
+    def test_ocr_receives_written_location(self):
+        # patch 覆盖**构造+canonicalize 全程**：import_dir 在 __init__ 即解析
+        with mock.patch("vllm_kb.config.PROJECT_ROOT", self.root):
+            cfg = SourceCfg(id="wiki", type="markdown", path="data/imports/md",
+                            title_pattern=r"^#\s+(.+)", enabled=True)
+            src = MarkdownSource(cfg, project_root=self.root, app_cfg=self.app_cfg)
+            with mock.patch("vllm_kb.ocr.ocr_image_detail",
+                            return_value=OcrResult(text=OCR_TEXT, confidence=0.9,
+                                                   confidence_source="model", provider="api")) as m:
+                docs = src.canonicalize()
+        self.assertEqual(m.call_count, 1)
+        asset_path = m.call_args[0][0]                     # OCR 收到的路径
+        self.assertTrue(asset_path.is_file(), asset_path)  # 必须是真实写盘位置
+        self.assertIn("data/assets/images",
+                      str(asset_path).replace("\\", "/"))  # 且带 data/ 一层
+        self.assertIn(OCR_TEXT, docs[0].body)              # OCR 拿到真文件 → 文本注入
+
+
+class TestPaddleNdarrayInput(unittest.TestCase):
+    """paddle 引擎收 ndarray（内存解码），不收文件路径——绕开 cv2 非 ASCII 路径限制。"""
+
+    def test_paddle_feeds_ndarray_not_path(self):
+        import io
+        import sys
+        import types
+
+        import numpy as np
+        from PIL import Image
+
+        from vllm_kb.ocr import ocr_image_detail
+
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10), "white").save(buf, format="PNG")
+        with tempfile.TemporaryDirectory() as td:
+            cdir = Path(td) / "中文目录"
+            cdir.mkdir()
+            img = cdir / "图.png"                 # 非 ASCII 路径
+            img.write_bytes(buf.getvalue())
+            calls = []
+
+            class _Stub:
+                def ocr(self, arr, cls=True):
+                    calls.append(arr)
+                    return [[([0, 0], ("hello", 0.9))]]
+
+            fake_cv2 = types.ModuleType("cv2")
+            fake_cv2.imdecode = lambda b, flag: np.zeros((4, 4, 3), dtype=np.uint8)
+            fake_cv2.IMREAD_COLOR = 1
+            with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
+                 mock.patch("vllm_kb.ocr._get_paddle", return_value=_Stub()):
+                res = ocr_image_detail(img, provider="paddle")
+        self.assertEqual(res.text, "hello")
+        self.assertEqual(res.provider, "paddle")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(hasattr(calls[0], "shape"))   # ndarray，非文件路径
+
+
 if __name__ == "__main__":
     unittest.main()

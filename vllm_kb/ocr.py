@@ -474,26 +474,28 @@ def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
 
 
 def _ocr_via_paddle(src: "str | Path | bytes", t0: float) -> OcrResult:
-    """本地 PaddleOCR（仅导入期使用；服务端请求期不执行本地 OCR）。"""
-    ocr = _get_paddle()
-    tmp: Optional[str] = None
-    if isinstance(src, (bytes, bytearray)):
-        import tempfile
+    """本地 PaddleOCR（仅导入期使用；服务端请求期不执行本地 OCR）。
 
-        fd, tmp = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
-        Path(tmp).write_bytes(bytes(src))
-        target = tmp
-    else:
-        target = str(src)
+    **一律 bytes → 内存解码 → ndarray 喂引擎**（2026-10 业务实测：cv2.imread 不支持
+    非 ASCII 路径，中文部署目录下 paddle 报"路径不存在"类错误；ndarray 输入彻底绕开
+    文件路径，bytes/路径两种输入统一走内存）。paddleocr 2.x/3.x 调用签名差异做容错
+    （3.x 的 ocr() 无 cls 参数）。
+    """
+    ocr = _get_paddle()
+    raw, ext = _read_image_bytes(src)
     try:
-        result = ocr.ocr(target, cls=True)
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        import cv2
+        import numpy as np
+    except ImportError as e:
+        raise OcrUnavailable(
+            f"paddle 引擎缺少 cv2/numpy（paddlepaddle 自带，请检查安装完整性）：{e}") from e
+    arr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        raise OcrApiError(f"图片解码失败（非图像或损坏）: {ext or '<bytes>'}")
+    try:
+        result = ocr.ocr(arr, cls=True)
+    except TypeError:
+        result = ocr.ocr(arr)   # 3.x：无 cls 参数
     lines: list[str] = []
     confs: list[float] = []
     # 2.x 返回 [[ [box, (text, conf)], ... ], ...]；3.x 可能不同——兼容解析

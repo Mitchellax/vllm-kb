@@ -369,10 +369,17 @@ class BaseSource(ABC):
                     return ""
             except OSError:
                 pass  # 读取失败按正常图处理，后续资产化自会报错
-            rel, sha, _ = _copy_asset(p, self.resolve("data/assets"), "images")
+            # 资产化目标 = 写入时的绝对路径（**不能**再 resolve(rel)）——rel 形如
+            # assets/images/x.png，未设 VLLM_KB_DATA_ROOT 时 resolve() 按 PROJECT_ROOT
+            # 拼接会丢掉 data/ 一层（业务实测：写入 data/assets/…、OCR 读 assets/…，
+            # 大量"图片不存在"报错且 asset_registry 登记坏路径）；设了 DATA_ROOT 时
+            # 恰好剥前缀自洽，测试环境全设了 DATA_ROOT 故此前未暴露。
+            assets_root = self.resolve("data/assets")
+            rel, sha, _ = _copy_asset(p, assets_root, "images")
+            img_path = assets_root / "images" / Path(rel).name
             ev.update({"kind": "local", "asset_id": sha[:16], "sha256": sha})
-            _reg(rel, sha, self.resolve(rel))
-            ocr_ev, inject = self._ocr_artifact_for(self.resolve(rel), sha, rel)
+            _reg(rel, sha, img_path)
+            ocr_ev, inject = self._ocr_artifact_for(img_path, sha, rel)
             if ocr_ev is not None:
                 ev["ocr"] = ocr_ev
             evidence.append(ev)
