@@ -375,6 +375,25 @@ def _resolve_graph_doc(arg: str, kind: str) -> str:
     return arg
 
 
+def _graph_lookup(base: str, path: str, doc_arg: str) -> dict:
+    """graph doc / evidence 的取数：支持完整 source_id 或 repo#number 简写。
+
+    简写不携带 issue/pr 类型——先按 issue 展开，结果为空（节点不存在/无邻接）再按
+    pr 重试，取**非空**者；两者皆空返回 issue 结果。业务实测（2026-10）：doc/evidence
+    原样透传短名会查到不存在的节点，与 chain/fixes 行为不一致。
+    """
+    if doc_arg.startswith("github:") or "#" not in doc_arg:
+        return _get(base, path, {"doc": doc_arg})
+    first = None
+    for kind in ("issue", "pr"):
+        d = _get(base, path, {"doc": _resolve_graph_doc(doc_arg, kind)})
+        if first is None:
+            first = d
+        if d.get("mentions") or d.get("documents") or d.get("tags") or d.get("docs"):
+            return d
+    return first
+
+
 def fmt_graph_chain(data: dict) -> str:
     if not data.get("found"):
         return f"[graph] issue 不存在于图中: {data.get('issue_id')}"
@@ -384,7 +403,7 @@ def fmt_graph_chain(data: dict) -> str:
     ]
     fixes = data.get("fixes") or []
     if not fixes:
-        lines.append("修复链路: (图中无 FIXES 边——无 PR 声明修复此 issue)")
+        lines.append("修复链路: (图中无 FIXES 边——无 PR 声明修复此 issue；非修复结案是正常现象)")
     for f in fixes:
         rel = f.get("release_tag")
         rel_txt = f"→ 落地 release: {rel} ({f.get('release_date') or '-'})" if rel else "→ 未发布（PR 已合并但日历中尚无对应 tag）"
@@ -393,6 +412,14 @@ def fmt_graph_chain(data: dict) -> str:
         lines.append(f"  {rel_txt}")
     if fixes and not data.get("released"):
         lines.append("结论: 有修复 PR 但尚未进入任何 release（需升级到修复合并后的版本或等发布）")
+    related = data.get("related") or []
+    if related:
+        lines.append("关联（REFERENCES，提及/引用，非修复语义）:")
+        for r in related:
+            lines.append(f"  [{r.get('status') or '-'}] {r.get('doc_id')}  {r.get('title')}")
+        if not fixes:
+            lines.append(
+                "  提示: 无 FIXES 边时这里是主要线索——已合并(merged)的关联 PR 通常含修复/规避动作，读其正文与落地版本")
     return "\n".join(lines)
 
 
@@ -894,11 +921,12 @@ def main() -> None:
         elif args.graph_cmd == "sig":
             print(fmt_graph_sig(_get(base, "/graph/sig", {"sig": args.sig, "limit": args.limit})))
         elif args.graph_cmd == "doc":
-            print(json.dumps(_get(base, "/graph/doc", {"doc": args.doc}), ensure_ascii=False, indent=2))
+            print(json.dumps(_graph_lookup(base, "/graph/doc", args.doc),
+                             ensure_ascii=False, indent=2))
         elif args.graph_cmd == "tags":
             print(fmt_graph_tags(_get(base, "/graph/tags", {"tag": args.tag})))
         elif args.graph_cmd == "evidence":
-            print(fmt_graph_evidence(_get(base, "/graph/evidence", {"doc": args.doc})))
+            print(fmt_graph_evidence(_graph_lookup(base, "/graph/evidence", args.doc)))
     elif args.cmd == "tags":
         if args.tags_cmd == "list":
             print(fmt_tags(_get(base, "/tags")))
