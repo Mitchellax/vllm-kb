@@ -137,7 +137,9 @@ class TestBuildFtsScript(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.cfg = make_cfg(self.root)
-        self.store = PythonVectorStore(self.cfg.resolve("data/vec.json"))
+        # 与 build_vector_store 的 python 后端路径严格一致（lancedb_path + "_py.json"）：
+        # build_fts 重建源就是这个 store 的原文
+        self.store = PythonVectorStore(self.cfg.resolve("data/lancedb_py.json"))
         ingest_docs(self.cfg, [CN_DOC], EmbeddingClient(self.cfg.embedding), self.store)
         # 破坏索引列（模拟旧/脏数据），验证重建恢复
         conn = sqlite3.connect(str(self.cfg.resolve("data/kb.sqlite3")))

@@ -286,7 +286,7 @@ python scripts/build_companion_matrix.py --refresh-cache   # 强制刷新跨运�
 python scripts/build_signal_words.py
 
 # FTS5 全文索引重建（jieba 中文分词——可选，不重嵌向量；装 jieba 或升级分词规则后重跑）
-python scripts/build_fts.py                     # 读现有 chunk 原文重新分词重建 chunks_fts
+python scripts/build_fts.py                     # 从向量库取权威原文重新分词，全量重建 chunks_fts（FTS 缺行回填同此命令）
 python scripts/build_fts.py --limit 1000        # 试跑前 N 个 chunk
 
 # 正文 TF-IDF 标签候选导出（jieba——输出文件，人工审阅后手动写入 config.tags.registry）

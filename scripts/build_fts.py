@@ -1,19 +1,23 @@
 """重建 FTS5 全文索引（jieba 中文分词版）——**不重嵌向量、不动 docs/审核数据**。
 
 用法：
-    python scripts/build_fts.py                 # 全量重建（读现有 chunk 原文重新分词）
+    python scripts/build_fts.py                 # 全量重建（从向量库取权威原文重新分词）
     python scripts/build_fts.py --limit 1000    # 试跑：只处理前 N 个 chunk
     python scripts/build_fts.py --config path   # 指定 config.json
 
-原理：读现有 kb.sqlite3 `chunks_fts` 的 (chunk_id, doc_id, text 原文)——chunk_id 与
-向量库严格一致（**不重新分块**，向量/嵌入结果不受影响）——对原文 jieba 分词后
-DROP 重建 chunks_fts（新 schema：indexed_text 索引列 + text 原文列），按相同 chunk_id 写回。
+原理（**2026-10 业务实测修正**：重建源是向量库，不是 chunks_fts 自身）：
+    1. 权威 chunk 清单 = `chunks_meta`（与向量库同源写入，FTS 缺行时它仍是全集）；
+    2. 权威原文 = 向量库（LanceDB `texts_by_id()`，每条 chunk 的 text 完整拷贝）——
+       旧实现从 `chunks_fts` 自身读原文，**缺行的表重建后仍缺行**，历史缺口永远找不回
+       （业务库曾 meta 150202 行 / fts 29078 行，重建后依旧 29078）；
+    3. 对原文 jieba 分词后 DROP 重建 chunks_fts（新 schema：indexed_text 索引列 +
+       text 原文列），按相同 chunk_id 写回——chunk_id 与向量库严格一致，
+       **不重新分块**，向量/嵌入结果不受影响。
 
-适用：升级 jieba 或分词规则后重建全文索引；旧库（无 indexed_text 列）升级后的
-首次重建。普通增量入库时新文档自动分词写入，无需每次运行本脚本。
+适用：FTS 缺行回填（历史 DROP 后未回填的存量库，跑一次即全量找回）；升级 jieba 或
+分词规则后重建。普通增量入库时新文档自动分词写入，无需每次运行本脚本。
 """
 import argparse
-import json
 import sqlite3
 import sys
 import time
@@ -24,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vllm_kb.config import AppConfig
 from vllm_kb.fts_tokenizer import register_words, tokenize_text
 from vllm_kb.tagging import TagRegistry
+from vllm_kb.vectorstore import build_vector_store
 
 _FTS_DDL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -48,38 +53,52 @@ def main() -> None:
     # 标签词典词注册进 jieba（复合标签不拆散；jieba 未装时降级原文，本脚本仍幂等）
     register_words([e.name for e in TagRegistry.load(cfg).entries])
 
+    # 权威原文来自向量库（只读用途，不写）
+    store = build_vector_store(cfg)
+
     conn = sqlite3.connect(str(kb_path))
     try:
-        # 1) 读现有 chunk 原文（旧/新 schema 的 text 列都是原文）
-        try:
-            rows = conn.execute("SELECT chunk_id, doc_id, text FROM chunks_fts").fetchall()
-        except sqlite3.OperationalError:
-            print("[fts] chunks_fts 表不存在，无可重建内容")
+        # 1) 权威 chunk 清单：chunks_meta 与向量库同源写入——FTS 缺行时它仍是全集
+        meta_rows = conn.execute(
+            "SELECT chunk_id, doc_id FROM chunks_meta ORDER BY doc_id, seq").fetchall()
+        if not meta_rows:
+            print("[fts] chunks_meta 为空——先运行 scripts/build_kb.py 入库")
             return
-        total = len(rows)
-        print(f"[fts] 读取 {total} 个 chunk 原文，分词重建 …")
-        # 2) 分词（进度节流）
+        # 2) 向量库原文映射（不加载向量列）
+        texts = store.texts_by_id()
+        print(f"[fts] chunks_meta {len(meta_rows)} chunk / 向量库 {len(texts)} chunk，"
+              "取原文分词重建 …")
         tokenized: list[tuple[str, str, str, str]] = []
+        missing: list[str] = []
         start_ts = time.time()
-        step = max(1, total // 100)
-        for i, (chunk_id, doc_id, text) in enumerate(rows, 1):
-            tokenized.append((chunk_id, doc_id, tokenize_text(text or ""), text or ""))
+        step = max(1, len(meta_rows) // 100)
+        for i, (chunk_id, doc_id) in enumerate(meta_rows, 1):
+            text = texts.get(chunk_id)
+            if text is None:
+                missing.append(chunk_id)   # 向量库也没有 → 两层都缺（不应发生，如实暴露）
+                continue
+            tokenized.append((chunk_id, doc_id, tokenize_text(text), text))
             if i % step == 0:
                 rate = i / max(0.001, time.time() - start_ts)
-                print(f"[fts] 分词 {i}/{total} ({100.0 * i / total:.0f}%) "
-                      f"| {rate:.0f} chunk/s | ETA {(total - i) / rate / 60:.1f}min",
+                print(f"[fts] 分词 {i}/{len(meta_rows)} ({100.0 * i / len(meta_rows):.0f}%) "
+                      f"| {rate:.0f} chunk/s | ETA {(len(meta_rows) - i) / rate / 60:.1f}min",
                       flush=True)
-        # 3) 重建表并写回（同 chunk_id，与向量库严格一致）
+        if missing:
+            print(f"[fts] ⚠️ {len(missing)} 个 chunk 在向量库中无原文（示例: "
+                  f"{missing[:3]}）——将按现有数据重建；若占比异常请检查向量库完整性")
+        # 3) 显式事务内重建（DROP→CREATE→INSERT 原子：中途失败不破坏现有索引）
         print(f"[fts] 分词完成（{time.time() - start_ts:.0f}s），重建 chunks_fts …")
+        done = tokenized[:args.limit] if args.limit else tokenized
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("DROP TABLE IF EXISTS chunks_fts")
-        conn.executescript(_FTS_DDL)
+        conn.execute(_FTS_DDL)
         conn.executemany(
             "INSERT INTO chunks_fts (chunk_id, doc_id, indexed_text, text) VALUES (?,?,?,?)",
-            tokenized[:args.limit] if args.limit else tokenized,
+            done,
         )
         conn.commit()
-        done = min(args.limit, total) if args.limit else total
-        print(f"[fts] 重建完成：{done}/{total} chunk（{time.time() - start_ts:.0f}s）。"
+        print(f"[fts] 重建完成：{len(done)}/{len(meta_rows)} chunk"
+              f"（{time.time() - start_ts:.0f}s）。"
               "向量库未改动——中文词（如'超时'）现在可命中含'超时排查'的文本。")
     finally:
         conn.close()

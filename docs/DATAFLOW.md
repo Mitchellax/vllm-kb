@@ -320,7 +320,7 @@ PR 提及 issue 无 fixes 关键字、issue 互引等**非修复语义**关联�
 
 | 命令 / 组件 | 产物 | 说明 |
 |---|---|---|
-| `python scripts/build_fts.py` | 重建 `kb.sqlite3` 的 `chunks_fts`（读现有 chunk 原文重新 jieba 分词，chunk_id 与向量库严格一致） | 升级分词规则/旧库升级后使用；**不重新分块、不重嵌向量**，普通增量入库自动分词无需运行 |
+| `python scripts/build_fts.py` | 重建 `kb.sqlite3` 的 `chunks_fts`（**权威原文来自向量库** `texts_by_id()`——2026-10 业务实测修正：旧版从 chunks_fts 自身读原文，缺行的表重建后仍缺行、历史缺口找不回；chunk 清单取 chunks_meta，chunk_id 与向量库严格一致） | **FTS 缺行回填**（历史 DROP 后未回填的存量库跑一次全量找回）/升级分词规则/旧库升级；**不重新分块、不重嵌向量**，普通增量入库自动分词无需运行 |
 | `python scripts/review_ui.py` | `data/review.sqlite3`（`review_items` 审核队列 / `asset_registry` 资产路径注册 / `doc_tags` 标签覆盖层） | 审核工作台独立端口，**只读检索 API 全程不碰该库**；资产路径只存 `asset_id → rel_path`，不进 canonical/检索库。图片资产由 `ImageSource`/`MarkdownSource`/`WordSource` 批量注册（内容寻址：同内容多副本共用一行），审核台按 `rel_path` 经 `/assets` 静态挂载预览原图。**补标认证**（verification_pending）写 `kb.sqlite3.doc_verification` 覆盖层并立即刷新 `docs.extra.verification`/`reliability`（w_rel 0.5→0.85 当场生效，无需重建） |
 
 > 审核队列的 7 类人工确认项、API 配置中心、知识缺口展示见

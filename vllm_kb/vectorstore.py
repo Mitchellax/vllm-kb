@@ -67,6 +67,13 @@ class BaseVectorStore(ABC):
     @abstractmethod
     def search(self, vector: list[float], top_k: int = 10) -> list[SearchHit]: ...
 
+    def texts_by_id(self) -> dict[str, str]:
+        """全表 id -> text 原文映射（离线回填工具用，不加载向量列）。
+
+        非抽象：默认实现供只读代理等简单委托；两个真实后端各自覆盖。
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def count(self) -> int: ...
 
@@ -131,6 +138,9 @@ class PythonVectorStore(BaseVectorStore):
 
     def count(self) -> int:
         return len(self._items)
+
+    def texts_by_id(self) -> dict[str, str]:
+        return {it.id: it.text for it in self._items.values()}
 
     def clear(self) -> None:
         self._items = {}
@@ -244,6 +254,18 @@ class LanceDBVectorStore(BaseVectorStore):
     def count(self) -> int:
         return self._table.count_rows() if self._table is not None else 0
 
+    def texts_by_id(self) -> dict[str, str]:
+        """全表 id -> text 原文（**不含向量列**，15 万 chunk 内存可控）。
+
+        FTS 回填的权威原文源：FTS 表缺行时（历史 DROP 后未回填），原文的完整
+        拷贝只在向量库——chunks_meta 无 text 列，chunks_fts 自身不可信。
+        """
+        if self._table is None:
+            return {}
+        arrow = self._table.to_arrow()
+        return dict(zip(arrow.column("id").to_pylist(),
+                        arrow.column("text").to_pylist()))
+
     def clear(self) -> None:
         if self._table is not None:
             self.db.drop_table(self.table_name)
@@ -280,6 +302,9 @@ class ReadOnlyVectorStore(BaseVectorStore):
 
     def search(self, vector: list[float], top_k: int = 10) -> list[SearchHit]:
         return self._store.search(vector, top_k)
+
+    def texts_by_id(self) -> dict[str, str]:
+        return self._store.texts_by_id()
 
     def count(self) -> int:
         return self._store.count()
