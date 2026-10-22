@@ -256,7 +256,8 @@ class BaseSource(ABC):
         if art is None:
             try:
                 res = ocr_image_detail(asset_path, provider, api_base=oc.api_base,
-                                       api_key=oc.api_key, model=oc.model, mode=oc.mode)
+                                       api_key=oc.api_key, model=oc.model, mode=oc.mode,
+                                       timeout=oc.timeout)
             except (OcrApiError, OcrUnavailable) as e:
                 print(f"[sources:{self.id}] 图片 OCR 失败（{asset_path.name}）：{e}", flush=True)
                 return None, ""
@@ -1147,7 +1148,9 @@ class ImageSource(BaseSource):
         {"id": "images", "type": "image",
          "ocr_provider": "ask",               # ask(默认) | api | paddle | none
          "ocr_api_base": "http://<ocr-svc>:8000",   # api 模式：HTTP OCR 服务
-         "ocr_api_key": ""}                   # 可选，或环境变量 OCR_API_KEY
+         "ocr_api_key": "",                   # 可选，或环境变量 OCR_API_KEY
+         "ocr_timeout": 300}                  # HTTP 超时秒（可选，默认 VLLM_KB_OCR_TIMEOUT=60；
+                                              # VLM 类 OCR 大图/密集图建议 300）
 
     - 图片随 markdown/pdf 导入进资产层（assets/images/），本来源只做 OCR；
     - canonicalize(): 扫描 assets/images/*，对每张图（幂等：ocr.json 记录 sha256 一致则跳过）
@@ -1192,6 +1195,7 @@ class ImageSource(BaseSource):
         import os
 
         from .ocr import (OcrApiError, OcrUnavailable, as_confidence_threshold,
+                          as_timeout_seconds,
                           build_ocr_artifact, engine_fingerprint, load_ocr_artifact,
                           ocr_image_detail, save_ocr_artifact)
 
@@ -1212,6 +1216,7 @@ class ImageSource(BaseSource):
         # ---- OCR 引擎决策 ----
         # 阈值与其他 ocr_* 字段一样直接读本来源配置（本来源即 image source）
         min_conf = as_confidence_threshold(self.cfg.get("ocr_min_confidence"))
+        ocr_timeout = as_timeout_seconds(self.cfg.get("ocr_timeout"))
         provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
         api_base = str(self.cfg.get("ocr_api_base", "") or "")
         api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
@@ -1244,7 +1249,8 @@ class ImageSource(BaseSource):
             while True:
                 try:
                     result = ocr_image_detail(img, provider, api_base=api_base,
-                                              api_key=api_key, model=api_model, mode=api_mode)
+                                              api_key=api_key, model=api_model, mode=api_mode,
+                                              timeout=ocr_timeout)
                     break
                 except OcrApiError as e:
                     print(f"[sources:{self.id}] OCR API 失败: {e}", flush=True)

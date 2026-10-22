@@ -116,7 +116,7 @@ def register(app, ctx) -> None:
         raw = _decode_image(req.image)
         try:
             res = ocr_image_detail(raw, "api", api_base=oc.api_base, api_key=oc.api_key,
-                                   model=oc.model, mode=oc.mode)
+                                   model=oc.model, mode=oc.mode, timeout=oc.timeout)
         except (OcrApiError, OcrUnavailable) as e:
             print(f"[api] /ocr 失败（provider=api mode={oc.mode} base={oc.api_base} "
                   f"model={oc.model or '-'}）：{e}", flush=True)

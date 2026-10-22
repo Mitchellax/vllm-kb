@@ -7,6 +7,7 @@
 - `api._sanitize_extra` 出口白名单放行 ocr 摘要；
 - `review.seed_low_confidence_ocr` 按图片 sha256 聚合生成审核项。
 """
+import io
 import json
 import os
 import sqlite3
@@ -378,6 +379,60 @@ class TestPaddleNdarrayInput(unittest.TestCase):
         self.assertEqual(res.provider, "paddle")
         self.assertEqual(len(calls), 1)
         self.assertTrue(hasattr(calls[0], "shape"))   # ndarray，非文件路径
+
+
+class TestOcrTimeoutConfig(unittest.TestCase):
+    """OCR HTTP 超时两级配置：image 源 config `ocr_timeout`（秒）优先，
+    未配置回退 VLLM_KB_OCR_TIMEOUT env（默认 60）。业务实测 paddle 服务端
+    100+ toks 仍有大图超 60s，超时必须可调。"""
+
+    def _cfg(self, source_extra: dict, env_timeout=None) -> AppConfig:
+        if env_timeout is not None:
+            os.environ["VLLM_KB_OCR_TIMEOUT"] = str(env_timeout)
+        try:
+            return AppConfig.model_validate({
+                "embedding": {"provider": "echo", "dimensions": 8},
+                "storage": {"vector_backend": "python"},
+                "sources": [dict({"id": "images", "type": "image", "enabled": True,
+                                  "ocr_provider": "api",
+                                  "ocr_api_base": "http://127.0.0.1:9"},
+                                 **source_extra)],
+            })
+        finally:
+            os.environ.pop("VLLM_KB_OCR_TIMEOUT", None)
+
+    def test_config_timeout_parses_and_wins(self):
+        from vllm_kb.ocr import as_timeout_seconds, ocr_config_from_cfg
+
+        cfg = self._cfg({"ocr_timeout": 300})
+        oc = ocr_config_from_cfg(cfg)
+        self.assertEqual(oc.timeout, 300)
+        self.assertEqual(as_timeout_seconds("abc"), 0)   # 非法回 0（env 默认）
+        self.assertEqual(as_timeout_seconds(-5), 0)
+        self.assertEqual(as_timeout_seconds(None), 0)
+
+    def test_env_fallback_when_config_missing(self):
+        """config 未配 → timeout=0 → _post_json 回退 VLLM_KB_OCR_TIMEOUT env 默认。"""
+        from vllm_kb.ocr import ocr_config_from_cfg
+
+        oc = ocr_config_from_cfg(self._cfg({}, env_timeout=120))
+        self.assertEqual(oc.timeout, 0)                  # 0 = env 语义（_HTTP_TIMEOUT）
+
+    def test_timeout_flows_to_post(self):
+        """ocr_image_detail 的 timeout 透传到 HTTP POST（不配时用 env 默认）。"""
+        from PIL import Image
+
+        from vllm_kb.ocr import ocr_image_detail
+
+        png = io.BytesIO()
+        Image.new("RGB", (4, 4), "white").save(png, format="PNG")
+        with mock.patch("vllm_kb.ocr._post_json",
+                        return_value={"text": "ok", "confidence": 0.9}) as p:
+            ocr_image_detail(png.getvalue(), "api",
+                             api_base="http://127.0.0.1:9", timeout=300)
+            self.assertEqual(p.call_args.kwargs.get("timeout"), 300)
+            ocr_image_detail(png.getvalue(), "api", api_base="http://127.0.0.1:9")
+            self.assertEqual(p.call_args.kwargs.get("timeout"), 0)   # 0 → env 默认
 
 
 if __name__ == "__main__":

@@ -106,6 +106,10 @@ class OcrConfig:
     model: str = ""
     mode: str = "custom"
     min_confidence: float = DEFAULT_MIN_CONFIDENCE
+    # HTTP 超时（秒）：0 = 用 VLLM_KB_OCR_TIMEOUT env（默认 60）。VLM 类 OCR 对
+    # 大图/密集图（整页截图、长表格）可能需要数分钟——业务实测 paddle 服务端
+    # 100+ toks 时仍有图超 60s。image 源 config `ocr_timeout` 同族配置。
+    timeout: int = 0
     extra: dict = field(default_factory=dict)
 
     @property
@@ -121,6 +125,15 @@ def as_confidence_threshold(v) -> float:
     except (TypeError, ValueError):
         return DEFAULT_MIN_CONFIDENCE
     return min(max(f, 0.0), 1.0)
+
+
+def as_timeout_seconds(v) -> int:
+    """解析 ocr_timeout（非法/缺失/≤0 回 0 = 用 VLLM_KB_OCR_TIMEOUT env 默认）。"""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
 
 
 def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
@@ -140,6 +153,7 @@ def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
         model=str(sc.get("ocr_api_model", "") or ""),
         mode=str(sc.get("ocr_api_mode", "custom") or "custom").lower(),
         min_confidence=as_confidence_threshold(sc.get("ocr_min_confidence")),
+        timeout=as_timeout_seconds(sc.get("ocr_timeout")),
     )
 
 
@@ -416,7 +430,7 @@ def _post_json(url: str, payload: dict, api_key: str, timeout: int = 0) -> dict:
 
 
 def _ocr_via_custom(src: "str | Path | bytes", api_base: str, api_key: str,
-                    model: str, t0: float) -> OcrResult:
+                    model: str, t0: float, timeout: int = 0) -> OcrResult:
     """自研协议：POST {api_base}/ocr。model 可选透传（服务端默认）。"""
     if not api_base:
         raise OcrApiError("ocr_api_base 未配置（OCR API provider 需要服务地址）")
@@ -426,7 +440,7 @@ def _ocr_via_custom(src: "str | Path | bytes", api_base: str, api_key: str,
     body: dict = {"image": b64, "filename": name or f"image.{sniff_image_ext(raw, ext or 'png')}"}
     if model:
         body["model"] = model
-    data = _post_json(api_base.rstrip("/") + "/ocr", body, api_key)
+    data = _post_json(api_base.rstrip("/") + "/ocr", body, api_key, timeout=timeout)
     text = data.get("text") or ""
     try:
         conf: Optional[float] = float(data["confidence"])
@@ -440,7 +454,7 @@ def _ocr_via_custom(src: "str | Path | bytes", api_base: str, api_key: str,
 
 
 def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
-                    model: str, t0: float) -> OcrResult:
+                    model: str, t0: float, timeout: int = 0) -> OcrResult:
     """OpenAI 兼容接口（vLLM 部署的 DeepSeek-OCR 等）：/chat/completions + 内联图片。
 
     置信度 = 模型自报（末行 CONFIDENCE: 0.xx）；自报异常置 None 并打 anomaly。
@@ -462,7 +476,8 @@ def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
             ],
         }],
     }
-    data = _post_json(api_base.rstrip("/") + "/chat/completions", payload, api_key)
+    data = _post_json(api_base.rstrip("/") + "/chat/completions", payload, api_key,
+                      timeout=timeout)
     try:
         content = data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError) as e:
@@ -516,12 +531,14 @@ def _ocr_via_paddle(src: "str | Path | bytes", t0: float) -> OcrResult:
 
 def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
                      api_base: str = "", api_key: str = "", model: str = "",
-                     mode: str = "custom") -> OcrResult:
+                     mode: str = "custom", timeout: int = 0) -> OcrResult:
     """对单张图片做 OCR，返回完整结果（含置信度来源与自报异常标记）。
 
     src 可以是图片路径，也可以是**原始字节**（请求期端点用，避免落盘）。
     provider: api（HTTP 服务，需 api_base；mode=custom 自研协议 / openai OpenAI 兼容，
     model 在 openai 模式必填）| paddle（本地）| none（占位）。
+    timeout: HTTP 超时秒数（0 = VLLM_KB_OCR_TIMEOUT env，默认 60）——config
+    `ocr_timeout` / env 两级配置，业务实测 paddle 服务端 100+ toks 仍有大图超 60s。
     引擎不可用抛 OcrUnavailable / OcrApiError，调用方决定询问或跳过。
     """
     provider = (provider or "none").lower()
@@ -531,8 +548,8 @@ def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
     if provider == "api":
         mode = (mode or "custom").lower()
         if mode == "openai":
-            return _ocr_via_openai(src, api_base, api_key, model, t0)
-        return _ocr_via_custom(src, api_base, api_key, model, t0)
+            return _ocr_via_openai(src, api_base, api_key, model, t0, timeout=timeout)
+        return _ocr_via_custom(src, api_base, api_key, model, t0, timeout=timeout)
     if provider == "paddle":
         return _ocr_via_paddle(src, t0)
     raise OcrUnavailable(f"未知 OCR provider: {provider}（支持 api | paddle | none）")
@@ -540,7 +557,7 @@ def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
 
 def ocr_image(src: "str | Path | bytes", provider: str = "none",
               api_base: str = "", api_key: str = "", model: str = "",
-              mode: str = "custom") -> tuple[str, float]:
+              mode: str = "custom", timeout: int = 0) -> tuple[str, float]:
     """对单张图片做 OCR，返回 (识别文本, 平均置信度)。
 
     兼容旧签名：置信度缺失（自报异常 / 引擎无输出）统一回退为 0.0（低置信语义，
@@ -548,5 +565,5 @@ def ocr_image(src: "str | Path | bytes", provider: str = "none",
     ocr_image_detail。
     """
     r = ocr_image_detail(src, provider, api_base=api_base, api_key=api_key,
-                         model=model, mode=mode)
+                         model=model, mode=mode, timeout=timeout)
     return r.text, (r.confidence if r.confidence is not None else 0.0)
