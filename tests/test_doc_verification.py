@@ -160,7 +160,19 @@ class DocVerificationTest(unittest.TestCase):
         seed_verification_pending(self.cfg, self.review_store)
         with self.assertRaises(ValueError):
             review_verification(self.cfg, self.review_store, self.item_id(), "approved", "t",
-                                result={"verification": "unverified"})
+                                result={"verification": "bogus"})
+
+    def test_approve_unverified_resets(self):
+        """unverified 是合法认证级别 = 撤销认证（清覆盖层）+ 审核项回 pending。"""
+        self.ingest()
+        seed_verification_pending(self.cfg, self.review_store)
+        iid = self.item_id()
+        review_verification(self.cfg, self.review_store, iid, "approved", "a",
+                            result={"verification": "tested"})
+        review_verification(self.cfg, self.review_store, iid, "approved", "b",
+                            result={"verification": "unverified"})
+        self.assertEqual(self.verif()[0], "unverified")  # 生效值回 canonical（覆盖层已清）
+        self.assertEqual(self.review_store.get_item(iid)["status"], "pending")
 
     def test_overlay_survives_reingest(self):
         """**核心**：canonical 仍写 unverified，重新入库后仍是 tested（不被冲掉）。"""

@@ -267,6 +267,81 @@ class TestSeeds(unittest.TestCase):
         self.assertEqual(items[0]["item_ref"], "md:caseA")
 
 
+class TestVerificationReset(unittest.TestCase):
+    """认证级别三档全覆盖：approved+unverified = 清人工覆盖层（重置），生效值回 canonical。
+
+    2026-10 业务复核：UI 只有 tested/expert 两档，无法撤销认证——补 unverified 重置语义
+    （不写 unverified 覆盖层：canonical 可能自带更高值如 PDF expert，清层后按 canonical 生效）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        # docs 表用完整列结构（apply_verification 会 UPDATE source_type/title/extra）
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        conn.executescript(
+            "CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT,"
+            " component TEXT, url TEXT, status TEXT, resolved_at TEXT, extra TEXT, reliability REAL)"
+        )
+        conn.executemany("INSERT INTO docs VALUES(?,?,?,?,?,?,?,?,?)", [
+            ("md:glm三板斧", "doc_markdown", "GLM5.1 崩溃三板斧", "", "", None, None,
+             json.dumps({"verification": "unverified"}), 0.5),
+            ("md:caseA", "doc_markdown", "【待审核】HCCN 排查案例", "", "", None, None,
+             json.dumps({"verification": "unverified"}), 0.5),
+            ("pdf:guide", "doc_pdf", "NPU 接口指南", "", "", None, None,
+             json.dumps({"verification": "expert"}), 0.85),
+        ])
+        conn.commit()
+        conn.close()
+        self.cfg = make_cfg(self.root)
+        self.store = ReviewStore(self.root / "review.sqlite3")
+        self.assertEqual(seed_verification_pending(self.cfg, self.store), 2)
+        # 先认证一档
+        item = next(i for i in self.store.list_items(category="verification_pending")
+                    if i["item_ref"] == "md:glm三板斧")
+        review_verification(self.cfg, self.store, item["id"], "approved",
+                            "alice", result={"verification": "expert"})
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        self.assertEqual(get_doc_verification_conn(conn, "md:glm三板斧")["verification"],
+                         "expert")
+        conn.close()
+        # 队列里该文档重新入队（认证后 seed 收敛）——直接用原 item_id 走重置
+        self.item_id = item["id"]
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_reset_unverified_clears_overlay_and_reopens(self):
+        """重置 = 清覆盖层（生效值回 canonical）+ 审核项回 pending（保留重审入口）。"""
+        review_verification(self.cfg, self.store, self.item_id, "approved",
+                            "bob", result={"verification": "unverified"})
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        try:
+            self.assertIsNone(
+                get_doc_verification_conn(conn, "md:glm三板斧")["verification"])
+        finally:
+            conn.close()
+        it = self.store.get_item(self.item_id)
+        self.assertEqual(it["status"], "pending")        # 队列项重开（可重新审核）
+        self.assertEqual(it["reviewer"], "bob")
+
+    def test_reset_reopens_queue_item(self):
+        """重置后队列项回 pending：文档回到待补标状态可被再次认证/重置（add_item 去重
+        铁律下 seed 不会补新项——重开原项是唯一正确入口）。"""
+        review_verification(self.cfg, self.store, self.item_id, "approved",
+                            "bob", result={"verification": "unverified"})
+        review_verification(self.cfg, self.store, self.item_id, "approved",
+                            "carol", result={"verification": "tested"})
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        try:
+            self.assertEqual(
+                get_doc_verification_conn(conn, "md:glm三板斧")["verification"], "tested")
+        finally:
+            conn.close()
+        self.assertEqual(self.store.get_item(self.item_id)["status"], "approved")
+
+
 class TestFileLevelVerification(unittest.TestCase):
     """表格文件粒度审核：seed 按文件聚合、认证批量应用到全部行、内容变更重新审核。"""
 

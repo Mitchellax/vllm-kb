@@ -174,11 +174,11 @@ const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.
 // 列表条目标题：tag_candidate 显示候选词本身（payload.title 是"兼容旧单文档"的首文档标题，
 // 曾把候选词压住——四篇 Atlas A3 手册的候选在列表里全显示成同一个产品名）；其余类别用文档标题
 const itemTitle=i=>{const p=i.payload||{};return i.category==='tag_candidate'?(p.candidate||i.item_ref):(p.title||i.item_ref)};
-$('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span></div>`
-+`<div id="queuebatch" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuebatch-n">0</span> 项补标</b> 认证级别: <select id="qb-level"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option></select> <button class="primary sm" onclick="queueBatchReview()">✓ 批量认证</button></div>`
-+`<div id="queuecand" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuecand-n">0</span> 条候选</b> tier（仅采纳可覆盖）: <select id="qc-tier"><option value="">用各候选建议</option><option value="domain">领域</option><option value="purpose">作用</option></select> <button class="primary sm" onclick="queueBatchCandidates('adopt')">✓ 批量采纳</button> <button class="sm" onclick="queueBatchCandidates('ignore')">忽略所选</button> <span class="muted">采纳=入词典+全部提及文档打标；忽略=不再出现（不改任何数据）</span></div>`
+$('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span> <button class="sm" onclick="queueSelectAll()" title="勾选当前筛选下全部未审核项（含候选与补标）">全选未审核</button> <button class="sm" onclick="queueClearSel()">清空选择</button> <span class="muted">选择技巧: 点击锚点后 <b>Shift+点击</b> 选区间，Ctrl/⌘+点击 单独切换</span></div>`
++`<div id="queuebatch" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuebatch-n">0</span> 项补标</b> 认证级别: <select id="qb-level"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option><option value="unverified">unverified（重置认证）</option></select> <button class="primary sm" onclick="queueBatchReview()">✓ 批量应用</button></div>`
++`<div id="queuecand" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuecand-n">0</span> 条候选</b> 提及≥<input id="qc-min-docs" type="number" value="3" min="1" style="width:54px">篇 <button class="sm" onclick="queueSelectDocs()" title="勾选当前筛选下提及篇数达标的高频候选——处理大量候选的推荐姿势">勾选高频</button> | tier（仅采纳可覆盖）: <select id="qc-tier"><option value="">用各候选建议</option><option value="domain">领域</option><option value="purpose">作用</option></select> <button class="primary sm" onclick="queueBatchCandidates('adopt')">✓ 批量采纳</button> <button class="sm" onclick="queueBatchCandidates('ignore')">忽略所选</button> <span class="muted">采纳=入词典+全部提及文档打标；忽略=不再出现（不改任何数据）</span></div>`
 +q.map(i=>{const pending=i.status==='pending';
-const chk=(pending&&(i.category==='verification_pending'||i.category==='tag_candidate'))?`<input type="checkbox" class="${i.category==='tag_candidate'?'cchk':'qchk'}" data-id="${i.id}" onclick="event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量操作"> `:'';
+const chk=(pending&&(i.category==='verification_pending'||i.category==='tag_candidate'))?`<input type="checkbox" class="${i.category==='tag_candidate'?'cchk':'qchk'}" data-id="${i.id}"${i.category==='tag_candidate'?` data-docs="${i.payload?.doc_count||1}"`:''} onclick="queueCheckClick(event,'${i.category==='tag_candidate'?'cchk':'qchk'}');event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量操作；Shift+点击=区间选择"> `:'';
 return `<div class="item" onclick="showItem(${i.id})"><div>${chk}<span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`}).join('')||'<div class="card muted">队列为空</div>'
 +`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid var(--rv-red)"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
 <div class="muted mono">${esc((i.payload||{}).asset&&(i.payload.asset.path)||'')}</div>
@@ -209,7 +209,7 @@ ${docPrev}
 <h4>审核（只做判定，不修改原始内容）</h4><input id="rev" placeholder="审核人（必填）" style="width:180px" oninput="saveReviewer(this.value)">
 <textarea id="rvnote" rows="2" style="width:100%" placeholder="备注（可选）"></textarea>
 <div class="actions">
-${i.category==='verification_pending'?`认证级别: <select id="verlevel"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option></select>`:''}
+${i.category==='verification_pending'?`认证级别: <select id="verlevel"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option><option value="unverified">unverified（重置认证）</option></select>`:''}
 ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
 <button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button>`:''}
 <button class="primary" onclick="review(${i.id},'approved')">✓ 认证${isFile?`（全部 ${p.row_count||rows.length} 行）`:''}</button>
@@ -222,7 +222,7 @@ async function adoptCandidate(id){const reviewer=document.getElementById('rev').
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
 async function review(id,action){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 const result={note:(document.getElementById('rvnote')||{}).value||''};
-const vl=document.getElementById('verlevel');if(vl)result.verification=vl.value;  // 补标项认证级别（tested/expert）
+const vl=document.getElementById('verlevel');if(vl)result.verification=vl.value;  // 补标项认证级别（tested/expert/unverified=重置）
 await j('/api/item/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reviewer,result})});loadQueue()}
 async function deleteDoc(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 if(!confirm('标记删除：删除数据库记录并登记墓碑（构建不再复活；表格项=整表全部行），原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
@@ -334,9 +334,25 @@ const problems=[...r.failed.map(f=>`${f.source_id}：${f.error}`),...(r.still_pr
 if(problems.length){openModal(`<h4>⚠ 删除未完全成功（${r.deleted}/${sids.length} 篇已删）</h4><div class="card">${problems.map(p=>`<div class="mono" style="margin:2px 0">${esc(p)}</div>`).join('')}</div><div class="muted">失败的条目可重试；"仍存在于库"说明删除未落库（如库被占用），重试通常可解。</div><div class="actions"><button class="danger sm" onclick="docBatchDelete(${JSON.stringify([...r.failed.map(f=>f.source_id),...(r.still_present||[])]).replace(/"/g,'&quot;')})">↻ 重试剩余 ${r.failed.length+(r.still_present||[]).length} 篇</button> <button class="sm" onclick="closeModal()">关闭</button></div>`)}
 else{toast(`✓ 已删除 ${r.deleted}/${sids.length} 篇（墓碑已登记）${r.candidates_cleaned&&r.candidates_cleaned.auto_ignored?`，联动忽略 ${r.candidates_cleaned.auto_ignored} 条候选`:''}`)}}catch(e){toast('✗ '+e.message)}}
 function queueCheckedIds(sel){return Array.from(document.querySelectorAll(sel+':checked')).map(x=>+x.dataset.id)}
+// 选择交互（文件管理器式）：点击记锚点；Shift+点击 选中同类项区间；Ctrl/⌘+点击 走原生单独切换
+const _selAnchor={qchk:null,cchk:null};
+function queueCheckClick(e,cls){
+  const boxes=Array.from(document.querySelectorAll('#view-queue .'+cls));
+  if(e.shiftKey&&_selAnchor[cls]&&boxes.includes(_selAnchor[cls])){
+    const a=boxes.indexOf(_selAnchor[cls]),b=boxes.indexOf(e.target);
+    if(a>=0&&b>=0){const[s,t]=[Math.min(a,b),Math.max(a,b)];
+      boxes.slice(s,t+1).forEach(x=>{x.checked=e.target.checked});
+      queueSelChanged();return}}
+  _selAnchor[cls]=e.target;
+}
 function queueSelChanged(){const vn=queueCheckedIds('#view-queue .qchk').length,cn=queueCheckedIds('#view-queue .cchk').length;
 const vb=document.getElementById('queuebatch');if(vb)vb.style.display=vn?'block':'none';const vc=document.getElementById('queuebatch-n');if(vc)vc.textContent=vn;
 const cb=document.getElementById('queuecand');if(cb)cb.style.display=cn?'block':'none';const cc=document.getElementById('queuecand-n');if(cc)cc.textContent=cn}
+function queueSelectAll(){document.querySelectorAll('#view-queue .qchk,#view-queue .cchk').forEach(x=>{x.checked=true});queueSelChanged()}
+function queueClearSel(){document.querySelectorAll('#view-queue .qchk,#view-queue .cchk').forEach(x=>{x.checked=false});_selAnchor.qchk=_selAnchor.cchk=null;queueSelChanged()}
+function queueSelectDocs(){const min=parseInt((document.getElementById('qc-min-docs')||{}).value||'0',10)||0;
+let n=0;document.querySelectorAll('#view-queue .cchk').forEach(x=>{const d=parseInt(x.dataset.docs||'1',10);
+if(min&&d>=min){x.checked=true;n++}});queueSelChanged();toast(`已勾选提及≥${min}篇的候选 ${n} 条`)}
 async function queueBatchReview(){const ids=queueCheckedIds('#view-queue .qchk');if(!ids.length){toast('先勾选补标项');return}
 const reviewer=requireReviewer();if(!reviewer)return;
 const level=((document.getElementById('qb-level')||{}).value)||'tested';
@@ -607,8 +623,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
             raise HTTPException(400, "action 须为 adopt|ignore")
         if not item_ids or not reviewer:
             raise HTTPException(400, "item_ids/reviewer 必填")
-        if len(item_ids) > 200:
-            raise HTTPException(400, "一次最多 200 项")
+        if len(item_ids) > 2000:
+            raise HTTPException(400, "一次最多 2000 项（积压 2000+ 候选的全选场景）")
         done, failed = 0, []
         for iid in item_ids:
             try:
@@ -851,8 +867,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
                 continue
         if not item_ids or not reviewer:
             raise HTTPException(400, "item_ids/reviewer 必填")
-        if len(item_ids) > 200:
-            raise HTTPException(400, "一次最多 200 项")
+        if len(item_ids) > 2000:
+            raise HTTPException(400, "一次最多 2000 项（积压 2000+ 的全选场景）")
         reviewed, failed = 0, []
         for iid in item_ids:
             try:

@@ -397,6 +397,22 @@ class ReviewStore:
         finally:
             conn.close()
 
+    def reopen(self, item_id: int, reviewer: str, result: Optional[dict] = None) -> bool:
+        """审核项重开（回 pending）：认证撤销（verification 重置为 unverified）专用——
+        撤销认证后文档回到待补标状态，队列项必须同步回 pending，否则用户失去重审入口
+        （add_item 的 (category, item_ref) 去重铁律会挡住 seed 重新入队）。"""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE review_items SET status='pending', reviewed_at=?, reviewer=?, result=? "
+                "WHERE id=?",
+                (_now(), reviewer, json.dumps(result or {}, ensure_ascii=False), int(item_id)),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def mark_deleted(self, item_id: int, reviewer: str, kb_path: str | Path,
                      note: str = "") -> bool:
         """标记删除：**只删除 kb.sqlite3 的数据库记录**，原始资产文件保留
@@ -1068,9 +1084,23 @@ def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, acti
         # 文件级（表格）：批量应用到全部行
         if action == "approved":
             want = (result or {}).get("verification") or "tested"
-            if want not in ("tested", "expert"):
-                raise ValueError(f"approved 的 verification 只能是 tested/expert，收到 {want!r}")
-            r = apply_verification_many(cfg, rows, want, reviewer)
+            if want == "unverified":
+                # 重置：清除人工覆盖层，生效值回 canonical（unverified）——认证撤销语义。
+                # 不直接写 "unverified" 覆盖层：canonical 可能自带更高值（如 PDF expert），
+                # 清层后按 canonical 生效与 seed 的过期清理逻辑一致。
+                r = apply_verification_many(cfg, rows, None, reviewer, clear=True)
+                store.reopen(item_id, reviewer,
+                             result={"action": "verification", "verification": "unverified",
+                                     "rows_count": len(rows), "rows_verified": r["verified"],
+                                     "rows_failed": len(r["failed"]), **(result or {})})
+                return {"ok": True, "source_id": rows[0], "aggregate": "excel_file",
+                        "reopened": True, "rows_count": len(rows),
+                        "rows_verified": r["verified"], "rows_failed": len(r["failed"]),
+                        "failed": r["failed"]}
+            elif want not in ("tested", "expert"):
+                raise ValueError(f"approved 的 verification 只能是 tested/expert/unverified，收到 {want!r}")
+            else:
+                r = apply_verification_many(cfg, rows, want, reviewer)
         elif action == "suspected":
             r = apply_verification_many(cfg, rows, None, reviewer, clear=True)
         else:
@@ -1086,9 +1116,16 @@ def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, acti
     source_id = it["item_ref"]
     if action == "approved":
         want = (result or {}).get("verification") or "tested"
-        if want not in ("tested", "expert"):
-            raise ValueError(f"approved 的 verification 只能是 tested/expert，收到 {want!r}")
-        r = apply_verification(cfg, source_id, want, reviewer)
+        if want == "unverified":
+            r = apply_verification(cfg, source_id, None, reviewer, clear=True)
+            store.reopen(item_id, reviewer,
+                         result={"action": "verification", "verification": "unverified",
+                                 **(result or {})})
+            return {"ok": True, "source_id": source_id, "reopened": True, **r}
+        elif want not in ("tested", "expert"):
+            raise ValueError(f"approved 的 verification 只能是 tested/expert/unverified，收到 {want!r}")
+        else:
+            r = apply_verification(cfg, source_id, want, reviewer)
     elif action == "suspected":
         r = apply_verification(cfg, source_id, None, reviewer, clear=True)
     else:
