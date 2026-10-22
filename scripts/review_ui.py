@@ -172,7 +172,7 @@ $('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pend
 let _queueTab='verification_pending', _otherCat='';
 async function loadQueue(tab){
   if(tab)_queueTab=tab;
-  const q=await j('/api/queue');
+  const q=await j('/api/queue?limit=5000');   // 全量：徽标计数与页签过滤都依赖完整列表
   const del=await j('/api/queue?status=deleted&limit=100');
   const isVerif=i=>i.category==='verification_pending', isCand=i=>i.category==='tag_candidate';
   const inTab=i=>_queueTab==='verification_pending'?isVerif(i):_queueTab==='tag_candidate'?isCand(i):(!isVerif(i)&&!isCand(i));
@@ -795,7 +795,10 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
     @app.get("/api/queue")
     def queue(category: Optional[str] = None, status: Optional[str] = None,
               limit: int = 50, offset: int = 0):
-        return store.list_items(category=category, status=status, limit=min(limit, 200), offset=offset)
+        # 上限 5000（原 200）：页签制前端一次拉全量按页签过滤+计徽标——业务环境
+        # tag_candidate 2000+ 时，200 截断会把补标项挤出响应（无参默认 50 更甚），
+        # 补标页签假性全空。只读端点，放宽无副作用。
+        return store.list_items(category=category, status=status, limit=min(limit, 5000), offset=offset)
 
     @app.get("/api/item/{item_id}")
     def item(item_id: int):

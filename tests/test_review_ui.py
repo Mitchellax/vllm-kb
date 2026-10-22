@@ -188,6 +188,26 @@ class ReviewUiApiTest(unittest.TestCase):
         td = self.client.get("/api/tag-dict").json()
         self.assertEqual(td["groups"]["domain"] + td["groups"]["purpose"], [])
 
+    def test_queue_limit_allows_full_pull(self):
+        """队列读端点上限 5000（原 200）：页签制前端一次拉全量按页签过滤+计徽标——
+        业务环境 tag_candidate 2000+ 时 200 截断把补标项挤出响应，补标页签假性全空。"""
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore, default_review_path
+
+        cfg = AppConfig.load(str(self.cfg_path), require_keys=False)
+        store = ReviewStore(default_review_path(cfg))
+        try:
+            for i in range(250):
+                store.add_item("tag_candidate", f"cand-{i}", {"candidate": f"w{i}", "doc_count": 1})
+            store.add_item("verification_pending", "md:the-doc", {"title": "补标项"})
+        finally:
+            store.close()
+        default_page = self.client.get("/api/queue").json()
+        self.assertEqual(len(default_page), 50)          # 默认页不变（首屏行为保持）
+        full = self.client.get("/api/queue?limit=5000").json()
+        self.assertEqual(len(full), 251)                 # 不再被 200 截断
+        self.assertTrue(any(i["category"] == "verification_pending" for i in full))
+
     def test_stats_queue_item_review_flow(self):
         # stats 初始为空
         self.assertEqual(self.client.get("/api/stats").json(), {})
