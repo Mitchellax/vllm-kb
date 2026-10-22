@@ -2094,8 +2094,9 @@ class HtmlSource(BaseSource):
         total = len(pages)
         start_ts = time.time()
         if total:
-            print(f"[sources:{self.id}] 解析 {total} 个网页 …", flush=True)
-        for f in pages:
+            print(f"[sources:{self.id}] 解析 {total} 个网页 …"
+                  "（图片多时含逐图 OCR，进度每 10 页打印一次）", flush=True)
+        for idx, f in enumerate(pages, 1):
             p, from_imports, stem = f.path, f.from_imports, f.stem
             try:
                 raw = p.read_bytes()
@@ -2132,6 +2133,15 @@ class HtmlSource(BaseSource):
             }
             if parsed.get("warnings"):
                 quality["convert_warnings"] = parsed["warnings"]
+            # 进度日志（每 10 页 + 末页）：html 图片多时逐图 OCR 串行耗时，静默窗口
+            # 不可接受（2026-10 业务实测：159 网页卡在"解析…"无日志，实为逐图 OCR 在跑）
+            if idx % 10 == 0 or idx == total:
+                n_assets = sum(1 for e in evidence
+                               if e.get("kind") in ("local", "base64"))
+                print(f"[sources:{self.id}] 进度 {idx}/{total} 网页"
+                      f"（本页 {len(evidence)} 图 / 资产化 {n_assets} / "
+                      f"未解析 {quality['images_unresolved']}，"
+                      f"累计 {time.time() - start_ts:.0f}s）", flush=True)
             # 文档级自动标签：文件名 + Markdown 标题（两级分类，见 tagging.py）
             tags, cands = extract_tags(stem, headings_from_markdown(parsed["body"]),
                                        registry=registry)
