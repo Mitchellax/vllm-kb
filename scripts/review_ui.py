@@ -167,19 +167,34 @@ async function loadStats(){const s=await j('/api/stats');const cats=Object.entri
 let tagCard='';try{const td=await j('/api/tag-dict');tagCard=`<div class="statcard"><b>标签词典</b><br><span class="muted">领域类 ${td.stats.domain} 个 · 作用类 ${td.stats.purpose} 个 · 已打标文档 ${td.stats.tagged_docs} 篇</span></div>`}catch(e){}
 $('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pending,0)} 待办 / ${cats.reduce((a,[k,v])=>a+v.suspected,0)} 存疑）</h3>`
 +(tagCard||'')+`<div class="statgrid">`+(cats.map(([k,v])=>`<div class="statcard"><b>${esc(k)}</b> <span class="badge pending">待办 ${v.pending}</span>${v.suspected?`<span class="badge suspected">存疑 ${v.suspected}</span>`:''} <span class="muted">共 ${v.total}</span></div>`).join('')||'<div class="card">暂无审核项（导入文档后自动补单）</div>')+`</div>`}
-async function loadQueue(cat=''){const q=await j('/api/queue'+(cat?'?category='+cat:''));
-const del=await j('/api/queue?status=deleted&limit=100');
-const opts=(await (async()=>{const r=await fetch('/api/categories');return r.ok?await r.json():[]})());
+// 队列页签制（业务反馈：补标认证与标签候选混在一个列表——管理不便、Shift 区间多选会
+// 跨类勾到另一类工作）。三页签独立视图：单页签内只有一类 checkbox，区间选择天然不跨类。
+let _queueTab='verification_pending', _otherCat='';
+async function loadQueue(tab){
+  if(tab)_queueTab=tab;
+  const q=await j('/api/queue');
+  const del=await j('/api/queue?status=deleted&limit=100');
+  const isVerif=i=>i.category==='verification_pending', isCand=i=>i.category==='tag_candidate';
+  const inTab=i=>_queueTab==='verification_pending'?isVerif(i):_queueTab==='tag_candidate'?isCand(i):(!isVerif(i)&&!isCand(i));
+  let shown=q.filter(inTab);
+  if(_queueTab==='other'&&_otherCat)shown=shown.filter(i=>i.category===_otherCat);
+  const pendingCnt=t=>q.filter(i=>i.status==='pending'&&(t==='verification_pending'?isVerif(i):t==='tag_candidate'?isCand(i):(!isVerif(i)&&!isCand(i)))).length;
 const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.rows||[]).length>1)?` <span class="badge approved">${p.row_count||(p.rows||[]).length} 行</span>`:''};
 // 列表条目标题：tag_candidate 显示候选词本身（payload.title 是"兼容旧单文档"的首文档标题，
 // 曾把候选词压住——四篇 Atlas A3 手册的候选在列表里全显示成同一个产品名）；其余类别用文档标题
 const itemTitle=i=>{const p=i.payload||{};return i.category==='tag_candidate'?(p.candidate||i.item_ref):(p.title||i.item_ref)};
-$('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><label>类别: </label><select id="qcat" onchange="loadQueue(this.value)"><option value="">全部</option>${opts.map(c=>`<option ${c===cat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">共 ${q.length} 条（未审核在前，存疑在后；表格项按文件粒度，<b>N 行</b>徽标 = 一次认证整表生效）</span> <button class="sm" onclick="queueSelectAll()" title="勾选当前筛选下全部未审核项（含候选与补标）">全选未审核</button> <button class="sm" onclick="queueClearSel()">清空选择</button> <span class="muted">选择技巧: 点击锚点后 <b>Shift+点击</b> 选区间，Ctrl/⌘+点击 单独切换</span></div>`
-+`<div id="queuebatch" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuebatch-n">0</span> 项补标</b> 认证级别: <select id="qb-level"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option><option value="unverified">unverified（重置认证）</option></select> <button class="primary sm" onclick="queueBatchReview()">✓ 批量应用</button></div>`
-+`<div id="queuecand" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuecand-n">0</span> 条候选</b> 提及≥<input id="qc-min-docs" type="number" value="3" min="1" style="width:54px">篇 <button class="sm" onclick="queueSelectDocs()" title="勾选当前筛选下提及篇数达标的高频候选——处理大量候选的推荐姿势">勾选高频</button> | tier（仅采纳可覆盖）: <select id="qc-tier"><option value="">用各候选建议</option><option value="domain">领域</option><option value="purpose">作用</option></select> <button class="primary sm" onclick="queueBatchCandidates('adopt')">✓ 批量采纳</button> <button class="sm" onclick="queueBatchCandidates('ignore')">忽略所选</button> <span class="muted">采纳=入词典+全部提及文档打标；忽略=不再出现（不改任何数据）</span></div>`
-+q.map(i=>{const pending=i.status==='pending';
-const chk=(pending&&(i.category==='verification_pending'||i.category==='tag_candidate'))?`<input type="checkbox" class="${i.category==='tag_candidate'?'cchk':'qchk'}" data-id="${i.id}"${i.category==='tag_candidate'?` data-docs="${i.payload?.doc_count||1}"`:''} onclick="queueCheckClick(event,'${i.category==='tag_candidate'?'cchk':'qchk'}');event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量操作；Shift+点击=区间选择"> `:'';
-return `<div class="item" onclick="showItem(${i.id})"><div>${chk}<span class="badge ${i.status}">${i.status}</span> <b>${esc(i.category)}</b> ${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`}).join('')||'<div class="card muted">队列为空</div>'
+  const tabBtn=(t,label)=>`<button class="sm ${_queueTab===t?'primary':''}" onclick="loadQueue('${t}')" style="margin-right:4px">${label} <span class="badge">${pendingCnt(t)}</span></button>`;
+  const otherCats=[...new Set(q.filter(i=>!isVerif(i)&&!isCand(i)).map(i=>i.category))];
+  $('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><div style="margin-bottom:6px">${tabBtn('verification_pending','📋 补标认证')}${tabBtn('tag_candidate','🏷 标签候选')}${tabBtn('other','🗂 其他')}</div>`
+  +`<span class="muted">共 ${shown.length} 条（未审核在前，存疑在后）</span> `
+  +(_queueTab!=='other'?`<button class="sm" onclick="queueSelectAll()" title="勾选本页签全部未审核项">全选未审核</button> <button class="sm" onclick="queueClearSel()">清空选择</button> <span class="muted">选择技巧: 点击锚点后 <b>Shift+点击</b> 选区间，Ctrl/⌘+点击 单独切换</span>`
+    :`<label class="muted">类别: </label><select id="qcat" onchange="_otherCat=this.value;loadQueue()"><option value="">全部</option>${otherCats.map(c=>`<option ${c===_otherCat?'selected':''}>${esc(c)}</option>`).join('')}</select> <span class="muted">标题冲突/OCR 低置信等单条审核项</span>`)
+  +`</div>`
+  +(_queueTab==='verification_pending'?`<div id="queuebatch" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuebatch-n">0</span> 项补标</b> 认证级别: <select id="qb-level"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option><option value="unverified">unverified（重置认证）</option></select> <button class="primary sm" onclick="queueBatchReview()">✓ 批量应用</button></div>`:'')
+  +(_queueTab==='tag_candidate'?`<div id="queuecand" class="card" style="display:none;border-left:3px solid var(--rv-accent)"><b>已选 <span id="queuecand-n">0</span> 条候选</b> 提及≥<input id="qc-min-docs" type="number" value="3" min="1" style="width:54px">篇 <button class="sm" onclick="queueSelectDocs()" title="勾选本页签提及篇数达标的高频候选——处理大量候选的推荐姿势">勾选高频</button> | tier（仅采纳可覆盖）: <select id="qc-tier"><option value="">用各候选建议</option><option value="domain">领域</option><option value="purpose">作用</option></select> <button class="primary sm" onclick="queueBatchCandidates('adopt')">✓ 批量采纳</button> <button class="sm" onclick="queueBatchCandidates('ignore')">忽略所选</button> <span class="muted">采纳=入词典+全部提及文档打标；忽略=不再出现（不改任何数据）</span></div>`:'')
+  +shown.map(i=>{const pending=i.status==='pending';
+  const chk=(pending&&_queueTab!=='other')?`<input type="checkbox" class="${_queueTab==='tag_candidate'?'cchk':'qchk'}" data-id="${i.id}"${_queueTab==='tag_candidate'?` data-docs="${i.payload?.doc_count||1}"`:''} onclick="queueCheckClick(event,'${_queueTab==='tag_candidate'?'cchk':'qchk'}');event.stopPropagation()" onchange="queueSelChanged()" style="margin-right:6px" title="勾选后批量操作；Shift+点击=区间选择"> `:'';
+  return `<div class="item" onclick="showItem(${i.id})"><div>${chk}<span class="badge ${i.status}">${i.status}</span> ${_queueTab==='other'?`<b>${esc(i.category)}</b> `:''}${esc(itemTitle(i))}${fileRows(i)}</div><div class="muted">#${i.id} · ${(i.created_at||'').slice(0,16)}</div></div>`}).join('')||'<div class="card muted">本页签暂无审核项</div>'
 +`<h3 style="margin-top:26px">待实际删除（${del.length}）— 数据库记录已删，原始文件请手动本地删除</h3>`+del.map(i=>`<div class="card" style="border-left:3px solid var(--rv-red)"><div><b>${esc((i.payload||{}).title||i.item_ref)}</b> <span class="mono muted">${esc((i.payload||{}).source_id||i.item_ref)}</span></div>
 <div class="muted mono">${esc((i.payload||{}).asset&&(i.payload.asset.path)||'')}</div>
 <div class="actions"><button class="ok" onclick="undoDelete(${i.id})">↩ 撤回（恢复记录并重新入队）</button> <span class="muted">删除人: ${esc(i.reviewer||'')} ${(i.reviewed_at||'').slice(0,16)}</span></div></div>`).join('')||''}

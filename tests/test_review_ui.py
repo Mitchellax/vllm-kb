@@ -497,10 +497,24 @@ class ReviewUiHtmlAudit(unittest.TestCase):
         self.assertIn("category==='tag_candidate'", fn)
         self.assertIn("p.candidate||i.item_ref", fn)
         # 队列 pending 列表必须走 itemTitle，不允许裸拼 payload.title（待删除列表不受限——
-        # 只含文档类条目）
-        qmap = src[src.index("+q.map(i=>"):src.index("待实际删除")]
+        # 只含文档类条目）；页签制后列表渲染源为 shown（当前页签过滤后的条目）
+        qmap = src[src.index("+shown.map(i=>"):src.index("待实际删除")]
         self.assertIn("itemTitle(i)", qmap)
         self.assertNotIn("(i.payload||{}).title||i.item_ref", qmap)
+
+    def test_queue_tabs_separate_workflows(self):
+        """队列页签制：补标认证与标签候选分页签独立视图（业务反馈：混排列表管理不便、
+        Shift 区间多选跨类）。审计三要素：页签状态变量、三个页签按钮、批量条按页签条件渲染。"""
+        src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
+        self.assertIn("let _queueTab=", src)
+        for tab in ("'verification_pending'", "'tag_candidate'", "'other'"):
+            self.assertIn(f"tabBtn({tab}", src, f"缺页签 {tab}")
+        # 批量条各归各页签（条件渲染，不再同屏出现两条）
+        self.assertIn("_queueTab==='verification_pending'?`<div id=\"queuebatch\"", src)
+        self.assertIn("_queueTab==='tag_candidate'?`<div id=\"queuecand\"", src)
+        # checkbox 类由页签判定（单页签内只有一类，Shift 区间不跨类）
+        qmap = src[src.index("+shown.map(i=>"):src.index("待实际删除")]
+        self.assertIn("_queueTab==='tag_candidate'?'cchk':'qchk'", qmap)
 
     def test_seed_tag_candidate_payload_has_no_legacy_title(self):
         """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）；
