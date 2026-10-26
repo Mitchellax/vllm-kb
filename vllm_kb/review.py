@@ -2091,10 +2091,19 @@ def normalize_tag_variants(cfg: "AppConfig", config_path: Optional[str | Path] =
         name = (item.get("name") if isinstance(item, dict) else str(item)) or ""
         if name.strip():
             names.append(name.strip())
-    # 按 tag_key 分组找变体对（保持 config 出现顺序；组内首条 = canonical）
+    # 按 tag_key 分组找变体对（组内首条 = canonical）：**干净名优先**（2026-10 业务实测
+    # "复位芯片。"/"复位芯片" 两个 tag）——首尾句读由 normalize_tag 剥离后同 key，canonical
+    # 选无句读的形式（词典/文档标签替换后不带标点尾巴）；同净度保持 config 出现顺序。
+    from .tagging import _EDGE_SENT_PUNCT_RE
+
+    def _dirty(n: str) -> int:
+        return 1 if _EDGE_SENT_PUNCT_RE.search(n) else 0
+
     groups: dict[str, list[str]] = {}
     for n in names:
         groups.setdefault(tag_key(n), []).append(n)
+    for g in groups.values():
+        g.sort(key=_dirty)          # 稳定排序：无首尾标点者靠前
     variants = [(g[1], g[0]) for g in groups.values() if len(g) > 1]
     if not variants:
         return {"merged_variants": 0, "docs_updated": 0}

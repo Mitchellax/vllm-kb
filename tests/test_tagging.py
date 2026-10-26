@@ -183,9 +183,21 @@ class TestTagKeyVariants(unittest.TestCase):
         self.assertEqual(tag_key("Atlas A3"), tag_key("Atlas-A3"))
         self.assertEqual(tag_key("超时 排查"), tag_key("超时排查"))
         self.assertEqual(tag_key("配置pip 源"), tag_key("配置pip源"))
-        # 版本号的点保留；数字串不合并
+        # 首尾句读剥离（2026-10 业务实测："复位芯片。" 与 "复位芯片" 两个 tag）
+        self.assertEqual(tag_key("复位芯片。"), tag_key("复位芯片"))
+        self.assertEqual(tag_key("复位芯片."), tag_key("复位芯片"))
+        self.assertEqual(tag_key("，网卡故障；"), tag_key("网卡故障"))
+        # 版本号的点保留（中间标点不伤）；数字串不合并
         self.assertEqual(tag_key("v0.11.0"), "v0.11.0")
+        self.assertEqual(normalize_tag("v0.11.0"), "v0.11.0")
         self.assertNotEqual(tag_key("v0.11.0"), tag_key("v0.12.0"))
+
+    def test_normalize_tag_strips_edge_punct(self):
+        self.assertEqual(normalize_tag("复位芯片。"), "复位芯片")
+        self.assertEqual(normalize_tag("复位芯片。 "), "复位芯片")
+        self.assertEqual(normalize_tag("Atlas A3."), "Atlas A3")
+        self.assertEqual(normalize_tag("v0.11.0"), "v0.11.0")     # 中间点保留
+        self.assertEqual(normalize_tag("方式二 构建容器镜像"), "方式二 构建容器镜像")
 
     def test_registry_contains_and_add_by_key(self):
         r = TagRegistry(entries=[TagEntry("Atlas A3", TIER_DOMAIN)])

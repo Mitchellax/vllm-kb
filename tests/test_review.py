@@ -444,6 +444,38 @@ class TestAdoptedTagVariants(unittest.TestCase):
         self.assertEqual(normalize_tag_variants(self.cfg, config_path=self.cfg_path),
                          {"merged_variants": 0, "docs_updated": 0})
 
+    def test_normalize_variants_prefers_clean_name(self):
+        """句尾标点变体（2026-10 业务实测："复位芯片。"/"复位芯片" 两个 tag）：
+        canonical 选**无标点尾巴**的干净名（词典与文档标签替换后都不带句号）。"""
+        from vllm_kb.review import normalize_tag_variants
+
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        conn.execute("INSERT INTO docs VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     ("md:c", "doc_markdown", "C", "", "", None, None, "{}", 0.5,
+                      json.dumps(["复位芯片。", "HCCL"], ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+        cfg_path = self.root / "config2.json"
+        cfg_path.write_text(json.dumps({
+            "project": {"name": "x", "data_root": str(self.root)},
+            "tags": {"registry": [
+                {"name": "复位芯片。", "tier": "domain"},   # 句尾标点词条（先出现）
+                {"name": "复位芯片", "tier": "domain"},
+            ]},
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "storage": {"vector_backend": "python",
+                        "sqlite_path": str(self.root / "kb.sqlite3")},
+        }, ensure_ascii=False), encoding="utf-8")
+        r = normalize_tag_variants(self.cfg, config_path=cfg_path)
+        self.assertEqual(r["merged_variants"], 1)
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        names = [e["name"] for e in data["tags"]["registry"]]
+        self.assertEqual(names, ["复位芯片"])              # 干净名保留（句号版删除）
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        tags_c = json.loads(conn.execute("SELECT tags FROM docs WHERE source_id='md:c'").fetchone()[0])
+        conn.close()
+        self.assertEqual(tags_c, ["复位芯片", "HCCL"])     # 文档标签句号版替换
+
 
 class TestVerificationReset(unittest.TestCase):
     """认证级别三档全覆盖：approved+unverified = 清人工覆盖层（重置），生效值回 canonical。
