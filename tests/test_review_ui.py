@@ -7,6 +7,7 @@ stats / queue / item / review / configs / configs-save / configs-test / 页面 H
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -541,6 +542,27 @@ class ReviewUiHtmlAudit(unittest.TestCase):
         # 已处理默认隐藏（approved 历史堆尾部是噪音），勾选后才显示
         self.assertIn("_showDone=this.checked;loadQueue()", src)
         self.assertIn("i.status==='pending'||i.status==='suspected'", src)
+
+    def test_html_script_parses_as_javascript(self):
+        """**JS 语法守卫**（2026-10 业务崩 frontal tab：Python 转义 `\\'` 让 JS 收到
+        `?','ignore':''` 非法序列——整个 <script> 解析失败 → 所有函数 undefined、
+        tab 点不动、loadStats 不执行待办全 0；字符串断言测试测不出语法错误）。
+        提取 _HTML 全部 <script> 用 node 实际编译；node 不可用时跳过。"""
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node 不可用，跳过 JS 语法守卫")
+        src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
+        scripts = re.findall(r"<script>(.*?)</script>", src, flags=re.S)
+        self.assertTrue(scripts, "未找到内联 <script>")
+        for idx, body in enumerate(scripts):
+            r = subprocess.run(
+                [node, "-e", "new Function(require('fs').readFileSync(0,'utf8'))"],
+                input=body, capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0,
+                             f"<script>#{idx} JS 语法错误:\n{r.stderr[:800]}")
 
     def test_seed_tag_candidate_payload_has_no_legacy_title(self):
         """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）；

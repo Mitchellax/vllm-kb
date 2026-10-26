@@ -247,7 +247,7 @@ ${docPrev}
 ${i.category==='verification_pending'?`认证级别: <select id="verlevel"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option><option value="unverified">unverified（重置认证）</option></select>`:''}
 ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
 <button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button>`:''}
-<button class="primary" onclick="review(${i.id},'approved'${i.category==='tag_candidate'?',\'ignore\'':''})">✓ 认证${i.category==='tag_candidate'?'（忽略）':isFile?`（全部 ${p.row_count||rows.length} 行）`:''}</button>
+<button class="primary" onclick="review(${i.id},'approved'${i.category==='tag_candidate'?",'ignore'":''})">✓ 认证${i.category==='tag_candidate'?'（忽略）':isFile?`（全部 ${p.row_count||rows.length} 行）`:''}</button>
 <button onclick="review(${i.id},'suspected')">？ 存疑（重新排队靠后）</button>
 ${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除${isFile?'（整表）':''}</button>`}
 </div>
