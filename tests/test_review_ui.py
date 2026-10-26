@@ -564,6 +564,14 @@ class ReviewUiHtmlAudit(unittest.TestCase):
             self.assertEqual(r.returncode, 0,
                              f"<script>#{idx} JS 语法错误:\n{r.stderr[:800]}")
 
+    def test_doc_verification_reset_ui(self):
+        """文档侧认证回撤入口（2026-10"已认证的文档怎么回撤"）：docCard 显示认证 badge、
+        重置按钮、JS 函数与端点齐全。"""
+        src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
+        for frag in ("resetDocVerification", "/api/doc/verification/reset",
+                     "d.verification?", "✓ ${esc(d.verification)}"):
+            self.assertIn(frag, src, f"缺少片段: {frag}")
+
     def test_seed_tag_candidate_payload_has_no_legacy_title(self):
         """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）；
         候选名聚合前过 normalize_tag——存量 extras 的空格变体收敛为同一聚合键。"""

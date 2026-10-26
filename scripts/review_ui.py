@@ -264,6 +264,9 @@ async function deleteDoc(id){const reviewer=document.getElementById('rev').value
 if(!confirm('标记删除：删除数据库记录并登记墓碑（构建不再复活；表格项=整表全部行），原始资产文件需到"待实际删除"列表手动本地删除。确认？'))return
 await j('/api/item/'+id+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,note:(document.getElementById('rvnote')||{}).value||''})});loadQueue()}
 async function undoDelete(id){if(!confirm('撤回删除：恢复数据库记录、解除墓碑（此后文档可重新入库）并重新加入队列？'))return;await j('/api/item/'+id+'/undo',{method:'POST'});loadQueue()}
+async function resetDocVerification(sid){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
+if(!confirm('重置认证：清除人工认证标记（回文档原始状态），关联审核项重新入队待审（表格文件=整表重审）。确认？'))return
+await j('/api/doc/verification/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id:sid,reviewer})});loadDocs()}
 let docQuery='';
 function clearDocSearch(){docQuery='';loadDocs()}
 async function loadDocs(){const inp=document.getElementById('docsearch');if(inp)docQuery=inp.value;
@@ -276,14 +279,14 @@ const tagB=(sid,t,cls,act,mark)=>`<span class="tagb ${cls} ${tierOf(t)}" onclick
 const groupRow=(list,cls,act,mark,sid)=>list.length?`<div style="margin-top:4px"><span class="muted">${cls==='excluded'?'已排除':cls==='manual'?'人工':'自动'}:</span> ${list.map(t=>tagB(sid,t,cls,act,mark)).join('')}</div>`:'';
 const docCard=d=>{const t=d.tags||{};const inp='newtag-'+q(d.source_id).replace(/[^a-zA-Z0-9]/g,'_');
 const dupPage=d.duplicate&&String(d.source_id).startsWith('html:page--');
-return `<div class="card" style="border-left:3px solid ${d.duplicate&&!dupPage?'var(--rv-amber)':'var(--rv-border)'}"><div><input type="checkbox" class="dchk" data-sid="${q(d.source_id)}" onchange="docSelChanged()" style="margin-right:6px" title="勾选后批量操作"><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${dupPage?`<span class="muted">统一 page.html 布局（按目录路径消歧，非重名冲突）</span>`:(d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:'')}</div>
+return `<div class="card" style="border-left:3px solid ${d.duplicate&&!dupPage?'var(--rv-amber)':'var(--rv-border)'}"><div><input type="checkbox" class="dchk" data-sid="${q(d.source_id)}" onchange="docSelChanged()" style="margin-right:6px" title="勾选后批量操作"><b>${esc(d.title||d.source_id)}</b> <span class="badge">${esc(d.source_type)}</span> ${d.verification?`<span class="badge approved" title="认证级别（人工认证在覆盖层，可回撤）">✓ ${esc(d.verification)}${(d.verification_reviewer||'')?` · ${esc(d.verification_reviewer)}`:''}</span>`:''} ${dupPage?`<span class="muted">统一 page.html 布局（按目录路径消歧，非重名冲突）</span>`:(d.duplicate?`<span class="warn">⚠ 同 stem 重名（入库已按相对路径指纹自动消歧，此处仅提示可合并）</span>`:'')}</div>
 <div class="mono muted">${esc(d.source_id)}${d.asset_path?` · ${esc(d.asset_path)}`:''}</div>
 ${groupRow(t.auto||[],'auto','exclude','✕',d.source_id)}
 ${groupRow(t.excluded||[],'excluded','restore','↺',d.source_id)}
 ${groupRow(t.manual||[],'manual','remove','✕',d.source_id)}
 <div style="margin-top:6px"><input id="${inp}" placeholder="添加标签" style="width:180px"><button class="sm" onclick="tagAdd('${q(d.source_id)}',document.getElementById('${inp}').value)">添加</button>
 <span class="muted">最终: ${(t.final||[]).map(esc).join(' · ')||'（无标签）'}</span></div>
-<div class="actions"><button class="danger sm" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button></div></div>`};
+<div class="actions"><button class="danger sm" onclick="delExternalDoc('${q(d.source_id)}')">🗑 从数据库删除（本地文件保留）</button> ${d.verification?`<button class="sm" onclick="resetDocVerification('${q(d.source_id)}')">↺ 重置认证</button>`:''}</div></div>`};
 // 按 imports 第一层子目录分组，组名带来源 id 前缀区分不同导入来源：
 // 组名=来源id\子目录（pdf\support官方文档）；根级=来源id（pdf）；资产回退件=来源id（资产回退）；网络来源=(未分组)
 const groupKey=d=>{const src=d.rel_src;if(src==null)return '(未分组)';
@@ -495,6 +498,18 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         """已回撤文档（删除墓碑）——痕迹视图；mirror 自动回撤的条目可撤回恢复。"""
         from vllm_kb.review import list_withdrawn
         return list_withdrawn(default_review_path(cfg))
+
+    @app.post("/api/doc/verification/reset")
+    def doc_verification_reset(body: dict):
+        """文档认证回撤（文档侧入口，2026-10 用户"已认证的文档怎么回撤"）：清人工
+        覆盖层回 canonical + 关联审核项重开（单行/文件级聚合均可，文件级=整表重审）。"""
+        from vllm_kb.review import reset_doc_verification
+
+        sid = (body or {}).get("source_id") or ""
+        reviewer = (body or {}).get("reviewer") or ""
+        if not sid or not reviewer:
+            raise HTTPException(status_code=400, detail="source_id 与 reviewer 必填")
+        return reset_doc_verification(cfg, sid, reviewer)
 
     # ---------------- 文档级标签（两层分类：主题/领域 domain、具体作用 purpose） ----------------
 

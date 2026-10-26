@@ -519,6 +519,81 @@ class TestVerificationReset(unittest.TestCase):
             conn.close()
         self.assertEqual(self.store.get_item(self.item_id)["status"], "approved")
 
+    def test_reset_doc_verification_docside(self):
+        """文档侧回撤入口（2026-10 用户"已认证的文档怎么回撤"）：清覆盖层 + 关联
+        审核项重开——不必先到队列"显示已处理"里翻记录。"""
+        from vllm_kb.review import reset_doc_verification
+
+        out = reset_doc_verification(self.cfg, "md:glm三板斧", "carol")
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["cleared"])                  # 人工覆盖层已清
+        self.assertEqual(out["reopened_item"], self.item_id)
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        try:
+            self.assertIsNone(                           # 生效值回 canonical（unverified）
+                get_doc_verification_conn(conn, "md:glm三板斧")["verification"])
+            row = conn.execute(
+                "SELECT extra FROM docs WHERE source_id='md:glm三板斧'").fetchone()
+            self.assertEqual(json.loads(row[0]).get("verification"), "unverified")
+        finally:
+            conn.close()
+        it = self.store.get_item(self.item_id)
+        self.assertEqual(it["status"], "pending")
+        # 无覆盖层（canonical 即原状）→ cleared=False 但仍返回 ok
+        out2 = reset_doc_verification(self.cfg, "md:caseA", "carol")
+        self.assertTrue(out2["ok"])
+        self.assertFalse(out2["cleared"])
+
+
+class TestExcelRowDocMigration(unittest.TestCase):
+    """旧行级 excel 文档识别与人工标签收集（scripts/migrate_excel_rowdocs.py 的核心）。
+
+    新版 ExcelSource 按文件聚合（excel:<文件名>，1 个冒号）；行级 `excel:文件:Sheet:行`
+    是旧版构建产物——文档打标/认证只能逐行做，需一次性迁移到文件级。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.conn = sqlite3.connect(self.root / "kb.sqlite3")
+        self.conn.executescript(
+            "CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT,"
+            " component TEXT, url TEXT, status TEXT, resolved_at TEXT, extra TEXT, reliability REAL)"
+        )
+        self.conn.executemany("INSERT INTO docs VALUES(?,?,?,?,?,?,?,?,?)", [
+            ("excel:登记表:Sheet1:1", "doc_excel", "登记表 行1", "", "", None, None,
+             json.dumps({"verification": "unverified"}), 0.5),
+            ("excel:登记表:Sheet1:2", "doc_excel", "登记表 行2", "", "", None, None,
+             json.dumps({"verification": "unverified"}), 0.5),
+            ("excel:清单", "doc_excel", "清单（新格式文件级）", "", "", None, None,
+             json.dumps({"verification": "unverified"}), 0.5),
+        ])
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_find_rowdocs_only_old_format(self):
+        from vllm_kb.review import find_excel_rowdocs
+
+        rows = find_excel_rowdocs(self.conn)
+        self.assertEqual({r["source_id"] for r in rows},
+                         {"excel:登记表:Sheet1:1", "excel:登记表:Sheet1:2"})
+
+    def test_collect_rowdoc_tags_union_per_file(self):
+        from vllm_kb.review import collect_rowdoc_tags, set_doc_tags_conn
+
+        set_doc_tags_conn(self.conn, "excel:登记表:Sheet1:1",
+                          manual=["HCCN 排查", "网卡"], excluded=["噪音"])
+        set_doc_tags_conn(self.conn, "excel:登记表:Sheet1:2",
+                          manual=["网卡", "Atlas A3"])
+        self.conn.commit()
+        groups = collect_rowdoc_tags(self.conn)
+        self.assertEqual(list(groups), ["excel:登记表"])     # 按文件分组
+        self.assertEqual(groups["excel:登记表"]["manual"],
+                         ["HCCN 排查", "网卡", "Atlas A3"])  # 并集保序去重
+        self.assertEqual(groups["excel:登记表"]["excluded"], ["噪音"])
+
 
 class TestFileLevelVerification(unittest.TestCase):
     """表格文件粒度审核：seed 按文件聚合、认证批量应用到全部行、内容变更重新审核。"""

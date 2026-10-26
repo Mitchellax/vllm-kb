@@ -725,6 +725,30 @@ python skills/vllm-kb/client.py graph sig <错误码>   # 验证实体命中
 - 错误码/算子/模型/版本由 signature 三层提取**自动入图**（建图只依赖 canonical，无需图侧适配）；
 - 验证状态 `unverified`（登记表低优先级），审核台补标认证后按 `tested` 参与 `w_rel`。
 
+**旧行级格式迁移（excel:文件:Sheet:行 → excel:文件名）**
+
+旧版构建的登记表是**逐行一篇**（打标/认证/删除只能逐行做）——`git pull` 新代码后用
+迁移工具一次性转换（幂等，可重复跑）：
+
+```bash
+python scripts/migrate_excel_rowdocs.py --plan        # ① 干跑：列行级文档+人工标签存档
+python scripts/migrate_excel_rowdocs.py --delete      # ② 删行级文档+墓碑（构建不复活）
+python scripts/build_kb.py                            # ③ 重跑构建 → excel:<文件名> 一篇/文件
+python scripts/migrate_excel_rowdocs.py --apply-tags  # ④ 人工标签写回文件级文档
+```
+
+- 行级文档的人工标签/排除按文件**并集**保留（人工意图不丢）；词典命中的自动标签构建时
+  自然重现，不迁移；
+- 审核队列自动自愈：行级补标审核项由 seed 自动清理（文件级项取代）；标签候选里对旧行
+  sid 的引用由 seed 校正（悬空忽略/刷新引用）。
+
+**已认证文档的回撤**（两条路径）
+
+- **队列侧**：审核台勾选"显示已处理"→ 找到该文档的补标审核项 → 认证级别选 `unverified`
+  → 批量应用/单条认证 = 清覆盖层回原始值 + 审核项回 pending 重审；
+- **文档侧**（2026-10 新增）：文档管理页 docCard 认证 badge（✓ tested/expert · 认证人）
+  旁点 **↺ 重置认证**——清覆盖层 + 关联审核项重开（表格文件 = 整表重审）。
+
 **内部数据脱敏（后置，Excel/Markdown 源生效）**
 
 - **库中存原文、出口统一脱敏**：serve_api 返回给 agent 的正文/标题（`/doc` 全文、`/search` snippet、

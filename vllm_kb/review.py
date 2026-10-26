@@ -1061,6 +1061,84 @@ def apply_verification_many(cfg: "AppConfig", source_ids: list[str],
     return {"verified": verified, "failed": failed}
 
 
+def find_excel_rowdocs(conn: sqlite3.Connection) -> list[dict]:
+    """识别**旧行级** excel 文档（source_id 形如 `excel:<文件名>:<Sheet>:<行>`）。
+
+    新版 ExcelSource 按文件聚合（`excel:<文件名>`，与 md/word/pdf 同构，1 个冒号）；
+    行级是旧版构建产物（≥3 个冒号；Windows 文件名不含冒号，段数判据安全）——打标/
+    认证/删除只能逐行操作，需要一次性迁移（scripts/migrate_excel_rowdocs.py）。
+    """
+    rows = conn.execute(
+        "SELECT source_id, title FROM docs WHERE source_id LIKE 'excel:%'").fetchall()
+    return [{"source_id": sid, "title": title or ""}
+            for sid, title in rows if sid.count(":") >= 3]
+
+
+def collect_rowdoc_tags(conn: sqlite3.Connection) -> dict[str, dict]:
+    """行级文档的人工标签收集（迁移用）：按文件分组（source_id 第 2 段），manual/
+    excluded 取**并集**（人工标记是行级时的选择，文件级合并后保留全部人工意图）。
+
+    返回 {"excel:<文件名>": {"manual": [...], "excluded": [...]}}——构建出新文件级
+    文档后用 set_doc_tags_conn 写回（词典命中的 auto 标签构建时自然重现，不迁移）。
+    """
+    tags = load_doc_tags_conn(conn)
+    groups: dict[str, dict] = {}
+    for it in find_excel_rowdocs(conn):
+        file_key = "excel:" + it["source_id"].split(":", 2)[1]
+        g = groups.setdefault(file_key, {"manual": [], "excluded": []})
+        t = tags.get(it["source_id"]) or {}
+        for key in ("manual", "excluded"):
+            for name in t.get(key) or []:
+                if name and name not in g[key]:
+                    g[key].append(name)
+    return groups
+
+
+def reset_doc_verification(cfg: "AppConfig", source_id: str, reviewer: str) -> dict:
+    """文档认证**回撤**（文档侧入口；队列侧回撤=详情页选 unverified，见
+    review_verification 的 unverified=重置语义）。
+
+    - 清人工覆盖层：docs.extra.verification 回 canonical 原始值 + reliability 重算
+      （apply_verification(clear=True) 的完整语义）；
+    - 关联审核项重开：单文档项 item_ref=source_id；文件级表格项 payload.rows 含该
+      source_id（文件级重开=整表回 pending 重审，与文件粒度审核语义一致）——
+      status∈(approved,suspected) 时 reopen；本就 pending 则不动。
+
+    返回 {"ok": True, "cleared": bool, "reopened_item": int|None}。
+    """
+    kb = cfg.resolve(cfg.storage.sqlite_path)
+    if not kb.exists():
+        raise ValueError(f"kb.sqlite3 不存在：{kb}（先跑 build_kb.py 入库）")
+    cleared = False
+    conn = sqlite3.connect(str(kb))
+    try:
+        if _has_table(conn, "doc_verification"):
+            row = conn.execute("SELECT 1 FROM doc_verification WHERE source_id=?",
+                               (source_id,)).fetchone()
+            cleared = row is not None
+    finally:
+        conn.close()
+    apply_verification(cfg, source_id, None, reviewer, clear=True)  # doc 不存在抛 ValueError
+    review_db = default_review_path(cfg)
+    store = ReviewStore(review_db)
+    try:
+        reopened = None
+        for it in store.list_items(category="verification_pending"):
+            hit = it["item_ref"] == source_id or any(
+                (rr or {}).get("source_id") == source_id
+                for rr in ((it["payload"] or {}).get("rows") or []))
+            if not hit or it["status"] not in ("approved", "suspected"):
+                continue
+            store.reopen(it["id"], reviewer,
+                         result={"action": "verification-reset",
+                                 "note": "文档侧认证重置（回撤）"})
+            reopened = it["id"]
+            break  # 一个文档只归属一个审核项（单行或文件级聚合）
+        return {"ok": True, "cleared": cleared, "reopened_item": reopened}
+    finally:
+        store.close()
+
+
 def review_verification(cfg: "AppConfig", store: ReviewStore, item_id: int, action: str,
                         reviewer: str, result: Optional[dict] = None) -> dict:
     """补标审核动作（verification_pending 专用）：写覆盖层 + 刷新 docs + 记录审核项。
