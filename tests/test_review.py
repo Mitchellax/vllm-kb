@@ -302,7 +302,8 @@ class TestTagCandidateVariants(unittest.TestCase):
         self.assertEqual(items[0]["payload"]["doc_count"], 3)
 
     def test_merge_existing_variants(self):
-        """存量 pending 同 key 变体：docs 并入最早条目，其余 approved(merged_variant)。"""
+        """存量 pending 同 key 变体：docs 并入规范 key 条目（item_ref=tag:{tag_key}），
+        其余 approved(merged_variant)；无规范条目时保留最早 id。"""
         from vllm_kb.review import _merge_tag_candidate_variants
 
         self.store.add_item("tag_candidate", "tag:Atlas A3",
@@ -312,17 +313,68 @@ class TestTagCandidateVariants(unittest.TestCase):
         self.store.add_item("tag_candidate", "tag:atlas_a3",
                             {"candidate": "atlas_a3", "doc_count": 1,
                              "docs": [{"source_id": "md:c", "title": "C"}]})
+        self.store.add_item("tag_candidate", "tag:atlas-a3",       # 规范 key 条目（新 seed 产物）
+                            {"candidate": "Atlas A3", "doc_count": 0, "docs": []})
         n = _merge_tag_candidate_variants(self.store)
-        self.assertEqual(n, 1)
+        self.assertEqual(n, 2)
         pending = [i for i in self.store.list_items(category="tag_candidate", status="pending")]
         self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["id"], 1)                            # 保留最早
-        self.assertEqual(pending[0]["payload"]["doc_count"], 3)          # docs 并入
-        gone = self.store.get_item(2)
-        self.assertEqual(gone["status"], "approved")
-        self.assertEqual(gone["result"]["action"], "merged_variant")
+        self.assertEqual(pending[0]["item_ref"], "tag:atlas-a3")     # 保留规范 key 条目
+        self.assertEqual(pending[0]["payload"]["doc_count"], 3)      # docs 全部并入
+        gone = {i["id"]: i for i in self.store.list_items(category="tag_candidate")}
+        self.assertEqual(gone[1]["status"], "approved")
+        self.assertEqual(gone[1]["result"]["action"], "merged_variant")
         # 幂等：再跑无操作
         self.assertEqual(_merge_tag_candidate_variants(self.store), 0)
+
+    def test_case_variant_not_requeued_after_ignore(self):
+        """业务实测（GLM5/glm5、DeepSeek-V4/Deepseek-V4 仍在队列）："GLM5" 被认证忽略后，
+        变体 "glm5" 换 item_ref 不得重新入队（忽略记忆按 key）；未处理词照常入队。"""
+        from vllm_kb.review import seed_tag_candidates
+
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        conn.execute("CREATE TABLE docs (source_id TEXT PRIMARY KEY, title TEXT, extra TEXT)")
+        conn.executemany("INSERT INTO docs VALUES(?,?,?)", [
+            ("md:a", "A", json.dumps({"tag_candidates": [{"name": "GLM5"}, {"name": "DeepSeek-V4"}]})),
+            ("md:b", "B", json.dumps({"tag_candidates": [{"name": "glm5"}, {"name": "Deepseek-V4"}]})),
+        ])
+        conn.commit()
+        conn.close()
+        self.store.add_item("tag_candidate", "tag:GLM5",
+                            {"candidate": "GLM5", "doc_count": 1,
+                             "docs": [{"source_id": "md:a", "title": "A"}]})
+        self.store.review(1, "approved", "bob", {"action": "ignore"})   # 用户忽略 GLM5
+        seed_tag_candidates(self.cfg, self.store)
+        pending = [i for i in self.store.list_items(category="tag_candidate", status="pending")]
+        # glm5 不重入队（同 key 已忽略）；DeepSeek-V4/Deepseek-V4 从未处理 → 一条规范条目
+        self.assertEqual([i["item_ref"] for i in pending], ["tag:deepseek-v4"])
+        self.assertEqual(pending[0]["payload"]["candidate"], "DeepSeek-V4")
+        self.assertEqual(pending[0]["payload"]["doc_count"], 2)
+
+    def test_seed_aggregates_case_variants(self):
+        """双 pending 原形条目 + extras 双变体 → seed 后 pending 仅剩规范 key 条目。"""
+        from vllm_kb.review import seed_tag_candidates
+
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        conn.execute("CREATE TABLE docs (source_id TEXT PRIMARY KEY, title TEXT, extra TEXT)")
+        conn.executemany("INSERT INTO docs VALUES(?,?,?)", [
+            ("md:a", "A", json.dumps({"tag_candidates": [{"name": "GLM5"}, {"name": "DeepSeek-V4"}]})),
+            ("md:b", "B", json.dumps({"tag_candidates": [{"name": "glm5"}, {"name": "Deepseek-V4"}]})),
+        ])
+        conn.commit()
+        conn.close()
+        self.store.add_item("tag_candidate", "tag:GLM5",
+                            {"candidate": "GLM5", "doc_count": 1,
+                             "docs": [{"source_id": "md:a", "title": "A"}]})
+        self.store.add_item("tag_candidate", "tag:DeepSeek-V4",
+                            {"candidate": "DeepSeek-V4", "doc_count": 1,
+                             "docs": [{"source_id": "md:a", "title": "A"}]})
+        seed_tag_candidates(self.cfg, self.store)
+        pending = [i for i in self.store.list_items(category="tag_candidate", status="pending")]
+        self.assertEqual({i["item_ref"] for i in pending},
+                         {"tag:glm5", "tag:deepseek-v4"})           # 规范 key，原形条目已合并
+        docs_by_ref = {i["item_ref"]: i["payload"]["doc_count"] for i in pending}
+        self.assertEqual(docs_by_ref, {"tag:glm5": 2, "tag:deepseek-v4": 2})
 
 
 class TestAdoptedTagVariants(unittest.TestCase):

@@ -1647,8 +1647,18 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
                     entry["tier"] = tier
     finally:
         conn.close()
+    # 忽略记忆按 key（2026-10 用户实测缺口："GLM5" 被认证忽略后，变体 "glm5" 换个
+    # item_ref 重新入队——add_item 按 item_ref 精确去重挡不住大小变体）。**已处理**
+    # （approved/suspected）存在过同 key 条目 = 这个词已裁决过，不再生成；pending 不算
+    # （否则规范 key 条目永远不生成、旧原形条目永存——双 pending 靠 merge 收敛）。
+    handled_keys = {tag_key(it["item_ref"][4:])
+                    for it in store.list_items(category="tag_candidate")
+                    if (it["item_ref"] or "").startswith("tag:")
+                    and it["status"] in ("approved", "suspected")}
     added = 0
     for key, info in sorted(agg.items()):
+        if key in handled_keys:
+            continue
         docs = info["docs"]
         if store.add_item("tag_candidate", f"tag:{key}", {
             "candidate": info["display"],
@@ -1677,24 +1687,48 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
 
 
 def _merge_tag_candidate_variants(store: "ReviewStore") -> int:
-    """存量 tag_candidate 按 tag_key 合并变体（幂等）：同 key 组内保留最早 id（队列位置
-    最老、可能已被人工看到），其余条目的 docs/doc_count 并入首条后标记 approved
-    （result.action=merged_variant，审计可查）；approved/suspected 历史条目不动。
-    返回被合并掉的条数。"""
+    """存量 tag_candidate 按 tag_key 合并变体（幂等）。同 key 组内分两种情形：
+
+    - **组内已有已处理条目**（approved/suspected，如 "GLM5" 曾被认证忽略）→ 该 key 已
+      处理过，pending 的变体条目（"glm5" 换马甲重新入队）全部自动忽略
+      （result.action=auto-ignore，reason 记同 key 已处理）；
+    - **组内全是 pending** → 保留**规范 key 条目**（item_ref == tag:{tag_key}；旧原形
+      条目如 tag:GLM5 让位——最终 item_ref 是归一键），无规范条目时保留最早 id；
+      其余条目 docs/doc_count 并入保留条后标记 approved（merged_variant，审计可查）。
+
+    返回被合并/忽略的条数。"""
     from .tagging import tag_key
 
     groups: dict[str, list[dict]] = {}
-    for it in store.list_items(category="tag_candidate", status="pending"):
+    for it in store.list_items(category="tag_candidate"):
         ref = it["item_ref"] or ""
         if not ref.startswith("tag:"):
             continue
         groups.setdefault(tag_key(ref[4:]), []).append(it)
-    merged = 0
-    for items in groups.values():
+    acted = 0
+    for key, items in groups.items():
         if len(items) < 2:
             continue
-        items.sort(key=lambda i: i["id"])
-        keep, rest = items[0], items[1:]
+        pending = [i for i in items if i["status"] == "pending"]
+        # "已处理"只认**真实裁决**（adopt 采纳 / ignore 忽略）——merged_variant 是系统
+        # 合并占位，不算：否则合并产生的 approved 会把保留的规范 pending 条目误杀（破坏幂等）
+        done = [i for i in items if i["status"] in ("approved", "suspected")
+                and (i["result"] or {}).get("action") in ("adopt", "ignore")]
+        if done and pending:
+            # 该 key 已处理过（采纳/忽略/存疑）——pending 变体全部自动忽略
+            for it in pending:
+                store.review(it["id"], "approved", "system",
+                             result={"action": "auto-ignore",
+                                     "reason": f"同 key 变体已处理（item_ref={done[0]['item_ref']}）"})
+                acted += 1
+            continue
+        if not pending:
+            continue  # 全是历史记录，不动
+        keep = next((i for i in pending if i["item_ref"] == f"tag:{key}"), None) \
+            or min(pending, key=lambda i: i["id"])
+        rest = [i for i in pending if i["id"] != keep["id"]]
+        if not rest:
+            continue
         kp = dict(keep["payload"] or {})
         kdocs = {d.get("source_id"): d for d in (kp.get("docs") or [])
                  if isinstance(d, dict) and d.get("source_id")}
@@ -1706,11 +1740,11 @@ def _merge_tag_candidate_variants(store: "ReviewStore") -> int:
             store.review(it["id"], "approved", "system",
                          result={"action": "merged_variant", "into_item": keep["id"],
                                  "candidate": p.get("candidate", "")})
-            merged += 1
+            acted += 1
         kp["docs"] = list(kdocs.values())[:20]
         kp["doc_count"] = len(kdocs)
         store.update_payload(keep["id"], kp)
-    return merged
+    return acted
 
 
 def _sweep_tag_candidates(store: "ReviewStore", agg: dict[str, dict],
