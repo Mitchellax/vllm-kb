@@ -267,6 +267,64 @@ class TestSeeds(unittest.TestCase):
         self.assertEqual(items[0]["item_ref"], "md:caseA")
 
 
+class TestTagCandidateVariants(unittest.TestCase):
+    """tag_candidate 同义变体（2026-10 业务积压）：聚合键 tag_key 收敛 +
+    存量 pending 变体合并迁移 + 采纳映射到词典正式名。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cfg = make_cfg(self.root)
+        self.store = ReviewStore(self.root / "review.sqlite3")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_seed_aggregates_by_tag_key(self):
+        """同一词的排版变体（Atlas A3 / atlas_a3）聚合为一条候选，display 保留首见原形。"""
+        from vllm_kb.review import seed_tag_candidates
+
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        conn.execute("CREATE TABLE docs (source_id TEXT PRIMARY KEY, title TEXT, extra TEXT)")
+        conn.executemany("INSERT INTO docs VALUES(?,?,?)", [
+            ("md:a", "A", json.dumps({"tag_candidates": [{"name": "Atlas A3"}]})),
+            ("md:b", "B", json.dumps({"tag_candidates": [{"name": "atlas_a3"}]})),
+            ("md:c", "C", json.dumps({"tag_candidates": [{"name": "ATLAS-A3"}]})),
+        ])
+        conn.commit()
+        conn.close()
+        seed_tag_candidates(self.cfg, self.store)
+        items = [i for i in self.store.list_items(category="tag_candidate", status="pending")]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["item_ref"], "tag:atlas-a3")
+        self.assertEqual(items[0]["payload"]["candidate"], "Atlas A3")   # 首见原形
+        self.assertEqual(items[0]["payload"]["doc_count"], 3)
+
+    def test_merge_existing_variants(self):
+        """存量 pending 同 key 变体：docs 并入最早条目，其余 approved(merged_variant)。"""
+        from vllm_kb.review import _merge_tag_candidate_variants
+
+        self.store.add_item("tag_candidate", "tag:Atlas A3",
+                            {"candidate": "Atlas A3", "doc_count": 2,
+                             "docs": [{"source_id": "md:a", "title": "A"},
+                                      {"source_id": "md:b", "title": "B"}]})
+        self.store.add_item("tag_candidate", "tag:atlas_a3",
+                            {"candidate": "atlas_a3", "doc_count": 1,
+                             "docs": [{"source_id": "md:c", "title": "C"}]})
+        n = _merge_tag_candidate_variants(self.store)
+        self.assertEqual(n, 1)
+        pending = [i for i in self.store.list_items(category="tag_candidate", status="pending")]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["id"], 1)                            # 保留最早
+        self.assertEqual(pending[0]["payload"]["doc_count"], 3)          # docs 并入
+        gone = self.store.get_item(2)
+        self.assertEqual(gone["status"], "approved")
+        self.assertEqual(gone["result"]["action"], "merged_variant")
+        # 幂等：再跑无操作
+        self.assertEqual(_merge_tag_candidate_variants(self.store), 0)
+
+
 class TestVerificationReset(unittest.TestCase):
     """认证级别三档全覆盖：approved+unverified = 清人工覆盖层（重置），生效值回 canonical。
 

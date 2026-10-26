@@ -17,6 +17,7 @@ from vllm_kb.tagging import (
     merge_final,
     normalize_tag,
     save_registry_to_config,
+    tag_key,
     tier_for,
 )
 
@@ -168,6 +169,56 @@ class TestExtractTags(unittest.TestCase):
         self.assertEqual(names.count("配置pip源"), 1)
         self.assertNotIn("配置pip 源", names)
         self.assertIn("升级NPU驱动", names)
+
+
+class TestTagKeyVariants(unittest.TestCase):
+    """聚合键 tag_key（2026-10 业务积压：候选大量同义词=同一词的排版变体）——
+    大小写/分隔符（空格-连字符-下划线）/CJK 间空格在 key 层收敛；显示与词典 name 保留原形。"""
+
+    def test_variant_groups_converge(self):
+        from vllm_kb.tagging import tag_key
+
+        self.assertEqual(tag_key("Atlas A3"), tag_key("atlas_a3"))
+        self.assertEqual(tag_key("Atlas A3"), tag_key("ATLAS A3"))
+        self.assertEqual(tag_key("Atlas A3"), tag_key("Atlas-A3"))
+        self.assertEqual(tag_key("超时 排查"), tag_key("超时排查"))
+        self.assertEqual(tag_key("配置pip 源"), tag_key("配置pip源"))
+        # 版本号的点保留；数字串不合并
+        self.assertEqual(tag_key("v0.11.0"), "v0.11.0")
+        self.assertNotEqual(tag_key("v0.11.0"), tag_key("v0.12.0"))
+
+    def test_registry_contains_and_add_by_key(self):
+        r = TagRegistry(entries=[TagEntry("Atlas A3", TIER_DOMAIN)])
+        self.assertTrue(r.contains("atlas_a3"))       # 变体查重命中
+        self.assertTrue(r.contains("ATLAS-A3"))
+        # add 同 key → 保留已有原形词条，不产生第二个
+        e = r.add("atlas_a3")
+        self.assertEqual(e.name, "Atlas A3")
+        self.assertEqual(len(r.entries), 1)
+
+    def test_match_separator_insensitive(self):
+        r = TagRegistry(entries=[TagEntry("hccn-tool", TIER_DOMAIN)])
+        hits = r.match("执行 hccn_tool 检查")
+        self.assertEqual([h.name for h in hits], ["hccn-tool"])
+
+    def test_extract_tags_variant_single_candidate(self):
+        # 同一词的两种排版经 heading 路径产出不同 name、同 key——seed 聚合时收敛为一条
+        # （latin token 层形态差异是预期：下划线连写 "Atlas_A3" 是一个 token、空格拆两个）
+        _, c1 = extract_tags("doc", ["Atlas_A3 部署"])
+        _, c2 = extract_tags("doc", ["Atlas A3 部署"])
+        self.assertIn(tag_key("Atlas_A3 部署"), {tag_key(c.name) for c in c1})
+        self.assertIn(tag_key("Atlas A3 部署"), {tag_key(c.name) for c in c2})
+        self.assertEqual(tag_key("Atlas_A3 部署"), tag_key("Atlas A3 部署"))
+
+    def test_cjk_stopword_whole_word_only(self):
+        from vllm_kb.tagging import _DEFAULT_CJK_STOPWORDS
+
+        self.assertIn(tag_key("排查"), {tag_key(s) for s in _DEFAULT_CJK_STOPWORDS})
+        # 整词等于（heading 短标题）→ 滤；含停用词的短语 → 保留（有价值标签不受影响）
+        _, c_alone = extract_tags("doc", ["排查"])
+        _, c_phrase = extract_tags("doc", ["HCCL 超时排查"])
+        self.assertEqual([c.name for c in c_alone], [])
+        self.assertTrue(any("超时排查" in c.name for c in c_phrase))
 
 
 class TestMergeFinal(unittest.TestCase):

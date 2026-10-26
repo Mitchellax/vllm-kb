@@ -56,6 +56,13 @@ _DEFAULT_LATIN_STOPWORDS = frozenset((
     "is", "are", "via", "use", "using", "based", "new", "guide", "manual", "doc", "docs",
     "case", "report", "log", "test", "demo",
 ))
+# 中文整词停用词（2026-10 业务积压：候选里大量"排查/说明/常见问题"类标题模式词——
+# **整词等于才滤**："HCCL 超时排查"含"排查"但是有价值短语，不受影响；cfg.stopwords 同样生效）
+_DEFAULT_CJK_STOPWORDS = frozenset((
+    "排查", "问题", "常见问题", "说明", "介绍", "汇总", "记录", "日志", "分析", "总结",
+    "笔记", "注意事项", "方案", "方法", "步骤", "示例", "演示", "教程", "学习", "实践",
+    "参考", "手册", "指南", "使用说明", "操作说明", "解决方案", "处理方法", "问题记录",
+))
 # 纯数字不是标签（版本片段/日期/序号）；带字母前缀的型号（A2/910B）不受影响
 _PURE_NUM_RE = re.compile(r"^\d+$")
 
@@ -69,7 +76,8 @@ class TagEntry:
 
 
 def normalize_tag(name: str) -> str:
-    """标签规范化：去首尾空白/包裹符号，内部空白归一，CJK↔拉丁边界空格剥离，截断超长。
+    """标签规范化（**显示级**，保留原形大小写）：去首尾空白/包裹符号，内部空白归一，
+    CJK↔拉丁边界空格剥离，截断超长。
 
     CJK↔拉丁边界空格剥离的原因：PDF/Word 标题里该空格不稳定（"配置pip 源"/"配置pip源"、
     "升级NPU 驱动"/"升级NPU驱动" 会生成两个候选词、占两个队列项）——归一后变体收敛，
@@ -83,6 +91,29 @@ def normalize_tag(name: str) -> str:
     if len(name) > 64:
         name = name[:64]
     return name
+
+
+# 聚合/匹配键（**不用于显示**）：大小写、分隔符、CJK 间空格的变体在此收敛。
+# 业务积压里 "Atlas A3"/"atlas_a3"/"ATLAS A3"、"超时 排查"/"超时排查" 是同一词的
+# 排版变体——聚合键归一后自动合并为一条候选；词典正式名/候选显示名仍保留首见原形
+# （Atlas A3、HCCL 等专有名词全小写会损害可读性）。
+_CJK_KEY_SPACE_RE = re.compile(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])")
+
+
+def tag_key(name: str) -> str:
+    """标签聚合键：normalize_tag → 全角空格半角化 → `_`→`-` → 删 CJK 字符间空格 →
+    剩余空白（拉丁词间）→`-` → 小写 → 压缩连字符。
+
+    用于：候选聚合去重（extract_tags/seed_tag_candidates）、词典查重（contains/add）、
+    存量候选变体合并。显示与词典 name 一律保留原形，不经本函数。
+    空格/连字符/下划线三种分隔在 key 层同义（"Atlas A3"=="atlas_a3"=="Atlas-A3"）；
+    点保留（版本号 v0.11.0）。
+    """
+    name = normalize_tag(name)
+    name = name.replace("\u3000", " ").replace("_", "-")
+    name = _CJK_KEY_SPACE_RE.sub("", name)
+    name = re.sub(r"\s+", "-", name.strip().lower())
+    return re.sub(r"-{2,}", "-", name).strip("-")
 
 
 def tier_for(name: str) -> str:
@@ -209,23 +240,32 @@ class TagRegistry:
     def by_name(self) -> dict[str, TagEntry]:
         return {e.name: e for e in self.entries}
 
+    def by_key(self) -> dict[str, TagEntry]:
+        """按聚合键索引（同 key 变体 "Atlas A3"/"atlas_a3" 收敛到首条）。"""
+        out: dict[str, TagEntry] = {}
+        for e in self.entries:
+            out.setdefault(tag_key(e.name), e)
+        return out
+
     def contains(self, name: str) -> bool:
-        return normalize_tag(name) in self.by_name()
+        return tag_key(name) in self.by_key()
 
     def tier(self, name: str) -> str:
-        return self.by_name().get(normalize_tag(name), TagEntry(name="", tier=TIER_DOMAIN)).tier
+        return self.by_key().get(tag_key(name), TagEntry(name="", tier=TIER_DOMAIN)).tier
 
     def match(self, text: str) -> list[TagEntry]:
-        """子串命中：文本（文件名+标题拼接）含词典词 → 返回命中条目（大小写不敏感）。
+        """子串命中：文本（文件名+标题拼接）含词典词 → 返回命中条目（大小写+分隔符不敏感）。
 
+        归一层 tag_key 的子串版：文本与词条都做 lower + `_`→`-` 后再匹配——正文里
+        "hccn_tool 使用" 能命中词典 "hccn-tool"（排版变体不应漏命中）。
         设备词表命中在词典之后：**别名命中归一为 canonical 设备标签**（文本含
         "800I A2" → A2 标签；含 910B → 910B 标签，但**不反推机型**——见 DeviceGlossary）。
         """
-        lowered = (text or "").lower()
+        lowered = (text or "").lower().replace("_", "-")
         hits: list[TagEntry] = []
         seen: set[str] = set()
         for e in self.entries:
-            if e.name and e.name.lower() in lowered and e.name not in seen:
+            if e.name and e.name.lower().replace("_", "-") in lowered and e.name not in seen:
                 hits.append(e)
                 seen.add(e.name)
         for de in self.devices.match(text):
@@ -237,16 +277,22 @@ class TagRegistry:
     # ---------- 修改 ----------
 
     def add(self, name: str, tier: Optional[str] = None) -> TagEntry:
-        """新增或更新词典条目（同名更新 tier）。返回条目。"""
+        """新增或更新词典条目。**同 key 已有词条（"Atlas A3" vs "atlas_a3"）→ 保留已有
+        原形词条**（变体不产生第二个词条；显式传 tier 时仅更新 tier）。返回条目。"""
         name = normalize_tag(name)
         if not name:
             raise ValueError("标签名不能为空")
+        key = tag_key(name)
+        existing = self.by_key().get(key)
+        if existing is not None:
+            if tier in (TIER_DOMAIN, TIER_PURPOSE) and tier != existing.tier:
+                self.set_tier(existing.name, tier)
+                existing = self.by_key()[key]
+            return existing
         if tier not in (TIER_DOMAIN, TIER_PURPOSE):
             tier = tier_for(name)
-        merged = self.by_name()
-        merged[name] = TagEntry(name=name, tier=tier)
-        self.entries = list(merged.values())
-        return merged[name]
+        self.entries.append(TagEntry(name=name, tier=tier))
+        return self.entries[-1]
 
     def rename(self, old: str, new: str) -> Optional[TagEntry]:
         """改名（保留 tier；新名已存在时后者覆盖）。返回新条目。"""
@@ -441,6 +487,8 @@ def extract_tags(
     """
     registry = registry or TagRegistry()
     stopwords = {s.lower() for s in (stopwords or [])} | _DEFAULT_LATIN_STOPWORDS
+    # 中文整词停用（tag_key 比对，覆盖大小写/全半角变体；cfg.stopwords 里的中文词同效）
+    cjk_stop = {tag_key(s) for s in (stopwords or [])} | {tag_key(s) for s in _DEFAULT_CJK_STOPWORDS}
     headings = [normalize_tag(h) for h in (headings or []) if normalize_tag(h)]
     # 词典子串匹配用原始文件名（hccn_tool 等连写词不被拆分）；token 提取用拆分后的文件名
     match_text = " ".join([stem or ""] + headings)
@@ -448,10 +496,12 @@ def extract_tags(
 
     matched: list[TagEntry] = []
     matched_names: set[str] = set()
+    matched_keys: set[str] = set()
     for e in registry.match(match_text):
         if e.name not in matched_names:
             matched.append(e)
             matched_names.add(e.name)
+            matched_keys.add(tag_key(e.name))
 
     # 命中的设备别名串：其组成 token（"800I"/"A2"）不再各自成为候选（已归一为设备标签）
     lowered_match = match_text.lower()
@@ -462,11 +512,17 @@ def extract_tags(
 
     def _add_candidate(name: str, tier: Optional[str] = None) -> None:
         name = normalize_tag(name)
-        if not name or name in matched_names or name in cand_seen:
+        if not name:
+            return
+        key = tag_key(name)
+        # 去重/排除按聚合键：词典命中词、已收候选的变体（"Atlas A3" vs "atlas_a3"）不再重复出现
+        if key in matched_keys or key in cand_seen:
+            return
+        if key in cjk_stop:
             return
         if len(name) < min_len:
             return
-        cand_seen.add(name)
+        cand_seen.add(key)
         candidates.append(TagEntry(name=name, tier=tier or tier_for(name)))
 
     # 拉丁词 token（文件名拆分 + 标题）

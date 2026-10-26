@@ -1612,7 +1612,7 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
     兼容升级：旧版按 (source_id::name) 生成，升级后自动清理旧格式残留（其词已收录/忽略的
     不重建，未处理的按新聚合格式重建）。
     """
-    from .tagging import TagRegistry, normalize_tag
+    from .tagging import TagRegistry, normalize_tag, tag_key
 
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
@@ -1621,7 +1621,10 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
     store.cleanup_old_tag_candidates()
     registry = TagRegistry.load(cfg)
     conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
-    # candidate -> {docs: [(source_id, title)], tier}
+    # key -> {display: 首见原形, docs: [(source_id, title)], tier}
+    # 聚合键 tag_key（大小写/分隔符/CJK 空格归一）：存量 extras 里 "Atlas A3"/"atlas_a3"、
+    # "超时 排查"/"超时排查" 是同一词的排版变体——收敛为一条候选；display 保留首见
+    # normalize 形式（专有名词可读性），采纳入词典时 add() 同 key 收敛到已有词条。
     agg: dict[str, dict] = {}
     try:
         rows = conn.execute("SELECT source_id, title, extra FROM docs").fetchall()
@@ -1632,24 +1635,23 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
                 continue
             cands = ex.get("tag_candidates") or []
             for c in cands:
-                # 候选名按词典同款规范化（normalize_tag，CJK↔拉丁边界空格剥离）：
-                # 存量 extras 是上次构建的快照，"配置pip 源"/"配置pip源" 两个变体
-                # 在此收敛为同一聚合键，无需等重建。规范化后为空（纯符号）的跳过。
-                name = normalize_tag(c.get("name") if isinstance(c, dict) else str(c))
-                if not name or registry.contains(name):
+                raw = c.get("name") if isinstance(c, dict) else str(c)
+                display = normalize_tag(raw)
+                key = tag_key(raw or "")
+                if not key or not display or registry.contains(display):
                     continue
                 tier = c.get("tier") if isinstance(c, dict) else None
-                entry = agg.setdefault(name, {"docs": [], "tier": tier})
+                entry = agg.setdefault(key, {"display": display, "docs": [], "tier": tier})
                 entry["docs"].append((source_id, title or source_id))
                 if tier and not entry["tier"]:
                     entry["tier"] = tier
     finally:
         conn.close()
     added = 0
-    for name, info in sorted(agg.items()):
+    for key, info in sorted(agg.items()):
         docs = info["docs"]
-        if store.add_item("tag_candidate", f"tag:{name}", {
-            "candidate": name,
+        if store.add_item("tag_candidate", f"tag:{key}", {
+            "candidate": info["display"],
             "suggested_tier": info["tier"],
             "doc_count": len(docs),
             "docs": [{"source_id": s, "title": t} for s, t in docs[:20]],  # 展示用，截断
@@ -1658,6 +1660,12 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
             # adopt/showItem 的 docs||[payload] 回退里，新条目一律有 docs。
         }):
             added += 1
+    # 存量变体合并（tag_key 引入后的一次性收敛，幂等）：旧 item_ref=tag:{normalize原形}，
+    # 同 key 的 "Atlas A3"/"atlas_a3" 等旧条目不会因 add_item 去重自动合并——
+    # 同 key 组内保留最早 id，docs 并入首条，其余标记 approved（merged_variant）。
+    merged_variants = _merge_tag_candidate_variants(store)
+    if merged_variants:
+        print(f"[candidates] 变体合并: {merged_variants} 条旧条目并入同 key 首条", flush=True)
     # 以 kb 现状校正 pending 队列（2026-10 用户实测缺口）：任何删库路径（审核台删除/
     # canonical 删行 + rebuild/换库）之后，kb 里文档没了但队列项会永久滞留 pending——
     # 全悬空自动忽略、部分悬空刷新引用，下次 seed（审核台启动）自动自愈。
@@ -1666,6 +1674,43 @@ def seed_tag_candidates(cfg: "AppConfig", store: ReviewStore) -> int:
         print(f"[candidates] 队列校正: 自动忽略 {ignored} 条（提及文档已不存在/词典已收录）、"
               f"刷新 {refreshed} 条的引用", flush=True)
     return added
+
+
+def _merge_tag_candidate_variants(store: "ReviewStore") -> int:
+    """存量 tag_candidate 按 tag_key 合并变体（幂等）：同 key 组内保留最早 id（队列位置
+    最老、可能已被人工看到），其余条目的 docs/doc_count 并入首条后标记 approved
+    （result.action=merged_variant，审计可查）；approved/suspected 历史条目不动。
+    返回被合并掉的条数。"""
+    from .tagging import tag_key
+
+    groups: dict[str, list[dict]] = {}
+    for it in store.list_items(category="tag_candidate", status="pending"):
+        ref = it["item_ref"] or ""
+        if not ref.startswith("tag:"):
+            continue
+        groups.setdefault(tag_key(ref[4:]), []).append(it)
+    merged = 0
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda i: i["id"])
+        keep, rest = items[0], items[1:]
+        kp = dict(keep["payload"] or {})
+        kdocs = {d.get("source_id"): d for d in (kp.get("docs") or [])
+                 if isinstance(d, dict) and d.get("source_id")}
+        for it in rest:
+            p = it["payload"] or {}
+            for d in (p.get("docs") or []):
+                if isinstance(d, dict) and d.get("source_id") and d["source_id"] not in kdocs:
+                    kdocs[d["source_id"]] = d
+            store.review(it["id"], "approved", "system",
+                         result={"action": "merged_variant", "into_item": keep["id"],
+                                 "candidate": p.get("candidate", "")})
+            merged += 1
+        kp["docs"] = list(kdocs.values())[:20]
+        kp["doc_count"] = len(kdocs)
+        store.update_payload(keep["id"], kp)
+    return merged
 
 
 def _sweep_tag_candidates(store: "ReviewStore", agg: dict[str, dict],
@@ -1678,12 +1723,15 @@ def _sweep_tag_candidates(store: "ReviewStore", agg: dict[str, dict],
     返回 (auto_ignored, refreshed)。
     """
     ignored = refreshed = 0
+    from .tagging import tag_key
+
     for it in store.list_items(category="tag_candidate", status="pending"):
         p = it["payload"] or {}
         name = p.get("candidate", "")
         if not name:
             continue
-        fresh = agg.get(name)
+        # agg 键是 tag_key（聚合键）——候选原形（payload.candidate 首见形式）须过同款归一再查
+        fresh = agg.get(tag_key(name))
         if fresh is None:
             reason = ("词典已收录，候选已生效" if registry.contains(name)
                       else "提及文档已不存在（重建后 kb 中不再提及）")
@@ -1722,7 +1770,10 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
     if not name:
         raise ValueError("审核项缺少 candidate")
     registry = TagRegistry.load_from_config_file(config_path)
-    entry = registry.add(name, tier)  # tier=None → 启发式
+    # add() 同 key 收敛：候选是词典词条的排版变体（"atlas_a3" vs 词典 "Atlas A3"）时
+    # 返回已有词条——manual 写词典正式名（标签体系统一），不产生第二个词条。
+    entry = registry.add(name, tier)  # tier=None → 启发式；已有词条 tier 仅显式覆盖
+    tag_name = entry.name
     save_registry_to_config(cfg, registry, config_path=config_path)
     # 提及该候选的全部文档（聚合）；旧单文档审核项回退到 source_id
     docs = [d["source_id"] for d in (payload.get("docs") or []) if d.get("source_id")]
@@ -1748,17 +1799,18 @@ def adopt_tag_candidate(cfg: "AppConfig", store: ReviewStore, item_id: int,
                 continue
             ov = get_doc_tags_conn(conn, sid)
             manual = list(ov["manual"])
-            if name not in manual:
-                manual.append(name)
+            if tag_name not in manual:
+                manual.append(tag_name)
             set_doc_tags_conn(conn, sid, manual=manual, reviewer=reviewer)
         conn.commit()
     finally:
         conn.close()
     store.review(item_id, "approved", reviewer,
-                 result={"action": "adopt", "tag": name, "tier": entry.tier,
+                 result={"action": "adopt", "tag": tag_name, "tier": entry.tier,
+                         **({"variant_of": tag_name} if tag_name != name else {}),
                          "docs_count": len(existing),
                          **({"docs_missing": missing} if missing else {})})
-    return {"ok": True, "tag": name, "tier": entry.tier, "source_id": source_id,
+    return {"ok": True, "tag": tag_name, "tier": entry.tier, "source_id": source_id,
             "docs_count": len(existing), "docs_missing": len(missing)}
 
 
