@@ -170,6 +170,22 @@ $('#view-stats').innerHTML=`<h3>待办概览（${cats.reduce((a,[k,v])=>a+v.pend
 // 队列页签制（业务反馈：补标认证与标签候选混在一个列表——管理不便、Shift 区间多选会
 // 跨类勾到另一类工作）。三页签独立视图：单页签内只有一类 checkbox，区间选择天然不跨类。
 let _queueTab='verification_pending', _otherCat='', _showDone=false;
+// approved 的动作语义（tag 候选的 approved = "已处理完毕"，由 result.action 区分）。
+// 历史数据（单条✓认证/旧版批量忽略）无 action——对 tag_candidate 兜底"已忽略"
+// （approved 且非 adopt/合并/自动忽略的候选就是忽略），其他类别兜底"已处理"。
+function actLabel(i){if(i.status!=='approved')return '';const a=((i.result||{}).action)||'';
+  const m={adopt:'已采纳',ignore:'已忽略',merged_variant:'已合并变体','auto-ignore':'自动忽略'};
+  return m[a]||((i.category==='tag_candidate')?'已忽略':'已处理')}
+function resultSummary(i){if(i.status==='pending')return '';
+  const r=i.result||{};const bits=[];
+  const a=actLabel(i);if(a)bits.push(a);
+  if(r.tag)bits.push('标签: '+(typeof r.tag==='string'?r.tag:''));
+  if(r.tier)bits.push('tier: '+r.tier);
+  if(r.reason)bits.push('原因: '+r.reason);
+  if(r.note)bits.push('备注: '+r.note);
+  if(i.reviewer)bits.push('处理人: '+i.reviewer);
+  if(i.reviewed_at)bits.push((i.reviewed_at||'').slice(0,16));
+  return bits.join(' · ')}
 async function loadQueue(tab){
   if(tab)_queueTab=tab;
   const q=await j('/api/queue?limit=5000');   // 全量：徽标计数与页签过滤都依赖完整列表
@@ -185,9 +201,6 @@ const fileRows=i=>{const p=i.payload||{};return (p.aggregate==='excel_file'||(p.
 // 列表条目标题：tag_candidate 显示候选词本身（payload.title 是"兼容旧单文档"的首文档标题，
 // 曾把候选词压住——四篇 Atlas A3 手册的候选在列表里全显示成同一个产品名）；其余类别用文档标题
 const itemTitle=i=>{const p=i.payload||{};return i.category==='tag_candidate'?(p.candidate||i.item_ref):(p.title||i.item_ref)};
-// approved 的动作语义（tag 候选的 approved = "已处理完毕"，四种路径由 result.action 区分）
-const actLabel=i=>{if(i.status!=='approved')return '';const a=((i.result||{}).action)||'';
-  return {adopt:'已采纳',ignore:'已忽略',merged_variant:'已合并变体','auto-ignore':'自动忽略'}[a]||'已处理'};
   const tabBtn=(t,label)=>`<button class="sm ${_queueTab===t?'primary':''}" onclick="loadQueue('${t}')" style="margin-right:4px">${label} <span class="badge">${pendingCnt(t)}</span></button>`;
   const otherCats=[...new Set(q.filter(i=>!isVerif(i)&&!isCand(i)).map(i=>i.category))];
   $('#view-queue').innerHTML=`<h3>审核队列</h3><div class="card subtle"><div style="margin-bottom:6px">${tabBtn('verification_pending','📋 补标认证')}${tabBtn('tag_candidate','🏷 标签候选')}${tabBtn('other','🗂 其他')}</div>`
@@ -216,6 +229,7 @@ if(i.category==='verification_pending'){const sid=isFile?((rows[0]||{}).source_i
   docPrev=`<h4>内容预览${isFile?'（该文件首行文档；body 含各 sheet 全表内容）':''}</h4><pre style="max-height:340px">${esc(d.body||'（无正文）')}</pre>${d.truncated?'<div class="muted">内容过长已截断</div>':''}`}
  catch(e){docPrev=`<p class="muted">内容预览不可用：${esc(e.message)}</p>`}}}
 $('#view-queue').innerHTML=`<div class="card"><button onclick="loadQueue()">← 返回队列</button><h3>#${i.id} ${esc(i.category)} <span class="badge ${i.status}">${i.status}</span>${fileHead}</h3>
+${i.status!=='pending'?`<p class="muted">状态: ${esc(resultSummary(i))||i.status}${((i.result||{}).verification)?` · 认证级别: ${esc(i.result.verification)}`:''}</p>`:''}
 <p><b>item_ref:</b> <span class="mono">${esc(i.item_ref)}</span></p>
 ${i.category==='tag_candidate'?`<p><b>候选标签:</b> <span class="tagb reg">${esc(p.candidate||'')}</span> 建议tier: ${esc(p.suggested_tier||'自动判定')}（提及文档 <b>${p.doc_count||1}</b> 篇：${esc((p.docs||[p]).map(d=>d.title||d.source_id||'').slice(0,5).join('、')||'')}${(p.doc_count||1)>5?' …':''}）</p>`:''}
 ${i.category==='low_confidence_ocr'?`<p><b>图片:</b> <span class="mono">${esc((p.sha256||'').slice(0,16)||p.asset_id||'')}</span>
@@ -233,7 +247,7 @@ ${docPrev}
 ${i.category==='verification_pending'?`认证级别: <select id="verlevel"><option value="tested">tested（已验证）</option><option value="expert">expert（专家认证）</option><option value="unverified">unverified（重置认证）</option></select>`:''}
 ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">自动判定</option><option value="domain">领域</option><option value="purpose">作用</option></select>
 <button class="ok" onclick="adoptCandidate(${i.id})">✓ 采纳为标签（入词典+全部提及文档打标，立即生效）</button>`:''}
-<button class="primary" onclick="review(${i.id},'approved')">✓ 认证${isFile?`（全部 ${p.row_count||rows.length} 行）`:''}</button>
+<button class="primary" onclick="review(${i.id},'approved'${i.category==='tag_candidate'?',\'ignore\'':''})">✓ 认证${i.category==='tag_candidate'?'（忽略）':isFile?`（全部 ${p.row_count||rows.length} 行）`:''}</button>
 <button onclick="review(${i.id},'suspected')">？ 存疑（重新排队靠后）</button>
 ${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除${isFile?'（整表）':''}</button>`}
 </div>
@@ -241,8 +255,9 @@ ${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class=
 $('#rev').value=loadReviewer()}
 async function adoptCandidate(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
-async function review(id,action){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
+async function review(id,action,tagAction){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 const result={note:(document.getElementById('rvnote')||{}).value||''};
+if(tagAction)result.action=tagAction;   // tag 候选的单条认证 = 忽略（动作语义入审计，列表/详情可见）
 const vl=document.getElementById('verlevel');if(vl)result.verification=vl.value;  // 补标项认证级别（tested/expert/unverified=重置）
 await j('/api/item/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reviewer,result})});loadQueue()}
 async function deleteDoc(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
@@ -660,7 +675,8 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
                     adopt_tag_candidate(cfg, store, iid, reviewer, tier=tier,
                                         config_path=_config_path)
                 else:
-                    store.review(iid, "approved", reviewer)
+                    store.review(iid, "approved", reviewer,
+                                 result={"action": "ignore"})   # 动作语义入审计（列表/详情可见）
                 done += 1
             except ValueError as e:
                 failed.append({"item_id": iid, "error": str(e)})
