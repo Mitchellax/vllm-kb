@@ -199,9 +199,19 @@ class SignatureHit:
 
 
 def _fts_phrase_sql(conn, sig: str, limit: int) -> list[tuple[str, str, str]]:
-    """FTS5 短语精确查询：命中返回 (chunk_id, doc_id, text)。"""
-    # 转义 FTS 特殊字符，作为短语查询
-    esc = sig.replace('"', '""')
+    """FTS5 短语精确查询：命中返回 (chunk_id, doc_id, text)。
+
+    **phrase 由查询侧 jieba 分词构造**（query_tokens，与索引侧 tokenize_text 同源）——
+    直接把原文短语丢给 MATCH 会被 FTS5 unicode61 按空格切：用户报错里 "芯片mac 地址"
+    切成 [芯片mac, 地址]，索引（jieba）却是 [芯片, mac, 地址]，连写 token 对不上永远
+    不命中；归一 + jieba 后两侧 token 序同构。"kernel NULL pointer" 类拉丁短语分词后
+    与空格切一致，不受影响。"""
+    from .fts_tokenizer import query_tokens
+
+    toks = query_tokens(sig)
+    if not toks:
+        return []
+    esc = " ".join(toks).replace('"', '""')
     try:
         rows = conn.execute(
             "SELECT chunk_id, doc_id, text FROM chunks_fts "

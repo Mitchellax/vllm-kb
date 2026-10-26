@@ -48,10 +48,32 @@ def register_words(words) -> None:
                 pass
 
 
+# CJK↔拉丁边界空格剥离（与 tagging.normalize_tag 的空格规则同源）：用户查询里
+# "芯片MAC 地址" 与文档里 "芯片MAC地址" 必须等价——该空格是排版噪音，两侧分词前
+# 统一剥离，jieba 切分才同构、FTS 短语才可命中。纯 CJK 间/纯拉丁间空格保留
+# （"HCCL 超时排查"、"kernel NULL pointer" 的词边界不动）。
+_CJK_LATIN_SPACE_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff]) +(?=[A-Za-z0-9])|(?<=[A-Za-z0-9]) +(?=[\u4e00-\u9fff])")
+
+
+def strip_cjk_latin_spaces(text: str) -> str:
+    """查询/索引归一：全角空格→半角、压缩连续空白、删 CJK↔拉丁边界空格。"""
+    if not text:
+        return text or ""
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"\s+", " ", text)
+    return _CJK_LATIN_SPACE_RE.sub("", text)
+
+
 def tokenize_text(text: str) -> str:
-    """文本 → 空格连接的分词结果（FTS 索引写入用）；jieba 不可用时返回原文。"""
+    """文本 → 空格连接的分词结果（FTS 索引写入用）；jieba 不可用时返回归一原文。
+
+    入口先做边界空格剥离：索引侧与查询侧同规则，"芯片MAC 地址" 类排版差异
+    不产生不同 token 序（改索引侧需重建 FTS——build_fts.py）。
+    """
     if not text:
         return ""
+    text = strip_cjk_latin_spaces(text)
     jb = _ensure_jieba()
     if jb is None:
         return text
@@ -66,11 +88,14 @@ _TOKEN_RE = re.compile(r"[\w\u4e00-\u9fff]+")
 def query_tokens(text: str) -> list[str]:
     """查询串 → token 列表（构造 FTS MATCH 用）。
 
+    入口先做 CJK↔拉丁边界空格剥离（与索引侧 tokenize_text 同规则）——"芯片MAC 地址"
+    与 "芯片MAC地址" 分词同构。
     jieba 可用：分词结果（中文词独立，"超时"可命中"超时排查"）；
     不可用：降级为中英 token 提取（原 unicode61 行为，整段中文一个 token）。
     """
     if not text:
         return []
+    text = strip_cjk_latin_spaces(text)
     jb = _ensure_jieba()
     if jb is not None:
         return [t for t in (w for w in jb.lcut(text)) if t and not t.isspace()]

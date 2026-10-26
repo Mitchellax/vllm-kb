@@ -40,11 +40,15 @@ class TestTokenizer(unittest.TestCase):
         self.assertIn("超时排查", toks)
 
     def test_downgrade_without_jieba(self):
-        """jieba 不可用时降级：索引写入原文、查询按中英 token 提取（旧行为）。"""
+        """jieba 不可用时降级：索引写入归一原文、查询按中英 token 提取。
+
+        CJK↔拉丁边界空格两侧同规则剥离（2026-10 查询归一）："超时排查 ab" 的索引与
+        查询都归一为连写 '超时排查ab'——带空格与不带空格的变体全等价，跨写法可命中。"""
         with mock.patch("vllm_kb.fts_tokenizer._jieba", False):
-            self.assertEqual(tokenize_text("超时排查 指南"), "超时排查 指南")
-            toks = query_tokens("超时排查 ab")
-            self.assertEqual(toks, ["超时排查", "ab"])  # 中文整段一个 token
+            self.assertEqual(tokenize_text("超时排查 指南"), "超时排查 指南")  # 纯 CJK 间空格保留
+            self.assertEqual(tokenize_text("超时排查 ab"), "超时排查ab")       # 边界空格剥离
+            self.assertEqual(query_tokens("超时排查 ab"), ["超时排查ab"])
+            self.assertEqual(query_tokens("超时排查ab"), ["超时排查ab"])       # 变体等价
 
 
 def make_cfg(tmp: Path) -> AppConfig:

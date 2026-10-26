@@ -534,28 +534,40 @@ def title_search(
     kw = keyword.strip()
     if not kw:
         return []
-    # title 按 match 语义；source_id（文件名）始终子串匹配
-    title_pat = f"%{kw}%" if match == "contains" else f"{kw}%"
-    sid_pat = f"%{kw}%"
-    sql = "SELECT source_id, title, url, component, resolved_at FROM docs " \
-          "WHERE (title LIKE ? OR source_id LIKE ?)"
-    params: list = [title_pat, sid_pat]
-    if component:
-        sql += " AND component = ?"
-        params.append(component)
-    sql += " ORDER BY length(title) LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
-    hits = []
-    for sid, title, url, comp, resolved_at in rows:
-        hits.append(
-            TitleHit(
-                doc_id=sid,
-                title=title or "",
-                url=url or "",
-                component=comp or "",
-                resolved=bool(resolved_at),
-                resolved_at=resolved_at,
+    # 双变体（原样 + CJK↔拉丁边界空格剥离）：查询 "芯片MAC 地址" 与标题 "芯片MAC地址"
+    # 等价——LIKE 是字面子串匹配，必须变体补查；纯拉丁词归一前后相同不重复。
+    from .fts_tokenizer import strip_cjk_latin_spaces
+
+    variants = [kw]
+    stripped = strip_cjk_latin_spaces(kw)
+    if stripped != kw:
+        variants.append(stripped)
+    seen: set[str] = set()
+    hits: list[TitleHit] = []
+    for variant in variants:
+        # title 按 match 语义；source_id（文件名）始终子串匹配
+        title_pat = f"%{variant}%" if match == "contains" else f"{variant}%"
+        sid_pat = f"%{variant}%"
+        sql = "SELECT source_id, title, url, component, resolved_at FROM docs " \
+              "WHERE (title LIKE ? OR source_id LIKE ?)"
+        params: list = [title_pat, sid_pat]
+        if component:
+            sql += " AND component = ?"
+            params.append(component)
+        sql += " ORDER BY length(title) LIMIT ?"
+        params.append(limit)
+        for sid, title, url, comp, resolved_at in conn.execute(sql, params).fetchall():
+            if sid in seen:
+                continue
+            seen.add(sid)
+            hits.append(
+                TitleHit(
+                    doc_id=sid,
+                    title=title or "",
+                    url=url or "",
+                    component=comp or "",
+                    resolved=bool(resolved_at),
+                    resolved_at=resolved_at,
+                )
             )
-        )
     return hits
