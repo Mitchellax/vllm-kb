@@ -291,7 +291,7 @@ ${groupRow(t.manual||[],'manual','remove','✕',d.source_id)}
 // 组名=来源id\子目录（pdf\support官方文档）；根级=来源id（pdf）；资产回退件=来源id（资产回退）；网络来源=(未分组)
 const groupKey=d=>{const src=d.rel_src;if(src==null)return '(未分组)';
  if(d.rel_dir==null)return `${src}（资产回退）`;
- return d.rel_dir?`${src}\\${d.rel_dir}`:src};
+ return d.rel_dir?`${src}\\\\${d.rel_dir}`:src};
 const groups={};ds.forEach(d=>{const k=groupKey(d);(groups[k]=groups[k]||[]).push(d)});
 const rank=k=>k==='(未分组)'?2:1;
 const keys=Object.keys(groups).sort((a,b)=>rank(a)-rank(b)||a.localeCompare(b,'zh'));

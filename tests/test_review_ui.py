@@ -572,6 +572,17 @@ class ReviewUiHtmlAudit(unittest.TestCase):
                      "d.verification?", "✓ ${esc(d.verification)}"):
             self.assertIn(frag, src, f"缺少片段: {frag}")
 
+    def test_html_no_escaped_interpolation(self):
+        """**插值转义守卫**（2026-10 业务实测：组名显示字面 `${d.rel_dir}`）——Python
+        三引号把 `\\\\` 转成单个 `\\`，JS 模板串里 `\\$` 是**转义的美元符**：插值被
+        干掉、原样输出 `${...}` 文本。new Function 语法守卫抓不到（语法合法、语义错）。
+        静态规则：Python 源码里 `\\\\${`（恰好两反斜杠紧跟插值）违规；正确写法
+        `\\\\\\\\${`（JS 收到字面反斜杠 + 正常插值）。"""
+        src = (PROJECT_ROOT / "scripts" / "review_ui.py").read_text(encoding="utf-8")
+        bad = re.findall(r".{0,40}(?<!\\)\\\$\{.{0,20}", src)
+        self.assertEqual(bad, [], "发现 JS 模板串内被转义的插值（显示为字面 ${...}）:\n"
+                         + "\n".join(bad))
+
     def test_seed_tag_candidate_payload_has_no_legacy_title(self):
         """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）；
         候选名聚合前过 normalize_tag——存量 extras 的空格变体收敛为同一聚合键。"""
