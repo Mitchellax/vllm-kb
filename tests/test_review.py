@@ -325,6 +325,74 @@ class TestTagCandidateVariants(unittest.TestCase):
         self.assertEqual(_merge_tag_candidate_variants(self.store), 0)
 
 
+class TestAdoptedTagVariants(unittest.TestCase):
+    """已认证 tag 的归一迁移（2026-10）：词典同 key 变体词条收敛 + 全库标签替换——
+    已认证的 tag 直接适用 tag_key 规则，无需删掉重加。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cfg_path = self.root / "config.json"
+        self.cfg_path.write_text(json.dumps({
+            "project": {"name": "x", "data_root": str(self.root)},
+            "tags": {"registry": [
+                {"name": "CANN版本说明", "tier": "purpose"},
+                {"name": "CANN 版本说明", "tier": "domain"},
+                {"name": "HCCL", "tier": "domain"},
+            ]},
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "storage": {"vector_backend": "python",
+                        "sqlite_path": str(self.root / "kb.sqlite3")},
+        }, ensure_ascii=False), encoding="utf-8")
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        conn.executescript(
+            "CREATE TABLE docs (source_id TEXT PRIMARY KEY, source_type TEXT, title TEXT,"
+            " component TEXT, url TEXT, status TEXT, resolved_at TEXT, extra TEXT, reliability REAL,"
+            " tags TEXT);"
+            "CREATE TABLE doc_tags (source_id TEXT PRIMARY KEY, manual TEXT, excluded TEXT, reviewer TEXT)")
+        conn.executemany("INSERT INTO docs VALUES(?,?,?,?,?,?,?,?,?,?)", [
+            ("md:a", "doc_markdown", "A", "", "", None, None, "{}", 0.5,
+             json.dumps(["CANN版本说明", "HCCL"], ensure_ascii=False)),
+            ("md:b", "doc_markdown", "B", "", "", None, None, "{}", 0.5,
+             json.dumps(["CANN 版本说明"], ensure_ascii=False)),
+        ])
+        conn.execute("INSERT INTO doc_tags VALUES(?,?,?,?)",
+                     ("md:b", json.dumps(["CANN 版本说明"], ensure_ascii=False),
+                      json.dumps([], ensure_ascii=False), "old"))
+        conn.commit()
+        conn.close()
+        self.cfg = AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "storage": {"vector_backend": "python",
+                        "sqlite_path": str(self.root / "kb.sqlite3")},
+        })
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_normalize_variants_merges_dict_and_rewrites_docs(self):
+        from vllm_kb.review import normalize_tag_variants
+
+        r = normalize_tag_variants(self.cfg, config_path=self.cfg_path)
+        self.assertEqual(r["merged_variants"], 1)
+        # 词典收敛：config 只剩正式名 + HCCL（HCCL 无变体不动）
+        data = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        names = [e["name"] for e in data["tags"]["registry"]]
+        self.assertEqual(names, ["CANN版本说明", "HCCL"])
+        # 全库替换：docs.tags 与 doc_tags.manual 里的变体 → 正式名
+        conn = sqlite3.connect(self.root / "kb.sqlite3")
+        tags_a = json.loads(conn.execute("SELECT tags FROM docs WHERE source_id='md:a'").fetchone()[0])
+        tags_b = json.loads(conn.execute("SELECT tags FROM docs WHERE source_id='md:b'").fetchone()[0])
+        manual_b = json.loads(conn.execute("SELECT manual FROM doc_tags WHERE source_id='md:b'").fetchone()[0])
+        conn.close()
+        self.assertEqual(tags_a, ["CANN版本说明", "HCCL"])
+        self.assertEqual(tags_b, ["CANN版本说明"])
+        self.assertEqual(manual_b, ["CANN版本说明"])
+        # 幂等：再跑零开销
+        self.assertEqual(normalize_tag_variants(self.cfg, config_path=self.cfg_path),
+                         {"merged_variants": 0, "docs_updated": 0})
+
+
 class TestVerificationReset(unittest.TestCase):
     """认证级别三档全覆盖：approved+unverified = 清人工覆盖层（重置），生效值回 canonical。
 

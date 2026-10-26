@@ -193,15 +193,17 @@ class TagRegistry:
                     if tier not in (TIER_DOMAIN, TIER_PURPOSE):
                         tier = tier_for(name)
                     entries.append(TagEntry(name=name, tier=tier))
-        # 同名去重（后出现的覆盖）
+        # 同 key 去重（**首见保留**，2026-10 同义变体收敛）：存量 config 里
+        # "CANN版本说明" 与 "CANN 版本说明" 可能都已被人工认证入典——加载即收敛为
+        # 一条（首见原形），contains/match/adopt 不再产生第二词条；config 文件本身
+        # 不动，下次 save 自然写收敛后的列表（全库标签替换走 normalize_tag_variants）
         merged: dict[str, TagEntry] = {}
         for e in entries:
-            merged[e.name] = e
+            merged.setdefault(tag_key(e.name), e)
         devices = DeviceGlossary._from_raw(devices_raw or [])
-        # 设备 name 补入词典（registry 已有同名 → registry tier 优先）
+        # 设备 name 补入词典（registry 已有同 key → registry tier 优先）
         for de in devices.entries:
-            if de.name not in merged:
-                merged[de.name] = TagEntry(name=de.name, tier=de.tier)
+            merged.setdefault(tag_key(de.name), TagEntry(name=de.name, tier=de.tier))
         reg = cls(list(merged.values()), devices)
         reg.devices.warnings.extend(devices.warnings)
         return reg

@@ -196,6 +196,18 @@ class TestTagKeyVariants(unittest.TestCase):
         self.assertEqual(e.name, "Atlas A3")
         self.assertEqual(len(r.entries), 1)
 
+    def test_load_converges_variant_entries(self):
+        """存量 config 词典里同 key 变体词条（都曾被人工认证入典）——加载即收敛为首条。"""
+        cfg = AppConfig.model_validate({"tags": {"registry": [
+            {"name": "CANN版本说明", "tier": "purpose"},
+            {"name": "CANN 版本说明", "tier": "domain"},   # 变体（后被认证）
+        ]}})
+        r = TagRegistry.load(cfg)
+        self.assertEqual(len(r.entries), 1)
+        self.assertEqual(r.entries[0].name, "CANN版本说明")   # 首见原形
+        self.assertEqual(r.entries[0].tier, TIER_PURPOSE)     # 首条 tier
+        self.assertTrue(r.contains("CANN 版本说明"))
+
     def test_match_separator_insensitive(self):
         r = TagRegistry(entries=[TagEntry("hccn-tool", TIER_DOMAIN)])
         hits = r.match("执行 hccn_tool 检查")

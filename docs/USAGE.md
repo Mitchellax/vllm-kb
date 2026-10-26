@@ -1019,8 +1019,12 @@ python scripts/review_ui.py --no-seed          # 启动但不自动补单
    `final = (自动 − 排除) ∪ 人工` 同步 `docs.tags`——**检索侧立即生效**；③ 审核项标记 approved，
    重跑补单不再出现；
 4. **忽略**：**✓ 认证**即忽略（不采纳、不改任何数据）；因 `item_ref` 已存在（任意状态），
-   之后自动补单不再打扰。**🗑 标记删除按钮对 tag_candidate 不适用**（其 `item_ref` 是候选词
-   `tag:{name}` 而非文档 source_id，点删除会报"文档不存在"）。
+   之后自动补单不再打扰。**🗑 标记删除按钮对 tag_candidate 不适用**（其 `item_ref` 是候选词   `tag:{name}` 而非文档 source_id，点删除会报"文档不存在"）。
+5. **已认证 tag 的变体归一（`normalize_tag_variants`，每次 seed 前自动跑，幂等）**：
+   存量词典里同 `tag_key` 的多个词条（"CANN版本说明" 与 "CANN 版本说明" 都曾被人工
+   认证入典）**收敛为首条原形**，并对全库做标签替换（`docs.tags` / `doc_tags.manual`
+   + `excluded`）——**已认证的 tag 自动适用聚合规则，不需要删掉重加**；同时 `TagRegistry`
+   加载即按 key 去重（config 文件在下次保存时自然收敛），adopt 同 key 映射到已有正式名。
 
 **生效边界**（"刷新到所有文档"需分清）：
 

@@ -1953,8 +1953,71 @@ def sweep_stale_verification_pending(store: "ReviewStore", kb_path: str | Path) 
     return ignored
 
 
+def normalize_tag_variants(cfg: "AppConfig", config_path: Optional[str | Path] = None) -> dict:
+    """已认证 tag 的同义变体归一（幂等，2026-10）：存量词典里同一 tag_key 的多个词条
+    （"CANN版本说明" 与 "CANN 版本说明" 都被人工认证入典）收敛为首条原形，并对全库做
+    标签替换（docs.tags / doc_tags.manual+excluded）——**已认证的 tag 同样适用 tag_key
+    规则**，不需要删掉重加。变体组为空时零开销（每次 seed 前跑）。
+
+    返回 {"merged_variants": 收敛对数, "docs_updated": 全库替换受影响文档数}。
+    """
+    import json as _json
+
+    from .config import PROJECT_ROOT
+    from .tagging import tag_key
+
+    p = Path(config_path) if config_path else PROJECT_ROOT / "config.json"
+    if not p.exists():
+        return {"merged_variants": 0, "docs_updated": 0}
+    try:
+        data = _json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return {"merged_variants": 0, "docs_updated": 0}
+    raw_entries = (data.get("tags") or {}).get("registry") or []
+    names: list[str] = []
+    for item in raw_entries:
+        name = (item.get("name") if isinstance(item, dict) else str(item)) or ""
+        if name.strip():
+            names.append(name.strip())
+    # 按 tag_key 分组找变体对（保持 config 出现顺序；组内首条 = canonical）
+    groups: dict[str, list[str]] = {}
+    for n in names:
+        groups.setdefault(tag_key(n), []).append(n)
+    variants = [(g[1], g[0]) for g in groups.values() if len(g) > 1]
+    if not variants:
+        return {"merged_variants": 0, "docs_updated": 0}
+    variant_names = {old for old, _ in variants}
+    # 词典层：直接从 config 删变体词条（TagRegistry 加载/contains/add 均按 key 收敛，
+    # 词典不留变体；load_from_config_file 已收敛所以这里不能用 rename——找不到旧词条）
+    def _keep(item) -> bool:
+        name = (item.get("name") if isinstance(item, dict) else str(item)) or ""
+        return name.strip() not in variant_names
+
+    data["tags"]["registry"] = [e for e in raw_entries if _keep(e)]
+    p.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    merged_docs = 0
+    kb_path = cfg.resolve(cfg.storage.sqlite_path)
+    for old, new in variants:
+        if Path(kb_path).exists():
+            conn = sqlite3.connect(str(kb_path))
+            try:
+                n = (_replace_json_list_tag(conn, "docs", "tags", old, new)
+                     + _replace_json_list_tag(conn, "doc_tags", "excluded", old, new)
+                     + _replace_json_list_tag(conn, "doc_tags", "manual", old, new))
+                conn.commit()
+            finally:
+                conn.close()
+            merged_docs += n
+    return {"merged_variants": len(variants), "docs_updated": merged_docs}
+
+
 def seed_all(cfg: "AppConfig", store: ReviewStore) -> dict[str, int]:
     """运行全部 seed（幂等），返回各 seed 新增数。"""
+    # 已认证 tag 的变体归一先于一切 seed：词典先收敛，候选的"词典已收录"判定才准确
+    norm = normalize_tag_variants(cfg)
+    if norm.get("merged_variants"):
+        print(f"[seed] 词典变体归一: {norm['merged_variants']} 组同 key 词条收敛，"
+              f"全库替换影响 {norm['docs_updated']} 行", flush=True)
     out = {
         "verification_pending": seed_verification_pending(cfg, store),
         "case_title_flag": seed_case_title_flags(cfg, store),
