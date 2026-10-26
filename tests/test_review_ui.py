@@ -535,6 +535,12 @@ class ReviewUiHtmlAudit(unittest.TestCase):
         # checkbox 类由页签判定（单页签内只有一类，Shift 区间不跨类）
         qmap = src[src.index("+shown.map(i=>"):src.index("待实际删除")]
         self.assertIn("_queueTab==='tag_candidate'?'cchk':'qchk'", qmap)
+        # approved 动作语义可见（tag 候选的 approved=已处理完毕，采纳/忽略/合并/自动忽略分清）
+        self.assertIn("actLabel", src)
+        self.assertIn("merged_variant:'已合并变体'", src)
+        # 已处理默认隐藏（approved 历史堆尾部是噪音），勾选后才显示
+        self.assertIn("_showDone=this.checked;loadQueue()", src)
+        self.assertIn("i.status==='pending'||i.status==='suspected'", src)
 
     def test_seed_tag_candidate_payload_has_no_legacy_title(self):
         """新 seed 的 tag_candidate payload 不再携带首文档 title/source_id（展示陷阱字段）；
