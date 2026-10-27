@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from vllm_kb.config import SourceCfg
+from vllm_kb.config import AppConfig, SourceCfg
 from vllm_kb.ocr import OcrApiError, OcrResult
 from vllm_kb.sources import ImageSource, MarkdownSource
 
@@ -493,6 +493,91 @@ class TestSelfConfidenceParsing(unittest.TestCase):
         self.assertEqual(res.confidence_source, "model")
         self.assertEqual(res.anomaly, "")
         self.assertFalse(res.needs_review)
+
+    def test_special_token_tail_tolerated(self):
+        """2026-10 业务实测 700 条统一 missing：vLLM/DeepSeek-OCR 输出尾部挂
+        <|end▁of▁sentence|> 类特殊 token——标记行后独立成行、或挂在值后面，
+        都必须仍按末行处理，不得误报 missing/unparsable。"""
+        from vllm_kb.ocr import parse_self_confidence
+
+        # 特殊 token 单独占行（标记行之后）
+        text, conf, anomaly, _ = parse_self_confidence(
+            "halMemCreate failed\nCONFIDENCE: 0.77\n<|end▁of▁sentence|>")
+        self.assertEqual(conf, 0.77)
+        self.assertEqual(anomaly, "")
+        self.assertEqual(text, "halMemCreate failed")
+        # 特殊 token 挂在值后面
+        _, conf, anomaly, _ = parse_self_confidence(
+            "text\nCONFIDENCE: 0.77<|end▁of▁sentence|>")
+        self.assertEqual(conf, 0.77)
+        self.assertEqual(anomaly, "")
+        # inline 尾部挂特殊 token
+        _, conf, anomaly, _ = parse_self_confidence(
+            "报错 failed CONFIDENCE: 0.88<|end▁of▁sentence|>")
+        self.assertEqual(conf, 0.88)
+        self.assertEqual(anomaly, "")
+        # 标记行后仍有实质正文 → 仍判 misplaced（防污染语义保留）
+        from vllm_kb.ocr import ANOMALY_MISPLACED
+
+        _, _, anomaly, _ = parse_self_confidence(
+            "CONFIDENCE: 0.9\nhalMemCreate failed\n<|end▁of▁sentence|>")
+        self.assertEqual(anomaly, ANOMALY_MISPLACED)
+
+    def test_max_tokens_sent_and_truncation_detected(self):
+        """payload 显式 max_tokens（vLLM 服务端默认截断是 700 张误报 missing 的
+        直接原因）；finish_reason=length → anomaly=truncated（与 missing 区分）。"""
+        from vllm_kb.ocr import ocr_image_detail
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+        captured: dict = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{
+                    "message": {"content": "正文被截断…"},
+                    "finish_reason": "length"}]}).encode()
+
+        def fake(req, timeout=60):
+            captured["payload"] = json.loads(req.data.decode())
+            return FakeResp()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                   model="m", mode="openai", max_tokens=2048)
+        self.assertEqual(captured["payload"]["max_tokens"], 2048)   # 显式注入
+        self.assertEqual(res.anomaly, "truncated")
+        self.assertIsNone(res.confidence)
+        self.assertTrue(res.needs_review)
+        # 默认值 4096
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            ocr_image_detail(png, "api", api_base="http://ocr:8000", model="m", mode="openai")
+        self.assertEqual(captured["payload"]["max_tokens"], 4096)
+
+    def test_ocr_max_tokens_config_wiring(self):
+        """image 源 ocr_max_tokens → OcrConfig.max_tokens（非法/缺失回 4096）。"""
+        from vllm_kb.ocr import as_max_tokens, ocr_config_from_cfg
+
+        self.assertEqual(as_max_tokens(None), 4096)
+        self.assertEqual(as_max_tokens("abc"), 4096)
+        self.assertEqual(as_max_tokens(-1), 4096)
+        self.assertEqual(as_max_tokens(2048), 2048)
+        cfg = AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "sources": [{"id": "img", "type": "image", "path": "x", "enabled": True,
+                         "ocr_provider": "api", "ocr_api_base": "http://ocr:8000",
+                         "ocr_api_mode": "openai", "ocr_max_tokens": 2048}],
+        })
+        oc = ocr_config_from_cfg(cfg)
+        self.assertEqual(oc.max_tokens, 2048)
 
 
 if __name__ == "__main__":
