@@ -66,6 +66,8 @@ _UPDATE_STEPS = [
      "代码快照（vllm-ascend，config.code.versions）"),
     ("scripts/build_vllm_snapshots.py", [], False, "代码快照（vllm 主仓，companion 对应）"),
     ("scripts/build_fork_snapshots.py", [], False, "代码快照（0day fork 镜像，矩阵锁定 SHA）"),
+    ("scripts/build_image_snapshots.py", [], False,
+     "镜像插件源码提取（0day 镜像内 vllm-ascend 代码，digest 锚幂等）"),
 ]
 
 _GRAPH_STEPS = [
@@ -83,6 +85,7 @@ _STEP_KEY = {  # 步骤名 → key（供 --skip-* 过滤）
     "代码快照（vllm-ascend，全部 tag --all）": "code_snapshots",
     "代码快照（vllm 主仓，companion 对应）": "code_snapshots",
     "代码快照（0day fork 镜像，矩阵锁定 SHA）": "code_snapshots",
+    "镜像插件源码提取（0day 镜像内 vllm-ascend 代码，digest 锚幂等）": "code_snapshots",
 }
 
 
@@ -220,6 +223,12 @@ def cmd_deploy(args) -> int:
         # 排在其后；索引幂等化（2026-10 业务维护反馈）
         steps.append(
             ("scripts/build_fork_snapshots.py", [], False, "代码快照（0day fork 镜像，矩阵锁定 SHA）")
+        )
+        # 0day 镜像内的 vllm-ascend 插件源码（COPY 层无版本痕迹，只能从镜像层取）；
+        # digest 锚幂等（镜像未重推跳过）；候选直接扫 quay，不依赖矩阵产物
+        steps.append(
+            ("scripts/build_image_snapshots.py", [], False,
+             "镜像插件源码提取（0day 镜像内 vllm-ascend 代码，digest 锚幂等）")
         )
     steps = _filter_steps(steps, args.skip)
 

@@ -100,10 +100,11 @@ python scripts/maintain.py --insecure update
 ```
 
 > **建图与拉取已拆分**（2026-10 业务维护反馈）：`update` = 拉取入库 + **追新镜像全链路**
-> （配套矩阵采新 tag → vllm-ascend / vllm 主仓 / 0day fork 三仓代码快照），**不停服务
-> 随时可跑**——0day 特殊镜像的代码在官方 GitHub 仓拿不到，update 按矩阵锁定的 fork SHA
-> 补齐；关系图（Kùzu 单写者）由 `maintain.py graph` 在凌晨停机窗口单独同步，图更新后
-> 重启 API。`deploy` 仍是一次性全量（含建图）。
+> （配套矩阵采新 tag → vllm-ascend / vllm 主仓 / 0day fork 三仓代码快照 → **0day 镜像内
+> 插件源码提取**——img 命名空间的代码现场，digest 锚幂等），**不停服务随时可跑**——
+> 0day 特殊镜像的代码在官方 GitHub 仓拿不到，update 按矩阵锁定的 fork SHA 与镜像层
+> 双路补齐；关系图（Kùzu 单写者）由 `maintain.py graph` 在凌晨停机窗口单独同步，
+> 图更新后重启 API。`deploy` 仍是一次性全量（含建图）。
 > **代码快照幂等**：镜像 tag 与锁定 SHA 的内容发布后不变——已存版本的下载/符号索引/
 > 跨版本符号表全部跳过（这是"已存在仓检查太长"的历史问题根因，已修复）；提取规则升级
 > 后需要强制重建时加 `--reindex`（三个 build_*_snapshots.py 均支持）。
@@ -123,9 +124,9 @@ python scripts/maintain.py --insecure update
 | `deploy/update/graph --config path` | 指定 config.json（默认项目根自动发现） |
 | `build_kb.py --strict` | 严格模式：任一来源失败即退出码 1（CI/严格流水线用） |
 
-> update 的 `--skip` 拆分：`--skip-matrix` 只跳矩阵（fork/vllm 快照依赖矩阵产物会随之
-> 拿不到新行）；`--skip-code-snapshots` 一次跳过三仓代码快照；单独补某仓直接跑对应
-> `scripts/build_{code,vllm,fork}_snapshots.py`（幂等，只补缺）。
+> update 的 `--skip` 拆分：`--skip-matrix` 只跳矩阵（fork 快照依赖矩阵产物会随之
+> 拿不到新行）；`--skip-code-snapshots` 一次跳过三仓代码快照 + 0day 镜像插件提取；
+> 单独补某仓直接跑对应 `scripts/build_{code,vllm,fork,image}_snapshots.py`（幂等，只补缺）。
 
 **自动降级**（子步骤失败不中断，只打印告警）：
 

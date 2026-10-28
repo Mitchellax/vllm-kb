@@ -166,17 +166,18 @@ class TestStepTable(unittest.TestCase):
         self.assertNotIn("图重建（Kùzu）", [tag for _s, _x, f, tag in _UPDATE_STEPS])
         # 图步骤独立存在（graph 子命令用）
         self.assertIn("图重建（Kùzu）", [tag for _s, _x, f, tag in _GRAPH_STEPS])
-        # 追新镜像全链路：矩阵（新 tag 采集）→ 三仓快照（va/vllm/fork），全部非致命
+        # 追新镜像全链路：矩阵（新 tag 采集）→ 三仓快照 + 镜像插件提取，全部非致命
         tags = [tag for _s, _x, f, tag in _UPDATE_STEPS if not f]
         for expect in ("配套矩阵（新镜像 tag 采集）",
                        "代码快照（vllm-ascend，config.code.versions）",
                        "代码快照（vllm 主仓，companion 对应）",
-                       "代码快照（0day fork 镜像，矩阵锁定 SHA）"):
+                       "代码快照（0day fork 镜像，矩阵锁定 SHA）",
+                       "镜像插件源码提取（0day 镜像内 vllm-ascend 代码，digest 锚幂等）"):
             self.assertIn(expect, tags)
         # fork 快照必须排在矩阵之后（fork_rows 读矩阵产物）
         self.assertLess(tags.index("配套矩阵（新镜像 tag 采集）"),
                         tags.index("代码快照（0day fork 镜像，矩阵锁定 SHA）"))
-        # --skip code_snapshots 一次跳过三个代码快照步骤
+        # --skip code_snapshots 一次跳过三仓快照 + 镜像提取
         filtered = _filter_steps(_UPDATE_STEPS, {"code_snapshots"})
         self.assertEqual([t for _s, _x, _f, t in filtered], ["增量拉取与入库", "配套矩阵（新镜像 tag 采集）"])
 
