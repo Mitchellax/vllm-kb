@@ -604,16 +604,40 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
 - **OCR API 两种调用模式（`ocr_api_mode`，默认 custom）**：
   - `custom`：`POST {ocr_api_base}/ocr`，body `{"image": "<base64>", "filename": "x.png", "model": "<可选>"}`，
     响应 `{"text": "...", "confidence": 0.93}`——适用于自研 FastAPI 包装 paddleocr 等；
-  - `openai`：OpenAI 兼容接口（如 siliconflow 的 DeepSeek-OCR）：`POST {base}/chat/completions`，
-    `model=ocr_api_model`（**必填**），图片以 data URI 内联，取 `choices[0].message.content`；
+  - `openai`：OpenAI 兼容接口（vllm-ascend 部署的 paddleocr-vl / siliconflow 的 DeepSeek-OCR 等）：
+    `POST {base}/chat/completions`，`model=ocr_api_model`（**必填**），图片以 data URI 内联；
+- **openai 模式调用参数（2026-10 paddleocr-vl-1.6 业务实测定版）**：
+  - `ocr_temperature` **默认 0**：vLLM 默认温度 1 会带崩 OCR 专用模型输出（大量 LOC 布局标签/乱码）；
+  - `ocr_api_prompt` 默认**模型原生极简指令 "OCR"**：长提示词对 OCR 专用模型是负担；
+    通用 VL 模型可换回自报提示词（要求末行输出 `CONFIDENCE: <0~1 小数>`，参考 `vllm_kb/ocr.py` 的 `_CONFIDENCE_PROMPT`）；
+  - `ocr_max_tokens` 默认 4096（必须显式——vLLM 服务端默认截断会切掉输出尾部）；
+  - **置信度走 logprobs**（`confidence_source=logprobs`，= exp(非特殊 token mean logprob)）：
+    paddleocr-vl 类 OCR 专用模型**不自报置信度**，logprobs 是唯一模型侧来源；特殊 token
+    （`<|...|>`）不计入均值（会把分数拉低到无意义）；无 logprobs 且无自报行 →
+    `anomaly=no_confidence` 进人工核对；输出被截断（finish_reason=length）→ `anomaly=truncated`；
 - key 可选（`ocr_api_key` 或环境变量 `OCR_API_KEY`）；`ocr_api_model` 可选透传（openai 模式必填）；
 - **置信度来源（单一来源原则）**：`custom` = 服务端返回（`confidence_source=service`）、
-  `paddle` = 引擎逐行平均（`engine`）、`openai` = **模型自报**（`model`）——不做多源融合，
-  也不做启发式二次打分（混合来源会让回溯时无法判断分数出处；中文 OCR 主要错误是形近字，
+  `paddle` = 引擎逐行平均（`engine`）、`openai` = **logprobs 优先，自报回退**（`logprobs`/`model`）——
+  不做多源融合，也不做启发式二次打分（混合来源会让回溯时无法判断分数出处；中文 OCR 主要错误是形近字，
   产出仍是合法可打印字符，纯文本启发式识别不了）；
-  `openai` 模式由提示词要求模型末行输出 `CONFIDENCE: <0~1 小数>`；**自报异常**
-  （缺失 / 不可解析 / 越界 / 不在末行 / 正文为空却高置信）→ `confidence=null` + `anomaly` 标记，
+  自报异常（缺失 / 不可解析 / 越界 / 不在末行 / 正文为空却高置信）→ `confidence=null` + `anomaly` 标记，
   交人工审核，**不回退**到启发式评分；
+- **预处理不做**（业务实测）：x3 放大 / CLAHE 对模糊小字无提升且引入乱码——插值放大不带
+  新信息；优化走源头（截图分辨率规范）与几何矫正（见下）；
+- **OCR 基准集与评估**（`scripts/eval_ocr_bench.py`）：任何 OCR 优化先过基准集量化，
+  不要靠"感觉有效"。四步：
+  ```bash
+  python scripts/eval_ocr_bench.py --pick-from-assets   # ① 从资产层按置信度分桶挑图+labels 草稿（expect 预填 OCR 文本，人工校对）
+  python scripts/eval_ocr_bench.py --gen-transforms     # ② 程序生成歪斜(3/7/12°)/透视变体（期望文本=原图，零标注成本）
+  # ③ 人工校对 <data_root>/ocr_bench/labels.json 的 expect（重点 blurry 桶）
+  python scripts/eval_ocr_bench.py --run                # ④ 跑评估 → report.json（分场景 avg_score/pass_rate/avg_confidence）
+  python scripts/eval_ocr_bench.py --run --baseline <旧 report.json>   # ⑤ 改参后对比（avg_score delta）
+  ```
+  场景配比建议 30 张：normal ×8 / blurry ×8 / tilt ×7 / persp ×7（tilt/persp 由清晰图程序变换生成）。
+  难场景优化路径（按性价比）：①采集规范（文字像素高 ≥16px、PNG 免 JPEG 伪影）；
+  ②几何矫正前置（方向分类 → det 框估角旋转 → 四点透视变换）；③双引擎交叉
+  （logprobs <0.85 的图用 PP-OCRv5 det+rec 复跑，编辑距离一致则采纳）；
+  ④救不回的走低置信人工审核兜底。
 - **embedding 强制 API**（本地 embedding 不做，部署复杂）：`embedding.base_url` 指向 OpenAI 兼容端点
   （可指向其他服务器的 vLLM 部署）；`echo` 仅离线演示（效果粗糙）；
 - 连通性测试：审核工作台 API 配置中心对 embedding / OCR 均提供"测试连通"（OCR 用内置测试图走真实识别链路）；
