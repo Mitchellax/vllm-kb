@@ -102,19 +102,32 @@ def download_zip(repo: str, version: str, dest: Path, insecure: bool = False,
     return True
 
 
-def index_version(code: VersionedCode, version: str) -> None:
-    """确保版本解压并重建符号索引。"""
+def index_version(code: VersionedCode, version: str, force: bool = False) -> None:
+    """确保版本解压并重建符号索引（幂等：已有索引跳过，force/--reindex 强制）。"""
     try:
         snap = code.ensure_snapshot(version)
     except Exception as e:
         print(f"[warn] {version} 解压失败: {e}")
         return
-    n = code.build_index_for_version(version)
+    n = code.build_index_for_version(version, force=force)
+    if n is None:
+        print(f"[code] {version} 已有索引，跳过（--reindex 重建）（快照 {snap}）")
+        return
     print(f"[code] {version} 符号索引 {n} 个符号（快照 {snap}）")
 
 
-def build_symbol_table(cfg) -> None:
-    """从全部已解压快照生成跨版本符号表（symbols.json），并统计社区高频信号词。"""
+def _versions_hash(versions: list[str]) -> str:
+    import hashlib
+
+    return hashlib.sha1(",".join(sorted(versions)).encode()).hexdigest()
+
+
+def build_symbol_table(cfg, force: bool = False) -> None:
+    """从全部已解压快照生成跨版本符号表（symbols.json），并统计社区高频信号词。
+
+    **幂等**（2026-10 业务维护反馈）：版本集合未变（_versions_hash 一致）且非 force
+    → 跳过重建——跨版本全快照扫描是大头耗时，日常轮次不该重复付。
+    """
     from vllm_kb.symbol_table import (
         build_symbol_table_from_snapshots,
         save_symbol_table,
@@ -123,11 +136,26 @@ def build_symbol_table(cfg) -> None:
     from vllm_kb.code_index import VersionedCode
 
     code = VersionedCode(cfg)
+    out = cfg.resolve(cfg.storage.code_root) / "symbols.json"
+    vh = _versions_hash(code.available_versions)
+    if not force and out.exists():
+        try:
+            if json.loads(out.read_text(encoding="utf-8")).get("_versions_hash") == vh:
+                print(f"[code] 符号表已是最新（版本集合未变），跳过（--reindex 重建）")
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
     table = build_symbol_table_from_snapshots(code.snapshots_dir)
     issue_dir = cfg.resolve("data/raw/vllm-ascend/issues")
     _extract_models_and_versions_from_issues(issue_dir, table)
-    out = cfg.resolve(cfg.storage.code_root) / "symbols.json"
     save_symbol_table(table, out)
+    # 追加版本集合哈希（幂等跳过依据；SymbolTable 本身无 meta 字段，落盘后补）
+    try:
+        data = json.loads(out.read_text(encoding="utf-8"))
+        data["_versions_hash"] = vh
+        out.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        pass
     print(f"[code] 符号表 {len(table.entries)} 个 -> {out}")
 
     # 社区高频信号词（供 agent 判断）
@@ -149,6 +177,8 @@ def main() -> None:
                     help="只列出可用版本对比（GitHub 全部 tag / 已预存 / 缺失），不下载——"
                          "方便人工更新 config.code.versions")
     ap.add_argument("--index-only", action="store_true", help="只重建索引，不下载")
+    ap.add_argument("--reindex", action="store_true",
+                    help="强制重建符号索引/符号表（默认幂等：已有索引且版本集合未变则跳过）")
     ap.add_argument("--insecure", action="store_true",
                     help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--base-url", default=None,
@@ -176,8 +206,8 @@ def main() -> None:
         conn = code._connect_index(write=True)
         conn.close()
         for v in code.available_versions:
-            index_version(code, v)
-        build_symbol_table(cfg)
+            index_version(code, v, force=args.reindex)
+        build_symbol_table(cfg, force=args.reindex)
         print(f"[code] 索引重建完成，可用版本: {code.available_versions}")
         return
 
@@ -216,13 +246,13 @@ def main() -> None:
     if downloaded:
         print(f"[code] 本轮新下载 {downloaded} 个版本")
 
-    # 2) 全部解压 + 建索引
+    # 2) 全部解压 + 建索引（幂等：已有索引跳过）
     for v in versions:
         if (code.zips_dir / f"{v}.zip").exists():
-            index_version(code, v)
+            index_version(code, v, force=args.reindex)
 
-    # 3) 生成跨版本符号表 + 社区高频信号词
-    build_symbol_table(cfg)
+    # 3) 生成跨版本符号表 + 社区高频信号词（幂等：版本集合未变跳过）
+    build_symbol_table(cfg, force=args.reindex)
 
     print(f"[code] 完成。可用版本: {code.available_versions}")
 

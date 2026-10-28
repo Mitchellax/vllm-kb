@@ -61,6 +61,9 @@ COMPANION_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend", "npu-driver", "
 # npu-driver(HDK) 与镜像版本不耦合（特定 HDK 有特定问题），缺失符合预期，不计入缺口告警
 REQUIRED_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend"]
 
+# tag 平台后缀（同 base 版本的变体归组；cann 同系列回退按此口径）：
+# -310p/-a3/-a5/-a2 = 机器型号；-openeuler = **openEuler 系统打包**（无该后缀 = ubuntu，
+# 是 OS 维度、与机器型号正交——2026-10 业务澄清）
 PLATFORM_SUFFIXES = ("-openeuler", "-310p", "-a3", "-a5", "-a2")
 _CANN_RE = re.compile(r"cann-(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
 _PYTHON_RE = re.compile(r"python(\d+\.\d+(?:\.\d+)?)")

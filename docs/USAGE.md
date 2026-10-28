@@ -88,7 +88,7 @@ export EMBEDDING_API_KEY=sk-xxx
 # 🟢 首次部署 / 全量重建（拉取+入库 → 建图 → 建FTS → 版本日历 → 配套矩阵 → 代码快照）
 python scripts/maintain.py deploy
 
-# 🔄 日常增量更新（数据段：增量拉取+入库，**不停检索服务**）
+# 🔄 日常增量更新（拉取+入库 → 新镜像矩阵 → 三仓代码快照；**不停检索服务**）
 python scripts/maintain.py update
 
 # 🌙 凌晨停机窗口：单独重建关系图（Kùzu 单写者，需停 serve_api，跑完重启 API）
@@ -99,10 +99,14 @@ python scripts/maintain.py deploy --insecure --all-code
 python scripts/maintain.py --insecure update
 ```
 
-> **建图与拉取已拆分**（2026-10 业务维护反馈）：`update` 只做数据段（拉取+入库，
-> 检索 FTS/向量即时生效），**不停服务随时可跑**——新镜像发布时不用停服务干等；
-> 关系图（Kùzu 单写者）由 `maintain.py graph` 在凌晨停机窗口单独同步，图更新后重启 API。
-> `deploy` 仍是一次性全量（含建图）。
+> **建图与拉取已拆分**（2026-10 业务维护反馈）：`update` = 拉取入库 + **追新镜像全链路**
+> （配套矩阵采新 tag → vllm-ascend / vllm 主仓 / 0day fork 三仓代码快照），**不停服务
+> 随时可跑**——0day 特殊镜像的代码在官方 GitHub 仓拿不到，update 按矩阵锁定的 fork SHA
+> 补齐；关系图（Kùzu 单写者）由 `maintain.py graph` 在凌晨停机窗口单独同步，图更新后
+> 重启 API。`deploy` 仍是一次性全量（含建图）。
+> **代码快照幂等**：镜像 tag 与锁定 SHA 的内容发布后不变——已存版本的下载/符号索引/
+> 跨版本符号表全部跳过（这是"已存在仓检查太长"的历史问题根因，已修复）；提取规则升级
+> 后需要强制重建时加 `--reindex`（三个 build_*_snapshots.py 均支持）。
 
 **细分指令**（按需裁剪步骤，省时 / 适配环境）：
 
@@ -118,6 +122,10 @@ python scripts/maintain.py --insecure update
 | `deploy/update/graph --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
 | `deploy/update/graph --config path` | 指定 config.json（默认项目根自动发现） |
 | `build_kb.py --strict` | 严格模式：任一来源失败即退出码 1（CI/严格流水线用） |
+
+> update 的 `--skip` 拆分：`--skip-matrix` 只跳矩阵（fork/vllm 快照依赖矩阵产物会随之
+> 拿不到新行）；`--skip-code-snapshots` 一次跳过三仓代码快照；单独补某仓直接跑对应
+> `scripts/build_{code,vllm,fork}_snapshots.py`（幂等，只补缺）。
 
 **自动降级**（子步骤失败不中断，只打印告警）：
 
@@ -1264,14 +1272,18 @@ python skills/vllm-kb/client.py code "memory leak" --kind msg --version v0.23.0r
 `--kind` 可选值：`def`（函数定义）/ `op`（算子）/ `env`（环境变量）/ `msg`（报错字面量）；
 不传则符号索引 + grep 兜底。
 
-**`--repo` 命名空间（四选一，互相物理隔离）**：
+**`--repo` 命名空间（四选一 + all 联合，互相物理隔离）**：
 
 | `--repo` | 指向的代码 | 版本键 |
 |---|---|---|
 | 缺省 `vllm-ascend` | 官方 vllm-ascend 快照（GitHub tag，`build_code_snapshots.py`） | `v0.23.0` 等 tag |
 | `vllm` | vllm 主仓快照（`build_vllm_snapshots.py`） | `0.22.1` 等版本号 |
+| `all` | **vllm-ascend + vllm 联合检索**（2026-10 业务维护反馈：vllm 与 va 拆开"缺哪边都不好定位"——一次查两仓，结果按 repo 分组；`code-versions --repo all` 联合列举） | 两仓各自键 |
 | `fork:{model}` | 0day fork 仓的 **vllm 代码**（`build_fork_snapshots.py`，按镜像锁定 SHA 拉） | SHA 前 12 位 |
 | `img:{tag}` | **某个 0day 镜像内实际部署的 vllm-ascend 插件代码**（`build_image_snapshots.py`） | 镜像 tag（如 `glm5.2`） |
+
+> 不确定符号在哪边时用 `--repo all`（vllm 插件在 va 仓、调度/执行器在 vllm 主仓，
+> 联合检索一次覆盖）；fork/img 的版本键不同，保持显式前缀。
 
 **跨命名空间 diff**：`diff` 的两个版本参数可带前缀，直接对比不同仓/命名空间的同一文件：
 

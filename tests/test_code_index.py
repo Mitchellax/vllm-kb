@@ -60,6 +60,16 @@ class TestCodeIndex(unittest.TestCase):
 
     def test_available_versions(self):
         self.assertIn("v0.23.0rc1", self.code.available_versions)
+
+    def test_build_index_idempotent(self):
+        """索引幂等（2026-10 业务维护反馈）：已存版本二次构建跳过返回 None，
+        force=True 才重建——每轮 deploy/update 全量重建是"检查太长"的主因。"""
+        # setUp 已构建过一次索引——再次调用应直接跳过
+        self.assertEqual(self.code.build_index_for_version("v0.23.0rc1"), None)
+        n = self.code.build_index_for_version("v0.23.0rc1", force=True)
+        self.assertGreater(n, 0)
+        # force 重建后，普通调用恢复幂等跳过
+        self.assertEqual(self.code.build_index_for_version("v0.23.0rc1"), None)
         self.assertTrue(self.code.has_version("v0.23.0rc1"))
 
     def test_symbol_search_exact(self):
@@ -197,12 +207,13 @@ class TestPythonAstExtraction(unittest.TestCase):
 
     def test_ast_fallback_on_syntax_error(self):
         # ast 解析失败的文件退回行级正则，def 仍被索引
+        # （setUp 已建过 0.25 索引，此处向快照**追加**文件模拟内容变更 → force 重建）
         snap = self.code.snapshots_dir / "v0.25.0rc1" / "vllm_ascend" / "ops"
         snap.mkdir(parents=True, exist_ok=True)
         (snap / "broken.py").write_text(
             "def fallback_fn():\n    pass\n\ndef broken(:\n", encoding="utf-8"
         )
-        self.code.build_index_for_version("v0.25.0rc1")
+        self.code.build_index_for_version("v0.25.0rc1", force=True)
         self.assertTrue(self.code.search_symbols("fallback_fn", "v0.25.0rc1"))
 
 

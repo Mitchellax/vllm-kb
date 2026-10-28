@@ -54,11 +54,18 @@ _DEPLOY_STEPS = [
     ("scripts/build_companion_matrix.py", [], False, "配套矩阵"),
 ]
 
-# 增量更新的**数据段**（2026-10 业务维护反馈拆分）：拉取+入库随时可跑，**不含建图**——
-# 建图要求停 serve_api（Kùzu 单写者），拆到独立的 `graph` 子命令，凌晨停机窗口单独跑；
-# 新镜像发布时不再"停服务干等拉取"。
+# 增量更新（2026-10 业务维护反馈重评估）：**update 的最大意义是追上新发的镜像**——
+# 特别是 0day 特殊镜像（其代码在官方 GitHub 仓拿不到，只能按矩阵锁定的 fork SHA 拉）。
+# 因此 update = 数据段（拉取入库）+ 配套矩阵（新镜像 tag 采集）+ 三仓代码快照
+# （vllm-ascend 精选版本 / vllm 主仓 companion 对应 / fork 镜像锁定 SHA）。
+# 全程**不停检索服务**（建图仍拆给 graph 子命令）；索引幂等化后已存版本快速跳过。
 _UPDATE_STEPS = [
     ("scripts/build_kb.py", ["--incremental"], True, "增量拉取与入库"),
+    ("scripts/build_companion_matrix.py", [], False, "配套矩阵（新镜像 tag 采集）"),
+    ("scripts/build_code_snapshots.py", [], False,
+     "代码快照（vllm-ascend，config.code.versions）"),
+    ("scripts/build_vllm_snapshots.py", [], False, "代码快照（vllm 主仓，companion 对应）"),
+    ("scripts/build_fork_snapshots.py", [], False, "代码快照（0day fork 镜像，矩阵锁定 SHA）"),
 ]
 
 _GRAPH_STEPS = [
@@ -71,9 +78,11 @@ _STEP_KEY = {  # 步骤名 → key（供 --skip-* 过滤）
     "全文索引重建（FTS5）": "fts",
     "版本日历": "calendar",
     "配套矩阵": "matrix",
+    "配套矩阵（新镜像 tag 采集）": "matrix",
     "代码快照（vllm-ascend，config.code.versions）": "code_snapshots",
     "代码快照（vllm-ascend，全部 tag --all）": "code_snapshots",
     "代码快照（vllm 主仓，companion 对应）": "code_snapshots",
+    "代码快照（0day fork 镜像，矩阵锁定 SHA）": "code_snapshots",
 }
 
 
@@ -207,6 +216,11 @@ def cmd_deploy(args) -> int:
         steps.append(
             ("scripts/build_vllm_snapshots.py", [], False, "代码快照（vllm 主仓，companion 对应）")
         )
+        # 0day fork 镜像代码（在官方 GitHub 仓拿不到，按矩阵锁定 SHA 拉）；依赖矩阵产物，
+        # 排在其后；索引幂等化（2026-10 业务维护反馈）
+        steps.append(
+            ("scripts/build_fork_snapshots.py", [], False, "代码快照（0day fork 镜像，矩阵锁定 SHA）")
+        )
     steps = _filter_steps(steps, args.skip)
 
     start = time.time()
@@ -239,11 +253,15 @@ def cmd_deploy(args) -> int:
 
 
 def cmd_update(args) -> int:
-    """增量更新（日常维护，**数据段**）：拉取+入库，不停检索服务；图单独跑 graph。"""
+    """增量更新（日常维护）：拉取入库 + 新镜像矩阵 + 三仓代码快照；不停检索服务。
+
+    update 的最大意义是**追上新发的镜像**（2026-10 业务维护反馈）——特别是 0day
+    特殊镜像（代码只在 fork 仓，按矩阵锁定 SHA 拉）。建图仍拆给 graph 子命令。
+    """
     insecure_env = _insecure_env_from_args(args)
     steps = _filter_steps(_UPDATE_STEPS, args.skip)
     start = time.time()
-    print(f"[maintain] 🔄 增量更新（数据段）开始 ...")
+    print(f"[maintain] 🔄 增量更新（拉取+入库+镜像/代码同步）开始 ...")
     if args.config:
         print(f"[maintain] 配置: {args.config}")
     if insecure_env:
@@ -253,7 +271,7 @@ def cmd_update(args) -> int:
     warn = _foreign_python_warning()
     if warn:
         print(f"[maintain] {warn}")
-    print("[maintain] 本流程**不含建图**（无需停检索服务）；关系图仍是旧数据，"
+    print("[maintain] 本流程**不停检索服务**；关系图仍是旧数据，"
           "凌晨停机窗口跑 `maintain.py graph` 同步。\n")
 
     success_count = 0
@@ -269,8 +287,8 @@ def cmd_update(args) -> int:
     print(f"\n{'='*60}")
     print(f"[maintain] ✅ 增量更新完成：{success_count}/{len(steps)} 步骤成功")
     print(f"[maintain] 耗时：{mins} 分 {secs} 秒")
-    print(f"[maintain] 提示：检索（FTS/向量）已是最新；关系图待 `maintain.py graph` 同步"
-          f"（凌晨停机窗口），图更新后重启检索 API 加载新图。")
+    print(f"[maintain] 提示：检索（FTS/向量）与代码快照已是最新；关系图待 `maintain.py graph`"
+          f" 同步（凌晨停机窗口），图更新后重启检索 API 加载新图。")
     return 0
 
 

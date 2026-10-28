@@ -87,6 +87,30 @@ class TestApiCodeAndSignature(unittest.TestCase):
         self.assertEqual(d["mode"], "message_index")
         self.assertIsInstance(d["hits"], list)
 
+    def test_code_search_repo_all(self):
+        """repo=all（2026-10 业务维护反馈）：vllm-ascend + vllm 联合检索，按仓分组。"""
+        r = self.client.post(
+            "/code/search", json={"keyword": "dispatch_ffn_combine", "repo": "all", "limit": 5}
+        )
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["mode"], "multi_repo")
+        self.assertEqual(d["repo"], "all")
+        repos = [p["repo"] for p in d["results"]]
+        self.assertEqual(repos, ["vllm-ascend", "vllm"])
+        va = d["results"][0]
+        self.assertTrue(va["hits"])          # va 侧该符号有索引命中
+        self.assertTrue(all(h.get("file") for h in va["hits"]))
+
+    def test_code_versions_repo_all(self):
+        r = self.client.get("/code/versions", params={"repo": "all"})
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["repo"], "all")
+        self.assertIn("by_repo", d)
+        self.assertIn("vllm-ascend", d["by_repo"])
+        self.assertIn("v0.23.0rc1", d["versions"])
+
     def test_code_file_endpoint(self):
         r = self.client.get(
             "/code/file",

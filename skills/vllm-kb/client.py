@@ -278,6 +278,15 @@ def fmt_matrix(data: dict, limit: int = 100) -> str:
 
 def fmt_code_versions(data: dict) -> str:
     repo = data.get("repo", "vllm-ascend")
+    # repo=all：vllm-ascend + vllm 联合列举（按仓分组 + 合并去重列表）
+    by_repo = data.get("by_repo")
+    if isinstance(by_repo, dict) and by_repo:
+        lines = ["[all] vllm-ascend + vllm 联合版本列举（检索：code <符号> --repo all）:"]
+        for rp, vs in by_repo.items():
+            lines.append(f"  [{rp}] {len(vs)} 个: {', '.join(vs[:12])}"
+                         + (f" … 共 {len(vs)}" if len(vs) > 12 else ""))
+        lines.append(f"提示: {data.get('note', '')}")
+        return "\n".join(lines)
     # repo=img：已提取镜像聚合视图（agent 发现 img:{tag} 前缀的入口）
     images = data.get("images")
     if images is not None:
@@ -318,6 +327,15 @@ def fmt_code_versions(data: dict) -> str:
 
 
 def fmt_code_hits(data: dict) -> str:
+    # repo=all 联合检索：按仓分组递归渲染（2026-10 业务维护反馈：vllm 与 va 一次查两边）
+    if data.get("mode") == "multi_repo":
+        lines = [f"检索模式: multi_repo  symbol: {data.get('symbol')}  version: {data.get('version') or '(全部)'}"]
+        for part in data.get("results") or []:
+            lines.append(f"―― repo: {part.get('repo')} ――")
+            sub = fmt_code_hits({**part, "symbol": data.get("symbol"),
+                                 "version": data.get("version")})
+            lines.extend("  " + ln for ln in sub.splitlines()[1:] if ln.strip())
+        return "\n".join(lines)
     lines = [f"检索模式: {data.get('mode')}  symbol: {data.get('symbol')}  version: {data.get('version') or '(全部)'}"]
     hits = data.get("hits", [])
     if not hits:
@@ -706,7 +724,9 @@ def main() -> None:
     p.add_argument("--version", default=None, help="限定版本（默认全部已预存版本）")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--repo", default="vllm-ascend",
-                   help="仓库：vllm-ascend（默认）| vllm | fork:{model}（0day fork 仓 vllm 代码）"
+                   help="仓库：vllm-ascend（默认）| vllm | all（vllm-ascend+vllm 联合检索，"
+                        "结果按 repo 分组——不确定符号在哪边时用）"
+                        "| fork:{model}（0day fork 仓 vllm 代码）"
                         "| img:{tag}（0day 镜像内 vllm-ascend 插件代码，如 img:glm5.2）")
     p.add_argument("--file", dest="code_file", metavar="PATH", default=None,
                    help="直接读取指定版本源码文件（需配合 --version；此时忽略 keyword）")
@@ -722,7 +742,7 @@ def main() -> None:
 
     p = sub.add_parser("code-versions", help="列出已预存的代码仓版本 / 已提取的镜像源码")
     p.add_argument("--repo", default="vllm-ascend",
-                   help="仓库：vllm-ascend（默认）| vllm | fork:{model} | img:{tag}；"
+                   help="仓库：vllm-ascend（默认）| vllm | all（两仓联合列举）| fork:{model} | img:{tag}；"
                         "repo=img 列出**全部已提取镜像**（发现 img: 前缀的入口）")
 
     p = sub.add_parser("diff", help="精确 diff：两个版本/两个命名空间同一文件的 unified diff")

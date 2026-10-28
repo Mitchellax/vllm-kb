@@ -345,9 +345,27 @@ class VersionedCode:
 
     # ---------------- 构建（由脚本调用） ----------------
 
-    def build_index_for_version(self, version: str) -> int:
-        """为单个已解压版本构建符号索引。返回索引符号数。"""
+    def build_index_for_version(self, version: str, force: bool = False) -> "int | None":
+        """为单个已解压版本构建符号索引。返回索引符号数；**已有索引且非 force → 跳过返回 None**。
+
+        **幂等**（2026-10 业务维护反馈）：tag 内容发布后不变，快照与索引已存在时重建
+        纯属浪费——每轮 deploy/update 对全部已存版本重建符号索引是"已存在仓检查时间
+        太长"的主因。--reindex（脚本侧）强制重建。
+        """
         snap = self.ensure_snapshot(version)
+        if not force:
+            try:
+                conn = self._connect_index(write=False)
+                try:
+                    n = conn.execute("SELECT COUNT(*) FROM symbols WHERE version = ?",
+                                     (version,)).fetchone()[0]
+                finally:
+                    conn.close()
+            except (sqlite3.OperationalError, CodeIndexError):
+                # OperationalError=库在表不在（首次）；CodeIndexError=索引库文件不存在
+                n = 0
+            if n:
+                return None
         conn = self._connect_index(write=True)
         count = 0
         indexed_dirs = ("vllm",) if (self.repo == "vllm" or self.repo.startswith("fork:")) \

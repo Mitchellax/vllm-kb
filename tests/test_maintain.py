@@ -159,13 +159,26 @@ class TestStepTable(unittest.TestCase):
             self.assertIn(expect, tags, f"{expect} 应标记为非致命步骤")
 
     def test_update_data_segment_only(self):
-        """update = **数据段**（2026-10 业务维护反馈拆分）：只增量拉取+入库（致命），
-        建图拆到独立 graph 子命令——拉取随时可跑，凌晨停机窗口再同步图。"""
+        """update = 数据段+镜像/代码同步（2026-10 业务维护反馈）：不含建图（Kùzu 需停服），
+        图拆到独立 graph 子命令；**追新镜像全链路**（矩阵 + 三仓代码快照）纳入 update。"""
         fatal_steps = [tag for _s, _x, f, tag in _UPDATE_STEPS if f]
         self.assertEqual(fatal_steps, ["增量拉取与入库"])
         self.assertNotIn("图重建（Kùzu）", [tag for _s, _x, f, tag in _UPDATE_STEPS])
         # 图步骤独立存在（graph 子命令用）
         self.assertIn("图重建（Kùzu）", [tag for _s, _x, f, tag in _GRAPH_STEPS])
+        # 追新镜像全链路：矩阵（新 tag 采集）→ 三仓快照（va/vllm/fork），全部非致命
+        tags = [tag for _s, _x, f, tag in _UPDATE_STEPS if not f]
+        for expect in ("配套矩阵（新镜像 tag 采集）",
+                       "代码快照（vllm-ascend，config.code.versions）",
+                       "代码快照（vllm 主仓，companion 对应）",
+                       "代码快照（0day fork 镜像，矩阵锁定 SHA）"):
+            self.assertIn(expect, tags)
+        # fork 快照必须排在矩阵之后（fork_rows 读矩阵产物）
+        self.assertLess(tags.index("配套矩阵（新镜像 tag 采集）"),
+                        tags.index("代码快照（0day fork 镜像，矩阵锁定 SHA）"))
+        # --skip code_snapshots 一次跳过三个代码快照步骤
+        filtered = _filter_steps(_UPDATE_STEPS, {"code_snapshots"})
+        self.assertEqual([t for _s, _x, _f, t in filtered], ["增量拉取与入库", "配套矩阵（新镜像 tag 采集）"])
 
     def test_filter_steps_removes_matching(self):
         """_filter_steps 按 key 正确过滤步骤。"""

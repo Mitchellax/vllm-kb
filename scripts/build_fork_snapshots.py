@@ -184,10 +184,19 @@ def _open_index(root: Path) -> sqlite3.Connection:
     return conn
 
 
-def build_index(root: Path, version: str) -> int:
-    """为 fork 版本构建符号索引（复用 vllm_kb.code_index 的提取器，独立库）。"""
+def build_index(root: Path, version: str, force: bool = False) -> "int | None":
+    """为 fork 版本构建符号索引（复用 vllm_kb.code_index 的提取器，独立库）。
+
+    **幂等**（2026-10 业务维护反馈）：fork 锁定 SHA 的内容不可变，已有索引且非
+    force → 跳过返回 None。--reindex 强制。
+    """
     snap = ensure_snapshot(root, version)
     conn = _open_index(root)
+    if not force:
+        n = conn.execute("SELECT COUNT(*) FROM symbols WHERE version = ?", (version,)).fetchone()[0]
+        if n:
+            conn.close()
+            return None
     # 顶层目录兼容（codeload zip 解压出 {repo}-{sha}/ 单目录）
     repo_root = snap
     subdirs = [d for d in snap.iterdir() if d.is_dir()]
@@ -245,6 +254,8 @@ def main() -> None:
                     help="指定 fork 模型（矩阵行键，如 hy4 / glm5.2，可多次）")
     ap.add_argument("--list", action="store_true", help="只列出 fork 行状态")
     ap.add_argument("--index-only", action="store_true", help="已下载的只重建索引")
+    ap.add_argument("--reindex", action="store_true",
+                    help="强制重建符号索引（默认幂等：已有索引的版本跳过）")
     ap.add_argument("--insecure", action="store_true",
                     help="跳过 SSL 证书校验（真实业务环境自签证书/SSL 被禁；亦可用环境变量 VLLM_KB_INSECURE=1）")
     ap.add_argument("--base-url", default=None,
@@ -301,8 +312,9 @@ def main() -> None:
             root = model_root(cfg, m)
             v = sha12(r["vllm_sha"])
             if (root / "zips" / f"{v}.zip").exists():
-                n = build_index(root, v)
-                print(f"[fork] {m}@{v} 符号索引 {n} 个符号")
+                n = build_index(root, v, force=args.reindex)
+                print(f"[fork] {m}@{v} " + (f"符号索引 {n} 个符号" if n is not None
+                                            else "已有索引，跳过（--reindex 重建）"))
         return
 
     # 1) 下载（按锁定 SHA，与镜像内代码一致）
@@ -318,14 +330,15 @@ def main() -> None:
     if downloaded:
         print(f"[fork] 本轮新下载 {downloaded} 个 fork 快照")
 
-    # 2) 解压 + 索引
+    # 2) 解压 + 索引（幂等：已有索引跳过）
     for r in rows:
         m = model_name(r["vllm-ascend"])
         root = model_root(cfg, m)
         v = sha12(r["vllm_sha"])
         if (root / "zips" / f"{v}.zip").exists():
-            n = build_index(root, v)
-            print(f"[fork] {m}@{v} 符号索引 {n} 个符号")
+            n = build_index(root, v, force=args.reindex)
+            print(f"[fork] {m}@{v} " + (f"符号索引 {n} 个符号" if n is not None
+                                        else "已有索引，跳过（--reindex 重建）"))
 
     print("[fork] 完成。检索需显式 repo=fork:{model}（与官方版本隔离）:")
     for r in rows:

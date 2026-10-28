@@ -88,6 +88,15 @@ def register(app, ctx) -> None:
                 "note": ("已提取的 0day 镜像插件源码（repo=img:{tag} 检索；版本键 = 镜像 tag）。"
                          "未列的镜像：python scripts/build_image_snapshots.py --tag <tag>"),
             }
+        if r == "all":
+            by_repo = {}
+            for rp in ("vllm-ascend", "vllm"):
+                ci2 = _code_index_for(rp)
+                by_repo[rp] = ci2.available_versions if ci2 else []
+            merged = sorted(set(by_repo["vllm-ascend"]) | set(by_repo["vllm"]))
+            return {"repo": "all", "versions": merged, "by_repo": by_repo,
+                    "note": ("vllm-ascend + vllm 联合列举（vllm 版本 = 配套矩阵对应）；"
+                             "检索用 repo=all，fork/img 命名空间用显式前缀")}
         ci = _code_index_for(repo)
         if ci is None:
             return {"repo": r, "versions": [],
@@ -115,9 +124,14 @@ def register(app, ctx) -> None:
         - kind=msg：报错字面量索引（raise/assert/logger.error 字符串参数）子串检索，
           定位"报错文本来自哪段代码"（无需全文 grep）；
         - path：限定文件路径子串（--in-file）；per_version：每个版本各自收集命中，
-          输出各版本行号便于对比"哪个版本引入/移动了该代码"。
+          输出各版本行号便于对比"哪个版本引入/移动了该代码"；
+        - repo=all：**vllm-ascend + vllm 联合检索**（2026-10 业务维护反馈：vllm 与 va
+          拆开定位"缺哪边都不太好"——一次查两仓并标注来源，命中按 repo 分组）；
+          fork:/img: 命名空间版本键不同，保持显式前缀检索。
         """
         repo = req.repo
+        if repo == "all":
+            return _code_search_multi(req)
         ci = _code_index_for(repo)
         if ci is None:
             raise HTTPException(status_code=503, detail="code_index 未初始化（运行 scripts/build_code_snapshots.py）")
@@ -135,6 +149,33 @@ def register(app, ctx) -> None:
         mode = "grep" if not req.per_version else "grep_per_version"
         return {"mode": mode, "symbol": req.keyword, "repo": repo or "vllm-ascend",
                 "version": req.version, "hits": greps}
+
+    def _code_search_one(ci, req) -> dict:
+        """单仓检索（repo=all 聚合的每仓部分）：与 code_search 单仓路径同逻辑。"""
+        if req.kind == "msg":
+            hits = _code_call(ci.search_messages, req.keyword, req.version, limit=req.limit or 20)
+            return {"mode": "message_index", "hits": hits}
+        symbols = _code_call(ci.search_symbols, req.keyword, req.version, limit=req.limit or 20,
+                             kind=req.kind)
+        if symbols and not req.per_version:
+            return {"mode": "symbol_index", "hits": symbols}
+        greps = _code_call(ci.grep, req.keyword, req.version, limit=req.limit or 20,
+                           path_sub=req.path, per_version=bool(req.per_version))
+        return {"mode": "grep_per_version" if req.per_version else "grep", "hits": greps}
+
+    def _code_search_multi(req) -> dict:
+        """repo=all：vllm-ascend + vllm 两仓联合检索，结果按 repo 分组。"""
+        results = []
+        for rp in ("vllm-ascend", "vllm"):
+            ci = _code_index_for(rp)
+            if ci is None:
+                results.append({"repo": rp, "note": "code_index 未初始化", "hits": []})
+                continue
+            part = _code_search_one(ci, req)
+            part["repo"] = rp
+            results.append(part)
+        return {"mode": "multi_repo", "symbol": req.keyword, "repo": "all",
+                "version": req.version, "results": results}
 
     @app.get("/code/file")
     def code_file(version: str, path: str, max_chars: int = 20000, repo: Optional[str] = None):
