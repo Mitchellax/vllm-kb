@@ -4,7 +4,7 @@
     "name": "vllm-kb",
     "data_root": "data"
   },
-  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled/deletion_policy(keep|mirror，默认 keep：keep=增量语义不删，文件消失=静默偏离+stray 告警；mirror=本地原始数据优先，快照对账，连续 2 次构建缺席自动回撤（四层删+墓碑+待实际删除可撤回），首轮全量对账清历史滞留——前提同 kind 唯一来源，见 docs/DESIGN-audited-git-source.md)；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments/fetch_timeline(true=采集 issue timeline 的 cross-referenced 事件即页面 Mentioned in 区，建图 REFERENCES 关联边；存量回填跑一轮增量拉取即补采)。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列)+skip_sheets(结构页过滤扩展名单，正则数组——封面/前言/目录/版权类 sheet 名内置过滤，业务特有名单在此追加，如 [\"^运维级别\"])；表头键值对 auto：sheet 非空行≥3 且首行≥2 列全短标签→数据行变'列名=值'（行 chunk 自包含列语义），说明页/无表头结构原样裸拼。image(不产生文档，只对资产层图片批量 OCR)：ocr_provider(ask|api|paddle|none)/ocr_api_base/ocr_api_key/ocr_api_model/ocr_api_mode(custom|openai)/ocr_min_confidence(高置信才注入正文，默认0.6)/ocr_timeout(HTTP 超时秒，默认 VLLM_KB_OCR_TIMEOUT=60；VLM 类 OCR 大图建议 300)/ocr_max_tokens(openai 模式生成上限，默认 4096——vLLM 服务端默认截断会让末行 CONFIDENCE 缺失、全量误报 missing，2026-10 实测)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
+  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled/deletion_policy(keep|mirror，默认 keep：keep=增量语义不删，文件消失=静默偏离+stray 告警；mirror=本地原始数据优先，快照对账，连续 2 次构建缺席自动回撤（四层删+墓碑+待实际删除可撤回），首轮全量对账清历史滞留——前提同 kind 唯一来源，见 docs/DESIGN-audited-git-source.md)；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments/fetch_timeline(true=采集 issue timeline 的 cross-referenced 事件即页面 Mentioned in 区，建图 REFERENCES 关联边；存量回填跑一轮增量拉取即补采)。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列)+skip_sheets(结构页过滤扩展名单，正则数组——封面/前言/目录/版权类 sheet 名内置过滤，业务特有名单在此追加，如 [\"^运维级别\"])；表头键值对 auto：sheet 非空行≥3 且首行≥2 列全短标签→数据行变'列名=值'（行 chunk 自包含列语义），说明页/无表头结构原样裸拼。image(不产生文档，只对资产层图片批量 OCR)：ocr_provider(ask|api|paddle|none)/ocr_api_base/ocr_api_key/ocr_api_model/ocr_api_mode(custom|openai)/ocr_min_confidence(高置信才注入正文，默认0.6)/ocr_timeout(HTTP 超时秒，默认 VLLM_KB_OCR_TIMEOUT=60；VLM 类 OCR 大图建议 300)/ocr_max_tokens(openai 模式生成上限，默认 4096——vLLM 服务端默认截断会让末行 CONFIDENCE 缺失、全量误报 missing，2026-10 实测)/ocr_temperature(默认 0——vLLM 默认温度 1 会带崩 paddleocr-vl 类 OCR 专用模型输出：LOC 标签/乱码，2026-10 实测)/ocr_api_prompt(默认模型原生极简指令 OCR——长提示词对 OCR 专用模型是负担；置信度走 logprobs(模型不自报)，通用 VL 模型可换回要求自报 CONFIDENCE 的提示词)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
   "sources": [
     {
       "id": "vllm-ascend",
@@ -92,6 +92,8 @@
       "ocr_min_confidence": 0.6,
       "ocr_timeout": 300,
       "ocr_max_tokens": 4096,
+      "ocr_temperature": 0,
+      "ocr_api_prompt": "OCR",
       "enabled": false
     }
   ],

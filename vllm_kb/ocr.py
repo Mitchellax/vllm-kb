@@ -41,7 +41,11 @@ from urllib.error import HTTPError, URLError
 _MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
          "webp": "image/webp", "gif": "image/gif"}
 
-# OpenAI 兼容模式：要求模型末行自报置信度（单一来源）
+# OpenAI 兼容模式提示词（**v2 默认已改为模型原生极简指令 "OCR"**——2026-10 业务实测
+# paddleocr-vl-1.6：长提示词 + vLLM 默认温度 1 会带崩输出（大量 LOC 标签/乱码）；
+# 温度 0 + 极简提示词精度正常，且该类 OCR 专用模型不支持自报置信度（logprobs 取）。
+# 本常量保留为**自报提示词参考**：通用 VL 模型场景可用 config `ocr_api_prompt`
+# 换回（要求模型末行自报 CONFIDENCE）。
 _CONFIDENCE_PROMPT = (
     "请识别图片中的全部文字，原样返回，不要添加解释，"
     "不要输出坐标标记或 <|...|> 类特殊符号。\n"
@@ -56,6 +60,9 @@ _CONF_INLINE_RE = re.compile(r"(?i)\bconfidence\s*[:：]\s*([0-9]*\.?[0-9]+)\s*$
 # 业务实测 700 条统一 anomaly=missing，简单截图也中）。行尾特殊 token 先剥再判。
 _SPECIAL_TAIL_RE = re.compile(r"(?:\s*<\|[^<>|]*\|>)+\s*$")
 _CONF_VALUE_RE = re.compile(r"(?i)^\s*confidence\s*[:：]\s*([0-9]*\.?[0-9]+)")
+# 整个 token 都是特殊 token（logprobs 统计剔除用；vLLM 的 logprobs 含特殊 token，
+# 不过滤会把 exp(mean logprob) 拉低到无意义）
+_SPECIAL_TOKEN_RE_FULL = re.compile(r"^(?:\s*<\|[^<>|]*\|>)+$")
 
 # 异常码（confidence=None 时的原因，用于审核分流与日志）
 ANOMALY_MISSING = "missing"              # 未找到 CONFIDENCE 行
@@ -64,11 +71,11 @@ ANOMALY_OUT_OF_RANGE = "out_of_range"    # 数值不在 [0,1]
 ANOMALY_MISPLACED = "misplaced"          # 不在末尾 / 出现多次（格式污染正文）
 ANOMALY_CONTRADICTORY = "contradictory"  # 正文为空却自报高置信
 
-# 提示词版本：改动 _CONFIDENCE_PROMPT / 解析规则时必须 +1——引擎指纹随之变化，
-# 已有 ocr.json 缓存全部失效并自动重算（避免"图片没变、提示词变了，结果还是旧的"）。
-# v2（2026-10）：补特殊标记禁令 + 显式 max_tokens + 特殊 token 容忍解析——700 张
-# missing 误报修复后需要重算全部缓存。
-_OCR_PROMPT_VERSION = 2
+# 提示词版本：改动提示词/解析规则时必须 +1——引擎指纹随之变化，已有 ocr.json 缓存
+# 全部失效并自动重算（避免"图片没变、提示词变了，结果还是旧的"）。
+# v3（2026-10 业务实测 paddleocr-vl-1.6）：极简提示词 "OCR" + 温度 0 + logprobs 置信度
+# （模型不自报）——温度 1 的旧调用输出带崩（LOC 标签/乱码），全部缓存需重算。
+_OCR_PROMPT_VERSION = 3
 
 # 高置信阈值默认值（source 级 ocr_min_confidence 可覆盖）：只有 ≥ 阈值才注入正文进检索库
 DEFAULT_MIN_CONFIDENCE = 0.6
@@ -121,6 +128,12 @@ class OcrConfig:
     # openai 模式生成上限：**必须显式传**——vLLM 服务端默认截断时末行 CONFIDENCE
     # 缺失，700 张图统一误报 missing（2026-10 业务实测）。image 源 `ocr_max_tokens`。
     max_tokens: int = 4096
+    # 采样温度：**默认 0**——vLLM 默认温度 1 会带崩 OCR 专用模型输出（LOC 标签/乱码，
+    # 2026-10 业务实测）。image 源 `ocr_temperature`。
+    temperature: float = 0.0
+    # 提示词：**默认模型原生极简指令 "OCR"**（paddleocr-vl 类 OCR 专用模型实测精度
+    # 最佳）；通用 VL 模型可用 `ocr_api_prompt` 换自报提示词（参考 _CONFIDENCE_PROMPT）。
+    prompt: str = "OCR"
     extra: dict = field(default_factory=dict)
 
     @property
@@ -157,6 +170,22 @@ def as_max_tokens(v) -> int:
     return n if n > 0 else 4096
 
 
+def as_temperature(v) -> float:
+    """解析 ocr_temperature（非法/缺失/负值回 0——vLLM 默认温度 1 会带崩 OCR 专用
+    模型输出，2026-10 业务实测）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f >= 0 else 0.0
+
+
+def as_prompt(v) -> str:
+    """解析 ocr_api_prompt（空/缺失回模型原生极简指令 "OCR"）。"""
+    s = str(v or "").strip()
+    return s or "OCR"
+
+
 def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
     """从 config 的 image source 解析 OCR 配置。
 
@@ -176,6 +205,8 @@ def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
         min_confidence=as_confidence_threshold(sc.get("ocr_min_confidence")),
         timeout=as_timeout_seconds(sc.get("ocr_timeout")),
         max_tokens=as_max_tokens(sc.get("ocr_max_tokens")),
+        temperature=as_temperature(sc.get("ocr_temperature")),
+        prompt=as_prompt(sc.get("ocr_api_prompt")),
     )
 
 
@@ -482,32 +513,65 @@ def _ocr_via_custom(src: "str | Path | bytes", api_base: str, api_key: str,
                      elapsed_s=time.time() - t0)
 
 
+def _logprobs_confidence(choice) -> tuple[Optional[float], int]:
+    """choices[0].logprobs.content[*].logprob → 置信度 = exp(非特殊 token 的 mean logprob)。
+
+    **paddleocr-vl 类 OCR 专用模型不自报置信度**（2026-10 业务实测）——logprobs 是
+    唯一的模型侧置信度来源（vllm-ascend 继承 vLLM 的 OpenAI 兼容 logprobs）。
+    特殊 token（<|...|> 包裹 / strip 后为空）**不计入**：vLLM 的 logprobs 含特殊
+    token，会把均值拉低到无意义。返回 (置信度或 None, 计入 token 数)。
+    """
+    import math
+
+    try:
+        items = (choice.get("logprobs") or {}).get("content") or []
+        vals = [float(it["logprob"]) for it in items
+                if isinstance(it, dict) and it.get("logprob") is not None
+                and str(it.get("token", "")).strip()
+                and not _SPECIAL_TOKEN_RE_FULL.match(str(it.get("token", "")))]
+    except (AttributeError, TypeError, ValueError):
+        return None, 0
+    if not vals:
+        return None, 0
+    return math.exp(sum(vals) / len(vals)), len(vals)
+
+
 def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
                     model: str, t0: float, timeout: int = 0,
-                    max_tokens: int = 4096) -> OcrResult:
-    """OpenAI 兼容接口（vLLM 部署的 DeepSeek-OCR 等）：/chat/completions + 内联图片。
+                    max_tokens: int = 4096, temperature: float = 0.0,
+                    prompt: str = "OCR") -> OcrResult:
+    """OpenAI 兼容接口（vllm-ascend 部署的 paddleocr-vl / DeepSeek-OCR 等）。
 
-    置信度 = 模型自报（末行 CONFIDENCE: 0.xx）；自报异常置 None 并打 anomaly。
-    **显式 max_tokens**（2026-10 业务实测 700 条统一 missing）：不传时 vLLM 按服务端
-    默认截断——正文/末行 CONFIDENCE 都可能被切掉，且 finish_reason 无人看；显式传
-    （image 源 config `ocr_max_tokens`，默认 4096）+ finish_reason=length 打
-    anomaly=truncated，与 missing 区分。
+    **业务实测（2026-10，paddleocr-vl-1.6）**：
+    - **温度必须 0**：vLLM 默认温度 1 直接带崩输出——大量 LOC 布局标签、乱码；
+      温度 0 + 极简提示词后输出精度正常；
+    - **提示词用模型原生极简指令**（"OCR"）：长提示词（旧版要求自报置信度 + 禁止
+      特殊标记）对该类 OCR 专用模型是负担，会触发异常输出；paddleocr-vl 不支持
+      自报置信度，提示词里要求它无意义；
+    - **置信度主来源 = logprobs**（exp(非特殊 token mean logprob)，source=logprobs）；
+      无 logprobs（服务端未支持）时回退解析自报 CONFIDENCE 行（自定义提示词的
+      通用 VL 模型场景）；两者皆无 → anomaly=no_confidence（进审核人工核对）；
+    - **显式 max_tokens**（默认 4096）+ finish_reason=length → anomaly=truncated；
+    - 预处理（x3 放大 / CLAHE）业务实测对模糊小字无提升且引入乱码——**不做**。
     """
     if not api_base:
         raise OcrApiError("ocr_api_base 未配置（OCR API provider 需要服务地址）")
     if not model:
-        raise OcrApiError("openai 模式的 OCR 需要 ocr_api_model（如 deepseek-ai/DeepSeek-OCR）")
+        raise OcrApiError("openai 模式的 OCR 需要 ocr_api_model（如 paddleocr-vl）")
     raw, ext = _read_image_bytes(src)
     mime = _MIME.get(sniff_image_ext(raw, ext or "png"), "image/png")
     b64 = base64.b64encode(raw).decode()
     payload = {
         "model": model,
         "max_tokens": int(max_tokens) if max_tokens else 4096,
+        "temperature": float(temperature if temperature is not None and temperature >= 0 else 0.0),
+        "logprobs": True,                 # 模型侧置信度唯一来源（paddleocr-vl 不自报）
+        "top_logprobs": 5,
         "messages": [{
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                {"type": "text", "text": _CONFIDENCE_PROMPT},
+                {"type": "text", "text": prompt or "OCR"},
             ],
         }],
     }
@@ -520,17 +584,23 @@ def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
     choice = choices[0]
     content = choice["message"].get("content") or ""
     text, conf, anomaly, raw_conf = parse_self_confidence(str(content))
+    source = "model"
+    lp_conf, lp_n = _logprobs_confidence(choice)
+    if lp_conf is not None:
+        # logprobs 优先：自报行缺失不再是异常（paddleocr-vl 本就不自报）
+        conf, source, anomaly, raw_conf = lp_conf, "logprobs", "", f"logprobs×{lp_n}"
+    elif anomaly == ANOMALY_MISSING:
+        anomaly = "no_confidence"    # 无任何置信度来源（服务端未开 logprobs 且无自报）
+        print(f"[ocr] 无置信度来源（{model}：响应无 logprobs 且无自报行，"
+              f"finish_reason={choice.get('finish_reason')}，响应尾: {str(content)[-120:]!r}）"
+              f"——确认 vLLM 部署支持 logprobs 或改用自定义提示词自报", flush=True)
     if choice.get("finish_reason") == "length":
-        # 输出被 max_tokens 截断：正文不完整、CONFIDENCE 行可能被切——异常原因
-        # **覆盖** parse 结果（截断更强），与 missing 区分（missing=完整响应没自报行）
+        # 输出被 max_tokens 截断：正文不完整——异常原因**覆盖**（截断更强）
         anomaly = "truncated"
         conf = None
         print(f"[ocr] 输出被 max_tokens 截断（{model}，max_tokens={payload['max_tokens']}，"
               f"响应尾: {str(content)[-120:]!r}）——调大 image 源 ocr_max_tokens", flush=True)
-    elif anomaly == ANOMALY_MISSING:
-        print(f"[ocr] 模型响应无 CONFIDENCE 行（{model}，finish_reason={choice.get('finish_reason')}，"
-              f"响应尾: {str(content)[-120:]!r}）", flush=True)
-    return OcrResult(text=text, confidence=conf, confidence_source="model", anomaly=anomaly,
+    return OcrResult(text=text, confidence=conf, confidence_source=source, anomaly=anomaly,
                      raw_confidence=raw_conf, provider="api", mode="openai", model=model,
                      elapsed_s=time.time() - t0)
 
@@ -579,7 +649,8 @@ def _ocr_via_paddle(src: "str | Path | bytes", t0: float) -> OcrResult:
 def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
                      api_base: str = "", api_key: str = "", model: str = "",
                      mode: str = "custom", timeout: int = 0,
-                     max_tokens: int = 4096) -> OcrResult:
+                     max_tokens: int = 4096, temperature: float = 0.0,
+                     prompt: str = "OCR") -> OcrResult:
     """对单张图片做 OCR，返回完整结果（含置信度来源与自报异常标记）。
 
     src 可以是图片路径，也可以是**原始字节**（请求期端点用，避免落盘）。
@@ -587,8 +658,9 @@ def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
     model 在 openai 模式必填）| paddle（本地）| none（占位）。
     timeout: HTTP 超时秒数（0 = VLLM_KB_OCR_TIMEOUT env，默认 60）——config
     `ocr_timeout` / env 两级配置，业务实测 paddle 服务端 100+ toks 仍有大图超 60s。
-    max_tokens: openai 模式生成上限（image 源 `ocr_max_tokens`，默认 4096）——vLLM
-    服务端默认可能截断输出，末行 CONFIDENCE 缺失造成大面积误报 missing。
+    max_tokens/temperature/prompt: openai 模式生成参数（image 源 `ocr_max_tokens` /
+    `ocr_temperature` / `ocr_api_prompt`）——温度默认 0、提示词默认极简 "OCR"，
+    logprobs 取置信度（paddleocr-vl 不自报，2026-10 业务实测）。
     引擎不可用抛 OcrUnavailable / OcrApiError，调用方决定询问或跳过。
     """
     provider = (provider or "none").lower()
@@ -599,7 +671,8 @@ def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
         mode = (mode or "custom").lower()
         if mode == "openai":
             return _ocr_via_openai(src, api_base, api_key, model, t0, timeout=timeout,
-                                   max_tokens=max_tokens)
+                                   max_tokens=max_tokens, temperature=temperature,
+                                   prompt=prompt)
         return _ocr_via_custom(src, api_base, api_key, model, t0, timeout=timeout)
     if provider == "paddle":
         return _ocr_via_paddle(src, t0)
@@ -609,7 +682,8 @@ def ocr_image_detail(src: "str | Path | bytes", provider: str = "none",
 def ocr_image(src: "str | Path | bytes", provider: str = "none",
               api_base: str = "", api_key: str = "", model: str = "",
               mode: str = "custom", timeout: int = 0,
-              max_tokens: int = 4096) -> tuple[str, float]:
+              max_tokens: int = 4096, temperature: float = 0.0,
+              prompt: str = "OCR") -> tuple[str, float]:
     """对单张图片做 OCR，返回 (识别文本, 平均置信度)。
 
     兼容旧签名：置信度缺失（自报异常 / 引擎无输出）统一回退为 0.0（低置信语义，
@@ -617,5 +691,6 @@ def ocr_image(src: "str | Path | bytes", provider: str = "none",
     ocr_image_detail。
     """
     r = ocr_image_detail(src, provider, api_base=api_base, api_key=api_key,
-                         model=model, mode=mode, timeout=timeout, max_tokens=max_tokens)
+                         model=model, mode=mode, timeout=timeout, max_tokens=max_tokens,
+                         temperature=temperature, prompt=prompt)
     return r.text, (r.confidence if r.confidence is not None else 0.0)

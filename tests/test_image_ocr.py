@@ -579,6 +579,141 @@ class TestSelfConfidenceParsing(unittest.TestCase):
         oc = ocr_config_from_cfg(cfg)
         self.assertEqual(oc.max_tokens, 2048)
 
+    def test_logprobs_confidence_primary(self):
+        """2026-10 业务实测（paddleocr-vl-1.6 不自报置信度）：置信度主来源 = logprobs
+        （exp(非特殊 token mean logprob)）；特殊 token 剔除；温度 0 + 极简提示词。"""
+        import math
+
+        from vllm_kb.ocr import ocr_image_detail
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+        captured: dict = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{
+                    "message": {"content": "复位芯片"},
+                    "finish_reason": "stop",
+                    "logprobs": {"content": [
+                        {"token": "复位", "logprob": math.log(0.9)},
+                        {"token": "芯片", "logprob": math.log(0.8)},
+                        {"token": "<|end▁of▁sentence|>", "logprob": -0.01},  # 特殊 token 剔除
+                    ]}}]}).encode()
+
+        def fake(req, timeout=60):
+            captured["payload"] = json.loads(req.data.decode())
+            return FakeResp()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                   model="paddleocr-vl", mode="openai")
+        # exp(mean(log(0.9), log(0.8))) ≈ 0.8487（特殊 token 不计入）
+        self.assertAlmostEqual(res.confidence, math.exp((math.log(0.9) + math.log(0.8)) / 2),
+                               places=6)
+        self.assertEqual(res.confidence_source, "logprobs")
+        self.assertEqual(res.anomaly, "")               # 无自报行不再是异常
+        self.assertFalse(res.needs_review)
+        # payload：温度 0 / 极简提示词 / logprobs 开
+        self.assertEqual(captured["payload"]["temperature"], 0)
+        self.assertEqual(captured["payload"]["messages"][0]["content"][1]["text"], "OCR")
+        self.assertTrue(captured["payload"]["logprobs"])
+        # 自定义提示词/温度透传
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            ocr_image_detail(png, "api", api_base="http://ocr:8000", model="m",
+                             mode="openai", temperature=0.3, prompt="请识别文字")
+        self.assertEqual(captured["payload"]["temperature"], 0.3)
+        self.assertEqual(captured["payload"]["messages"][0]["content"][1]["text"], "请识别文字")
+
+    def test_no_confidence_source_anomaly(self):
+        """无 logprobs 且无自报行 → anomaly=no_confidence（与 missing 区分，进人工核对）。"""
+        from vllm_kb.ocr import ocr_image_detail
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{
+                    "message": {"content": "识别文本"}, "finish_reason": "stop"}]}).encode()
+
+        def fake(req, timeout=60):
+            return FakeResp()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                   model="m", mode="openai")
+        self.assertIsNone(res.confidence)
+        self.assertEqual(res.anomaly, "no_confidence")
+        self.assertTrue(res.needs_review)
+
+    def test_self_report_fallback_with_custom_prompt(self):
+        """无 logprobs 但响应带自报 CONFIDENCE 行（通用 VL 模型 + 自报提示词）→ 回退自报。"""
+        from vllm_kb.ocr import ocr_image_detail
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{
+                    "message": {"content": "halMemCreate failed\nCONFIDENCE: 0.91"},
+                    "finish_reason": "stop"}]}).encode()
+
+        def fake(req, timeout=60):
+            return FakeResp()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000", model="m",
+                                   mode="openai", prompt="识别并自报 CONFIDENCE")
+        self.assertAlmostEqual(res.confidence, 0.91)
+        self.assertEqual(res.confidence_source, "model")   # 自报回退（非 logprobs）
+        self.assertEqual(res.anomaly, "")
+
+    def test_temperature_prompt_config_wiring(self):
+        """image 源 ocr_temperature / ocr_api_prompt → OcrConfig（非法/缺失回 0/"OCR"）。"""
+        from vllm_kb.ocr import as_prompt, as_temperature, ocr_config_from_cfg
+
+        self.assertEqual(as_temperature(None), 0.0)
+        self.assertEqual(as_temperature(-1), 0.0)
+        self.assertEqual(as_temperature(0.3), 0.3)
+        self.assertEqual(as_prompt(None), "OCR")
+        self.assertEqual(as_prompt("  请识别  "), "请识别")
+        cfg = AppConfig.model_validate({
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "sources": [{"id": "img", "type": "image", "path": "x", "enabled": True,
+                         "ocr_provider": "api", "ocr_api_base": "http://ocr:8000",
+                         "ocr_api_mode": "openai", "ocr_temperature": 0.2,
+                         "ocr_api_prompt": "请识别文字"}],
+        })
+        oc = ocr_config_from_cfg(cfg)
+        self.assertEqual(oc.temperature, 0.2)
+        self.assertEqual(oc.prompt, "请识别文字")
+
 
 if __name__ == "__main__":
     unittest.main()

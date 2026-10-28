@@ -257,7 +257,8 @@ class BaseSource(ABC):
             try:
                 res = ocr_image_detail(asset_path, provider, api_base=oc.api_base,
                                        api_key=oc.api_key, model=oc.model, mode=oc.mode,
-                                       timeout=oc.timeout, max_tokens=oc.max_tokens)
+                                       timeout=oc.timeout, max_tokens=oc.max_tokens,
+                                       temperature=oc.temperature, prompt=oc.prompt)
             except (OcrApiError, OcrUnavailable) as e:
                 print(f"[sources:{self.id}] 图片 OCR 失败（{asset_path.name}）：{e}", flush=True)
                 return None, ""
@@ -1217,9 +1218,11 @@ class ImageSource(BaseSource):
         # 阈值与其他 ocr_* 字段一样直接读本来源配置（本来源即 image source）
         min_conf = as_confidence_threshold(self.cfg.get("ocr_min_confidence"))
         ocr_timeout = as_timeout_seconds(self.cfg.get("ocr_timeout"))
-        from .ocr import as_max_tokens
+        from .ocr import as_max_tokens, as_prompt, as_temperature
 
         max_tokens = as_max_tokens(self.cfg.get("ocr_max_tokens"))
+        temperature = as_temperature(self.cfg.get("ocr_temperature"))
+        prompt = as_prompt(self.cfg.get("ocr_api_prompt"))
         provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
         api_base = str(self.cfg.get("ocr_api_base", "") or "")
         api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
@@ -1253,7 +1256,8 @@ class ImageSource(BaseSource):
                 try:
                     result = ocr_image_detail(img, provider, api_base=api_base,
                                               api_key=api_key, model=api_model, mode=api_mode,
-                                              timeout=ocr_timeout, max_tokens=max_tokens)
+                                              timeout=ocr_timeout, max_tokens=max_tokens,
+                                              temperature=temperature, prompt=prompt)
                     break
                 except OcrApiError as e:
                     print(f"[sources:{self.id}] OCR API 失败: {e}", flush=True)
