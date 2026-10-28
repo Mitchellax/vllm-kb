@@ -295,7 +295,9 @@ class TestStripSuffix(unittest.TestCase):
 
 
 class TestExtractFromEnv(unittest.TestCase):
-    def test_cann_soc_python(self):
+    def test_cann_python_and_soc_dropped(self):
+        """SOC 维度已移除（2026-10 业务维护反馈）：镜像只与机器型号（A2/A3/A5）相关，
+        SOC_VERSION env 只在部分镜像出现——单点值写进矩阵误导。"""
         env = [
             "ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.1",
             "PATH=/usr/local/Ascend/cann-8.5.1/bin:/usr/local/python3.11.14/bin:/usr/bin",
@@ -303,13 +305,13 @@ class TestExtractFromEnv(unittest.TestCase):
         ]
         out = bm.extract_from_env(env)
         self.assertEqual(out["cann"], "8.5.1")
-        self.assertEqual(out["soc"], "ascend910b1")
+        self.assertNotIn("soc", out)
         self.assertEqual(out["python"], "3.11.14")
         self.assertEqual(out["vllm_tag"], "")
 
     def test_empty_env(self):
         out = bm.extract_from_env([])
-        self.assertEqual(out, {"cann": "", "soc": "", "python": "", "vllm_tag": ""})
+        self.assertEqual(out, {"cann": "", "python": "", "vllm_tag": ""})
 
     def test_vllm_tag_extraction(self):
         # 带 v 前缀的 VLLM_TAG（镜像构建锁定的 vllm 配套版本）

@@ -80,25 +80,29 @@ export EMBEDDING_API_KEY=sk-xxx
 
 ### 2.0 快速运维（单指令）
 
-**不需要了解项目内部结构**——日常维护只有两个命令：首次部署用 `deploy`，之后每天用
-`update`。命令自动编排多步并**自动降级**（某一步缺依赖/断网只告警不中断），
+**不需要了解项目内部结构**——日常维护命令：首次部署用 `deploy`，日常 `update`（数据段）
++ `graph`（凌晨停机窗口）。命令自动编排多步并**自动降级**（某一步缺依赖/断网只告警不中断），
 `--insecure` / `--github-base` / `--quay-base` 自动透传给所有子步骤。
 
 ```bash
 # 🟢 首次部署 / 全量重建（拉取+入库 → 建图 → 建FTS → 版本日历 → 配套矩阵 → 代码快照）
 python scripts/maintain.py deploy
 
-# 🔄 日常增量更新（增量拉取+入库 → 重建图）
+# 🔄 日常增量更新（数据段：增量拉取+入库，**不停检索服务**）
 python scripts/maintain.py update
+
+# 🌙 凌晨停机窗口：单独重建关系图（Kùzu 单写者，需停 serve_api，跑完重启 API）
+python scripts/maintain.py graph
 
 # 真实业务环境（SSL 被禁 / 自签证书）：--insecure 放子命令前或后均可
 python scripts/maintain.py deploy --insecure --all-code
 python scripts/maintain.py --insecure update
 ```
 
-> ⚠️ **更新前必须停止检索服务（`serve_api`）**：`deploy` / `update` 都包含建图步骤，
-> Kùzu 单写者——图被 API 占用时建图会失败。**流程：停 API → 跑更新 → 重启 API**。
-> API 不便停时用 `update --skip-graph` 只做增量入库，图稍后单独补建。
+> **建图与拉取已拆分**（2026-10 业务维护反馈）：`update` 只做数据段（拉取+入库，
+> 检索 FTS/向量即时生效），**不停服务随时可跑**——新镜像发布时不用停服务干等；
+> 关系图（Kùzu 单写者）由 `maintain.py graph` 在凌晨停机窗口单独同步，图更新后重启 API。
+> `deploy` 仍是一次性全量（含建图）。
 
 **细分指令**（按需裁剪步骤，省时 / 适配环境）：
 
@@ -110,9 +114,9 @@ python scripts/maintain.py --insecure update
 | `deploy --skip-matrix` | 跳过配套矩阵拉取（省 quay+GitHub 调用） |
 | `deploy --skip-code-snapshots` | 跳过代码快照下载（省时间 / 省网络） |
 | `deploy --all-code` | vllm-ascend 代码拉**全部 tag**（默认仅 `config.code.versions` 精选版本；全量数 GB、耗时长，按需开启） |
-| `update --skip-graph` | 仅增量入库不改图（API 不便停时；图稍后 `build_graph.py` 单独补） |
-| `deploy/update --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
-| `deploy/update --config path` | 指定 config.json（默认项目根自动发现） |
+| `graph` | **单独建图**（凌晨停机窗口：Kùzu 单写者，先停 serve_api，跑完重启加载新图） |
+| `deploy/update/graph --insecure` | 跳过 SSL 证书校验（真实业务环境自签证书；子步骤自动继承） |
+| `deploy/update/graph --config path` | 指定 config.json（默认项目根自动发现） |
 | `build_kb.py --strict` | 严格模式：任一来源失败即退出码 1（CI/严格流水线用） |
 
 **自动降级**（子步骤失败不中断，只打印告警）：
@@ -200,9 +204,11 @@ canonical / raw / 图 / 审核库不受影响；中断后重跑仍会先清空�
 知识库是"离线数据 + 定期刷新"，不需要实时：
 
 ```bash
-# 单指令增量更新（日常维护：增量拉取 + 入库 + 重建图，一步到位）
-# ⚠️ 先停 serve_api（建图需 Kùzu 单写者）→ 更新 → 重启 API
+# 白天随时：增量拉取 + 入库（数据段，不停检索服务，FTS/向量即时生效）
 python scripts/maintain.py update
+
+# 凌晨停机窗口：单独重建关系图（Kùzu 单写者，停 serve_api → 重建 → 重启 API）
+python scripts/maintain.py graph
 
 # 或分步执行（了解细节时）：
 # 1. 拉取社区增量 + 增量入库（新增 + 状态同步：已拉条目 open→closed/内容变化
@@ -221,19 +227,18 @@ python scripts/build_graph.py
 
 注意：
 
-- **日常维护用 `python scripts/maintain.py update` 一步到位**（见 §2.0 快速运维）：
-  内部执行 `build_kb.py --incremental`（增量拉取+入库）→ `build_graph.py`（重建图）→
-  提示重启 API；分步命令（下）用于需要细粒度控制时；
+- **日常维护分两段**（2026-10 业务维护反馈）：`update`=数据段（拉取+入库，不停服务），
+  `graph`=建图（凌晨停机窗口，完成提示重启 API）；
 - **全量部署用 `python scripts/maintain.py deploy`**（见 §2.0）：内部按序执行
   `build_kb.py`（全量拉取+入库）→ `build_graph.py` → `build_fts.py` → 版本日历 →
   配套矩阵 → 代码快照（vllm-ascend + vllm 主仓）；**自动降级**：建图/FTS/日历/矩阵/
   快照任一步失败只告警不中断（不影响已完成的入库结果）；`--insecure` / `--github-base` /
   `--quay-base` 传给全部子步骤（也可用 `VLLM_KB_INSECURE` 等环境变量）；
   细分指令（`--skip-graph` / `--skip-fts` / `--skip-code-snapshots` 等）见 §2.0 表格；
-- **更新前先停检索 API**：`deploy` / `update`（含建图步骤）都要先停 `serve_api`
-  （Kùzu 单写者），更新完再启动；
+- **更新前先停检索 API 的只有建图**：`deploy` / `graph`（含建图）要先停 `serve_api`
+  （Kùzu 单写者），完成后再启动；`update`（数据段）**不停服务随时可跑**；
 - **增量入库后必须重建图**：`build_graph.py` 从 canonical 全量重建，新增文档不会自动进图
-  （`maintain.py update` 已含此步）；
+  （凌晨停机窗口跑 `maintain.py graph`）；
 - **FTS 全文索引不需要日常重建**：增量入库时新文档已实时写入 `chunks_fts`（含 jieba 分词）；
   仅当升级 jieba / 分词规则 / 标签词典（`tags.registry`）后，才跑 `build_fts.py` 让存量文档
   也用新分词（不重嵌向量；旧库无分词列升级时 ingest 会打印提示）；
@@ -323,6 +328,11 @@ python scripts/build_companion_matrix.py         # 全部脚本自动走业务�
 | fork 行（0day 模型镜像，如 `hy4`/`glm5.2`） | 除上表字段外自动带 `vllm_repo`（fork 仓）、`vllm_ref`（分支）、`vllm_base`（基线版本）、`vllm_sha`（**clone 层扫描固化的锁定 commit**）、`image_digest`（digest 锚定：镜像未重推则跳过重扫）、`vllm_commit_date`（该 fork SHA 的提交日期）；配套代码快照用 `build_fork_snapshots.py` 按锁定 SHA 拉取 |
 | `cann` | 镜像 Env 的 `cann-X.Y.Z` 路径；缺失时按**基础版本号**回退同系列其他形态（如 `v0.13.0rc1` 用 `0.13.0` 系列的 cann），同系列也没有则留空人工看护 |
 | `pytorch-ascend`（PTA）/ `pytorch`（torch） | 对应 tag 的 `requirements.txt`（`torch-npu==X.Y.Z.postN` / `torch==X.Y.Z`）——**本地快照 zip 优先**（零网络），快照未预存的 tag 走 GitHub API 兜底；0day 模型（非版本 tag）无 requirements 时回退**同 minor 系列已发布 tag**（bailing 0.19.0 → 0.19.x 系列），系列内无 release 或未发布版本留空人工 |
+
+> **SOC 型号已不进矩阵**（2026-10 业务维护反馈）：镜像只与**机器型号**（`-a2`/`-a3`/`-a5`
+> 平台后缀，见 `PLATFORM_SUFFIXES`）相关，SOC 对同一机器型号不构成区分维度；且
+> `SOC_VERSION` env 只出现在部分镜像——单点值写进 notes 反而误导（看似"该镜像仅支持
+> 此 SOC"），故不再采集。
 
 > **"这个镜像对应哪个 commit"**：官方仓镜像（如 `kimi-k3`）看 `vllm_commit` + `vllm_commit_date`；
 > fork 镜像（`hy4`/`glm5.2`）看 `vllm_sha` + `vllm_commit_date`（锁的是 **fork 仓**的代码）。

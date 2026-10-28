@@ -54,8 +54,14 @@ _DEPLOY_STEPS = [
     ("scripts/build_companion_matrix.py", [], False, "配套矩阵"),
 ]
 
+# 增量更新的**数据段**（2026-10 业务维护反馈拆分）：拉取+入库随时可跑，**不含建图**——
+# 建图要求停 serve_api（Kùzu 单写者），拆到独立的 `graph` 子命令，凌晨停机窗口单独跑；
+# 新镜像发布时不再"停服务干等拉取"。
 _UPDATE_STEPS = [
     ("scripts/build_kb.py", ["--incremental"], True, "增量拉取与入库"),
+]
+
+_GRAPH_STEPS = [
     ("scripts/build_graph.py", [], False, "图重建（Kùzu）"),
 ]
 
@@ -95,11 +101,10 @@ def _foreign_python_warning(repo_root: Path = REPO_ROOT, exe: str | None = None)
     return ""
 
 
-def _remind_stop_api(skip_keys: set[str]):
-    """在图相关步骤将执行时打印停服务提醒。"""
-    if "graph" not in skip_keys:
-        print("\n[maintain] ⚠️  注意：build_graph 要求停 serve_api（Kùzu 单写者）。")
-        print("[maintain]   如果 serve_api 仍在运行，请先 Ctrl-C 停止，更新完成后重启。\n")
+def _remind_stop_api(skip_keys: set[str] | None = None):
+    """建图（Kùzu 单写者）需要停 serve_api 的提醒。"""
+    print("\n[maintain] ⚠️  注意：build_graph 要求停 serve_api（Kùzu 单写者）。")
+    print("[maintain]   如果 serve_api 仍在运行，请先 Ctrl-C 停止，完成后重启。\n")
 
 
 def _resolve(script: str) -> str:
@@ -214,7 +219,7 @@ def cmd_deploy(args) -> int:
     warn = _foreign_python_warning()
     if warn:
         print(f"[maintain] {warn}")
-    _remind_stop_api(args.skip)
+    _remind_stop_api()
     print()
 
     success_count = 0
@@ -234,11 +239,11 @@ def cmd_deploy(args) -> int:
 
 
 def cmd_update(args) -> int:
-    """增量更新（日常维护）。"""
+    """增量更新（日常维护，**数据段**）：拉取+入库，不停检索服务；图单独跑 graph。"""
     insecure_env = _insecure_env_from_args(args)
     steps = _filter_steps(_UPDATE_STEPS, args.skip)
     start = time.time()
-    print(f"[maintain] 🔄 增量更新开始 ...")
+    print(f"[maintain] 🔄 增量更新（数据段）开始 ...")
     if args.config:
         print(f"[maintain] 配置: {args.config}")
     if insecure_env:
@@ -248,8 +253,8 @@ def cmd_update(args) -> int:
     warn = _foreign_python_warning()
     if warn:
         print(f"[maintain] {warn}")
-    _remind_stop_api(args.skip)
-    print()
+    print("[maintain] 本流程**不含建图**（无需停检索服务）；关系图仍是旧数据，"
+          "凌晨停机窗口跑 `maintain.py graph` 同步。\n")
 
     success_count = 0
     for script, extra, fatal, tag in steps:
@@ -264,7 +269,34 @@ def cmd_update(args) -> int:
     print(f"\n{'='*60}")
     print(f"[maintain] ✅ 增量更新完成：{success_count}/{len(steps)} 步骤成功")
     print(f"[maintain] 耗时：{mins} 分 {secs} 秒")
-    print(f"[maintain] 提示：增量更新后图已重建，检索 API 需重启才能加载新图。")
+    print(f"[maintain] 提示：检索（FTS/向量）已是最新；关系图待 `maintain.py graph` 同步"
+          f"（凌晨停机窗口），图更新后重启检索 API 加载新图。")
+    return 0
+
+
+def cmd_graph(args) -> int:
+    """单独建图（凌晨停机窗口）：Kùzu 单写者要求停 serve_api；数据段已随时跑完。"""
+    insecure_env = _insecure_env_from_args(args)
+    warn = _foreign_python_warning()
+    if warn:
+        print(f"[maintain] {warn}")
+    _remind_stop_api()
+    print(f"[maintain] 🗺 图重建开始 ...")
+    if args.config:
+        print(f"[maintain] 配置: {args.config}")
+    if insecure_env:
+        print(f"[maintain] 不安全模式: {insecure_env}")
+    print()
+    start = time.time()
+    for script, extra, fatal, tag in _GRAPH_STEPS:
+        if not _run_step(script, extra, fatal, tag, insecure_env, args.config):
+            print(f"\n[maintain] 💥 图重建失败。")
+            return 1
+    elapsed = time.time() - start
+    mins, secs = divmod(int(elapsed), 60)
+    print(f"\n{'='*60}")
+    print(f"[maintain] ✅ 图重建完成，耗时：{mins} 分 {secs} 秒")
+    print(f"[maintain] 提示：重启检索 API 加载新图。")
     return 0
 
 
@@ -315,12 +347,17 @@ def main() -> None:
                                "config.code.versions 精选版本；全量数 GB、耗时长，按需开启）")
     p_deploy.set_defaults(func=cmd_deploy)
 
-    # --- update ---
-    p_update = sub.add_parser("update", help="增量更新：增量拉取+入库+重建图")
+    # --- update（数据段）---
+    p_update = sub.add_parser("update", help="增量更新（数据段）：增量拉取+入库，不停检索服务；"
+                                             "图用 graph 子命令凌晨单独跑")
     _add_common_args(p_update, suppress_defaults=True)
-    p_update.add_argument("--skip-graph", action="store_true",
-                          help="跳过图重建（API 不便停时，仅增量入库）")
     p_update.set_defaults(func=cmd_update)
+
+    # --- graph（凌晨停机窗口）---
+    p_graph = sub.add_parser("graph", help="单独建图（Kùzu 单写者，需停 serve_api）："
+                                           "先 update 拉取入库，停机窗口跑本命令同步关系图")
+    _add_common_args(p_graph, suppress_defaults=True)
+    p_graph.set_defaults(func=cmd_graph)
 
     args = ap.parse_args()
     # 汇总 --skip-* 为步骤 key 集合，供步骤过滤

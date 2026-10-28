@@ -15,6 +15,7 @@ from unittest import mock
 
 from scripts.maintain import (
     _DEPLOY_STEPS,
+    _GRAPH_STEPS,
     _UPDATE_STEPS,
     _filter_steps,
     _foreign_python_warning,
@@ -157,13 +158,14 @@ class TestStepTable(unittest.TestCase):
         for expect in ("图构建（Kùzu）", "全文索引重建（FTS5）", "版本日历", "配套矩阵"):
             self.assertIn(expect, tags, f"{expect} 应标记为非致命步骤")
 
-    def test_update_build_kb_is_fatal(self):
+    def test_update_data_segment_only(self):
+        """update = **数据段**（2026-10 业务维护反馈拆分）：只增量拉取+入库（致命），
+        建图拆到独立 graph 子命令——拉取随时可跑，凌晨停机窗口再同步图。"""
         fatal_steps = [tag for _s, _x, f, tag in _UPDATE_STEPS if f]
         self.assertEqual(fatal_steps, ["增量拉取与入库"])
-
-    def test_update_graph_nonfatal(self):
-        tags = [tag for _s, _x, f, tag in _UPDATE_STEPS if not f]
-        self.assertIn("图重建（Kùzu）", tags)
+        self.assertNotIn("图重建（Kùzu）", [tag for _s, _x, f, tag in _UPDATE_STEPS])
+        # 图步骤独立存在（graph 子命令用）
+        self.assertIn("图重建（Kùzu）", [tag for _s, _x, f, tag in _GRAPH_STEPS])
 
     def test_filter_steps_removes_matching(self):
         """_filter_steps 按 key 正确过滤步骤。"""

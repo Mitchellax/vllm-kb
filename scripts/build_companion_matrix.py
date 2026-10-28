@@ -63,7 +63,6 @@ REQUIRED_FIELDS = ["vllm", "cann", "pytorch", "pytorch-ascend"]
 
 PLATFORM_SUFFIXES = ("-openeuler", "-310p", "-a3", "-a5", "-a2")
 _CANN_RE = re.compile(r"cann-(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
-_SOC_RE = re.compile(r"^SOC_VERSION=(.+)$")
 _PYTHON_RE = re.compile(r"python(\d+\.\d+(?:\.\d+)?)")
 # 镜像 Env 里的 vllm tag（如 VLLM_TAG=v0.26.0）——比 release 说明更直接的配套证据
 _VLLM_TAG_RE = re.compile(r"(?:^|[\s;])VLLM_TAG\s*=\s*v?(\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -562,21 +561,21 @@ def enrich_fork_sha(rows: list[dict], groups: dict, token: str,
 
 
 def extract_from_env(env: list[str]) -> dict[str, str]:
-    """从镜像 Env 提取 cann 版本 / SOC 型号 / python 版本 / vllm tag。
+    """从镜像 Env 提取 cann 版本 / python 版本 / vllm tag。
 
     vllm_tag：镜像 Env 的 VLLM_TAG（如 VLLM_TAG=v0.26.0）——镜像构建时锁定的
     vllm 配套版本，比 GitHub release 说明/版本号启发式更可靠。
+
+    **不采集 SOC 型号**（2026-10 业务维护反馈）：镜像只与**机器型号**（A2/A3/A5）相关，
+    SOC 对同一机器型号的各代镜像不构成区分维度；且 SOC_VERSION env 只出现在部分
+    镜像——采到的单点值写进矩阵反而误导（看似"该镜像仅支持此 SOC"）。
     """
-    out = {"cann": "", "soc": "", "python": "", "vllm_tag": ""}
+    out = {"cann": "", "python": "", "vllm_tag": ""}
     for e in env:
         if not out["cann"]:
             m = _CANN_RE.search(e)
             if m:
                 out["cann"] = m.group(1)
-        if not out["soc"]:
-            m = _SOC_RE.match(e)
-            if m:
-                out["soc"] = m.group(1)
         if not out["python"]:
             m = _PYTHON_RE.search(e)
             if m and "PATH" in e:
@@ -1089,7 +1088,7 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
         got = infos[base]
         fork_mark = f" fork={got['vllm_repo']}@{got['vllm_ref']}" if got.get("is_fork") else ""
         print(f"[matrix]    cann={got['cann'] or '(空)'} vllm_tag={got['vllm_tag'] or '(空)'} "
-              f"soc={got['soc'] or '(空)'} python={got['python'] or '(空)'}{fork_mark}", flush=True)
+              f"python={got['python'] or '(空)'}{fork_mark}", flush=True)
     # 基础版本号 -> 该系列任一非空 cann（首个遇到即用，确定性依赖排序）
     cann_by_base: dict[str, str] = {}
     for base in sorted(groups):
@@ -1193,8 +1192,6 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
             torch_v = re.match(r"^(\d+\.\d+(?:\.\d+)?)", pta).group(1) \
                 if re.match(r"^(\d+\.\d+(?:\.\d+)?)", pta) else ""
         notes = []
-        if info["soc"]:
-            notes.append(f"SOC={info['soc']}")
         if info["python"]:
             notes.append(f"python={info['python']}")
         if info.get("is_fork"):
