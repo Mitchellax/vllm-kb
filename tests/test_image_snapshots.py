@@ -430,6 +430,76 @@ class TestExtractOne(unittest.TestCase):
             r = bis.extract_one(self.cand, self.cfg, "token", self.matrix, index_only=True)
         self.assertEqual(r["status"], "skip")
 
+    def test_content_dedup_same_source_snapshot(self):
+        """内容去重（2026-10 业务维护反馈：同源码镜像不重复入库）：第二个同源码镜像
+        下载解包后指纹命中 → 快照不落盘，meta 记 dedup_source；检索重定向到源快照。"""
+        r1, _ = self._run()                                   # 首个 tag 正常入库
+        self.assertEqual(r1["status"], "ok")
+        other = "other-platform-variant"
+        cand2 = {"group": other, "tag": other, "variants": [other],
+                 "tag_info": {"name": other, "manifest_digest": "sha256:other",
+                              "last_modified": "Mon, 27 Jul 2026 15:41:42 -0000"}}
+        meta2 = dict(self.layers)
+        meta2["session"] = None
+        with mock.patch.object(bis, "fetch_image_layers", return_value=meta2), \
+                mock.patch.object(bis, "download_layer",
+                                  return_value=io.BytesIO(self.blob)):
+            r2 = bis.extract_one(cand2, self.cfg, "token", self.matrix)
+        self.assertEqual(r2["status"], "ok")
+        code_root = self.cfg.resolve(self.cfg.storage.code_root)
+        root2 = bis.image_dir(other, code_root)
+        # 快照不落盘（去重）
+        self.assertFalse((root2 / "snapshots" / other).exists())
+        meta = json.loads((root2 / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["dedup_source"], TAG)
+        self.assertTrue(meta.get("plugin_fingerprint"))
+        # 检索重定向：img:other 的文件读取/符号检索走源快照，索引独立
+        code = VersionedCode(self.cfg, repo=f"img:{other}")
+        self.assertIsNotNone(code.dedup_source)
+        self.assertEqual(code.available_versions, [other])
+        self.assertTrue(code.search_symbols("glm52_platform", other))
+        self.assertIsNotNone(code.read_file(other, "vllm_ascend/platform.py"))
+        # 清单标注同源
+        from vllm_kb.code_index import list_image_snapshots
+        ents = {e["tag"]: e for e in list_image_snapshots(code_root)}
+        self.assertEqual(ents[other]["same_as"], TAG)
+        self.assertTrue(ents[other]["extracted"])
+
+    def test_dedup_existing_migrates(self):
+        """--dedup-existing：同内容存量快照迁移——后提取方删快照、meta 记 dedup_source。"""
+        self._run()                                           # arm 入库（登记指纹）
+        other = "other-platform-variant"
+        cand2 = {"group": other, "tag": other, "variants": [other],
+                 "tag_info": {"name": other, "manifest_digest": "sha256:other"}}
+        meta2 = dict(self.layers)
+        meta2["session"] = None
+        # 绕过去重判定：直接造第二份相同快照（模拟存量；走 extract_plugin_tree
+        # 保证与首个 tag 相同的前缀剥离/路径归一，指纹只对内容敏感）
+        root2 = bis.image_dir(other, self.cfg.resolve(self.cfg.storage.code_root))
+        (root2 / "snapshots" / other).mkdir(parents=True)
+        bis.extract_plugin_tree(io.BytesIO(self.blob), root2 / "snapshots" / other)
+        (root2 / "meta.json").write_text(json.dumps(
+            {"tag": other, "extracted_at": "2026-10-02T00:00:00Z"}), encoding="utf-8")
+        # 手动跑 dedup-existing 的核心逻辑（不进 main）：直接调用内部步骤
+        code_root = self.cfg.resolve(self.cfg.storage.code_root)
+        snap2 = root2 / "snapshots" / other
+        fp = bis._tree_fingerprint(snap2)
+        reg = bis._load_fingerprints(code_root)
+        hit = reg.get(fp)
+        self.assertIsNotNone(hit)                             # 与首个 tag 同指纹
+        import shutil
+
+        shutil.rmtree(snap2)
+        m = json.loads((root2 / "meta.json").read_text(encoding="utf-8"))
+        m["dedup_source"] = hit["tag"]
+        (root2 / "meta.json").write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
+        code = VersionedCode(self.cfg, repo=f"img:{other}")
+        self.assertTrue(code.dedup_source)
+        # 索引构建走重定向（读源快照、写本 tag 索引）——业务流程 extract_one 末尾即此步
+        n = code.build_index_for_version(other)
+        self.assertGreater(n, 0)
+        self.assertTrue(code.search_symbols("glm52_platform", other))  # 重定向可检索
+
     def test_matrix_commit_absent_falls_back_to_tag_lookup(self):
         self.matrix = {TAG: {"vllm-ascend": TAG, "vllm": "0.23.0"}}  # 无 vllm_commit
         with mock.patch.object(bis.bcm, "_github_token", return_value="tok"), \

@@ -61,6 +61,38 @@ def images_root(code_root: Path | str) -> Path:
     return Path(code_root) / "images"
 
 
+def _tree_fingerprint(snap: Path) -> str:
+    """插件源码树内容指纹：sorted(相对路径:文件sha256) 的总 sha256。
+
+    层 tar digest 含构建时间戳等元数据（同源码两次打包 digest 必不同），不能用于
+    "相同镜像"判定；解包后的路径+内容哈希才是代码同一性的判据。
+    """
+    entries = []
+    for p in sorted(snap.rglob("*")):
+        if p.is_file():
+            rel = p.relative_to(snap).as_posix()
+            entries.append(f"{rel}:{hashlib.sha256(p.read_bytes()).hexdigest()}")
+    return "t1:" + hashlib.sha256("\n".join(entries).encode()).hexdigest()
+
+
+def _fingerprints_path(code_root: Path | str) -> Path:
+    return images_root(code_root) / "_fingerprints.json"
+
+
+def _load_fingerprints(code_root: Path | str) -> dict:
+    p = _fingerprints_path(code_root)
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_fingerprints(code_root: Path | str, reg: dict) -> None:
+    p = _fingerprints_path(code_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(reg, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def image_dir(row_tag: str, code_root: Path | str) -> Path:
     return images_root(code_root) / row_tag
 
@@ -591,6 +623,32 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
             "source": f"archive:{archive.name}" if offline else "quay",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
         }
+        # —— 内容指纹去重（2026-10 业务维护反馈：同源码镜像不重复入库）——
+        # 层 tar digest 含构建元数据（同源码两次打包必不同），不能判定"相同镜像"；
+        # 解包后的路径+内容哈希（tree 指纹）才是代码同一性判据。命中已有指纹 →
+        # 快照不落盘（meta 记 dedup_source，检索路径重定向到源 tag 的快照实体；
+        # 本 tag 索引仍独立建立，img:{tag} 检索语义不变）。
+        fp = _tree_fingerprint(snap)
+        meta_out["plugin_fingerprint"] = fp
+        code_root = cfg.resolve(cfg.storage.code_root)
+        reg = _load_fingerprints(code_root)
+        hit = reg.get(fp) or {}
+        if hit.get("tag") and hit["tag"] != tag:
+            import shutil
+
+            src_meta = image_dir(hit["tag"], code_root) / "meta.json"
+            try:
+                src_real = json.loads(src_meta.read_text(encoding="utf-8")).get("dedup_source")
+            except (OSError, json.JSONDecodeError):
+                src_real = None
+            real = src_real or hit["tag"]          # 源也可能是 dedup（链式→取真身）
+            shutil.rmtree(snap, ignore_errors=True)
+            meta_out["dedup_source"] = real
+            print(f"[img] {tag}: 插件源码与 {real} 完全相同（指纹 {fp[:16]}…），"
+                  f"快照不重复入库", flush=True)
+        else:
+            reg[fp] = {"tag": tag, "files": info["files"]}
+            _save_fingerprints(code_root, reg)
         root.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(json.dumps(meta_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -620,6 +678,10 @@ def main() -> None:
                     help="强制重建符号索引（默认幂等：已有索引跳过——digest 锚命中的镜像"
                          "每轮 update 都会走到索引步，不重复全量重建）")
     ap.add_argument("--refresh", action="store_true", help="忽略 digest 锚，强制重取")
+    ap.add_argument("--dedup-existing", action="store_true",
+                    help="对已提取镜像做内容去重迁移（2026-10 业务维护反馈：同源码镜像"
+                         "不重复入库）——算 tree 指纹，同源码组保留最早提取的，其余删快照、"
+                         "meta 记 dedup_source（检索重定向，img:{tag} 语义不变）")
     ap.add_argument("--archive", action="append", default=None, metavar="[TAG=]PATH",
                     help="离线归档导入（docker save / OCI layout，不经 quay 不触网）："
                          "归档路径，或 tag=路径 显式指定 img: 前缀键；可多次")
@@ -633,6 +695,53 @@ def main() -> None:
     insecure = args.insecure or insecure_from_env()
     qbase = quay_base(args.quay_base)
     cfg = AppConfig.load(args.config, require_keys=False)
+
+    if args.dedup_existing:
+        code_root = cfg.resolve(cfg.storage.code_root)
+        imgs = images_root(code_root)
+        if not imgs.is_dir():
+            raise SystemExit(f"[img] 无已提取镜像目录：{imgs}")
+        reg: dict[str, dict] = {}
+        entries = []
+        for d in sorted(p for p in imgs.iterdir() if p.is_dir() and (p.name != "_fingerprints")):
+            snap = d / "snapshots" / d.name
+            if not (snap.is_dir() and any(snap.iterdir())):
+                continue                     # 已 dedup 或无快照
+            entries.append((d.name, snap))
+        # 按提取时间排序：同指纹保留最早（extracted_at）
+        def _ts(name: str) -> str:
+            try:
+                return json.loads((imgs / name / "meta.json").read_text(
+                    encoding="utf-8")).get("extracted_at", "")
+            except (OSError, json.JSONDecodeError):
+                return ""
+        entries.sort(key=lambda t: (_ts(t[0]), t[0]))
+        dedup_n = 0
+        for tag, snap in entries:
+            fp = _tree_fingerprint(snap)
+            hit = reg.get(fp) or {}
+            if hit.get("tag"):
+                import shutil
+
+                shutil.rmtree(snap)
+                mp = imgs / tag / "meta.json"
+                try:
+                    m = json.loads(mp.read_text(encoding="utf-8"))
+                    m["dedup_source"] = hit["tag"]
+                    m["plugin_fingerprint"] = fp
+                    mp.write_text(json.dumps(m, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+                except (OSError, json.JSONDecodeError):
+                    pass
+                dedup_n += 1
+                print(f"[img] {tag}：插件源码与 {hit['tag']} 相同（{fp[:16]}…），"
+                      f"快照已去重", flush=True)
+            else:
+                reg[fp] = {"tag": tag}
+        _save_fingerprints(code_root, reg)
+        print(f"[img] 存量去重完成：扫描 {len(entries)} 个快照，去重 {dedup_n} 个"
+              f"（注册表 {imgs / '_fingerprints.json'}）", flush=True)
+        return
     matrix = _matrix_rows(cfg)
     dest_root = images_root(cfg.resolve(cfg.storage.code_root))
 

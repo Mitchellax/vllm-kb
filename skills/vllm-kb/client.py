@@ -311,6 +311,8 @@ def fmt_code_versions(data: dict) -> str:
                 parts.append(f"镜像时间={i['image_created']}")
             if i.get("plugin_commit"):
                 parts.append(f"插件commit={str(i['plugin_commit'])[:12]}")
+            if i.get("same_as"):
+                parts.append(f"同源={i['same_as']}")   # 内容去重：快照实体在源 tag
             parts.append("索引=有" if i.get("indexed") else "索引=无")
             lines.append("  " + "  ".join(parts))
         lines.append(f"提示: {data.get('note', '')}")

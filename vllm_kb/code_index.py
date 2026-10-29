@@ -104,6 +104,17 @@ class VersionedCode:
         self.index_path = self.root / "index.sqlite3"
         self.zips_dir = self.root / "zips"
         self.snapshots_dir = self.root / "snapshots"
+        # img 内容去重（2026-10 业务维护反馈：同源码镜像不重复入库）：meta 带
+        # dedup_source 时，快照实体在源 tag 目录（本 tag 只保留 index+meta），
+        # 快照路径解析统一重定向；索引/检索版本键仍是本 tag，语义不变。
+        self.dedup_source: str | None = None
+        if repo.startswith("img:"):
+            try:
+                self.dedup_source = json.loads(
+                    (self.root / "meta.json").read_text(encoding="utf-8")
+                ).get("dedup_source") or None
+            except (OSError, json.JSONDecodeError):
+                pass
 
     @property
     def _preset_hint(self) -> str:
@@ -125,7 +136,10 @@ class VersionedCode:
 
     @property
     def available_versions(self) -> list[str]:
-        """已预存（有 zip 或已解压）的版本列表。"""
+        """已预存（有 zip 或已解压）的版本列表。img 去重镜像：meta 在即已入库。"""
+        if self.dedup_source and self.repo.startswith("img:"):
+            tag = self.repo[4:]
+            return [tag] if (self.root / "meta.json").exists() else []
         versions: set[str] = set()
         if self.zips_dir.exists():
             for p in self.zips_dir.glob("*.zip"):
@@ -137,12 +151,19 @@ class VersionedCode:
         return sorted(versions)
 
     def has_version(self, version: str) -> bool:
+        if self.dedup_source and self.repo.startswith("img:"):
+            return version == self.repo[4:] and (self.root / "meta.json").exists()
         return (self.zips_dir / f"{version}.zip").exists() or (self.snapshots_dir / version).is_dir()
 
     def _snapshot_dir(self, version: str) -> Path:
+        """快照根目录；img 去重镜像重定向到 dedup_source 的快照实体。"""
+        if self.dedup_source and self.repo.startswith("img:"):
+            return self.root.parent / self.dedup_source / "snapshots" / self.dedup_source
         return self.snapshots_dir / version
 
     def snapshot_exists(self, version: str) -> bool:
+        if self.dedup_source and self.repo.startswith("img:"):
+            return self._snapshot_dir(version).is_dir()      # 实体在源 tag
         return (self.snapshots_dir / version / "vllm_ascend").exists() or \
                any((self.snapshots_dir / version).glob("*")) and (self.snapshots_dir / version).is_dir()
 
@@ -547,9 +568,13 @@ def list_image_snapshots(code_root: Path) -> list[dict]:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 if isinstance(meta, dict):
                     ent.update({k: meta.get(k, ent[k]) for k in ent if k in meta})
+                    if meta.get("dedup_source"):
+                        # 内容去重：快照实体在源 tag（同源码镜像不重复入库）
+                        ent["same_as"] = meta["dedup_source"]
             except Exception:
                 pass
         snaps = d / "snapshots"
-        ent["extracted"] = snaps.is_dir() and any(p.is_dir() for p in snaps.iterdir())
+        ent["extracted"] = bool(ent.get("same_as")) or \
+            (snaps.is_dir() and any(p.is_dir() for p in snaps.iterdir()))
         out.append(ent)
     return out
