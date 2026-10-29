@@ -480,7 +480,7 @@ def _matrix_rows(cfg) -> dict:
 def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = False,
                 qbase: str = "https://quay.io", refresh: bool = False,
                 index_only: bool = False, archive: Path | None = None,
-                archive_meta: dict | None = None) -> dict:
+                archive_meta: dict | None = None, reindex: bool = False) -> dict:
     """提取单个镜像的插件源码 + 建索引 + 写 meta。返回状态 dict。
 
     archive 非空 = 离线归档导入（docker save / OCI layout，不经 quay 不触网）；
@@ -572,9 +572,14 @@ def extract_one(cand: dict, cfg, token: str, matrix: dict, insecure: bool = Fals
         meta_path.write_text(json.dumps(meta_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 建索引（复用 VersionedCode：img:{tag} → data/code/images/{tag}/）
+    # 幂等：已有索引跳过（build_index_for_version 返回 None）——锚命中的镜像每轮
+    # update 都会走到这里，不能重复全量重建（2026-10 业务维护反馈）
     code = VersionedCode(cfg, repo=f"img:{tag}")
-    n = code.build_index_for_version(tag)
-    print(f"[img] {tag}: 索引 {n} 个文件", flush=True)
+    n = code.build_index_for_version(tag, force=reindex)
+    if n is None:
+        print(f"[img] {tag}: 索引已存在，跳过（--reindex 重建）", flush=True)
+    else:
+        print(f"[img] {tag}: 索引 {n} 个文件", flush=True)
     return {"tag": tag, "status": "ok", "indexed": n,
             "meta": json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}}
 
@@ -588,6 +593,9 @@ def main() -> None:
                     help="只处理指定镜像（quay tag 或矩阵行键，可多次）")
     ap.add_argument("--list", action="store_true", help="只列出候选镜像与提取状态")
     ap.add_argument("--index-only", action="store_true", help="只重建索引（不联网）")
+    ap.add_argument("--reindex", action="store_true",
+                    help="强制重建符号索引（默认幂等：已有索引跳过——digest 锚命中的镜像"
+                         "每轮 update 都会走到索引步，不重复全量重建）")
     ap.add_argument("--refresh", action="store_true", help="忽略 digest 锚，强制重取")
     ap.add_argument("--archive", action="append", default=None, metavar="[TAG=]PATH",
                     help="离线归档导入（docker save / OCI layout，不经 quay 不触网）："
@@ -622,7 +630,8 @@ def main() -> None:
             ci = VersionedCode(cfg, repo=f"img:{c['tag']}")
             ci._connect_index(write=True).close()
         for c in cands:
-            extract_one(c, cfg, "", matrix, insecure=insecure, qbase=qbase, index_only=True)
+            extract_one(c, cfg, "", matrix, insecure=insecure, qbase=qbase, index_only=True,
+                        reindex=args.reindex)
         print(f"[img] 索引重建完成：{len(cands)} 个镜像", flush=True)
         return
 
@@ -649,7 +658,7 @@ def main() -> None:
                       f"digest={arch['image_digest'][:19]}…）", flush=True)
                 cand = {"group": tag, "tag": tag, "tag_info": {}, "variants": [tag]}
                 r = extract_one(cand, cfg, "", matrix, refresh=args.refresh,
-                                archive=path, archive_meta=arch)
+                                archive=path, archive_meta=arch, reindex=args.reindex)
                 if r["status"] == "ok" and r.get("indexed"):
                     ok += 1
                 else:
@@ -690,8 +699,10 @@ def main() -> None:
     for c in cands:
         try:
             r = extract_one(c, cfg, token, matrix, insecure=insecure, qbase=qbase,
-                            refresh=args.refresh)
-            if r["status"] == "ok" and r.get("indexed"):
+                            refresh=args.refresh, reindex=args.reindex)
+            # 成功判定只看 status：indexed=None = 索引已存在（幂等跳过），
+            # 也是成功——曾按 r.get("indexed") 判定导致锚命中镜像被计入"跳过"
+            if r["status"] == "ok":
                 ok += 1
             else:
                 skipped += 1
