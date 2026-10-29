@@ -456,10 +456,12 @@ def _extract_python_ast(text: str, lines: list[str], syms: set) -> None:
     - 报错字面量（raise/assert/logger.error 的字符串参数）→ kind=msg；
     - ast 解析失败（语法错误/非 Python 内容）→ 退回行级正则（保底，不丢符号）。
 
-    第三方源码含大量 `"\d"` 这类 invalid escape：Python 3.12 起 ast.parse 对
+    第三方源码含大量 `"\\d"` 这类 invalid escape：Python 3.12 起 ast.parse 对
     其发 SyntaxWarning 且默认显示（3.14 起直接 SyntaxError）——建索引时刷屏。
     这里只做符号提取、不改第三方代码，故屏蔽该警告（SyntaxError 仍由调用方
-    兜底到行级正则）。本模块自身代码均为合法转义，不受影响。
+    兜底到行级正则）。注意：本 docstring 与全模块源码自身必须用合法转义/
+    raw 字符串——import 期（编译时）的 SyntaxWarning 不受下方 catch_warnings
+    控制（它只覆盖运行时 ast.parse 阶段）。
     """
     try:
         with warnings.catch_warnings():
