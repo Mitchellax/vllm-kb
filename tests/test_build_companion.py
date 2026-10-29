@@ -581,9 +581,72 @@ class TestExtractFromImage(unittest.TestCase):
         self.assertEqual(bad[0]["image_digest"], "")
 
 
+class TestImageConfigCache(unittest.TestCase):
+    """build_rows 镜像 config 探测缓存（2026-10 业务维护反馈：已探测过的镜像应跳过）。
+
+    键=manifest_digest（内容寻址）：digest 不变 = env/history 提取结果不变；
+    tag 重推（digest 变）自动 miss；探测失败（空 history）不写缓存。
+    """
+
+    CFG = {
+        "env": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.1.0"],
+        "history": [
+            {"created_by": "ARG VLLM_REPO=https://github.com/vllm-project/vllm.git",
+             "empty_layer": True},
+            {"created_by": "ARG VLLM_TAG=v0.23.0", "empty_layer": True},
+        ],
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.tmp.name)
+        self.groups = {"bailing-flash": [
+            {"name": "bailing-flash-a3", "manifest_digest": "sha256:" + "a" * 64,
+             "last_modified": "Mon, 27 Jul 2026 15:39:42 -0000"}]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _build(self, cfgs, **kw):
+        """跑 build_rows；cfgs 未覆盖的 tag 触发 fetch 即失败（看护"不应触网"）。"""
+        def _fetch(tag_info, token, **k):
+            if tag_info["name"] in cfgs:
+                return cfgs[tag_info["name"]]
+            raise AssertionError(f"digest 锚命中不应探测：{tag_info['name']}")
+        with mock.patch("build_companion_matrix.default_cache_dir",
+                        return_value=self.cache_dir), \
+                mock.patch("build_companion_matrix.fetch_image_config", side_effect=_fetch):
+            return bm.build_rows(self.groups, {}, "T", **kw)
+
+    def test_digest_anchor_skips_reprobe(self):
+        r1 = self._build({"bailing-flash-a3": self.CFG})
+        self.assertEqual(r1[0]["cann"], "9.1.0")
+        r2 = self._build({})                       # 二轮：缓存命中，fetch 即失败
+        for k in ("cann", "vllm", "vllm_tag", "vllm_tag_src", "python"):
+            self.assertEqual(r2[0].get(k), r1[0].get(k), k)
+        self.assertIn("镜像buildkit(VLLM_TAG)", r2[0]["source"])
+
+    def test_repush_reprobes(self):
+        self._build({"bailing-flash-a3": self.CFG})
+        self.groups["bailing-flash"][0]["manifest_digest"] = "sha256:" + "b" * 64
+        cfg2 = {"env": ["ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.2.0"],
+                "history": self.CFG["history"]}
+        rows = self._build({"bailing-flash-a3": cfg2})   # 重推 → 重新探测
+        self.assertEqual(rows[0]["cann"], "9.2.0")
+
+    def test_failed_probe_not_cached(self):
+        self._build({"bailing-flash-a3": {"env": [], "history": []}})   # 探测失败
+        rows = self._build({"bailing-flash-a3": self.CFG})              # 二轮应重探
+        self.assertEqual(rows[0]["cann"], "9.1.0")
+
+    def test_refresh_cache_reprobes(self):
+        self._build({"bailing-flash-a3": self.CFG})
+        rows = self._build({"bailing-flash-a3": self.CFG}, refresh_cache=True)
+        self.assertEqual(rows[0]["cann"], "9.1.0")
+
+
 class TestBuildRowsFork(unittest.TestCase):
     """build_rows 的 fork（0day 开发分支）行逻辑。"""
-
     HY4_CFG = {
         "env": ["VLLM_VERSION=0.23.0", "ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.0.1"],
         "history": [

@@ -29,7 +29,10 @@ tag 走 GitHub API 会撞未认证限流 60 次/小时；快照由 build_code_sn
   github_releases.json      release 说明（历史不可变，TTL 7 天兜底新 release）
   github_requirements.json  requirements 兜底结果（含 404，永久有效）
   github_tag_commits.json   tag → commit SHA + 日期（tag 指向的 commit 不可变，永久有效）
-缓存消除两类重复网络成本：fork 层 75MB 下载（业务环境慢链路上分钟级）与
+  image_config.json         镜像 config 探测结果（键=manifest_digest，内容寻址：
+                            digest 不变 = env/history 提取结果不变；tag 重推自动 miss）
+缓存消除三类重复网络成本：镜像 config 逐组探测（无缓存时一次整跑 ~85 分钟的大头）、
+fork 层 75MB 下载（业务环境慢链路上分钟级）与
 GitHub API 用量（releases ~6 请求 + requirements ~40 请求/次 → 命中后 0）。
 
 用法：
@@ -688,6 +691,7 @@ _FORK_SHA_CACHE = "fork_sha.json"
 _RELEASES_CACHE = "github_releases.json"
 _REQ_CACHE = "github_requirements.json"
 _TAG_COMMIT_CACHE = "github_tag_commits.json"
+_IMAGE_CONFIG_CACHE = "image_config.json"   # 镜像 config 探测（键=manifest_digest）
 
 
 def default_cache_dir() -> Path:
@@ -1081,14 +1085,35 @@ def build_rows(groups: dict, releases: dict[str, str], token: str,
                gbase: str = "https://api.github.com",
                refresh_cache: bool = False) -> list[dict]:
     # 第一遍：收齐所有组的 env 信息（同基础版本的组共享 cann 用于回退）
+    # config 探测缓存（2026-10 业务维护反馈：已探测过的镜像应跳过）：
+    # 键 = manifest_digest（内容寻址）——digest 不变 = manifest/config 内容不变 =
+    # env/history 提取结果不变，直接复用；tag 重推（digest 变）自动 miss。
+    # 网络失败/空 history 不写缓存（下次重试），--refresh-cache 强制重探。
+    # 与 fork SHA 层缓存同款思路：无缓存时一次整跑 ~85 分钟几乎全耗在逐镜像
+    # config 探测上（每组 1 次 manifest + config blob，串行带重试）。
     infos: dict[str, dict] = {}  # base(group key) -> extract_from_env 结果
     total = len(groups)
+    cfg_cache = {} if refresh_cache else _cache_load(_IMAGE_CONFIG_CACHE)
     for i, base in enumerate(sorted(groups), 1):
         rep = pick_representative(groups[base])
+        dg = str(rep.get("manifest_digest") or "")
+        cached = cfg_cache.get(dg) if _DIGEST_VALID_RE.match(dg) else None
+        if isinstance(cached, dict) and cached:
+            infos[base] = cached
+            got = cached
+            fork_mark = f" fork={got['vllm_repo']}@{got['vllm_ref']}" if got.get("is_fork") else ""
+            print(f"[matrix] 镜像 config {i}/{total}：{base}（代表 tag {rep['name']}）"
+                  f"——digest 锚命中，跳过探测", flush=True)
+            print(f"[matrix]    cann={got['cann'] or '(空)'} vllm_tag={got['vllm_tag'] or '(空)'} "
+                  f"python={got['python'] or '(空)'}{fork_mark}", flush=True)
+            continue
         print(f"[matrix] 镜像 config {i}/{total}：{base}（代表 tag {rep['name']}）...", flush=True)
         cfg = fetch_image_config(rep, token, insecure=insecure, qbase=qbase)
         infos[base] = extract_from_image(cfg["env"], cfg["history"])
         got = infos[base]
+        if cfg["history"] and _DIGEST_VALID_RE.match(dg):
+            cfg_cache[dg] = dict(got)
+            _cache_save(_IMAGE_CONFIG_CACHE, cfg_cache)
         fork_mark = f" fork={got['vllm_repo']}@{got['vllm_ref']}" if got.get("is_fork") else ""
         print(f"[matrix]    cann={got['cann'] or '(空)'} vllm_tag={got['vllm_tag'] or '(空)'} "
               f"python={got['python'] or '(空)'}{fork_mark}", flush=True)
