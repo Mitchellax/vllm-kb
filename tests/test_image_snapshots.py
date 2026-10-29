@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import build_image_snapshots as bis  # noqa: E402
 
+def _sha256(b: bytes) -> str:
+    return "sha256:" + hashlib.sha256(b).hexdigest()
+
 from vllm_kb.code_index import VersionedCode  # noqa: E402
 from vllm_kb.config import AppConfig  # noqa: E402
 
@@ -157,9 +160,10 @@ class TestDownloadLayer(unittest.TestCase):
     """层体下载：流式读取 + 整层重试（quay CDN 偶发读超时）。"""
 
     class _Resp:
-        def __init__(self, chunks, fail_after=None):
+        def __init__(self, chunks, fail_after=None, status_code=200):
             self._chunks = chunks
             self._fail_after = fail_after
+            self.status_code = status_code
 
         def raise_for_status(self):
             return None
@@ -170,30 +174,79 @@ class TestDownloadLayer(unittest.TestCase):
                     raise OSError("read timeout")
                 yield c
 
+        def close(self):
+            return None
+
     class _Sess:
         def __init__(self, responses):
             self._responses = list(responses)
             self.calls = 0
+            self.last_headers = {}
 
         def get(self, url, **kw):
             self.calls += 1
+            self.last_headers = kw.get("headers") or {}
             return self._responses.pop(0)
 
-    def test_retries_whole_layer_on_timeout(self):
+    def test_retries_on_timeout(self):
+        """断流重试（第一响应发不出任何 chunk）：重收全部；sha256 校验通过。"""
+        body = b"y" * 10
         sess = self._Sess([self._Resp([b"x" * 10], fail_after=0),
-                           self._Resp([b"y" * 10])])
+                           self._Resp([body])])
         meta = {"session": sess, "v2": "v2", "token": "t"}
         with mock.patch("build_image_snapshots.time.sleep"):
-            buf = bis.download_layer(meta, "sha256:l", 10)
+            buf = bis.download_layer(meta, _sha256(body), len(body))
         self.assertEqual(sess.calls, 2)
-        self.assertEqual(buf.read(), b"y" * 10)
+        self.assertEqual(buf.read(), body)
+
+    def test_resume_with_range_after_partial(self):
+        """断点续传（2026-10 业务实测：慢链路每次重试从头来导致 44.8MB 层永远下不完，
+        镜像每轮 update 都重复下载）：第一响应发一半后断流 → 第二请求带 Range 续传
+        （206 Partial），拼接完整层并按 layer_digest（sha256）校验通过。"""
+        body = bytes(range(256)) * 40                       # 10240 字节
+        first = body[:4000]
+        sess = self._Sess([
+            self._Resp([first[i:i + 1000] for i in range(0, len(first), 1000)],
+                       fail_after=4),
+            self._Resp([body[4000:]], status_code=206),     # 支持 Range → 206
+        ])
+        meta = {"session": sess, "v2": "v2", "token": "t", "insecure": False}
+        with mock.patch("build_image_snapshots.time.sleep"):
+            buf = bis.download_layer(meta, _sha256(body), len(body))
+        self.assertEqual(sess.calls, 2)
+        self.assertEqual(sess.last_headers.get("Range"), f"bytes={len(first)}-")
+        self.assertEqual(buf.read(), body)
+
+    def test_server_ignoring_range_falls_back_to_full(self):
+        """代理/镜像源忽略 Range 回 200 全量：丢弃残片重收（降级正确）。"""
+        body = bytes(range(256)) * 40
+        first = body[:4000]
+        sess = self._Sess([
+            self._Resp([first[i:i + 1000] for i in range(0, len(first), 1000)],
+                       fail_after=4),
+            self._Resp([body]),                              # 200：忽略 Range
+        ])
+        meta = {"session": sess, "v2": "v2", "token": "t", "insecure": False}
+        with mock.patch("build_image_snapshots.time.sleep"):
+            buf = bis.download_layer(meta, _sha256(body), len(body))
+        self.assertEqual(sess.calls, 2)
+        self.assertEqual(sess.last_headers.get("Range"), f"bytes={len(first)}-")
+        self.assertEqual(buf.read(), body)   # 200 残片丢弃后重收全量，内容仍完整
+
+    def test_sha_mismatch_raises(self):
+        """内容校验失败（期望 digest 与实际不符）→ 不返回坏层。"""
+        sess = self._Sess([self._Resp([b"abc"])])
+        meta = {"session": sess, "v2": "v2", "token": "t"}
+        with mock.patch("build_image_snapshots.time.sleep"), \
+                self.assertRaises(RuntimeError):
+            bis.download_layer(meta, "sha256:" + "0" * 64, 3, retries=1)
 
     def test_raises_after_all_retries(self):
         sess = self._Sess([self._Resp([b"x"], fail_after=0) for _ in range(3)])
         meta = {"session": sess, "v2": "v2", "token": "t"}
         with mock.patch("build_image_snapshots.time.sleep"), \
                 self.assertRaises(RuntimeError):
-            bis.download_layer(meta, "sha256:l", 10, retries=3)
+            bis.download_layer(meta, _sha256(b"x"), 1, retries=3)
         self.assertEqual(sess.calls, 3)
 
 

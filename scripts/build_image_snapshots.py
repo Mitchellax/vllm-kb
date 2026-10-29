@@ -140,7 +140,7 @@ def fetch_image_layers(tag_info: dict, token: str, insecure: bool = False,
     return {"layers": [str(l.get("digest") or "") for l in md.get("layers", []) or []],
             "layer_sizes": [int(l.get("size") or 0) for l in md.get("layers", []) or []],
             "history": cfg.get("history", []) or [],
-            "session": session, "v2": v2, "token": token}
+            "session": session, "v2": v2, "token": token, "insecure": insecure}
 
 
 # ---------------- 层解包（tar 安全 + 前缀剥离） ----------------
@@ -219,34 +219,57 @@ def extract_plugin_tree(blob_stream, dest: Path, prefix: str = _PLUGIN_PREFIX,
 
 
 def download_layer(meta: dict, layer_digest: str, layer_size: int,
-                   progress_every: int = 10 << 20, retries: int = 3):
-    """流式下载层 blob，返回可解压的字节流（带进度行 + 重试）。
+                   progress_every: int = 10 << 20, retries: int = 5):
+    """流式下载层 blob，返回可解压的字节流（**断点续传** + 进度行 + 重试）。
 
-    quay CDN 偶发握手/读超时（实测同一 tag 的 config 请求正常、层体却读超时），
-    这里对**整个层体**重试；每次重试前打印一行，避免长时间静默被误判卡死。
+    quay blob GET 支持 HTTP Range（OCI distribution spec）——重试从**已下载字节**续传，
+    不是从头重来：慢链路/CDN 断流多次重试也能拼完整层（2026-10 业务实测：44.8MB 层
+    在慢链路上每次重试都从头来，永远下不完 → 提取失败 → meta 永远不写 → 镜像每轮
+    update 都重复下载）。完成后按 layer_digest（sha256）校验完整性。
     """
     session = meta["session"]
     last: Exception | None = None
+    buf = io.BytesIO()
+    got = 0
+    mark = progress_every
     for attempt in range(retries):
-        buf = io.BytesIO()
-        got = 0
-        mark = progress_every
         try:
+            headers = {"Authorization": "Bearer " + meta["token"]}
+            if got:
+                headers["Range"] = f"bytes={got}-"
             r = session.get(f"{meta['v2']}/blobs/{layer_digest}",
-                            headers={"Authorization": "Bearer " + meta["token"]},
-                            timeout=600, stream=True)
+                            headers=headers, timeout=600, stream=True)
+            if r.status_code in (401, 403):
+                # 匿名 token 有效期短——续传重试中途过期，刷新后本轮直接重试
+                print("[img]     匿名 token 失效（401/403），刷新后重试", flush=True)
+                meta["token"] = bcm.get_quay_token(insecure=bool(meta.get("insecure")))
+                raise ConnectionError("token 刷新，本轮重试")
+            if r.status_code == 416:   # Range 越界 = 已全部拿到（防御）
+                r.close()
+                break
             r.raise_for_status()
+            if got and r.status_code == 200:
+                # 服务器不支持 Range（回 200 全量）→ 丢弃残片重收
+                buf = io.BytesIO()
+                got = 0
+                mark = progress_every
             for chunk in r.iter_content(1 << 20):
                 if not chunk:
                     continue
                 buf.write(chunk)
-                got += len(chunk)
+                got = buf.tell()
                 if got >= mark:
                     print(f"[img]     下载 {got / 1e6:.0f}MB / {layer_size / 1e6:.0f}MB", flush=True)
                     mark += progress_every
+            if got < layer_size:
+                # 连接提前断开但 iter_content 正常结束——主动失败触发**续传**重试
+                raise ConnectionError(f"连接提前断开（{got}/{layer_size} 字节）")
             buf.seek(0)
+            actual = "sha256:" + hashlib.sha256(buf.getvalue()).hexdigest()
+            if actual != layer_digest:
+                raise IOError(f"内容校验失败（期望 {layer_digest[:19]}…，实际 {actual[:19]}…）")
             return buf
-        except Exception as e:  # noqa: BLE001  （网络/超时：整层重试）
+        except Exception as e:  # noqa: BLE001  （网络/超时：从已下载字节续传）
             last = e
             print(f"[img]     下载失败（已 {got / 1e6:.0f}MB，第 {attempt + 1}/{retries} 次）："
                   f"{type(e).__name__}: {str(e)[:80]}", flush=True)
