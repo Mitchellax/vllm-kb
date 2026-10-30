@@ -115,6 +115,7 @@ def cmd_run(cfg, bench: Path, scene: str | None, baseline: Path | None) -> dict:
             "confidence": (round(r.confidence, 4) if r.confidence is not None else None),
             "confidence_source": r.confidence_source,
             "anomaly": r.anomaly,
+            "main_text": r.text or "",   # 主引擎全文（--cross 交叉比对 + 人工核对用）
         })
         flag = "PASS" if rows[-1]["pass"] else "FAIL"
         print(f"[bench] {it['image']:24} [{flag}] score={score:.3f} "
@@ -247,6 +248,71 @@ def cmd_pick_from_assets(assets_dir: Path, bench: Path, count: int) -> int:
     return len(items)
 
 
+def cmd_cross(bench: Path, threshold: float) -> int:
+    """双引擎交叉验证：主引擎（API VL，--run 的 report.json）vs 本地 PP-OCRv5。
+
+    **为什么**（2026-10 业务实测教训）：VL 端到端模型对小字会"脑补"、对干扰内容
+    （导航栏/侧栏）选择性输出——本地 PP-OCRv5（det+rec 两段式）是独立第二意见。
+    一致度 = score_pair(pp_text, main_text)；低于 threshold 的样本列出并进人工核对。
+    依赖（可选）：pip install paddleocr paddlepaddle（CPU 可跑，首次自动拉模型权重）。
+    """
+    report_path = bench / "report.json"
+    if not report_path.exists():
+        raise SystemExit(f"[bench] 先 --run 生成主引擎报告：{report_path}")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError as e:
+        raise SystemExit(f"[bench] 交叉验证需要本地 PP-OCRv5：pip install paddleocr "
+                         f"paddlepaddle（{e}）")
+    print("[bench] 初始化 PP-OCRv5（首次运行会自动下载 det/rec 模型权重）…", flush=True)
+    try:  # 3.x 新 API
+        engine = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False,
+                           use_textline_orientation=True, lang="ch")
+    except TypeError:  # 2.x 兼容
+        engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+
+    def pp_text(img: Path) -> str:
+        if hasattr(engine, "predict"):  # 3.x
+            lines = []
+            for res in engine.predict(str(img)):
+                d = res.json.get("res", res.json) if hasattr(res, "json") else {}
+                lines.extend(d.get("rec_texts") or [])
+            return "\n".join(lines)
+        out = engine.ocr(str(img), cls=True)  # 2.x
+        lines = []
+        for page in (out or []):
+            for line in (page or []):
+                if line and len(line) >= 2 and isinstance(line[1], (list, tuple)):
+                    lines.append(str(line[1][0]))
+        return "\n".join(lines)
+
+    rows = report.get("items") or []
+    if not rows:
+        raise SystemExit("[bench] report.json 无 items")
+    n_agree = 0
+    for it in rows:
+        img = bench / "images" / str(it.get("image", ""))
+        if not img.exists():
+            continue
+        txt = pp_text(img)
+        agree = score_pair(str(it.get("main_text", "")), txt)
+        it["cross_ppocr_score"] = round(agree, 4)
+        it["cross_ppocr_text_len"] = len(norm_text(txt))
+        flag = "AGREE" if agree >= threshold else "DIVERGE"
+        n_agree += agree >= threshold
+        print(f"[bench] {it.get('image'):24} [{flag}] 一致度={agree:.3f} "
+              f"ppocr字数={len(norm_text(txt))} 主引擎字数={len(norm_text(str(it.get('main_text', ''))))}")
+        if agree < threshold:
+            print(f"         ppocr头: {norm_text(txt)[:100]}")
+    report["cross_check"] = {"engine": "PP-OCRv5(local)", "threshold": threshold,
+                             "agree_rate": round(n_agree / len(rows), 4) if rows else None}
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[bench] 交叉一致率 {n_agree}/{len(rows)}，已写回 {report_path}——"
+          f"DIVERGE 样本进人工核对（双引擎分歧=VL'脑补'或 PP 漏识的高发信号）")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -256,6 +322,10 @@ def main() -> int:
     g.add_argument("--gen-transforms", action="store_true", help="生成 tilt/persp 变体图")
     g.add_argument("--pick-from-assets", metavar="DIR",
                    help="从资产目录按置信度分桶挑图 + labels 草稿（默认 data/assets/images）")
+    g.add_argument("--cross", action="store_true",
+                   help="PP-OCRv5 本地交叉验证（依赖 paddleocr，先 --run）")
+    ap.add_argument("--threshold", type=float, default=0.85,
+                    help="交叉一致度阈值（低于=DIVERGE 进人工，默认 0.85）")
     ap.add_argument("--bench", default=None, help="基准集目录（默认 <data_root>/ocr_bench）")
     ap.add_argument("--scene", choices=SCENES, help="只评估指定场景")
     ap.add_argument("--baseline", metavar="REPORT", help="对比基线报告（--run 时）")
@@ -273,6 +343,8 @@ def main() -> int:
     if args.gen_transforms:
         cmd_gen_transforms(bench)
         return 0
+    if args.cross:
+        return cmd_cross(bench, args.threshold)
     cmd_run(cfg, bench, args.scene,
             Path(args.baseline) if args.baseline else None)
     return 0

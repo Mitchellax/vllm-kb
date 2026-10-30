@@ -89,7 +89,15 @@ class OcrUnavailable(RuntimeError):
 
 
 class OcrApiError(RuntimeError):
-    """OCR API 调用失败（不可达 / 非 200 / 响应格式错误）。消息带定位上下文。"""
+    """OCR API 调用失败（不可达 / 非 200 / 响应格式错误）。消息带定位上下文。
+
+    status: HTTP 状态码（不可达/非 HTTP 失败为 None）——调用方可据此做参数级
+    降级重试（如服务端不支持 logprobs/top_logprobs 时 400，去掉再试）。
+    """
+
+    def __init__(self, msg: str, status: "int | None" = None):
+        super().__init__(msg)
+        self.status = status
 
 
 @dataclass
@@ -476,7 +484,8 @@ def _post_json(url: str, payload: dict, api_key: str, timeout: int = 0) -> dict:
             pass
         raise OcrApiError(
             f"OCR API 返回 HTTP {e.code}（{url}，耗时 {time.time() - t0:.1f}s）："
-            f"{snippet or e.reason}"
+            f"{snippet or e.reason}",
+            status=e.code,
         ) from e
     except (URLError, OSError) as e:
         raise OcrApiError(
@@ -511,6 +520,11 @@ def _ocr_via_custom(src: "str | Path | bytes", api_base: str, api_key: str,
                      raw_confidence=str(data.get("confidence", "")),
                      provider="api", mode="custom", model=model,
                      elapsed_s=time.time() - t0)
+
+
+# 已确认不支持 logprobs/top_logprobs 的 api_base（HTTP 400 降级后记忆，进程内）——
+# 避免"每张图先发一次注定 400 的请求再重试"的双倍耗时（服务端处理完才拒）。
+_NO_LOGPROBS_APIS: set = set()
 
 
 def _logprobs_confidence(choice) -> tuple[Optional[float], int]:
@@ -565,8 +579,6 @@ def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
         "model": model,
         "max_tokens": int(max_tokens) if max_tokens else 4096,
         "temperature": float(temperature if temperature is not None and temperature >= 0 else 0.0),
-        "logprobs": True,                 # 模型侧置信度唯一来源（paddleocr-vl 不自报）
-        "top_logprobs": 5,
         "messages": [{
             "role": "user",
             "content": [
@@ -575,8 +587,38 @@ def _ocr_via_openai(src: "str | Path | bytes", api_base: str, api_key: str,
             ],
         }],
     }
-    data = _post_json(api_base.rstrip("/") + "/chat/completions", payload, api_key,
-                      timeout=timeout)
+    # 部分服务端不支持 logprobs/top_logprobs（siliconflow paddleocr-vl 2026-10 实测
+    # HTTP 400，且**处理完整请求后**才拒——双倍耗时）。400 后记住该 api_base，
+    # 同进程后续请求直接不带（业务环境自部署 vLLM 完整支持，不受影响）。
+    if api_base not in _NO_LOGPROBS_APIS:
+        payload["logprobs"] = True                 # 模型侧置信度唯一来源（模型不自报时）
+        payload["top_logprobs"] = 5
+    data = None
+    retried_5xx = False
+    for attempt in ("full", "no-logprobs"):
+        try:
+            data = _post_json(api_base.rstrip("/") + "/chat/completions", payload, api_key,
+                              timeout=timeout)
+            break
+        except OcrApiError as e:
+            # 参数级降级：部分 OpenAI 兼容云（如 siliconflow paddleocr-vl，2026-10 实测）
+            # 不支持 top_logprobs → HTTP 400。去掉 logprobs/top_logprobs 重试一次
+            # （置信度回退自报/no_confidence 链路）；自部署 vLLM 完整支持，不走此分支。
+            if attempt == "full" and e.status == 400 and payload.pop("logprobs", None):
+                payload.pop("top_logprobs", None)
+                _NO_LOGPROBS_APIS.add(api_base)
+                print(f"[ocr] 服务端不支持 logprobs/top_logprobs（HTTP 400），本次与后续"
+                      f"请求不再携带（置信度回退自报行或 no_confidence）", flush=True)
+                continue
+            # 服务端瞬时错误（5xx，免费通道抖动常见）：等 3s 重试一次再放弃
+            if e.status is not None and e.status >= 500 and not retried_5xx:
+                retried_5xx = True
+                print(f"[ocr] OCR 服务端 HTTP {e.status}（瞬时错误），3s 后重试一次", flush=True)
+                time.sleep(3)
+                data = _post_json(api_base.rstrip("/") + "/chat/completions", payload,
+                                  api_key, timeout=timeout)
+                break
+            raise
     choices = data.get("choices") or []
     if not choices or not isinstance(choices[0], dict) or "message" not in choices[0]:
         raise OcrApiError(f"OpenAI 兼容 OCR 响应格式异常: choices 缺 message"

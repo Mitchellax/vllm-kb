@@ -399,6 +399,13 @@ class TestOcrOpenAiMode(unittest.TestCase):
                           model="m", mode="openai")
 
 
+def ocr_mod_clear() -> None:
+    """清 _NO_LOGPROBS_APIS 降级记忆（模块级全局，测试间隔离）。"""
+    import vllm_kb.ocr as _o
+
+    _o._NO_LOGPROBS_APIS.clear()
+
+
 class TestSelfConfidenceParsing(unittest.TestCase):
     """OpenAI 兼容模式：模型自报置信度的解析与异常判定（单一来源，无启发式评分）。"""
 
@@ -693,6 +700,128 @@ class TestSelfConfidenceParsing(unittest.TestCase):
         self.assertAlmostEqual(res.confidence, 0.91)
         self.assertEqual(res.confidence_source, "model")   # 自报回退（非 logprobs）
         self.assertEqual(res.anomaly, "")
+
+    def test_openai_400_downgrades_logprobs(self):
+        """HTTP 400（服务端不支持 top_logprobs，如 siliconflow）→ 去掉 logprobs 重试一次。
+
+        业务渠道（自部署 vLLM）支持 logprobs 不受影响；云渠道置信度回退自报/no_confidence。
+        400 后进程内记忆该 api_base，后续请求直接不带（无双倍耗时）。
+        """
+        import io
+        import urllib.error
+
+        from vllm_kb.ocr import ocr_image_detail
+
+        ocr_mod_clear()   # 清模块级降级记忆（测试间隔离）
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+        payloads: list[dict] = []
+
+        def fake(req, timeout=60):
+            payloads.append(json.loads(req.data.decode()))
+            if len(payloads) == 1:
+                raise urllib.error.HTTPError(
+                    "http://ocr:8000/chat/completions", 400, "Bad Request", {},
+                    io.BytesIO(b'{"code":20015,"message":"The parameter is invalid."}'))
+
+            class R:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return json.dumps({"choices": [{
+                        "message": {"content": "识别文本"}, "finish_reason": "stop"}]}).encode()
+
+            return R()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                   model="m", mode="openai")
+        self.assertEqual(len(payloads), 2, "400 后应降级重试一次")
+        self.assertTrue(payloads[0].get("logprobs"))
+        self.assertNotIn("logprobs", payloads[1], "重试 payload 应去掉 logprobs")
+        self.assertNotIn("top_logprobs", payloads[1])
+        self.assertEqual(res.text, "识别文本")
+        self.assertEqual(res.anomaly, "no_confidence")   # 无 logprobs 且无自报行
+        # 记忆生效：同 api_base 的后续请求**一次**发出即不带 logprobs（无双倍耗时）
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            res2 = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                    model="m", mode="openai")
+        self.assertEqual(len(payloads), 3, "记忆后不再发注定 400 的请求")
+        self.assertNotIn("logprobs", payloads[2])
+        self.assertEqual(res2.text, "识别文本")
+
+    def test_openai_5xx_retries_once(self):
+        """服务端瞬时 5xx → 3s 后重试一次（幂等请求；免费通道抖动常见）。"""
+        import io
+        import urllib.error
+
+        from vllm_kb.ocr import ocr_image_detail
+
+        ocr_mod_clear()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+        calls = {"n": 0}
+
+        class R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{
+                    "message": {"content": "ok 文本"}, "finish_reason": "stop"}]}).encode()
+
+        def fake(req, timeout=60):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.HTTPError("http://ocr:8000/chat/completions", 500,
+                                             "Internal Server Error", {},
+                                             io.BytesIO(b'{"code":50507}'))
+            return R()
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake), \
+                mock.patch("vllm_kb.ocr.time.sleep") as ms:
+            res = ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                   model="m", mode="openai")
+        self.assertEqual(calls["n"], 2)
+        ms.assert_called_once_with(3)
+        self.assertEqual(res.text, "ok 文本")
+
+    def test_openai_400_without_logprobs_raises(self):
+        """非 logprobs 引起的 400（重试后仍 400）→ 照常抛 OcrApiError（不掩盖真错误）。"""
+        import io
+        import urllib.error
+
+        from vllm_kb.ocr import OcrApiError, ocr_image_detail
+
+        ocr_mod_clear()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        png = Path(tmp.name) / "img.png"
+        make_png(png)
+        calls = {"n": 0}
+
+        def fake(req, timeout=60):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                "http://ocr:8000/chat/completions", 400, "Bad Request", {},
+                io.BytesIO(b'{"message":"image too large"}'))
+
+        with mock.patch("vllm_kb.ocr.urllib_request.urlopen", fake):
+            with self.assertRaises(OcrApiError):
+                ocr_image_detail(png, "api", api_base="http://ocr:8000",
+                                 model="m", mode="openai")
+        self.assertEqual(calls["n"], 2, "降级重试一次后仍 400 应抛出")
 
     def test_temperature_prompt_config_wiring(self):
         """image 源 ocr_temperature / ocr_api_prompt → OcrConfig（非法/缺失回 0/"OCR"）。"""

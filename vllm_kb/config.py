@@ -283,7 +283,8 @@ class AppConfig(BaseModel):
             raise FileNotFoundError(
                 f"未找到配置文件: {p}\n请复制 config.example.json 为 config.json 并填写参数。"
             )
-        data = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig：容忍 Windows 记事本/PowerShell 生成的 BOM（用户手改 config 的常见坑）
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
         cfg = cls.model_validate(data)
         # 先注入本地 secrets（data/secrets.local.json）到环境变量，再校验——
         # 否则写入路径（require_keys=True）校验时看不到工作台配置的 key
