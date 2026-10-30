@@ -99,11 +99,69 @@ def _is_decorative_image(data: bytes) -> bool:
 
 
 def _sha256(p: Path) -> str:
+    """文件 sha256——带 **size+mtime_ns 快速通道缓存**（判重提速）。
+
+    判重链路每次构建每篇都要全文件哈希：pdf/word/html 的 extract 缓存键（asset_id=
+    sha 前缀）必须先算 sha 才能查缓存；md 资产化落盘校验、image 源逐图判重同理——
+    大 pdf 场景（几十 MB × 几千篇）是构建主瓶颈。size+mtime_ns 未变 → 直接复用
+    上次哈希（git racily-clean 同款思路；"同秒修改同大小"的理论窗口在导入即冻结的
+    业务文档场景可忽略）。缓存持久化 data/parsed/.file_sha.json（跨构建复用；
+    损坏忽略重建；上限 5 万条，超出裁掉最早写入的 10%）。构建结束 save_sha_cache()。
+    """
+    global _SHA_CACHE, _SHA_CACHE_LOADED
+    try:
+        st = p.stat()
+    except OSError:
+        pass  # 文件不存在等 → 让下面 open 抛自然异常
+    else:
+        if not _SHA_CACHE_LOADED:
+            _SHA_CACHE_LOADED = True
+            _SHA_CACHE = _load_sha_cache()
+        hit = _SHA_CACHE.get(f"{p}|{st.st_size}|{st.st_mtime_ns}")
+        if hit is not None:
+            return hit
     h = hashlib.sha256()
     with p.open("rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()
+    sha = h.hexdigest()
+    if _SHA_CACHE_LOADED:
+        if len(_SHA_CACHE) >= _SHA_CACHE_MAX:
+            for k in list(_SHA_CACHE)[: _SHA_CACHE_MAX // 10]:
+                _SHA_CACHE.pop(k, None)     # dict 保序 = 最早写入先裁
+        _SHA_CACHE[f"{p}|{st.st_size}|{st.st_mtime_ns}"] = sha
+    return sha
+
+
+_SHA_CACHE: dict[str, str] = {}
+_SHA_CACHE_LOADED = False
+_SHA_CACHE_MAX = 50_000
+
+
+def _sha_cache_file() -> Path:
+    from .config import PROJECT_ROOT
+
+    return PROJECT_ROOT / "data" / "parsed" / ".file_sha.json"
+
+
+def _load_sha_cache() -> dict[str, str]:
+    try:
+        data = json.loads(_sha_cache_file().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sha_cache() -> None:
+    """构建结束统一回写文件哈希缓存（幂等；写盘失败只告警不影响构建产物）。"""
+    if not _SHA_CACHE:
+        return
+    try:
+        fp = _sha_cache_file()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(json.dumps(_SHA_CACHE, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        print(f"[sources] 文件哈希缓存写盘失败（不影响构建）：{e}")
 
 
 def _asset_entry(rel: str, sha: str, stype: str, path: Path) -> tuple:

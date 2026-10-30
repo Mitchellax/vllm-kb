@@ -275,6 +275,10 @@ def run_build(cfg: AppConfig, pull: bool = True, limit: int | None = None,
             grand["failed"].append({"id": src.id, "type": src.type,
                                     "error": f"{type(e).__name__}: {e}"})
     grand["vector_backends"] = sorted(grand["vector_backends"])
+    # 判重提速：把本次构建积累的 size+mtime→sha 缓存落盘（下次构建免重哈希未变文件）
+    from .sources import save_sha_cache
+
+    save_sha_cache()
     return grand
 
 
