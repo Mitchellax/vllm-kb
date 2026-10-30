@@ -1318,6 +1318,9 @@ class ImageSource(BaseSource):
 
         processed, skipped, failed, review = 0, 0, 0, 0
         asked = False  # API 失败后的本地询问只问一次
+        from collections import Counter
+
+        conf_sources: Counter = Counter()   # 置信度来源分布（部署版本判据：p3 产物=logprobs）
         for img in all_imgs:
             if provider == "none":
                 break
@@ -1327,6 +1330,7 @@ class ImageSource(BaseSource):
             cached = load_ocr_artifact(ocr_path, sha, fp)
             if cached is not None:
                 skipped += 1
+                conf_sources[cached.confidence_source or "?"] += 1
                 # 阈值改了但图片/引擎未变：不重跑 OCR，只按新阈值刷新判定字段
                 if cached.min_confidence != min_conf:
                     cached.min_confidence = min_conf
@@ -1363,15 +1367,19 @@ class ImageSource(BaseSource):
                 continue
             art = build_ocr_artifact(img, sha, result, provider, api_mode, api_model, min_conf)
             save_ocr_artifact(ocr_path, art, image_ref=f"assets/images/{img.name}")
+            conf_sources[art.confidence_source or "?"] += 1
             if art.review_reason:
                 review += 1
                 print(f"[sources:{self.id}] 图片 {img.name} OCR 需人工复核"
                       f"（reason={art.review_reason} conf={art.confidence}）——不进正文", flush=True)
             processed += 1
         total = len(list(images.iterdir()))
+        dist = " ".join(f"{k}={v}" for k, v in sorted(conf_sources.items())) or "无"
         print(f"[sources:{self.id}] OCR 完成：新增 {processed}，跳过（幂等）{skipped}，"
-              f"失败 {failed}，待人工复核 {review}（图片 {total} 张；"
-              f"高置信文本已随所属文档正文入库）")
+              f"失败 {failed}，待人工复核 {review}（图片 {total} 张；指纹 fp={fp}；"
+              f"置信度来源分布 {dist}）——旧产物 model=自报/p2 前实现，logprobs=p3 起的"
+              f"新实现；全部是 model/无 logprobs 却应重算时，先确认部署代码含"
+              f" _OCR_PROMPT_VERSION=3")
         return []
 
 
