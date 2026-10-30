@@ -657,7 +657,10 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   第二意见）；一致度 <0.85 的样本列 DIVERGE 进人工核对，结果写回 report.json 的
   cross_check。依赖 `pip install paddleocr paddlepaddle`（**可选**；Windows 缺 VC++
   运行库时报 DLL load failed → 装 Microsoft Visual C++ Redistributable 2015-2022 x64；
-  主目录不可写时用 `PADDLE_PDX_CACHE_HOME` 重定向模型缓存目录）。
+  paddle 3.3.1 CPU 的 oneDNN+PIR 兼容 bug 已在工具内禁 mkldnn 规避；主目录不可写时用
+  `PADDLE_PDX_CACHE_HOME` + `USERPROFILE` 重定向模型缓存目录）。
+  **DIVERGE ≠ 识别错误**：版面覆盖差异（PP 全量读含侧栏/目录，VL 极简提示词做取舍）
+  也会触发——分歧样本需人工比对确认（工具目的就是把分歧挑出来给人）。
   场景配比建议 30 张：normal ×8 / blurry ×8 / tilt ×7 / persp ×7（tilt/persp 由清晰图程序变换生成）。
   难场景优化路径（按性价比）：①采集规范（文字像素高 ≥16px、PNG 免 JPEG 伪影）；
   ②几何矫正前置（方向分类 → det 框估角旋转 → 四点透视变换）；③双引擎交叉

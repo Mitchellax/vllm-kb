@@ -271,9 +271,11 @@ def cmd_cross(bench: Path, threshold: float) -> int:
         raise SystemExit(f"[bench] 交叉验证需要本地 PP-OCRv5：pip install paddleocr "
                          f"paddlepaddle{extra}（{e}）")
     print("[bench] 初始化 PP-OCRv5（首次运行会自动下载 det/rec 模型权重）…", flush=True)
+    # enable_mkldnn=False：paddle 3.3.1 CPU 的 oneDNN+PIR 对 PP-OCR 模型有
+    # ConvertPirAttribute2RuntimeAttribute 兼容 bug（NotImplementedError），纯 CPU 后端可跑
     try:  # 3.x 新 API
         engine = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False,
-                           use_textline_orientation=True, lang="ch")
+                           use_textline_orientation=True, lang="ch", enable_mkldnn=False)
     except TypeError:  # 2.x 兼容
         engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
 
