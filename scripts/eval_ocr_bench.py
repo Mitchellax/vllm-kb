@@ -263,8 +263,13 @@ def cmd_cross(bench: Path, threshold: float) -> int:
     try:
         from paddleocr import PaddleOCR
     except ImportError as e:
+        hint = str(e)
+        extra = ""
+        if "DLL load failed" in hint:
+            extra = ("（Windows：缺 VC++ 运行库——装 Microsoft Visual C++ Redistributable "
+                     "2015-2022 x64 后重试；业务环境/服务器一般已装）")
         raise SystemExit(f"[bench] 交叉验证需要本地 PP-OCRv5：pip install paddleocr "
-                         f"paddlepaddle（{e}）")
+                         f"paddlepaddle{extra}（{e}）")
     print("[bench] 初始化 PP-OCRv5（首次运行会自动下载 det/rec 模型权重）…", flush=True)
     try:  # 3.x 新 API
         engine = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False,
@@ -334,6 +339,9 @@ def main() -> int:
 
     from vllm_kb.config import AppConfig
 
+    if args.cross:      # 交叉验证只用 report.json + 本地 PP-OCRv5，不需要业务 config
+        return cmd_cross(Path(args.bench) if args.bench else Path("data/ocr_bench"),
+                         args.threshold)
     cfg = AppConfig.load(args.config, require_keys=False)
     bench = Path(args.bench) if args.bench else cfg.resolve("data/ocr_bench")
     if args.pick_from_assets:
@@ -343,8 +351,6 @@ def main() -> int:
     if args.gen_transforms:
         cmd_gen_transforms(bench)
         return 0
-    if args.cross:
-        return cmd_cross(bench, args.threshold)
     cmd_run(cfg, bench, args.scene,
             Path(args.baseline) if args.baseline else None)
     return 0

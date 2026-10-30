@@ -651,7 +651,13 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   # ③ 人工校对 <data_root>/ocr_bench/labels.json 的 expect（重点 blurry 桶）
   python scripts/eval_ocr_bench.py --run                # ④ 跑评估 → report.json（分场景 avg_score/pass_rate/avg_confidence）
   python scripts/eval_ocr_bench.py --run --baseline <旧 report.json>   # ⑤ 改参后对比（avg_score delta）
+  python scripts/eval_ocr_bench.py --cross              # ⑥ PP-OCRv5 本地交叉验证（可选，先 ④）
   ```
+  ⑥ 双引擎交叉：主引擎（API VL）vs 本地 PP-OCRv5（det+rec 两段式，VL 对小字"脑补"的
+  第二意见）；一致度 <0.85 的样本列 DIVERGE 进人工核对，结果写回 report.json 的
+  cross_check。依赖 `pip install paddleocr paddlepaddle`（**可选**；Windows 缺 VC++
+  运行库时报 DLL load failed → 装 Microsoft Visual C++ Redistributable 2015-2022 x64；
+  主目录不可写时用 `PADDLE_PDX_CACHE_HOME` 重定向模型缓存目录）。
   场景配比建议 30 张：normal ×8 / blurry ×8 / tilt ×7 / persp ×7（tilt/persp 由清晰图程序变换生成）。
   难场景优化路径（按性价比）：①采集规范（文字像素高 ≥16px、PNG 免 JPEG 伪影）；
   ②几何矫正前置（方向分类 → det 框估角旋转 → 四点透视变换）；③双引擎交叉
