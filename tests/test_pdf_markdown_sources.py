@@ -1,6 +1,7 @@
 """PDF / Markdown 来源导入测试：pull 幂等、canonicalize 解析、验证状态默认规则、表格结构化、
 文档级标签提取（两级分类）、资产路径脱敏（asset_id + 正文图片占位）。"""
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -326,6 +327,53 @@ class TestPdfSource(unittest.TestCase):
         self.assertEqual(len(docs), 1)
         # 缓存已重建为合法 JSON
         self.assertIn("body", json.loads(cache.read_text(encoding="utf-8")))
+
+    def test_parse_cache_stale_ocr_fp_reparses(self):
+        """OCR 引擎指纹变化 → 重新解析（2026-10 缺口：提示词版本升级后 pdf 内嵌图
+        永不重跑）。
+
+        `_OCR_PROMPT_VERSION` 升级只让 ImageSource / md 图重算——pdf 的 extract.json
+        缓存（sha256+schema 幂等）把旧 evidence 原样复用，`_ocr_artifact_for` 不被
+        调用。修：ocr_fp 进缓存键。测试：app_cfg 带 api 模式 image 源 → 首次解析写
+        ocr_fp；monkeypatch 提示词版本后指纹变化 → pymupdf.open 重调 + 新缓存写新指纹。
+        """
+        import unittest.mock as mock
+
+        import pymupdf
+        import vllm_kb.ocr as ocr_mod
+
+        from vllm_kb.config import AppConfig
+
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.root / "data")   # env= data/ 目录本身（resolve 剥 data 前缀）
+        self.addCleanup(os.environ.pop, "VLLM_KB_DATA_ROOT", None)
+        app_cfg = AppConfig.model_validate({
+            "project": {"name": "x", "data_root": str(self.root)},
+            "embedding": {"provider": "echo", "dimensions": 8},
+            "sources": [{"id": "img", "type": "image", "path": "x", "enabled": True,
+                         "ocr_provider": "api", "ocr_api_base": "http://ocr:8000",
+                         "ocr_api_mode": "openai", "ocr_api_model": "paddleocr-vl"}],
+        })
+        src = PdfSource(self.cfg, project_root=self.root, app_cfg=app_cfg)
+        src.pull()
+        docs1 = src.canonicalize()
+        self.assertEqual(len(docs1), 1)
+        cache = list((self.root / "data" / "parsed" / "pdf").glob("*.extract.json"))[0]
+        stale = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertIn("ocr_fp", stale, "缓存未写 ocr_fp")
+        old_fp = stale["ocr_fp"]
+        with mock.patch.object(ocr_mod, "_OCR_PROMPT_VERSION", 99):
+            new_fp = src._ocr_fingerprint()
+            self.assertNotEqual(new_fp, old_fp, "提示词版本升级应改变指纹")
+            with mock.patch("pymupdf.open", wraps=pymupdf.open) as m:
+                docs2 = src.canonicalize()
+        self.assertEqual(m.call_count, 1, "ocr_fp 变化应重新解析（内嵌图重跑 OCR）")
+        self.assertEqual(len(docs2), 1)
+        fresh = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual(fresh["ocr_fp"], new_fp, "重解析后缓存写新指纹")
+
+    def test_ocr_fingerprint_none_without_image_source(self):
+        """无 image 源 / provider=none → 指纹恒 none（无 OCR 场景缓存键无区分度）。"""
+        self.assertEqual(self.src._ocr_fingerprint(), "none")
 
     def test_parse_cache_stale_schema_reparses(self):
         """缓存 schema 位不符 → 重新解析。

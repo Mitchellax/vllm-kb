@@ -226,6 +226,25 @@ class BaseSource(ABC):
 
         return ocr_config_from_cfg(self.app_cfg)
 
+    def _ocr_fingerprint(self) -> str:
+        """当前 OCR 引擎指纹（无 OCR 配置 → "none"）——**纳入含图文档的解析缓存幂等键**。
+
+        2026-10 缺口：`_OCR_PROMPT_VERSION` 升级只让 ImageSource / md 图片重算——
+        **pdf/word/html 的 extract.json 缓存**（sha256+schema 幂等）命中时直接复用旧
+        evidence，`_ocr_artifact_for` 不被调用，内嵌图 OCR 永不重跑。把指纹写进缓存
+        键后：提示词/模型/模式升级 → 缓存 miss → 重解析并重跑 OCR（canonical 更新 →
+        ingest 增量生效）。**升级后首次构建全量重解析一次**（含无图文档，一次性成本）。
+        """
+        try:
+            oc = self._ocr_settings()
+        except Exception:
+            oc = None
+        if oc is None or oc.provider in ("none", ""):
+            return "none"
+        from .ocr import engine_fingerprint
+
+        return engine_fingerprint(oc.provider, oc.mode, oc.model)
+
     def _ocr_artifact_for(self, asset_path: Path, sha: str,
                           image_ref: str) -> tuple[Optional[dict], str]:
         """对已资产化的图片做 OCR（ocr.json 为幂等缓存），返回 (evidence.ocr 摘要, 正文注入后缀)。
@@ -751,14 +770,17 @@ class PdfSource(BaseSource):
         sha = _sha256(p)
         asset_id = sha[:16]
         registry = TagRegistry.load(self.app_cfg) if self.app_cfg else TagRegistry()
+        ocr_fp = self._ocr_fingerprint()
         cache = parsed_dir / f"{asset_id}.extract.json"
         if cache.exists():
             try:
                 data = json.loads(cache.read_text(encoding="utf-8"))
                 # schema 位必须校验：`_extract_pdf` 升级后旧缓存的 sha256 仍然匹配，
                 # 不校验就会**静默沿用旧解析结果**（例如新增的表格提取永远不生效）
+                # ocr_fp 同理（2026-10）：OCR 引擎/提示词升级后内嵌图必须重跑
                 if (data.get("sha256") == sha
-                        and data.get("schema") == _PDF_EXTRACT_SCHEMA):
+                        and data.get("schema") == _PDF_EXTRACT_SCHEMA
+                        and data.get("ocr_fp") == ocr_fp):
                     return self._doc_from_extract(p, sha, asset_id, data, registry,
                                                   sid=sid, stem=stem,
                                                   from_imports=from_imports), True
@@ -767,6 +789,7 @@ class PdfSource(BaseSource):
         parsed = self._extract_pdf(p)
         if parsed is None:
             return None, False
+        parsed["ocr_fp"] = ocr_fp
         cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
         self._write_tables(parsed_dir, asset_id, parsed.get("tables") or [])
         return self._doc_from_extract(p, sha, asset_id, parsed, registry,
@@ -1695,20 +1718,24 @@ class WordSource(BaseSource):
         """
         sha = _sha256(p)
         asset_id = sha[:16]
+        ocr_fp = self._ocr_fingerprint()
         cache = parsed_dir / f"{asset_id}.extract.json"
         if cache.exists():
             try:
                 data = json.loads(cache.read_text(encoding="utf-8"))
                 # schema 位必须校验：`_extract_docx` 升级后旧缓存的 sha256 仍然匹配，
                 # 不校验就会**静默无图**（比报错难查得多）
+                # ocr_fp 同理（2026-10）：OCR 引擎/提示词升级后内嵌图必须重跑
                 if (data.get("sha256") == sha
-                        and data.get("schema") == _WORD_EXTRACT_SCHEMA):
+                        and data.get("schema") == _WORD_EXTRACT_SCHEMA
+                        and data.get("ocr_fp") == ocr_fp):
                     return data, True
             except (OSError, ValueError):
                 pass  # 缓存损坏 → 重新解析
         parsed = self._extract_docx(p)
         if parsed is None:
             return None, False
+        parsed["ocr_fp"] = ocr_fp
         cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
         self._write_tables(parsed_dir, asset_id, parsed.get("tables_data") or [])
         return parsed, False
@@ -2215,12 +2242,14 @@ class HtmlSource(BaseSource):
         """
         sha = _sha256(p)
         asset_id = sha[:16]
+        ocr_fp = self._ocr_fingerprint()
         cache = self._parsed_dir() / f"{asset_id}.extract.json"
         if cache.is_file():
             try:
                 data = json.loads(cache.read_text(encoding="utf-8"))
                 if (data.get("sha256") == sha
-                        and data.get("schema") == self._EXTRACT_SCHEMA):
+                        and data.get("schema") == self._EXTRACT_SCHEMA
+                        and data.get("ocr_fp") == ocr_fp):
                     data["tables_rel"] = ([f"parsed/html/{asset_id}.tables.json"]
                                           if data.get("tables") else [])
                     return data, True
@@ -2234,6 +2263,7 @@ class HtmlSource(BaseSource):
             "schema": self._EXTRACT_SCHEMA,
             "sha256": sha,
             "asset_id": asset_id,
+            "ocr_fp": ocr_fp,          # OCR 引擎指纹进缓存键（升级后内嵌图重跑）
             "body": res.body,
             "title": res.title,
             "tables": res.tables,
