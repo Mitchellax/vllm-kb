@@ -400,10 +400,21 @@ class TestOcrOpenAiMode(unittest.TestCase):
 
 
 def ocr_mod_clear() -> None:
-    """清 _NO_LOGPROBS_APIS 降级记忆（模块级全局，测试间隔离）。"""
+    """清模块级全局（测试间隔离）：_NO_LOGPROBS_APIS 降级记忆 + PP 第二意见引擎缓存。
+
+    PP 引擎在单测沙箱不可用（无 PADDLE_PDX_CACHE_HOME / 用户目录写禁止），且 paddlex
+    初始化会做模型源联网检查——直接标记失败跳过，保证测试只走主引擎路径。
+    """
     import vllm_kb.ocr as _o
 
     _o._NO_LOGPROBS_APIS.clear()
+    _o._PPOCR_FAILED = True
+    _o._PPOCR_ENGINE = None
+
+
+def setUpModule():
+    """整个模块只跑一次：关闭 PP 第二意见真实初始化（沙箱不可用且避免联网检查）。"""
+    ocr_mod_clear()
 
 
 class TestSelfConfidenceParsing(unittest.TestCase):

@@ -1993,10 +1993,22 @@ def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
     no_confidence（无置信度）。
 
     已认证/存疑/删除过的项因 item_ref 已存在（任意状态）不再重复打扰。
+
+    **三档分流**（2026-10 双模型审评）：已人工锁定（evidence.review）不进队列；
+    结构类 anomaly（truncated/contradictory/misplaced/missing）不参与翻案照旧入队；
+    低置信/no_confidence 且 PP 复核一致（agree≥cross_threshold）→ **复核一致**自动采纳
+    不入队（审核台「复核一致」档另列）；PP 复核分歧 → reason="diverged" 入队
+    （payload 带 vl_text/pp_text 供 diff UI）；PP 未复核 → 现状 reason。
     """
     kb = cfg.resolve(cfg.storage.sqlite_path)
     if not kb.exists():
         return 0
+    from .ocr import ocr_config_from_cfg
+
+    try:
+        cross_threshold = ocr_config_from_cfg(cfg).cross_threshold
+    except Exception:
+        cross_threshold = 0.85
     # 图片资产反查（asset_id → rel_path，管理员侧）：让审核台能直接预览原图
     assets = list_assets(cfg.resolve(cfg.storage.review_path))
     conn = sqlite3.connect(f"file:{kb.as_posix()}?mode=ro", uri=True)
@@ -2014,18 +2026,31 @@ def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
                 ocr = ev.get("ocr")
                 if not isinstance(ocr, dict) or ocr.get("text_included"):
                     continue
+                if ocr.get("review"):
+                    continue  # 已人工锁定：审评后不再打扰（删除审评项才恢复）
                 sha = str(ev.get("sha256", "") or "")
                 ref = f"ocr:{sha[:16]}" if sha else f"ocr:{source_id}"
                 conf = ocr.get("confidence")
                 anomaly = str(ocr.get("anomaly", "") or "")
-                if anomaly:
-                    reason = "anomaly"
+                so = ocr.get("second_opinion") or {}
+                agree = so.get("agree")
+                reason = ""
+                if anomaly and anomaly not in ("no_confidence",):
+                    reason = "anomaly"      # 结构异常：不参与翻案
+                elif (agree is not None and isinstance(agree, (int, float))
+                      and agree >= cross_threshold):
+                    continue                # 复核一致：低置信翻案自动采纳（「复核一致」档另列）
+                elif (agree is not None and isinstance(agree, (int, float))
+                      and agree < cross_threshold):
+                    reason = "diverged"     # 有分歧：diff 待办
+                elif anomaly:
+                    reason = "anomaly"      # no_confidence 且未复核
                 elif conf is None:
                     reason = "no_confidence"
                 else:
                     reason = "low"
                 aid = str(ev.get("asset_id", "") or "")
-                if store.add_item("low_confidence_ocr", ref, {
+                payload = {
                     "source_id": source_id, "title": title, "url": url,
                     "asset_id": aid, "sha256": sha,
                     "kind": ev.get("kind", ""), "reason": reason,
@@ -2035,11 +2060,212 @@ def seed_low_confidence_ocr(cfg: "AppConfig", store: ReviewStore) -> int:
                     "signatures": ocr.get("signatures") or [],
                     # 审核侧路径（管理员可见）：assets 静态挂载在审核端口，可直接预览
                     "asset_path": (assets.get(aid) or {}).get("rel_path", ""),
-                }):
+                }
+                if reason == "diverged" and sha:
+                    # diff 两侧全文从 ocr.json 直读（evidence 摘要不带 pp_text）
+                    oj = ocr_json_path_for_sha(cfg, sha)
+                    try:
+                        full = json.loads(oj.read_text(encoding="utf-8")) if oj else {}
+                    except (OSError, ValueError):
+                        full = {}
+                    payload.update({
+                        "vl_text": str(full.get("text", "") or ""),
+                        "pp_text": str((full.get("second_opinion") or {}).get("text", "") or ""),
+                        "agree": agree,
+                        "second_engine": str(so.get("engine", "") or ""),
+                    })
+                if store.add_item("low_confidence_ocr", ref, payload):
                     added += 1
     finally:
         conn.close()
     return added
+
+
+# ---------------- OCR 双模型审评（ocr_reviews，review.db；sha256 锁定锚） ----------------
+
+# 三档状态：diverged（低置信+PP分歧，diff 待办）/ manual（人工审核，PP 未复核或结构异常）
+# / approved（审评保存后的锁定终态）。复核一致（auto_consistent）是**队列外的自动翻案**
+# 档，不落数据库（无人工动作），只在 ocr.json 的 second_opinion 里可见。
+_OCR_REVIEWS_DDL = """
+CREATE TABLE IF NOT EXISTS ocr_reviews (
+  sha256      TEXT PRIMARY KEY,
+  status      TEXT NOT NULL,
+  final_text  TEXT NOT NULL,
+  decision    TEXT NOT NULL,
+  vl_text     TEXT,
+  pp_text     TEXT,
+  agree       REAL,
+  reviewer    TEXT NOT NULL,
+  reviewed_at TEXT NOT NULL
+);
+"""
+
+
+def _ocr_reviews_conn(cfg: "AppConfig") -> sqlite3.Connection:
+    p = Path(default_review_path(cfg))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(p))
+    conn.executescript(_OCR_REVIEWS_DDL)
+    return conn
+
+
+def upsert_ocr_review(cfg: "AppConfig", sha256: str, final_text: str, decision: str,
+                      vl_text: str = "", pp_text: str = "", agree: "float | None" = None,
+                      reviewer: str = "admin") -> None:
+    """保存 OCR 审评并**锁定**（sha256 主键）：图片内容不变则始终优先采用 final_text。
+
+    decision: vl | pp | edited。锁定优先于引擎指纹——换提示词/模型后该图不重跑，
+    删除本记录（delete_ocr_review）才恢复重审。
+    """
+    if decision not in ("vl", "pp", "edited"):
+        raise ValueError(f"未知审评决策: {decision}（支持 vl | pp | edited）")
+    conn = _ocr_reviews_conn(cfg)
+    try:
+        conn.execute(
+            "INSERT INTO ocr_reviews(sha256,status,final_text,decision,vl_text,pp_text,"
+            "agree,reviewer,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(sha256) DO UPDATE SET status='approved', final_text=?, decision=?, "
+            "vl_text=?, pp_text=?, agree=?, reviewer=?, reviewed_at=?",
+            (sha256, "approved", final_text, decision, vl_text, pp_text, agree,
+             reviewer, _now(),
+             final_text, decision, vl_text, pp_text, agree, reviewer, _now()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_ocr_review(cfg: "AppConfig", sha256: str) -> Optional[dict]:
+    conn = _ocr_reviews_conn(cfg)
+    try:
+        row = conn.execute(
+            "SELECT sha256,status,final_text,decision,vl_text,pp_text,agree,reviewer,"
+            "reviewed_at FROM ocr_reviews WHERE sha256=?", (sha256,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    keys = ("sha256", "status", "final_text", "decision", "vl_text", "pp_text",
+            "agree", "reviewer", "reviewed_at")
+    return dict(zip(keys, row))
+
+
+def delete_ocr_review(cfg: "AppConfig", sha256: str) -> bool:
+    """删除审评记录（**只删数据，不动图片/ocr.json 文件**）——该图恢复引擎重跑与归档。"""
+    conn = _ocr_reviews_conn(cfg)
+    try:
+        cur = conn.execute("DELETE FROM ocr_reviews WHERE sha256=?", (sha256,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_ocr_reviews(cfg: "AppConfig") -> list[dict]:
+    conn = _ocr_reviews_conn(cfg)
+    try:
+        rows = conn.execute(
+            "SELECT sha256,status,final_text,decision,vl_text,pp_text,agree,reviewer,"
+            "reviewed_at FROM ocr_reviews ORDER BY reviewed_at DESC").fetchall()
+    finally:
+        conn.close()
+    keys = ("sha256", "status", "final_text", "decision", "vl_text", "pp_text",
+            "agree", "reviewer", "reviewed_at")
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def _asset_sha_set(cfg: "AppConfig") -> set[str]:
+    """当前资产层图片 sha256 集合（文件名内容寻址 img_{sha16}.* ——文件在场即资产在场）。"""
+    d = cfg.resolve("data/assets/images")
+    if not d.exists():
+        return set()
+    return {p.stem.split("_", 1)[1]: p.stem for p in d.iterdir()
+            if p.is_file() and p.stem.startswith("img_")}
+
+
+def list_ocr_review_orphans(cfg: "AppConfig") -> list[dict]:
+    """孤儿审评数据：ocr_reviews.sha256 不再出现在资产层（图片被替换/删除）。
+
+    **不删**（锁定语义：本地文件变动不撤回审评数据）——仅列出供人工查看/手动清理。
+    资产 sha 集合是文件名前 16 位形态，比较同样取前 16。
+    """
+    shas = _asset_sha_set(cfg)
+    return [r for r in list_ocr_reviews(cfg) if r["sha256"][:16] not in shas]
+
+
+def apply_locked_ocr(artifact, sha256: str, cfg: "AppConfig") -> bool:
+    """把已锁定审评覆盖到 OCR 产物上（in place）。有锁 → True（调用方跳过引擎判定）。
+
+    final_text 覆盖 text；confidence_source=manual、confidence=1.0、anomaly 清空——
+    high_confidence 属性随之成立（人工审评 = 最高可信，锁定优先于引擎指纹）。
+    """
+    rev = get_ocr_review(cfg, sha256)
+    if not rev:
+        return False
+    artifact.text = rev["final_text"]
+    artifact.confidence = 1.0
+    artifact.confidence_source = "manual"
+    artifact.anomaly = ""
+    return True
+
+
+def ocr_json_path_for_sha(cfg: "AppConfig", sha256: str) -> Optional[Path]:
+    """sha256 → 对应 ocr.json（assets 内容寻址命名 img_{sha16}.* → parsed/images/<stem>.ocr.json）。
+
+    文件不存在（图从未 OCR 过/已清理）→ None。
+    """
+    d = cfg.resolve("data/parsed/images")
+    p = d / f"img_{sha256[:16]}.ocr.json"
+    return p if p.is_file() else None
+
+
+def set_ocr_json_review(cfg: "AppConfig", sha256: str, review: Optional[dict]) -> bool:
+    """ocr.json 写/清 review 字段（锁定标记随缓存文件走，引擎无关）；返回是否写入。
+
+    review=None 清除（删除审评项时）——**只改字段，不动文件存在性与其余内容**。
+    """
+    p = ocr_json_path_for_sha(cfg, sha256)
+    if p is None:
+        return False
+    d = json.loads(p.read_text(encoding="utf-8"))
+    if review is None:
+        d.pop("review", None)
+    else:
+        d["review"] = review
+    p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    return True
+
+
+def list_auto_consistent(cfg: "AppConfig") -> list[dict]:
+    """「复核一致」档：原低置信/no_confidence 但 PP 复核翻案采纳的结果（cross_confirmed）。
+
+    数据源 = data/parsed/images/*.ocr.json（confidence_source=cross_confirmed）——
+    这些图**不进待办队列**（自动采纳），此列表供审核台抽查（可展开 diff）。
+    """
+    from .ocr import as_confidence_threshold
+
+    d = cfg.resolve("data/parsed/images")
+    if not d.exists():
+        return []
+    out = []
+    for p in sorted(d.glob("*.ocr.json")):
+        try:
+            o = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if str(o.get("confidence_source", "")) != "cross_confirmed":
+            continue
+        so = o.get("second_opinion") or {}
+        out.append({
+            "sha256": str(o.get("sha256", "") or ""),
+            "stem": p.stem[: -len(".ocr")] if p.stem.endswith(".ocr") else p.stem,
+            "text": str(o.get("text", "") or ""),
+            "confidence": o.get("confidence"),
+            "second_opinion": so,
+            "vl_text": str(o.get("text", "") or ""),
+            "pp_text": str(so.get("text", "") or ""),
+            "agree": so.get("agree"),
+        })
+    return out
 
 
 def sweep_stale_verification_pending(store: "ReviewStore", kb_path: str | Path) -> int:

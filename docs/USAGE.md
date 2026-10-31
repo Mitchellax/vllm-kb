@@ -666,6 +666,26 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   ②几何矫正前置（方向分类 → det 框估角旋转 → 四点透视变换）；③双引擎交叉
   （logprobs <0.85 的图用 PP-OCRv5 det+rec 复跑，编辑距离一致则采纳）；
   ④救不回的走低置信人工审核兜底。
+- **OCR 双模型审评（2026-10，审核工作台「OCR 审评」页）**：构建时对**所有** OCR 图自动跑
+  本地 PP-OCR 第二意见复核（`second_opinion` 幂等缓存在 ocr.json；PP 未安装自动退化），
+  按三档分流：
+  - **自动**：高置信（≥ `ocr_min_confidence`）→ 现状采纳；PP 结果**仅记录**（PP 不审
+    layout，对 VL 的版面取舍有系统性分歧误报——四图实证 issue 页 0.522 / doc 页 0.545
+    均为侧栏取舍，内容实际重叠——故高置信不吃 PP 判定、不进队列）；
+  - **复核一致**：原低置信 / no_confidence 但 PP 一致（agree ≥ `ocr_cross_threshold`，
+    默认 0.85）→ **翻案自动采纳**（confidence_source=cross_confirmed，正文注入），
+    不进待办；「OCR 审评」页可展开 diff 抽查；
+  - **有分歧 / 人工审核**：低置信 + PP 分歧（agree <0.85）→ 队列 reason=diverged（带
+    双模型全文）；结构类 anomaly（truncated/contradictory/misplaced）与 PP 未复核的
+    低置信 → 照旧人工审核。
+  **审评操作**（队列点开 OCR 项详情）：类 GitHub unified diff（红=主引擎独有、绿=PP
+  独有）逐差异块三选——采用主引擎 / 采用 PP / 手动编辑；保存即**锁定**（`ocr_reviews`
+  表，sha256 锚）：重建不重跑该图、正文用审评文本（confidence_source=manual），
+  **换模型/提示词也不重跑**（人工锁定优先于引擎指纹；删除审评项才恢复重审）。
+  **删除语义**：删除审评只删数据（ocr_reviews 行 + ocr.json 的 review 字段 + 队列项），
+  **图片与 ocr.json 文件一律不动**，该项按当前状态重新归档。
+  **孤儿数据**：图片被替换/删除后，旧审评记录 sha 不再匹配资产 → 进「孤儿审评数据」
+  列表保留不撤回（可手动删记录）。
 - **embedding 强制 API**（本地 embedding 不做，部署复杂）：`embedding.base_url` 指向 OpenAI 兼容端点
   （可指向其他服务器的 vLLM 部署）；`echo` 仅离线演示（效果粗糙）；
 - 连通性测试：审核工作台 API 配置中心对 embedding / OCR 均提供"测试连通"（OCR 用内置测试图走真实识别链路）；

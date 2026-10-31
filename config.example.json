@@ -4,7 +4,7 @@
     "name": "vllm-kb",
     "data_root": "data"
   },
-  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled/deletion_policy(keep|mirror，默认 keep：keep=增量语义不删，文件消失=静默偏离+stray 告警；mirror=本地原始数据优先，快照对账，连续 2 次构建缺席自动回撤（四层删+墓碑+待实际删除可撤回），首轮全量对账清历史滞留——前提同 kind 唯一来源，见 docs/DESIGN-audited-git-source.md)；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments/fetch_timeline(true=采集 issue timeline 的 cross-referenced 事件即页面 Mentioned in 区，建图 REFERENCES 关联边；存量回填跑一轮增量拉取即补采)。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列)+skip_sheets(结构页过滤扩展名单，正则数组——封面/前言/目录/版权类 sheet 名内置过滤，业务特有名单在此追加，如 [\"^运维级别\"])；表头键值对 auto：sheet 非空行≥3 且首行≥2 列全短标签→数据行变'列名=值'（行 chunk 自包含列语义），说明页/无表头结构原样裸拼。image(不产生文档，只对资产层图片批量 OCR)：ocr_provider(ask|api|paddle|none)/ocr_api_base/ocr_api_key/ocr_api_model/ocr_api_mode(custom|openai)/ocr_min_confidence(高置信才注入正文，默认0.6；logprobs 置信度分布整体低于自报，按 scripts/ocr_conf_stats.py 的分布校准)/ocr_timeout(HTTP 超时秒，默认 VLLM_KB_OCR_TIMEOUT=60；VLM 类 OCR 大图建议 300)/ocr_max_tokens(openai 模式生成上限，默认 4096——paddleocr-vl-1.5 实测 8192 防长图截断；vLLM 服务端默认截断会让末行 CONFIDENCE 缺失、全量误报 missing，2026-10 实测)/ocr_temperature(默认 0——vLLM 默认温度 1 会带崩 paddleocr-vl 类 OCR 专用模型输出：LOC 标签/乱码，2026-10 实测)/ocr_api_prompt(默认模型原生极简指令 OCR——长提示词对 OCR 专用模型是负担；置信度走 logprobs(模型不自报)，通用 VL 模型可换回要求自报 CONFIDENCE 的提示词)。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
+  "_comment_sources": "数据源列表（多来源可配置）。列表顺序=构建优先级：vllm-ascend 是主知识库，应排第一（优先完成采集）。通用字段: id(唯一标识,决定默认raw目录与checkpoint名)/type/enabled/deletion_policy(keep|mirror，默认 keep：keep=增量语义不删，文件消失=静默偏离+stray 告警；mirror=本地原始数据优先，快照对账，连续 2 次构建缺席自动回撤（四层删+墓碑+待实际删除可撤回），首轮全量对账清历史滞留——前提同 kind 唯一来源，见 docs/DESIGN-audited-git-source.md)；其余字段按 type 由对应 adapter 读取。github: repo/token/token_env(二选一)/max_issues(0=全量)/issue_state(all=open+closed)/include_prs/fetch_comments/fetch_timeline(true=采集 issue timeline 的 cross-referenced 事件即页面 Mentioned in 区，建图 REFERENCES 关联边；存量回填跑一轮增量拉取即补采)。markdown: path/title_pattern。pdf: path。excel: path(文件或目录，schema-free：任意 sheet/列)+skip_sheets(结构页过滤扩展名单，正则数组——封面/前言/目录/版权类 sheet 名内置过滤，业务特有名单在此追加，如 [\"^运维级别\"])；表头键值对 auto：sheet 非空行≥3 且首行≥2 列全短标签→数据行变'列名=值'（行 chunk 自包含列语义），说明页/无表头结构原样裸拼。image(不产生文档，只对资产层图片批量 OCR)：ocr_provider(ask|api|paddle|none)/ocr_api_base/ocr_api_key/ocr_api_model/ocr_api_mode(custom|openai)/ocr_min_confidence(高置信才注入正文，默认0.6；logprobs 置信度分布整体低于自报，按 scripts/ocr_conf_stats.py 的分布校准)/ocr_timeout(HTTP 超时秒，默认 VLLM_KB_OCR_TIMEOUT=60；VLM 类 OCR 大图建议 300)/ocr_max_tokens(openai 模式生成上限，默认 4096——paddleocr-vl-1.5 实测 8192 防长图截断；vLLM 服务端默认截断会让末行 CONFIDENCE 缺失、全量误报 missing，2026-10 实测)/ocr_temperature(默认 0——vLLM 默认温度 1 会带崩 paddleocr-vl 类 OCR 专用模型输出：LOC 标签/乱码，2026-10 实测)/ocr_api_prompt(默认模型原生极简指令 OCR——长提示词对 OCR 专用模型是负担；置信度走 logprobs(模型不自报)，通用 VL 模型可换回要求自报 CONFIDENCE 的提示词)。OCR 双模型审评: ocr_cross_threshold(PP 第二意见复核一致阈值，默认 0.85——低置信/no_confidence 且 agree≥阈值自动翻案采纳不进待办；有分歧进审核队列 diff 三选；高置信不受影响，PP 不审 layout 对版面取舍有系统性分歧误报)；审核台「OCR 审评」页可查复核一致档/孤儿审评数据。新增来源类型无需改代码结构：实现 BaseSource 并注册即可（见 vllm_kb/sources.py）。",
   "sources": [
     {
       "id": "vllm-ascend",
@@ -94,6 +94,7 @@
       "ocr_max_tokens": 8192,
       "ocr_temperature": 0,
       "ocr_api_prompt": "OCR",
+      "ocr_cross_threshold": 0.85,
       "enabled": false
     }
   ],
@@ -182,7 +183,12 @@
     "feedback_seed_fail": 1.0,
     "telemetry_path": "data/telemetry.sqlite3",
     "feedback_path": "data/confidence_feedback.json",
-    "strong_sig_kinds": ["kernel", "op", "errcode", "acl_code"],
+    "strong_sig_kinds": [
+      "kernel",
+      "op",
+      "errcode",
+      "acl_code"
+    ],
     "strong_sig_weight_min": 2.5
   },
   "_comment_retrieval": "default_target_version 兜底；查询时应显式传实际部署的 vLLM 版本或使用 'vllm-ascend:0.18.0 问题' 组件查询。prefer_unresolved_without_resolved: 无强匹配已解决问题时优先列未解决（含规避方案），resolved_min_similarity 为触发阈值。dedupe_by_doc 让同一 issue 只保留最高分 chunk。",
@@ -221,19 +227,58 @@
   "_comment_tags": "文档级标签（两级分类：主题/领域 domain、具体作用 purpose）。registry=标签词典（全局唯一事实源，条目 {\"name\":..., \"tier\":\"domain|purpose\"}，兼容裸字符串），审核页新增/改名/改 tier 后同步回本段；stopwords=拉丁词 token 过滤（guide/manual 等文档形态词）；min_len=token 成为候选的最小长度；heading_max_chars=标题直接作为候选的最大字符数（超长标题只参与词典子串匹配）。",
   "tags": {
     "registry": [
-      {"name": "HCCL", "tier": "domain"},
-      {"name": "超时排查", "tier": "purpose"},
-      {"name": "命令参考", "tier": "purpose"},
-      {"name": "错误码表", "tier": "purpose"}
+      {
+        "name": "HCCL",
+        "tier": "domain"
+      },
+      {
+        "name": "超时排查",
+        "tier": "purpose"
+      },
+      {
+        "name": "命令参考",
+        "tier": "purpose"
+      },
+      {
+        "name": "错误码表",
+        "tier": "purpose"
+      }
     ],
-    "stopwords": ["guide", "manual", "doc", "docs", "reference", "user", "users", "operation", "vllm-kb"],
+    "stopwords": [
+      "guide",
+      "manual",
+      "doc",
+      "docs",
+      "reference",
+      "user",
+      "users",
+      "operation",
+      "vllm-kb"
+    ],
     "min_len": 2,
     "heading_max_chars": 12
   },
   "_comment_sanitize": "内部数据脱敏（后置：库中存原文、原文检索，serve_api 返回给 agent 时统一脱敏——改配置即时生效、无需重嵌）。keep_paths=保留的默认路径前缀（白名单内绝对路径保留——昇腾默认安装/系统日志/配置目录诊断价值高；其余内部路径→<PATH>）；keep_ips=保留的 IP（默认回环/通配；其余 IPv4→<IP>）；sources=入库时扫描维护日志的源 type（默认 excel/markdown/word；github 不扫）。不配置=用默认；显式空数组=全部脱敏/全部关闭。被脱敏的原始 IP/路径落盘 data/sanitize_log.json 供维护。",
   "sanitize": {
-    "sources": ["excel", "markdown", "word"],
-    "keep_paths": ["/usr/local/Ascend", "/var/log/", "/etc/ascend", "/etc/npu", "/tmp/", "/usr/bin/", "/usr/lib/"],
-    "keep_ips": ["127.0.0.1", "0.0.0.0", "255.255.255.255", "::1"]
+    "sources": [
+      "excel",
+      "markdown",
+      "word"
+    ],
+    "keep_paths": [
+      "/usr/local/Ascend",
+      "/var/log/",
+      "/etc/ascend",
+      "/etc/npu",
+      "/tmp/",
+      "/usr/bin/",
+      "/usr/lib/"
+    ],
+    "keep_ips": [
+      "127.0.0.1",
+      "0.0.0.0",
+      "255.255.255.255",
+      "::1"
+    ]
   }
 }

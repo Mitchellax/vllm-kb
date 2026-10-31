@@ -939,6 +939,17 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
         self.assertIn("md:wd1", by_sid)
         self.assertIsNone(by_sid["md:wd1"]["undo_item_id"])
 
+    def test_page_html_ocr_review_tokens(self):
+        """OCR 双模型审评 UI：三档入口、diff 渲染、三选、保存/删除、孤儿列表必须在页面里。"""
+        html = self.client.get("/").text
+        for token in ("nav-ocrreview", "loadOcrReview", "renderOcrDiff", "assembleOcrFinal",
+                      "ocrDiffChoice", "ocrDiffEdit", "saveOcrReview", "deleteOcrReview",
+                      "toggleAcDiff", "/api/ocr/review", "/api/ocr/orphans",
+                      "/api/ocr/auto-consistent", "复核一致", "孤儿审评数据",
+                      "采用主引擎", "采用 PP", "手动编辑", "保存审评并锁定",
+                      "dline del", "dline ins", "dpfx"):
+            self.assertIn(token, html, f"页面缺少 {token}")
+
     def test_page_html_batch_tokens(self):
         """批量操作 UI 入口与分组结构必须在页面里。"""
         html = self.client.get("/").text
@@ -953,6 +964,97 @@ class ReviewUiBatchApiTest(ReviewUiApiTest):
                       "querySelectorAll(sel+':checked')", ".dchk:checked", ".tchk:checked",
                       "undoWithdraw", "/api/withdrawn", "已回撤"):
             self.assertIn(token, html, f"页面缺少 {token}")
+
+
+class OcrReviewApiTest(unittest.TestCase):
+    """OCR 双模型审评 API：diff 详情 / 保存锁定 / 删除语义 / 孤儿 / 复核一致档。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.data_root, self.cfg_path = make_env(self.root)
+        os.environ["VLLM_KB_DATA_ROOT"] = str(self.data_root)
+        for k in ("EMBEDDING_API_KEY", "OCR_API_KEY", "GITHUB_TOKEN"):
+            os.environ.pop(k, None)
+        self.client = TestClient(review_ui.create_app(str(self.cfg_path), auto_seed=False))
+        # 资产 + ocr.json（带 second_opinion 分歧）+ diverged 队列项
+        self.sha = "ab" * 32
+        (self.data_root / "assets" / "images").mkdir(parents=True, exist_ok=True)
+        (self.data_root / "assets" / "images" / f"img_{self.sha[:16]}.png").write_bytes(b"x")
+        img_dir = self.data_root / "parsed" / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        (img_dir / f"img_{self.sha[:16]}.ocr.json").write_text(json.dumps({
+            "sha256": self.sha, "text": "主引擎全文\n第二行", "confidence": 0.4,
+            "confidence_source": "model", "anomaly": "",
+            "second_opinion": {"engine": "PP-OCRv5(local)", "text": "主引擎全文\nPP改写行",
+                               "agree": 0.5},
+        }, ensure_ascii=False), encoding="utf-8")
+        from vllm_kb.config import AppConfig
+        from vllm_kb.review import ReviewStore
+
+        self.store = ReviewStore(AppConfig.load(str(self.cfg_path), require_keys=False)
+                                 .resolve("data/review.sqlite3"))
+        self.store.add_item("low_confidence_ocr", f"ocr:{self.sha[:16]}", {"reason": "diverged"})
+
+    def tearDown(self):
+        self.client.close()
+        os.environ.pop("VLLM_KB_DATA_ROOT", None)
+        self.tmp.cleanup()
+
+    def test_detail_diff_and_16_prefix(self):
+        r = self.client.get(f"/api/ocr/review/{self.sha[:16]}")
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["sha256"], self.sha)
+        self.assertEqual(d["agree"], 0.5)
+        tags = [b["tag"] for b in d["diff"]]
+        self.assertIn("equal", tags)
+        self.assertIn("replace", tags)     # 第二行 ≠ PP改写行
+        repl = next(b for b in d["diff"] if b["tag"] == "replace")
+        self.assertEqual(repl["a_lines"], ["第二行"])
+        self.assertEqual(repl["b_lines"], ["PP改写行"])
+
+    def test_save_locks_and_updates_queue(self):
+        r = self.client.post("/api/ocr/review", json={
+            "sha256": self.sha, "final_text": "采用 PP 的文本", "decision": "pp",
+            "vl_text": "主引擎全文", "pp_text": "PP文本", "agree": 0.5, "reviewer": "t1"})
+        self.assertEqual(r.status_code, 200)
+        oj = json.loads((self.data_root / "parsed" / "images" /
+                         f"img_{self.sha[:16]}.ocr.json").read_text(encoding="utf-8"))
+        self.assertEqual(oj["review"]["decision"], "pp")       # 锁定标记进缓存文件
+        it = self.store.list_items(category="low_confidence_ocr")[0]
+        self.assertEqual(it["status"], "approved")             # 队列项转 approved
+        # 详情页能看到锁定记录
+        d = self.client.get(f"/api/ocr/review/{self.sha}").json()
+        self.assertEqual(d["review"]["decision"], "pp")
+        self.assertEqual(d["review"]["final_text"], "采用 PP 的文本")
+
+    def test_delete_keeps_files_and_resets_queue(self):
+        self.client.post("/api/ocr/review", json={
+            "sha256": self.sha, "final_text": "x", "decision": "vl"})
+        r = self.client.delete(f"/api/ocr/review/{self.sha}")
+        self.assertEqual(r.status_code, 200)
+        oj = json.loads((self.data_root / "parsed" / "images" /
+                         f"img_{self.sha[:16]}.ocr.json").read_text(encoding="utf-8"))
+        self.assertNotIn("review", oj)                          # 锁定标记清除
+        self.assertTrue((self.data_root / "assets" / "images" /
+                         f"img_{self.sha[:16]}.png").is_file())  # 文件不动
+        self.assertTrue((self.data_root / "parsed" / "images" /
+                         f"img_{self.sha[:16]}.ocr.json").is_file())
+        self.assertEqual(self.store.list_items(category="low_confidence_ocr"), [])  # 队列项删（seed 重判）
+
+    def test_orphans_and_auto_consistent(self):
+        self.assertEqual(self.client.get("/api/ocr/orphans").json(), [])  # 资产在场 → 无孤儿
+        # 资产消失 → 孤儿（不删，仅列出）
+        (self.data_root / "assets" / "images" / f"img_{self.sha[:16]}.png").unlink()
+        orph = self.client.get("/api/ocr/orphans").json()
+        self.assertEqual(len(orph), 0)  # 尚无审评记录
+        self.client.post("/api/ocr/review", json={
+            "sha256": self.sha, "final_text": "x", "decision": "vl"})
+        orph = self.client.get("/api/ocr/orphans").json()
+        self.assertEqual(len(orph), 1)  # 有审评 + 文件不在场 → 孤儿列出
+        self.assertEqual(orph[0]["sha256"], self.sha)
+        self.assertEqual(self.client.get("/api/ocr/auto-consistent").json(), [])
 
 
 if __name__ == "__main__":

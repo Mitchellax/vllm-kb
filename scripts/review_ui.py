@@ -142,24 +142,35 @@ pre{background:var(--rv-bg-2);border:1px solid var(--rv-border);color:var(--rv-l
 #modal-card .row label{width:64px;color:var(--rv-label-2);font-size:12.5px;flex:none}
 #modal-card .actions{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}
 .tagb.editing{outline:2px solid var(--rv-accent);outline-offset:1px}
+/* OCR 双模型 diff（类 GitHub unified：红=主引擎独有，绿=PP 独有，灰=上下文） */
+.dline{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-all;padding:1px 6px}
+.dline.del{background:#ffebe9}.dline.ins{background:#e6ffec}
+.dline.ctx{color:var(--rv-label-2);background:var(--rv-bg-2)}
+.dpfx{display:inline-block;width:16px;color:#999;user-select:none}
+.dchoice{margin:3px 0;font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap}
+.dchoice label{cursor:pointer}
+.dblock{margin:6px 0}
+.dblock.diff{border-left:2px solid var(--rv-border);padding-left:8px}
+.dedit{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
 </style></head><body>
 <header><strong>vllm-kb 审核工作台</strong>
 <a id="nav-stats" class="active" onclick="tab('stats')">概览</a>
 <a id="nav-queue" onclick="tab('queue')">审核队列</a>
 <a id="nav-docs" onclick="tab('docs')">文档管理</a>
+<a id="nav-ocrreview" onclick="tab('ocrreview')">OCR 审评</a>
 <a id="nav-tags" onclick="tab('tags')">标签管理</a>
 <a id="nav-configs" onclick="tab('configs')">API 配置</a><a id="nav-gaps" onclick="tab('gaps')">知识缺口</a></header>
 <div id="toast"></div>
 <div id="modal" hidden onclick="if(event.target===this)closeModal()"><div id="modal-card"></div></div>
 <main>
-<div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-tags" style="display:none"></div><div id="view-configs" style="display:none"></div><div id="view-gaps" style="display:none"></div>
+<div id="view-stats"></div><div id="view-queue" style="display:none"></div><div id="view-docs" style="display:none"></div><div id="view-ocrreview" style="display:none"></div><div id="view-tags" style="display:none"></div><div id="view-configs" style="display:none"></div><div id="view-gaps" style="display:none"></div>
 </main>
 <script>
 const $=s=>document.querySelector(s);
 async function j(url,opt){const r=await fetch(url,opt);const d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);return d}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function badge(s){return `<span class="badge ${s}">${s}</span>`}
-function tab(name){['stats','queue','docs','tags','configs','gaps'].forEach(t=>{document.getElementById('view-'+t).style.display=t===name?'':'none';document.getElementById('nav-'+t).className=t===name?'active':''});if(name==='stats')loadStats();if(name==='queue')loadQueue();if(name==='docs')loadDocs();if(name==='tags')loadTagDict();if(name==='configs')loadConfigs();if(name==='gaps')loadGaps()}
+function tab(name){['stats','queue','docs','ocrreview','tags','configs','gaps'].forEach(t=>{document.getElementById('view-'+t).style.display=t===name?'':'none';document.getElementById('nav-'+t).className=t===name?'active':''});if(name==='stats')loadStats();if(name==='queue')loadQueue();if(name==='docs')loadDocs();if(name==='ocrreview')loadOcrReview();if(name==='tags')loadTagDict();if(name==='configs')loadConfigs();if(name==='gaps')loadGaps()}
 async function loadGaps(){let gs=[];try{gs=await j('/api/gaps')}catch(e){$('#view-gaps').innerHTML=`<h3>知识缺口</h3><div class="card muted">未启用行为遥测（config.confidence.feedback_enabled）或无缺口数据。启用后跑 scripts/build_feedback.py 生成。</div>`;return}
 const byType={hard_gap:'强签名零命中',soft_gap:'命中无结论',quality_gap:'弱签名零命中'};
 $('#view-gaps').innerHTML=`<h3>知识缺口（${gs.length} 个，行为遥测推断——同签名跨会话反复查无果）</h3>`+gs.map(g=>`<div class="card"><b>${esc(byType[g.gap_type]||g.gap_type)}</b> <span class="badge pending">sessions=${g.session_count}</span> <span class="muted">${esc(g.component||'')}</span><table><tr><th>签名</th><td class="mono">${esc((g.signature_text||'').slice(0,120))}</td></tr><tr><th>样例查询</th><td class="mono">${esc((g.sample_queries||[]).join(' | ').slice(0,200))}</td></tr><tr><th>平均命中</th><td>${g.avg_result_count}</td></tr><tr><th>首现/末现</th><td class="muted">${esc((g.first_seen||'').slice(0,16))} ~ ${esc((g.last_seen||'').slice(0,16))}</td></tr></table></div>`).join('')||'<div class="card muted">暂无缺口</div>'}
@@ -237,7 +248,8 @@ ${i.category==='low_confidence_ocr'?`<p><b>图片:</b> <span class="mono">${esc(
   <br><img src="/${esc(p.asset_path||'')}" alt="原图" style="max-width:100%;max-height:320px;border:1px solid var(--rv-border);border-radius:8px;margin:4px 0" onerror="this.style.display='none'">
   原因: <b>${esc(p.reason||'')}</b>（置信度 ${p.confidence===null||p.confidence===undefined?'无':p.confidence}，来源 ${esc(p.confidence_source||'')}${p.anomaly?`，自报异常 ${esc(p.anomaly)}`:''}）
  ${(p.signatures||[]).length?`<br><b>OCR 签名线索:</b> ${esc((p.signatures||[]).map(s=>(s.kind||'')+':'+(s.text||'')).join('、'))}`:'<br><span class="muted">无签名线索</span>'}
- <br><span class="muted">该图 OCR 文本<b>未进正文</b>（低置信或自报异常），本项只是待核对清单：✓ 认证即忽略，存疑则重新排队。</span></p>`:''}
+ <br><span class="muted">该图 OCR 文本<b>未进正文</b>（低置信或自报异常），本项只是待核对清单：✓ 认证即忽略，存疑则重新排队。</span></p>
+ <div id="ocrdiff"><p class="muted">加载双模型 diff…</p></div>`:''}
 ${isFile?`<h4>文件内行清单（展示前 ${Math.min(rows.length,100)} 行）</h4><table><tr><th>source_id</th><th>标题</th></tr>${rows.slice(0,100).map(r=>`<tr><td class="mono">${esc(r.source_id)}</td><td>${esc(r.title||'')}</td></tr>`).join('')}</table>`:''}
 ${docPrev}
 <h4>原始 payload</h4><pre>${esc(JSON.stringify(p,null,2))}</pre>
@@ -252,7 +264,75 @@ ${i.category==='tag_candidate'?`tier: <select id="adopt-tier"><option value="">�
 ${['tag_candidate','low_confidence_ocr'].includes(i.category)?'':`<button class="danger" onclick="deleteDoc(${i.id})">🗑 标记删除${isFile?'（整表）':''}</button>`}
 </div>
 <span class="muted">存疑项排在未审核之后；删除可在队列底部'待实际删除'撤回；tag_candidate 按词聚合（同词多文档一条）、low_confidence_ocr 按图片 sha256 聚合，两者 item_ref 不是文档 id，故不提供删除按钮（忽略请用 ✓ 认证）${isFile?'；表格项删除=整表全部行，可在待删除列表撤回':''}</span></div>`
-$('#rev').value=loadReviewer()}
+$('#rev').value=loadReviewer()
+if(i.category==='low_confidence_ocr'&&(p.sha256||''))loadOcrDiff(p.sha256,true)
+// ---------------- OCR 双模型审评（diff 渲染 + 差异块三选 + 锁定/删除） ----------------
+let _ocrDiff=null;   // {sha256,diff,vl_text,pp_text,agree,review,choices:{块序:'vl'|'pp'|'edited'},edits:{块序:文本}}
+let _ocrDiffTarget='#ocrdiff';
+async function loadOcrDiff(sha,editable,target){
+  _ocrDiffTarget=target||'#ocrdiff';
+  try{const d=await j('/api/ocr/review/'+encodeURIComponent(sha));
+    _ocrDiff=Object.assign({},d,{choices:{},edits:{}});
+    renderOcrDiff(editable);}
+  catch(e){const el=document.querySelector(_ocrDiffTarget);if(el)el.innerHTML=`<p class="muted">双模型 diff 不可用：${esc(e.message)}</p>`}}
+function renderOcrDiff(editable){
+  const d=_ocrDiff;
+  const box=typeof _ocrDiffTarget==='string'?document.querySelector(_ocrDiffTarget):_ocrDiffTarget;
+  if(!box||!d)return;
+  const blocks=d.diff.map((b,idx)=>{
+    if(b.tag==='equal')return `<div class="dblock">${b.a_lines.map(l=>`<div class="dline ctx"><span class="dpfx"> </span>${esc(l)}</div>`).join('')}</div>`;
+    const choice=d.choices[idx]||'vl';
+    const sel=v=>v===choice?'checked':'';
+    const vlHtml=b.a_lines.map(l=>`<div class="dline del"><span class="dpfx">-</span>${esc(l)}</div>`).join('');
+    const ppHtml=b.b_lines.map(l=>`<div class="dline ins"><span class="dpfx">+</span>${esc(l)}</div>`).join('');
+    const editArea=choice==='edited'?`<textarea class="dedit" rows="3" style="width:100%" oninput="ocrDiffEdit(${idx},this.value)">${esc(d.edits[idx]!==undefined?d.edits[idx]:b.a_lines.join('\n'))}</textarea>`:'';
+    const ctl=editable?`<div class="dchoice"><label><input type="radio" name="dc${idx}" ${sel('vl')} onchange="ocrDiffChoice(${idx},'vl')">采用主引擎</label><label><input type="radio" name="dc${idx}" ${sel('pp')} onchange="ocrDiffChoice(${idx},'pp')">采用 PP</label><label><input type="radio" name="dc${idx}" ${sel('edited')} onchange="ocrDiffChoice(${idx},'edited')">手动编辑</label></div>`:'';
+    return `<div class="dblock diff">${vlHtml}${ppHtml}${ctl}${editArea}</div>`}).join('');
+  box.innerHTML=`<h4 style="margin-top:14px">双模型 diff（VL vs ${esc(d.second_engine||'PP')}，一致度 ${d.agree===null||d.agree===undefined?'—':d.agree}）</h4>
+   ${d.review?`<p class="muted">已锁定（${esc(d.review.decision)} · ${esc(d.review.reviewer)} · ${(d.review.reviewed_at||'').slice(0,16)}）——重建不再重跑该图。</p>`:''}
+   ${blocks||'<p class="muted">两侧文本一致（无差异块）</p>'}
+   ${editable&&!d.review?`<h4>最终文本（随上方选择自动组装，可再微调）</h4><textarea id="ocrfinal" class="dedit" rows="5" style="width:100%"></textarea>
+     <div class="actions"><input id="ocrrev" placeholder="审核人（必填）" style="width:160px" value="${esc((document.getElementById('rev')||{}).value||'')}"><button class="primary" onclick="saveOcrReview()">💾 保存审评并锁定</button></div>
+     <span class="muted">锁定以图片 sha256 为锚：重建不重跑、本地文件变动不撤回（图片被替换后本记录进「孤儿数据」）。</span>`:''}
+   ${d.review?`<div class="actions"><button class="danger" onclick="deleteOcrReview('${d.sha256}')">🗑 删除审评（只删数据不动文件，该项按当前状态重新归档）</button></div>`:''}`;
+  if(editable&&!d.review)updateOcrFinalPreview()}
+function ocrDiffChoice(idx,v){_ocrDiff.choices[idx]=v;renderOcrDiff(true)}
+function ocrDiffEdit(idx,txt){_ocrDiff.edits[idx]=txt;updateOcrFinalPreview()}
+function assembleOcrFinal(){let out=[];
+  _ocrDiff.diff.forEach((b,idx)=>{if(b.tag==='equal'){out=out.concat(b.a_lines);return}
+    const c=_ocrDiff.choices[idx]||'vl';
+    if(c==='pp')out=out.concat(b.b_lines);
+    else if(c==='edited')out.push(_ocrDiff.edits[idx]!==undefined?_ocrDiff.edits[idx]:b.a_lines.join('\n'));
+    else out=out.concat(b.a_lines)});
+  return out.join('\n')}
+function updateOcrFinalPreview(){const el=document.getElementById('ocrfinal');if(el)el.value=assembleOcrFinal()}
+async function saveOcrReview(){const final=assembleOcrFinal();
+  const reviewer=document.getElementById('ocrrev').value;if(!reviewer){alert('请填写审核人');return}
+  const ch=Object.values(_ocrDiff.choices);
+  const decision=ch.includes('edited')?'edited':(ch.includes('pp')?(ch.includes('vl')?'edited':'pp'):'vl');
+  try{await j('/api/ocr/review',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sha256:_ocrDiff.sha256,final_text:final,decision,
+      vl_text:_ocrDiff.vl_text,pp_text:_ocrDiff.pp_text,agree:_ocrDiff.agree,reviewer})});
+    toast('✓ 已保存并锁定（重建后该图不再重跑 OCR）');loadQueue()}catch(e){toast('✗ '+e.message)}}
+async function deleteOcrReview(sha){if(!confirm('删除审评记录？只删数据不动图片/ocr.json 文件；该项按当前状态重新归档（如仍分歧则回待办）。'))return;
+  try{await j('/api/ocr/review/'+sha,{method:'DELETE'});toast('已删除审评记录')}catch(e){toast('✗ '+e.message)}}
+async function loadOcrReview(){
+  let ac=[],orph=[];
+  try{ac=await j('/api/ocr/auto-consistent')}catch(e){}
+  try{orph=await j('/api/ocr/orphans')}catch(e){}
+  $('#view-ocrreview').innerHTML=`<h3>OCR 双模型审评（VL 主引擎 vs 本地 PP 复核）</h3>
+  <div class="card subtle">三档分流：<b>自动</b>（高置信，PP 结果仅记录不判定——PP 不审 layout，对高置信的版面取舍有系统性分歧误报）；<b>复核一致</b>（原低置信/no_confidence 但 PP 认可 → 翻案自动采纳，下方可抽查 diff）；<b>有分歧/人工审核</b>（进审核队列，点开详情做 diff 三选审评，锁定后重建不重跑）。图片被替换/删除后，其审评记录成为<b>孤儿数据</b>保留不撤回。</div>
+  <h4 style="margin-top:18px">复核一致（${ac.length}）——自动采纳，抽查入口</h4>`
+  +(ac.map(a=>`<div class="card"><b class="mono">${esc(a.sha256.slice(0,16))}</b> <span class="badge approved">agree ${a.agree}</span> <span class="muted">${esc((a.text||'').slice(0,60))}…</span> <button class="sm" onclick="toggleAcDiff('${a.sha256}',this)">展开 diff</button><div class="acdiff"></div></div>`).join('')||'<div class="card muted">暂无复核一致项</div>')
+  +`<h4 style="margin-top:22px">孤儿审评数据（${orph.length}）——审评记录保留（不撤回），仅列出</h4>`
+  +(orph.map(o=>`<div class="card" style="border-left:3px solid var(--rv-red)"><b class="mono">${esc(o.sha256.slice(0,16))}</b> <span class="muted">${esc((o.reviewed_at||'').slice(0,16))} · ${esc(o.reviewer||'')} · ${esc(o.decision||'')}</span><div class="muted">${esc((o.final_text||'').slice(0,100))}${(o.final_text||'').length>100?'…':''}</div><div class="actions"><button class="danger sm" onclick="deleteOcrReview('${o.sha256}').then(loadOcrReview)">🗑 删除记录（不动文件）</button></div></div>`).join('')||'<div class="card muted">暂无孤儿数据</div>')}
+async function toggleAcDiff(sha,btn){const box=btn.parentElement.querySelector('.acdiff');
+  if(box.innerHTML){box.innerHTML='';btn.textContent='展开 diff';return}
+  btn.textContent='收起';
+  try{const d=await j('/api/ocr/review/'+encodeURIComponent(sha));
+    const keepT=_ocrDiffTarget;_ocrDiffTarget=box;_ocrDiff=Object.assign({},d,{choices:{},edits:{}});
+    renderOcrDiff(false);_ocrDiffTarget=keepT}
+  catch(e){box.innerHTML=`<p class="muted">diff 不可用：${esc(e.message)}</p>`}}}
 async function adoptCandidate(id){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
 try{await j('/api/tag-candidate/'+id+'/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer,tier:document.getElementById('adopt-tier').value||null})});loadQueue();toast('✓ 已采纳（词典已同步，重建图后入图）')}catch(e){toast('✗ '+e.message)}}
 async function review(id,action,tagAction){const reviewer=document.getElementById('rev').value;if(!reviewer){alert('请填写审核人');return}
@@ -843,6 +923,121 @@ def create_app(config_path: Optional[str] = None, auto_seed: bool = True):
         if it is None:
             raise HTTPException(404, "审核项不存在")
         return it
+
+    # ---------------- OCR 双模型审评（diff + 三选 + 锁定/孤儿/删除） ----------------
+
+    def _resolve_ocr_sha(sha: str) -> str:
+        """sha 可为 64 位全量或 16 位前缀。**ocr.json 优先**（审评前就要看 diff），
+        记录兜底（ocr.json 已清理的孤儿查看场景）。"""
+        import json as _json
+
+        from vllm_kb.review import get_ocr_review, list_ocr_reviews, ocr_json_path_for_sha
+
+        p = ocr_json_path_for_sha(cfg, sha)   # 文件名 = img_{sha16}，前缀即命中
+        if p is not None:
+            try:
+                s = str(_json.loads(p.read_text(encoding="utf-8")).get("sha256", "") or "")
+                if s:
+                    return s
+            except (OSError, ValueError):
+                pass
+        if get_ocr_review(cfg, sha):
+            return sha
+        for r in list_ocr_reviews(cfg):
+            if r["sha256"].startswith(sha):
+                return r["sha256"]
+        raise HTTPException(404, f"无此 OCR 产物或审评记录: {sha}")
+
+    def _load_ocr_json(sha: str) -> dict:
+        import json as _json
+
+        from vllm_kb.review import ocr_json_path_for_sha
+
+        p = ocr_json_path_for_sha(cfg, sha)
+        if p is None:
+            raise HTTPException(404, f"ocr.json 不存在（图已清理或从未 OCR）: {sha[:16]}")
+        try:
+            return _json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise HTTPException(500, f"ocr.json 读取失败: {e}")
+
+    @app.get("/api/ocr/review/{sha}")
+    def ocr_review_detail(sha: str):
+        """diff 详情（后端算 opcodes，前端纯渲染）：vl=主引擎行集，pp=第二意见行集。"""
+        from vllm_kb.ocr import diff_opcodes
+        from vllm_kb.review import get_ocr_review
+
+        full_sha = _resolve_ocr_sha(sha)
+        o = _load_ocr_json(full_sha)
+        so = o.get("second_opinion") or {}
+        vl_text = str(o.get("text", "") or "")
+        pp_text = str(so.get("text", "") or "")
+        return {
+            "sha256": full_sha,
+            "review": get_ocr_review(cfg, full_sha),
+            "confidence": o.get("confidence"),
+            "confidence_source": o.get("confidence_source"),
+            "anomaly": o.get("anomaly", ""),
+            "second_engine": str(so.get("engine", "") or ""),
+            "agree": so.get("agree"),
+            "vl_text": vl_text,
+            "pp_text": pp_text,
+            "diff": diff_opcodes(vl_text, pp_text),
+        }
+
+    @app.post("/api/ocr/review")
+    def ocr_review_save(body: dict):
+        """保存审评并**锁定**（sha256 锚）：写 ocr_reviews + ocr.json review 字段，
+        对应队列项转 approved；decision: vl | pp | edited。**只动数据，不动文件**。"""
+        from vllm_kb.review import set_ocr_json_review, upsert_ocr_review
+
+        sha = str(body.get("sha256", "") or "")
+        final = str(body.get("final_text", "") or "")
+        decision = str(body.get("decision", "") or "")
+        reviewer = str(body.get("reviewer", "") or "admin")
+        if not sha or not final or decision not in ("vl", "pp", "edited"):
+            raise HTTPException(400, "需要 sha256 / final_text / decision(vl|pp|edited)")
+        upsert_ocr_review(cfg, sha, final, decision,
+                          vl_text=str(body.get("vl_text", "") or ""),
+                          pp_text=str(body.get("pp_text", "") or ""),
+                          agree=body.get("agree"), reviewer=reviewer)
+        set_ocr_json_review(cfg, sha, {"decision": decision, "reviewer": reviewer})
+        # 队列项同步：ocr:{sha16} 转 approved（审核台列表即消失）
+        ref = f"ocr:{sha[:16]}"
+        for it in store.list_items(category="low_confidence_ocr"):
+            if it["item_ref"] == ref and it["status"] == "pending":
+                store.review(it["id"], "approved", reviewer,
+                             result={"action": "ocr-review-locked", "decision": decision})
+        return {"ok": True, "sha256": sha}
+
+    @app.delete("/api/ocr/review/{sha}")
+    def ocr_review_delete(sha: str):
+        """删除审评（**只删数据不动文件**）：ocr_reviews 行删 + ocr.json review 字段清 +
+        队列项删除（下次 seed 按当前状态重新归档，如仍分歧则回待办）。"""
+        from vllm_kb.review import delete_ocr_review, set_ocr_json_review
+
+        full_sha = _resolve_ocr_sha(sha)
+        ok = delete_ocr_review(cfg, full_sha)
+        set_ocr_json_review(cfg, full_sha, None)
+        ref = f"ocr:{full_sha[:16]}"
+        for it in store.list_items(category="low_confidence_ocr"):
+            if it["item_ref"] == ref:
+                store.delete_item(it["id"])
+        return {"ok": ok, "sha256": full_sha}
+
+    @app.get("/api/ocr/orphans")
+    def ocr_orphans():
+        """孤儿审评数据（图片被替换/删除后 sha 不再在场）：**不删**，仅列出供查看/清理。"""
+        from vllm_kb.review import list_ocr_review_orphans
+
+        return list_ocr_review_orphans(cfg)
+
+    @app.get("/api/ocr/auto-consistent")
+    def ocr_auto_consistent():
+        """「复核一致」档（低置信但 PP 复核翻案采纳）：不进待办，此处可抽查。"""
+        from vllm_kb.review import list_auto_consistent
+
+        return list_auto_consistent(cfg)
 
     @app.get("/api/doc-preview")
     def doc_preview(source_id: str, limit: int = 3000):

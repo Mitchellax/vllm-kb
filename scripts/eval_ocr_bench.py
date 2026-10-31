@@ -32,30 +32,19 @@ import json
 import shutil
 import sys
 import time
-from difflib import SequenceMatcher
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from vllm_kb.ocr import norm_text, score_pair  # noqa: E402  去空白后 SequenceMatcher ratio
 
 PASS_SCORE = 0.95          # 字符准确率通过线
 SCENES = ("normal", "blurry", "tilt", "persp")
 
 
-# ---------------- 纯评估函数（可单测） ----------------
+# ---------------- 纯评估函数（可单测；公共实现已上移 vllm_kb.ocr，此处别名兼容） ----------------
 
-def norm_text(t: str) -> str:
-    """对比前归一：去全部空白——OCR 换行/空格位置不定，不参与扣分（字符级公平）。"""
-    return "".join((t or "").split())
-
-
-def score_pair(expect: str, actual: str) -> float:
-    """字符准确率 = 1 - 编辑距离占比（SequenceMatcher ratio，去空白后对比）。"""
-    e, a = norm_text(expect), norm_text(actual)
-    if not e and not a:
-        return 1.0
-    if not e or not a:
-        return 0.0
-    return SequenceMatcher(None, e, a).ratio()
+from vllm_kb.ocr import norm_text, score_pair  # noqa: E402  去空白后 SequenceMatcher ratio
 
 
 def summarize(rows: list[dict]) -> dict:

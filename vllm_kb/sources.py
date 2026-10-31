@@ -315,9 +315,10 @@ class BaseSource(ABC):
         provider=ask 且无 ocr_api_base 时**不在此交互询问**（询问由 ImageSource 统一做一次），
         此时本次构建不注入正文——本地 OCR 产出缓存后，下次构建即生效。
         """
-        from .ocr import (OcrApiError, OcrUnavailable, build_ocr_artifact,
+        from .ocr import (OcrApiError, OcrResult, OcrUnavailable, build_ocr_artifact,
                           engine_fingerprint, load_ocr_artifact, ocr_image_detail,
                           save_ocr_artifact)
+        from .review import get_ocr_review
 
         oc = self._ocr_settings()
         if oc is None or oc.provider == "none":
@@ -331,20 +332,40 @@ class BaseSource(ABC):
         fp = engine_fingerprint(provider, oc.mode, oc.model)
         art = load_ocr_artifact(cache, sha, fp)
         if art is None:
-            try:
-                res = ocr_image_detail(asset_path, provider, api_base=oc.api_base,
-                                       api_key=oc.api_key, model=oc.model, mode=oc.mode,
-                                       timeout=oc.timeout, max_tokens=oc.max_tokens,
-                                       temperature=oc.temperature, prompt=oc.prompt)
-            except (OcrApiError, OcrUnavailable) as e:
-                print(f"[sources:{self.id}] 图片 OCR 失败（{asset_path.name}）：{e}", flush=True)
-                return None, ""
-            art = build_ocr_artifact(asset_path, sha, res, provider, oc.mode, oc.model,
-                                     oc.min_confidence)
-            save_ocr_artifact(cache, art, image_ref=image_ref)
+            # **人工锁定优先于引擎指纹**：有审评记录（换模型/提示词后缓存 miss）也不
+            # 重跑引擎——直接以锁定文本构造产物并写缓存（删除审评项才恢复重跑）
+            rev = get_ocr_review(self.app_cfg, sha) if self.app_cfg is not None else None
+            if rev:
+                art = build_ocr_artifact(asset_path, sha, OcrResult(
+                    text=rev["final_text"], confidence=1.0, confidence_source="manual",
+                    anomaly=""), provider, oc.mode, oc.model, oc.min_confidence)
+                save_ocr_artifact(cache, art, image_ref=image_ref)
+                print(f"[sources:{self.id}] 图片 {asset_path.name} 使用人工锁定审评文本"
+                      f"（decision={rev['decision']}，跳过引擎重跑）", flush=True)
+            else:
+                try:
+                    res = ocr_image_detail(asset_path, provider, api_base=oc.api_base,
+                                           api_key=oc.api_key, model=oc.model, mode=oc.mode,
+                                           timeout=oc.timeout, max_tokens=oc.max_tokens,
+                                           temperature=oc.temperature, prompt=oc.prompt)
+                except (OcrApiError, OcrUnavailable) as e:
+                    print(f"[sources:{self.id}] 图片 OCR 失败（{asset_path.name}）：{e}", flush=True)
+                    return None, ""
+                art = build_ocr_artifact(asset_path, sha, res, provider, oc.mode, oc.model,
+                                         oc.min_confidence)
+                save_ocr_artifact(cache, art, image_ref=image_ref)
         else:
             # 阈值即时生效（不进引擎指纹：调阈值只重判定，不重跑 OCR）
             art.min_confidence = oc.min_confidence
+        # ---- 双引擎第二意见（PP 全量复核，幂等缓存；失败不阻塞）+ 低置信翻案 ----
+        # 结构类 anomaly（truncated 等）不翻案（文本完整性问题 PP 弥补不了）；
+        # 高置信不受影响（PP 不审 layout，对版面取舍有系统性分歧误报）。
+        from .ocr import enrich_ocr_artifact
+
+        enrich_ocr_artifact(art, asset_path, min_confidence=oc.min_confidence,
+                            cross_threshold=oc.cross_threshold,
+                            save=lambda a, image_ref=image_ref: save_ocr_artifact(
+                                cache, a, image_ref=image_ref))
         if art.high_confidence and art.text.strip():
             return art.evidence(), (f"\n图片文字（OCR 置信度 {art.confidence:.2f}）:\n"
                                     f"{art.text.strip()}")
@@ -1276,10 +1297,11 @@ class ImageSource(BaseSource):
     def canonicalize(self) -> list[KbDocument]:
         import os
 
-        from .ocr import (OcrApiError, OcrUnavailable, as_confidence_threshold,
-                          as_timeout_seconds,
-                          build_ocr_artifact, engine_fingerprint, load_ocr_artifact,
-                          ocr_image_detail, save_ocr_artifact)
+        from .ocr import (OcrApiError, OcrResult, OcrUnavailable, as_confidence_threshold,
+                          as_timeout_seconds, build_ocr_artifact, enrich_ocr_artifact,
+                          engine_fingerprint, load_ocr_artifact, ocr_image_detail,
+                          save_ocr_artifact)
+        from .review import get_ocr_review
 
         images = self._images_dir()
         if not images.exists():
@@ -1304,6 +1326,7 @@ class ImageSource(BaseSource):
         max_tokens = as_max_tokens(self.cfg.get("ocr_max_tokens"))
         temperature = as_temperature(self.cfg.get("ocr_temperature"))
         prompt = as_prompt(self.cfg.get("ocr_api_prompt"))
+        cross_threshold = as_confidence_threshold(self.cfg.get("ocr_cross_threshold"))
         provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
         api_base = str(self.cfg.get("ocr_api_base", "") or "")
         api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
@@ -1330,11 +1353,29 @@ class ImageSource(BaseSource):
             cached = load_ocr_artifact(ocr_path, sha, fp)
             if cached is not None:
                 skipped += 1
-                conf_sources[cached.confidence_source or "?"] += 1
                 # 阈值改了但图片/引擎未变：不重跑 OCR，只按新阈值刷新判定字段
-                if cached.min_confidence != min_conf:
-                    cached.min_confidence = min_conf
+                changed = cached.min_confidence != min_conf
+                cached.min_confidence = min_conf
+                # ---- 第二意见复核（幂等）+ 低置信翻案（与 _ocr_artifact_for 同一套）----
+                # 仅在有变更时写盘（幂等：mtime 不动）
+                if enrich_ocr_artifact(cached, img, min_confidence=min_conf,
+                                       cross_threshold=cross_threshold):
+                    changed = True
+                conf_sources[cached.confidence_source or "?"] += 1
+                if changed:
                     save_ocr_artifact(ocr_path, cached, image_ref=f"assets/images/{img.name}")
+                continue
+            # **人工锁定优先于引擎指纹**：有审评记录也不重跑引擎（换模型/提示词后同样跳过）
+            rev = get_ocr_review(self.app_cfg, sha) if self.app_cfg is not None else None
+            if rev:
+                art = build_ocr_artifact(img, sha, OcrResult(
+                    text=rev["final_text"], confidence=1.0, confidence_source="manual",
+                    anomaly=""), provider, api_mode, api_model, min_conf)
+                save_ocr_artifact(ocr_path, art, image_ref=f"assets/images/{img.name}")
+                skipped += 1
+                conf_sources["manual"] += 1
+                print(f"[sources:{self.id}] 图片 {img.name} 使用人工锁定审评文本"
+                      f"（decision={rev['decision']}，跳过引擎重跑）", flush=True)
                 continue
             result = None
             while True:
@@ -1367,6 +1408,11 @@ class ImageSource(BaseSource):
                 continue
             art = build_ocr_artifact(img, sha, result, provider, api_mode, api_model, min_conf)
             save_ocr_artifact(ocr_path, art, image_ref=f"assets/images/{img.name}")
+            # 新跑结果同样走第二意见复核 + 低置信翻案（有变更即回写）
+            enrich_ocr_artifact(art, img, min_confidence=min_conf,
+                                cross_threshold=cross_threshold,
+                                save=lambda a: save_ocr_artifact(
+                                    ocr_path, a, image_ref=f"assets/images/{img.name}"))
             conf_sources[art.confidence_source or "?"] += 1
             if art.review_reason:
                 review += 1

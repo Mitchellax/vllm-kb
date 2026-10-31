@@ -79,6 +79,9 @@ _OCR_PROMPT_VERSION = 3
 
 # 高置信阈值默认值（source 级 ocr_min_confidence 可覆盖）：只有 ≥ 阈值才注入正文进检索库
 DEFAULT_MIN_CONFIDENCE = 0.6
+# 第二意见（PP）复核一致阈值：低置信/no_confidence 结果 agree≥此值 → 翻案自动采纳。
+# 高置信不受此阈值影响（PP 不审 layout，对高置信的版面取舍有系统性分歧误报，四图实证）。
+DEFAULT_CROSS_THRESHOLD = 0.85
 
 # 签名导向：只保留"可判错"的签名类型（能定位问题的算子/错误码/模型/版本）
 JUDGABLE_KINDS = ("kernel", "op", "errcode", "model", "version")
@@ -142,6 +145,10 @@ class OcrConfig:
     # 提示词：**默认模型原生极简指令 "OCR"**（paddleocr-vl 类 OCR 专用模型实测精度
     # 最佳）；通用 VL 模型可用 `ocr_api_prompt` 换自报提示词（参考 _CONFIDENCE_PROMPT）。
     prompt: str = "OCR"
+    # 交叉一致度阈值：第二意见（PP）复核 ≥ 此值视为复核一致——低置信/no_confidence
+    # 结果翻案自动采纳（不进待办）；< 此值进「有分歧」待办。高置信不受影响（PP 不审
+    # layout，对高置信的版面取舍有系统性分歧误报）。image 源 `ocr_cross_threshold`。
+    cross_threshold: float = 0.85
     extra: dict = field(default_factory=dict)
 
     @property
@@ -215,6 +222,7 @@ def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
         max_tokens=as_max_tokens(sc.get("ocr_max_tokens")),
         temperature=as_temperature(sc.get("ocr_temperature")),
         prompt=as_prompt(sc.get("ocr_api_prompt")),
+        cross_threshold=as_confidence_threshold(sc.get("ocr_cross_threshold")),
     )
 
 
@@ -304,6 +312,124 @@ def extract_judgable_signatures(text: str) -> list[dict]:
             for s in extract_signatures(text or "") if s.kind in JUDGABLE_KINDS]
 
 
+# ---------------- 双引擎交叉（第二意见）公共工具 ----------------
+
+def norm_text(t: str) -> str:
+    """对比前归一：去全部空白——OCR 换行/空格位置不定，不参与扣分（字符级公平）。"""
+    return "".join((t or "").split())
+
+
+def score_pair(expect: str, actual: str) -> float:
+    """字符一致度 = SequenceMatcher ratio（去空白后对比；双引擎交叉/基准集共用）。"""
+    e, a = norm_text(expect), norm_text(actual)
+    if not e and not a:
+        return 1.0
+    if not e or not a:
+        return 0.0
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, e, a).ratio()
+
+
+# PP-OCR 引擎实例进程内缓存（懒加载；失败标记避免每图重试拖慢构建）
+_PPOCR_ENGINE = None
+_PPOCR_FAILED = False
+
+
+def ppocr_second_opinion(img_path) -> "str | None":
+    """本地 PP-OCR（v5/v6 det+rec）第二意见文本。不可用/失败 → None（不阻塞主流程）。
+
+    PP 不审 layout：全量文本流，与 VL 的版面取舍会有系统性"分歧"（侧栏/目录）——
+    其一致度只用于**低置信结果的复核翻案**，高置信结果的分歧是预期误报（不进队列）。
+    可选依赖：pip install paddleocr paddlepaddle；paddle 3.3.1 CPU 的 oneDNN+PIR
+    兼容 bug 用 enable_mkldnn=False 规避；受限环境用 PADDLE_PDX_CACHE_HOME /
+    USERPROFILE 重定向模型缓存。
+    """
+    global _PPOCR_ENGINE, _PPOCR_FAILED
+    if _PPOCR_FAILED:
+        return None
+    try:
+        if _PPOCR_ENGINE is None:
+            from paddleocr import PaddleOCR
+
+            try:  # 3.x 新 API
+                _PPOCR_ENGINE = PaddleOCR(use_doc_orientation_classify=False,
+                                          use_doc_unwarping=False,
+                                          use_textline_orientation=True, lang="ch",
+                                          enable_mkldnn=False)
+            except TypeError:  # 2.x 兼容
+                _PPOCR_ENGINE = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        if hasattr(_PPOCR_ENGINE, "predict"):  # 3.x
+            lines = []
+            for res in _PPOCR_ENGINE.predict(str(img_path)):
+                d = res.json.get("res", res.json) if hasattr(res, "json") else {}
+                lines.extend(d.get("rec_texts") or [])
+            return "\n".join(lines)
+        out = _PPOCR_ENGINE.ocr(str(img_path), cls=True)  # 2.x
+        lines = []
+        for page in (out or []):
+            for line in (page or []):
+                if line and len(line) >= 2 and isinstance(line[1], (list, tuple)):
+                    lines.append(str(line[1][0]))
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001 —— 第二意见尽力而为，任何失败不阻塞主流程
+        print(f"[ocr] PP-OCR 第二意见不可用（{type(e).__name__}: {e}）"
+              f"——本次构建不再尝试（pip install paddleocr paddlepaddle 可启用）", flush=True)
+        _PPOCR_FAILED = True
+        return None
+
+
+def enrich_ocr_artifact(art: "OcrArtifact", img_path, *, min_confidence: float,
+                        cross_threshold: float = DEFAULT_CROSS_THRESHOLD,
+                        save=None, image_ref: str = "") -> bool:
+    """OCR 产物双引擎增强（in place）：第二意见复核（幂等）+ 低置信翻案判定。
+
+    - PP 全量复核：art.second_opinion 为空才跑（ocr.json 缓存幂等）；
+    - **翻案**：低置信（无结构异常）+ PP 一致 ≥cross_threshold → confidence 提到
+      cross_threshold、source=cross_confirmed（自动采纳，不进待办）；
+    - 结构类 anomaly（truncated/contradictory/misplaced/missing）不翻案；
+    - 高置信不受影响（PP 不审 layout，版面取舍分歧是预期误报）。
+    save: 传入则**有变更时**回写缓存（幂等标记落盘）；无变更不写（mtime 不动）。
+    返回是否发生变更。
+    """
+    changed = False
+    if not art.second_opinion:
+        pp = ppocr_second_opinion(img_path)
+        if pp is not None:
+            art.second_opinion = {"engine": "PP-OCRv5(local)", "text": pp,
+                                  "agree": round(score_pair(pp, art.text or ""), 4)}
+            changed = True
+    if (not art.high_confidence and not art.anomaly
+            and art.confidence is not None and art.confidence < min_confidence
+            and art.second_opinion.get("agree") is not None
+            and art.second_opinion["agree"] >= cross_threshold):
+        art.confidence = cross_threshold
+        art.confidence_source = "cross_confirmed"
+        changed = True
+        print(f"[ocr] 图片复核一致（agree={art.second_opinion['agree']}）→ 低置信翻案"
+              f"自动采纳", flush=True)
+    if changed and save is not None:
+        save(art, image_ref=image_ref)
+    return changed
+
+
+def diff_opcodes(a: str, b: str) -> list[dict]:
+    """行级 diff opcodes（unified 语义，前端渲染 GitHub 风格红/绿/上下文）。
+
+    返回 [{tag: equal|replace|delete|insert, a: [i1,i2], b: [j1,j2],
+           a_lines: [...], b_lines: [...]}]——a=主引擎行集，b=第二意见行集；
+    equal 段折叠逻辑在前端（v1 后端不做上下文裁剪，块数少时直接全量渲染）。
+    """
+    from difflib import SequenceMatcher
+
+    al = (a or "").splitlines()
+    bl = (b or "").splitlines()
+    sm = SequenceMatcher(None, al, bl, autojunk=False)
+    return [{"tag": tag, "a": [i1, i2], "b": [j1, j2],
+             "a_lines": al[i1:i2], "b_lines": bl[j1:j2]}
+            for tag, i1, i2, j1, j2 in sm.get_opcodes()]
+
+
 @dataclass
 class OcrArtifact:
     """单张图片的 OCR 产物（`data/parsed/images/<stem>.ocr.json` 的内容）。
@@ -322,6 +448,8 @@ class OcrArtifact:
     anomaly: str = ""
     signatures: list = field(default_factory=list)
     min_confidence: float = DEFAULT_MIN_CONFIDENCE
+    # 第二意见（PP-OCR 本地复核，全量跑、幂等缓存）：{"engine","text","agree"}；空=未复核
+    second_opinion: dict = field(default_factory=dict)
 
     @property
     def high_confidence(self) -> bool:
@@ -356,6 +484,7 @@ class OcrArtifact:
             "min_confidence": self.min_confidence,
             "text_included": self.high_confidence,
             "signatures": self.signatures,
+            "second_opinion": (self.second_opinion or None),
         }
 
     @classmethod
@@ -373,6 +502,7 @@ class OcrArtifact:
             anomaly=str(d.get("anomaly", "") or ""),
             signatures=list(d.get("signatures") or []),
             min_confidence=as_confidence_threshold(d.get("min_confidence")),
+            second_opinion=dict(d.get("second_opinion") or {}),
         )
 
     def evidence(self) -> dict:
@@ -384,6 +514,9 @@ class OcrArtifact:
             "anomaly": self.anomaly,
             "text_included": self.high_confidence,
             "signatures": self.signatures,
+            "second_opinion": ({k: self.second_opinion[k] for k in
+                                ("engine", "agree") if k in self.second_opinion}
+                               if self.second_opinion else None),
         }
 
 
