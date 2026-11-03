@@ -708,7 +708,15 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   三方框架兼容性不做保证；不装则三档分流退化为现状——低置信直进人工审核，主链路零影响。
   若启用：`pip install paddlepaddle paddleocr` 装 **CPU 版 wheel 即可**（paddlepaddle
   默认就是 CPU 推理，不装 paddle-custom-npu 就不碰卡），Linux 系统库 libstdc++/libgomp
-  已预装、opencv 缺 libGL 时 `dnf install mesa-libGL` 或换 `opencv-contrib-python-headless`），
+  已预装；**opencv 缺 libGL 时优先用系统包管理器安装**（容器重建后需重装——镜像里通常
+  没有）：
+  ```bash
+  # Ubuntu 容器（首选）
+  apt-get update && apt-get install -y libgl1 libgomp1
+  # openEuler 容器
+  dnf install -y mesa-libGL
+  ```
+  无在线安装条件时再用 headless 规避（target/venv 目录级换 headless，见下文隔离安装）），
   按三档分流：
   - **开关**：image 源 `ocr_second_opinion`（默认 true）——装了 paddle 即启用复核，false
     可单独关闭（复核拖慢构建/临时停用），**只影响第二意见，主 OCR（外部 API）不受影响**；
@@ -752,11 +760,17 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     ```bash
     pip install --target=/opt/ppdeps "paddlepaddle>=3.0" paddleocr==3.7.0
     # aarch64 容器 pip 解析到的 paddlepaddle 上限是 3.2.2（官方 wheel 平台差异），可用
-    # 缺 libGL 且装不了 mesa-libGL：目录级换 headless（不碰系统 opencv）
+    # 缺 libGL：优先系统包管理器（apt-get install -y libgl1 libgomp1 / dnf install mesa-libGL）；
+    # 无在线安装条件才用 headless 规避（目录级，不碰系统 opencv）
     rm -rf /opt/ppdeps/opencv_contrib_python-*.dist-info /opt/ppdeps/cv2
     pip install --target=/opt/ppdeps opencv-contrib-python-headless
     # 离线环境：export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True 后再跑构建
     ```
+    **⚠️ `ocr_pp_python` 必须写实际执行 `pip install --target` 的解释器真身**
+    （`readlink -f "$(which python3)"`，如 `/usr/local/python3.12.13/bin/python3`）——
+    写成 `/usr/bin/python3`（发行版另一个 python）会撞上版本错配的诡异 ImportError
+    （pydantic/_pydantic_core argKwargs unknown location 等），且 `--target` 补装时
+    pip 对 target 里已存在的包目录默认**不覆盖**，要加 `--upgrade` 才真正替换。
     config image 源加 `"ocr_pp_python": "/usr/bin/python3"`（容器 python 绝对路径）+
     `"ocr_pp_pythonpath": "/opt/ppdeps"`（PYTHONPATH 仅注入 runner 子进程——主进程
     依旧用系统 numpy/pandas，**不遮蔽**）。装后校验 `pip check`（与装前一致）+ runner

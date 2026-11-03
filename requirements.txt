@@ -31,9 +31,10 @@ jieba>=0.42             # 入库侧/查询侧分词（scripts/build_fts.py 重�
 #                        # 3.2.2 与 paddleocr 3.7 兼容（paddleocr 只要求 paddlepaddle>=3.0），直接装即可
 # 业务环境（openEuler + ascend）默认不装：三方框架在 NPU 上的兼容性不做保证，且复核是
 # 增强能力——不装则三档分流退化为现状（低置信直进人工审核，队列与主链路完全不受影响）。
-# 系统运行库（Linux）：libstdc++/libgomp 通常已预装；opencv 缺 libGL 时 dnf install
-# mesa-libGL（或 pip 装 opencv-contrib-python-headless 替代——注意先卸 opencv-contrib-python
-# 完整版避免并存冲突）。Windows 另需 VC++ Redist 2015-2022 x64。
+# 系统运行库（Linux）：libstdc++/libgomp 通常已预装；opencv 缺 libGL 时**优先系统包管理器**
+# （容器重建后需重装——Ubuntu: apt-get install -y libgl1 libgomp1；openEuler: dnf install
+# mesa-libGL）；无在线安装条件再用 opencv-contrib-python-headless 规避（注意先卸
+# opencv-contrib-python 完整版避免并存冲突）。Windows 另需 VC++ Redist 2015-2022 x64。
 # 开关：image 源 ocr_second_opinion（默认 true）——装了即启用复核，false 单独关闭；
 # 权重默认 ~/.paddlex/official_models/（约 23MB），PADDLE_PDX_CACHE_HOME 可重定向；
 # **离线/内网环境加 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True**（paddlex 启动时会做
