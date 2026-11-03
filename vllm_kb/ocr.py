@@ -393,10 +393,23 @@ class PpocrSubprocess:
     def text(self, img_path: str) -> str:
         self.p.stdin.write(str(img_path).replace("\n", " ") + "\n")
         self.p.stdin.flush()
-        line = self.p.stdout.readline()
-        if not line:
-            raise RuntimeError("PP runner 管道已关闭（进程退出）")
-        d = json.loads(line)
+        # 容错读取：跳过空行/库打印混入的非 JSON 行（理论上 runner 已把 stdout 全部
+        # 换成 stderr，这里兜底防御），上限 50 行防死循环。
+        d = None
+        for _ in range(50):
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("PP runner 管道已关闭（进程退出）")
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                d = json.loads(line)
+                break
+            except ValueError:  # 截断/损坏 JSON 行 → 跳过继续读
+                continue
+        if d is None:
+            raise RuntimeError("PP runner 连续 50 行无有效 JSON（协议错位）")
         if d.get("error"):
             raise RuntimeError(f"PP runner: {d['error']}")
         return str(d.get("text", "") or "")

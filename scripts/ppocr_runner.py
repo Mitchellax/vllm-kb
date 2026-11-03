@@ -45,6 +45,10 @@ def _ocr_text(engine, img_path: str) -> str:
 def main() -> int:
     args = [a for a in sys.argv[1:] if a and not a.startswith("-")]
     if "--serve" in sys.argv:
+        # **进程最早期**把 stdout 整体换成 stderr（在 import paddle 之前）——paddle/paddlex
+        # 的初始化与推理期打印（进度/日志/logger 若绑定 stdout 也会在此之后拿到 stderr）
+        # 永远进不了协议管道；协议行用保存的原 stdout 句柄输出。
+        proto, sys.stdout = sys.stdout, sys.stderr
         engine = None
         for line in sys.stdin:
             path = line.strip()
@@ -52,17 +56,12 @@ def main() -> int:
                 break
             try:
                 if engine is None:  # 首图才初始化（paddle 冷启动 ~10s 只付一次）
-                    real = sys.stdout
-                    sys.stdout = sys.stderr  # paddle 初始化噪音（Fetching/Creating）不让它污染协议管道
-                    try:
-                        engine = _new_engine()
-                    finally:
-                        sys.stdout = real
+                    engine = _new_engine()
                 print(json.dumps({"text": _ocr_text(engine, path)}, ensure_ascii=False),
-                      flush=True)
+                      file=proto, flush=True)
             except Exception as e:  # noqa: BLE001 —— 单图失败不杀服务
                 print(json.dumps({"text": "", "error": f"{type(e).__name__}: {e}"},
-                                 ensure_ascii=False), flush=True)
+                                 ensure_ascii=False), file=proto, flush=True)
         return 0
     if args:
         try:

@@ -191,6 +191,25 @@ class TestEnrichCrossConfirm(unittest.TestCase):
                                 pp_pythonpath="/opt/ppdeps")
         self.assertEqual(seen, [("/usr/bin/python3", "/opt/ppdeps")])
 
+    def test_subproc_text_skips_noise_lines(self):
+        """PpocrSubprocess.text 容错：空行/库打印混入的非 JSON 行被跳过，JSON 行命中。"""
+        import io
+        from vllm_kb.ocr import PpocrSubprocess
+
+        fake = mock.Mock()
+        fake.stdin = io.StringIO()
+        fake.stdout = io.StringIO('\nFetching model files...\n{"text": "123 456"}\n')
+        sub = PpocrSubprocess.__new__(PpocrSubprocess)
+        sub.p = fake
+        self.assertEqual(sub.text("x.png"), "123 456")
+        # 管道关闭（EOF）→ 明确报错降级
+        fake2 = mock.Mock()
+        fake2.stdin = io.StringIO()
+        fake2.stdout = io.StringIO("")
+        sub.p = fake2
+        with self.assertRaises(RuntimeError):
+            sub.text("x.png")
+
     def test_idempotent_and_missing_pp(self):
         art = self._art(conf=0.4)
         art.second_opinion = {"engine": "PP-OCR(local)", "text": "VL文本", "agree": 0.9}
