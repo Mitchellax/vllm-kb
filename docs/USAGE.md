@@ -727,6 +727,18 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     pin、`huggingface-hub`/`modelscope`（可能升级 hub 影响 transformers 兼容）、ie/trans
     extras 还会拉 **langchain 全家与 openai 客户端**——直接 `pip install paddleocr` 在
     vllm-ascend 容器里**不能保证不破坏**（pip resolver 会为满足新包要求静默改现有包）。
+    **⚠️ 红字：绝对不要把 paddle 裸 `pip install` 进容器系统 Python**——aarch64 的
+    paddlepaddle（3.2.x）依赖链会 pin `numpy<2`，而 vllm-kb 主链路的 pyarrow/lancedb
+    **要求 numpy≥2.0**——裸装会把系统 numpy 降级到 1.26.x → **lancedb「已安装但无法加载」、
+    检索/建库全挂**。踩到后的恢复：
+    ```bash
+    python3 -c "import numpy; print(numpy.__version__, numpy.__file__)"   # 确认被降到 1.26.x
+    pip install "numpy>=2.0,<2.4" --upgrade                               # 恢复（以回滚锚点记录的原版本为准）
+    python3 -c "import lancedb, pyarrow; print('lancedb ok', pyarrow.__version__)"
+    ```
+    同时排查两类常见误操作：① shell 里 `export PYTHONPATH=/opt/ppdeps`（**全局遮蔽**——
+    PYTHONPATH 必须只经 config `ocr_pp_pythonpath` 注入 runner 子进程，主进程不能看到
+    /opt/ppdeps）；② 直接 `pip install paddlepaddle`（未带 --target）落进系统。
     安全做法 = target 目录隔离，系统包零改动：
     ```bash
     pip install --target=/opt/ppdeps "paddlepaddle>=3.0" paddleocr==3.7.0

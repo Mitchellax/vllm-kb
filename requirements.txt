@@ -38,6 +38,10 @@ jieba>=0.42             # 入库侧/查询侧分词（scripts/build_fts.py 重�
 # **vllm-ascend 共享 venv 场景**：勿在主 venv 装/换 opencv（headless 替换会破坏 vllm-ascend
 # 依赖链）——paddle 装独立 venv 或 pip --target 隔离目录，image 源配 ocr_pp_python
 # （独立解释器）+ ocr_pp_pythonpath（--target 目录），子进程长驻隔离，主 venv 零改动。
+# **⚠️ 容器系统 Python 裸装 paddle 会把 numpy 降级到 1.26.x**（aarch64 paddlepaddle 3.2.x
+# 依赖链 pin numpy<2，而主链路 pyarrow/lancedb 要求 numpy≥2.0 → lancedb 无法加载、检索
+# 全挂）——PYTHONPATH 也绝不能 shell 全局 export（遮蔽主进程 numpy）；PYTHONPATH 只经
+# config ocr_pp_pythonpath 注入 runner 子进程。恢复：pip install "numpy>=2.0,<2.4" --upgrade。
 
 # ---- 开发/测试 ----
 # pytest>=8.0
