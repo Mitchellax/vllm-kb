@@ -46,7 +46,11 @@ vLLM / vllm-ascend 故障知识库与检索工具链：自动采集 GitHub 社�
   图片收割补回 + saved-from-url 保留原始 URL + GBK 编码兜底；只认本地文件不联网抓取，
   见 USAGE §2.6）、
   截图**签名导向 OCR**（provider 可插拔：api/custom、openai 兼容如 DeepSeek-OCR、paddle、ask 交互询问；
-   **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列）；
+   **高置信文本注入正文**参与 FTS + 向量检索，低置信/自报异常只留签名线索并进审核队列；
+   **OCR 双模型审评**（可选）：本地 PP-OCR 第二意见复核——三档分流（复核一致自动翻案 /
+   有分歧 diff 待审 / 人工审核）、类 GitHub diff 三选审评、sha256 锁定与孤儿数据；
+   PP 为可选依赖（paddlepaddle CPU 版，与主 OCR 外部 API 无关、不碰 NPU），vllm-ascend
+   共享环境用 `ocr_pp_python`/`ocr_pp_pythonpath` 子进程隔离，详见 USAGE §2.3「OCR 双模型审评」）；
    **请求期图片 OCR**（`client.py ocr <图片路径>` → `POST /ocr`，只读、不落盘、不审计：模型无图像输入能力时
    把用户截图转成文本 + 报错签名再检索；置信度取 OCR 模型自报单一来源，自报异常标记待人工复核；
    **与模型视觉能力无关**，但需要"可读的本地路径"——DSH 默认路由未声明图像模态时，

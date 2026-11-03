@@ -711,11 +711,15 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     独立 venv，主进程经子进程长驻管道调用（主 venv 零 paddle/opencv 改动）：
     ```bash
     python3 -m venv ~/ppvenv
-    ~/ppvenv/bin/pip install paddlepaddle==3.3.1 paddleocr==3.7.0
+    ~/ppvenv/bin/pip install "paddlepaddle>=3.0" paddleocr==3.7.0
     ```
     config image 源加 `"ocr_pp_python": "~/ppvenv/bin/python"`（tilde 展开）/绝对路径。
     权重/缓存重定向对 PP venv 生效（`PADDLE_PDX_CACHE_HOME` 要在**主进程环境**里设置，
-    runner 继承）；
+    runner 继承）；**离线/内网环境加 `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True`**
+    （paddlex 启动会做模型源联网检查，离线机器卡超时；权重已预置时此变量跳过检查）。
+    **paddlepaddle 版本按平台选**（wheel 按架构发布）：x86_64 上限 3.3.1；**aarch64
+    （鲲鹏/昇腾容器）PyPI 上限 3.2.2**——paddleocr 3.7 只要求 paddlepaddle>=3.0，
+    3.2.2 直接可用（oneDNN 兼容规避代码对 3.x 全系生效）；
   - **无 venv 的容器（vllm-ascend 容器直跑）用 --target 目录隔离**——**依赖面事实**
     （paddlex 3.7.2 metadata 实测）：`numpy<2.4,>=1.24`（区间较宽，容器 1.26/2.0-2.3
     都满足）、`pandas>=1.3`（只下限，不会动现有版本）、**`opencv-contrib-python==
@@ -725,10 +729,12 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     vllm-ascend 容器里**不能保证不破坏**（pip resolver 会为满足新包要求静默改现有包）。
     安全做法 = target 目录隔离，系统包零改动：
     ```bash
-    pip install --target=/opt/ppdeps paddlepaddle==3.3.1 paddleocr==3.7.0
+    pip install --target=/opt/ppdeps "paddlepaddle>=3.0" paddleocr==3.7.0
+    # aarch64 容器 pip 解析到的 paddlepaddle 上限是 3.2.2（官方 wheel 平台差异），可用
     # 缺 libGL 且装不了 mesa-libGL：目录级换 headless（不碰系统 opencv）
     rm -rf /opt/ppdeps/opencv_contrib_python-*.dist-info /opt/ppdeps/cv2
     pip install --target=/opt/ppdeps opencv-contrib-python-headless
+    # 离线环境：export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True 后再跑构建
     ```
     config image 源加 `"ocr_pp_python": "/usr/bin/python3"`（容器 python 绝对路径）+
     `"ocr_pp_pythonpath": "/opt/ppdeps"`（PYTHONPATH 仅注入 runner 子进程——主进程
