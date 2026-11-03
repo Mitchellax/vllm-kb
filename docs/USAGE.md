@@ -716,6 +716,24 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     config image 源加 `"ocr_pp_python": "~/ppvenv/bin/python"`（tilde 展开）/绝对路径。
     权重/缓存重定向对 PP venv 生效（`PADDLE_PDX_CACHE_HOME` 要在**主进程环境**里设置，
     runner 继承）；
+  - **无 venv 的容器（vllm-ascend 容器直跑）用 --target 目录隔离**——**依赖面事实**
+    （paddlex 3.7.2 metadata 实测）：`numpy<2.4,>=1.24`（区间较宽，容器 1.26/2.0-2.3
+    都满足）、`pandas>=1.3`（只下限，不会动现有版本）、**`opencv-contrib-python==
+    4.10.0.84` 硬 pin**（最大破坏点，pip 会强改容器已有 opencv）、`PyYAML==6.0.2` 精确
+    pin、`huggingface-hub`/`modelscope`（可能升级 hub 影响 transformers 兼容）、ie/trans
+    extras 还会拉 **langchain 全家与 openai 客户端**——直接 `pip install paddleocr` 在
+    vllm-ascend 容器里**不能保证不破坏**（pip resolver 会为满足新包要求静默改现有包）。
+    安全做法 = target 目录隔离，系统包零改动：
+    ```bash
+    pip install --target=/opt/ppdeps paddlepaddle==3.3.1 paddleocr==3.7.0
+    # 缺 libGL 且装不了 mesa-libGL：目录级换 headless（不碰系统 opencv）
+    rm -rf /opt/ppdeps/opencv_contrib_python-*.dist-info /opt/ppdeps/cv2
+    pip install --target=/opt/ppdeps opencv-contrib-python-headless
+    ```
+    config image 源加 `"ocr_pp_python": "/usr/bin/python3"`（容器 python 绝对路径）+
+    `"ocr_pp_pythonpath": "/opt/ppdeps"`（PYTHONPATH 仅注入 runner 子进程——主进程
+    依旧用系统 numpy/pandas，**不遮蔽**）。装后校验 `pip check`（与装前一致）+ runner
+    单图验证；
   - **自动**：高置信（≥ `ocr_min_confidence`）→ 现状采纳；PP 结果**仅记录**（PP 不审
     layout，对 VL 的版面取舍有系统性分歧误报——四图实证 issue 页 0.522 / doc 页 0.545
     均为侧栏取舍，内容实际重叠——故高置信不吃 PP 判定、不进队列）；

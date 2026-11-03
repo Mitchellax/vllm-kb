@@ -180,14 +180,16 @@ class TestEnrichCrossConfirm(unittest.TestCase):
         self.assertEqual(art2.confidence_source, "cross_confirmed")
 
     def test_pp_python_passthrough(self):
-        """ocr_pp_python（独立 venv 隔离模式）应透传到 ppocr_second_opinion。"""
+        """ocr_pp_python / ocr_pp_pythonpath（隔离模式）应透传到 ppocr_second_opinion。"""
         art = self._art(conf=0.4)
         seen = []
         with mock.patch("vllm_kb.ocr.ppocr_second_opinion",
-                        side_effect=lambda p, pp_python="": seen.append(pp_python) or None):
+                        side_effect=lambda p, pp_python="", pp_pythonpath="":
+                            seen.append((pp_python, pp_pythonpath)) or None):
             enrich_ocr_artifact(art, "x.png", min_confidence=0.6,
-                                pp_python="/opt/ppvenv/bin/python")
-        self.assertEqual(seen, ["/opt/ppvenv/bin/python"])
+                                pp_python="/usr/bin/python3",
+                                pp_pythonpath="/opt/ppdeps")
+        self.assertEqual(seen, [("/usr/bin/python3", "/opt/ppdeps")])
 
     def test_idempotent_and_missing_pp(self):
         art = self._art(conf=0.4)

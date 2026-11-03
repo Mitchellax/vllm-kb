@@ -156,6 +156,10 @@ class OcrConfig:
     # PP 专用解释器（image 源 `ocr_pp_python`，空=同进程 import）：独立 venv 隔离模式
     # （如 `~/ppvenv/bin/python`）——vllm-ascend 共享 venv 场景必用，主 venv 零 paddle 依赖。
     pp_python: str = ""
+    # PP 专用 PYTHONPATH（image 源 `ocr_pp_pythonpath`，仅注入 runner 子进程）：无 venv
+    # 的容器场景用 `pip install --target=/opt/ppdeps ...` 隔离安装 + 此字段指向该目录——
+    # **主进程环境零改动**（不遮蔽系统 numpy/pandas，opencv 硬 pin 的副本只在子进程生效）。
+    pp_pythonpath: str = ""
     extra: dict = field(default_factory=dict)
 
     @property
@@ -241,6 +245,7 @@ def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
         cross_threshold=as_confidence_threshold(sc.get("ocr_cross_threshold")),
         second_opinion=as_bool(sc.get("ocr_second_opinion"), default=True),
         pp_python=str(sc.get("ocr_pp_python", "") or ""),
+        pp_pythonpath=str(sc.get("ocr_pp_pythonpath", "") or ""),
     )
 
 
@@ -366,11 +371,14 @@ class PpocrSubprocess:
     stdin/stdout JSON 行协议逐图调用：paddle 冷启动只付一次，主 venv 零 paddle 依赖。
     """
 
-    def __init__(self, pp_python: str):
+    def __init__(self, pp_python: str, pp_pythonpath: str = ""):
         import subprocess
 
         runner = Path(__file__).resolve().parents[1] / "scripts" / "ppocr_runner.py"
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        if pp_pythonpath:  # --target 隔离安装目录：只注入 runner 子进程（主进程不遮蔽系统包）
+            env["PYTHONPATH"] = (pp_pythonpath + os.pathsep + env["PYTHONPATH"]
+                                 if env.get("PYTHONPATH") else pp_pythonpath)
         self.p = subprocess.Popen(
             [pp_python, "-X", "utf8", str(runner), "--serve"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -395,15 +403,18 @@ class PpocrSubprocess:
             self.p.kill()
 
 
-def ppocr_second_opinion(img_path, pp_python: str = "") -> "str | None":
+def ppocr_second_opinion(img_path, pp_python: str = "", pp_pythonpath: str = "") -> "str | None":
     """本地 PP-OCR（v5/v6 det+rec）第二意见文本。不可用/失败 → None（不阻塞主流程）。
 
     PP 不审 layout：全量文本流，与 VL 的版面取舍会有系统性"分歧"（侧栏/目录）——
     其一致度只用于**低置信结果的复核翻案**，高置信结果的分歧是预期误报（不进队列）。
-    可选依赖两种模式：
+    可选依赖三种模式：
     - pp_python 为空（默认）：同进程懒 import paddleocr——主 venv 可自由安装时用；
     - pp_python 指向独立解释器（如 `~/ppvenv/bin/python`）：**子进程长驻隔离**——
-      vllm-ascend 共享 venv 场景必用（主 venv 零 paddle/opencv 改动）。
+      vllm-ascend 共享 venv 场景必用（主 venv 零 paddle/opencv 改动）；
+    - pp_python + pp_pythonpath（`pip install --target=/opt/ppdeps` 安装目录）：无 venv
+      的**容器场景**——依赖装进独立目录，仅 runner 子进程注入 PYTHONPATH，系统
+      numpy/pandas/opencv 零改动（paddlex 的 opencv==4.10.0.84 硬 pin 副本只在子进程生效）。
     paddle 3.3.1 CPU 的 oneDNN+PIR 兼容 bug 用 enable_mkldnn=False 规避。
     """
     global _PPOCR_ENGINE, _PPOCR_FAILED, _PP_SUBPROC, _PP_SUBPROC_FAILED
@@ -413,7 +424,7 @@ def ppocr_second_opinion(img_path, pp_python: str = "") -> "str | None":
             return None
         try:
             if _PP_SUBPROC is None:
-                _PP_SUBPROC = PpocrSubprocess(pp_python.strip())
+                _PP_SUBPROC = PpocrSubprocess(pp_python.strip(), pp_pythonpath.strip())
             return _PP_SUBPROC.text(str(img_path))
         except Exception as e:  # noqa: BLE001 —— runner 崩溃/不可用只降级不阻塞
             print(f"[ocr] PP 子进程复核不可用（{type(e).__name__}: {e}）"
@@ -463,6 +474,7 @@ def ppocr_second_opinion(img_path, pp_python: str = "") -> "str | None":
 def enrich_ocr_artifact(art: "OcrArtifact", img_path, *, min_confidence: float,
                         cross_threshold: float = DEFAULT_CROSS_THRESHOLD,
                         enabled: bool = True, pp_python: str = "",
+                        pp_pythonpath: str = "",
                         save=None, image_ref: str = "") -> bool:
     """OCR 产物双引擎增强（in place）：第二意见复核（幂等）+ 低置信翻案判定。
 
@@ -479,7 +491,8 @@ def enrich_ocr_artifact(art: "OcrArtifact", img_path, *, min_confidence: float,
     """
     changed = False
     if enabled and not art.second_opinion:
-        pp = ppocr_second_opinion(img_path, pp_python=pp_python)
+        pp = ppocr_second_opinion(img_path, pp_python=pp_python,
+                                  pp_pythonpath=pp_pythonpath)
         if pp is not None:
             art.second_opinion = {"engine": "PP-OCRv5(local)", "text": pp,
                                   "agree": round(score_pair(pp, art.text or ""), 4)}

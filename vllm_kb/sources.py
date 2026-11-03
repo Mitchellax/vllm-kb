@@ -364,7 +364,7 @@ class BaseSource(ABC):
 
         enrich_ocr_artifact(art, asset_path, min_confidence=oc.min_confidence,
                             cross_threshold=oc.cross_threshold, enabled=oc.second_opinion,
-                            pp_python=oc.pp_python,
+                            pp_python=oc.pp_python, pp_pythonpath=oc.pp_pythonpath,
                             save=lambda a, image_ref=image_ref: save_ocr_artifact(
                                 cache, a, image_ref=image_ref))
         if art.high_confidence and art.text.strip():
@@ -1331,6 +1331,7 @@ class ImageSource(BaseSource):
         cross_threshold = as_confidence_threshold(self.cfg.get("ocr_cross_threshold"))
         second_opinion_on = as_bool(self.cfg.get("ocr_second_opinion"), default=True)
         pp_python = str(self.cfg.get("ocr_pp_python", "") or "")
+        pp_pythonpath = str(self.cfg.get("ocr_pp_pythonpath", "") or "")
         provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
         api_base = str(self.cfg.get("ocr_api_base", "") or "")
         api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
@@ -1364,7 +1365,8 @@ class ImageSource(BaseSource):
                 # 仅在有变更时写盘（幂等：mtime 不动）
                 if enrich_ocr_artifact(cached, img, min_confidence=min_conf,
                                        cross_threshold=cross_threshold,
-                                       enabled=second_opinion_on, pp_python=pp_python):
+                                       enabled=second_opinion_on, pp_python=pp_python,
+                                       pp_pythonpath=pp_pythonpath):
                     changed = True
                 conf_sources[cached.confidence_source or "?"] += 1
                 if changed:
@@ -1416,7 +1418,7 @@ class ImageSource(BaseSource):
             # 新跑结果同样走第二意见复核 + 低置信翻案（有变更即回写）
             enrich_ocr_artifact(art, img, min_confidence=min_conf,
                                 cross_threshold=cross_threshold, enabled=second_opinion_on,
-                                pp_python=pp_python,
+                                pp_python=pp_python, pp_pythonpath=pp_pythonpath,
                                 save=lambda a: save_ocr_artifact(
                                     ocr_path, a, image_ref=f"assets/images/{img.name}"))
             conf_sources[art.confidence_source or "?"] += 1
