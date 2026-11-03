@@ -21,9 +21,13 @@ openpyxl>=3.0           # Excel（schema-free：任意列/sheet，行 cell 拼�
 # ---- 中文分词（FTS5 中文检索，可选——不装则 FTS 中文按整段匹配，行为同旧版）----
 jieba>=0.42             # 入库侧/查询侧分词（scripts/build_fts.py 重建全文索引，不重嵌向量）
 
-# ---- OCR（可选——按需安装；不装则 ocr_provider=ask 时询问/跳过）----
-# paddleocr>=2.7         # 本地 OCR（首次运行下载模型；离线需预置模型目录）
-# paddlepaddle>=2.6
+# ---- OCR 第二意见复核（可选——默认不装；主 OCR 是外部 API，与此包无关）----
+# paddleocr>=3.7         # ① 本地 OCR 主引擎（ocr_provider=paddle 可选模式）；② PP-OCR 第二意见复核
+# paddlepaddle>=3.3      # 同上，CPU 版 wheel 即可——与 ascend NPU 无关，不装 NPU 插件就不碰卡
+# 业务环境（openEuler + ascend）默认不装：三方框架在 NPU 上的兼容性不做保证，且复核是
+# 增强能力——不装则三档分流退化为现状（低置信直进人工审核，队列与主链路完全不受影响）。
+# 系统运行库（Linux）：libstdc++/libgomp 通常已预装；opencv 缺 libGL 时 dnf install
+# mesa-libGL（或 pip 装 opencv-python-headless 替代）。Windows 另需 VC++ Redist 2015-2022 x64。
 
 # ---- 开发/测试 ----
 # pytest>=8.0

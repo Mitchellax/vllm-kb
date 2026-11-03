@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS ocr_reviews (
 
 - **PP 不审 layout（四图实证）**：PP 是纯 det+rec 全量文本流，对 VL 的版面取舍（侧栏/目录略读）会系统性报"分歧"（issue 页 0.522 / doc 页 0.545，内容实际重叠）——因此**高置信结果不吃 PP 判定**（仅记录），复核一致翻案只作用于低置信结果（PP 认可 = 文本层面可靠，阈值边缘误伤被纠正）；DIVERGE 样本人工比对时先区分"版面差异"与"真识别错误"；
 
-- **PP 引擎是可选依赖**：业务环境需 `pip install paddleocr paddlepaddle`（+VC 运行库）；未装 → 复核一致/有分歧两档不存在（退化为现状：低置信直进人工），功能不残废；
+- **PP 引擎是可选依赖**：业务环境需 `pip install paddleocr paddlepaddle`（+VC 运行库）；未装 → 复核一致/有分歧两档不存在（退化为现状：低置信直进人工），功能不残废；**业务环境（openEuler + ascend NPU）决策：默认不装**——主 OCR 是外部 API（paddleocr-vl 走 vLLM），与本地 paddle 包无关，NPU 上三方框架兼容性不做保证；若未来启用，CPU 版 wheel 即可（不装 paddle-custom-npu 就不碰卡）；
 - **PP 全量跑的成本**：首轮 ~20 分钟（700 张，本地 CPU 1-2s/张）；幂等缓存后增量仅新图；与 build 串行——量大时可后置独立脚本跑（v1 随 build）；
 - **锁定 vs 指纹**：人工锁定优先于引擎指纹——用户改提示词/模型后，已审评图**不自动重跑**（预期行为，删除审评项即可重审）；USAGE 必须写明；
 - **diff 行对齐质量**：两引擎版面顺序差异大时 diff 块会碎片化——后端先按"行集相似度"决定 unified 还是 side-by-side 阈值？**v1 只做 unified**（碎片化可接受，人工核对本意）；

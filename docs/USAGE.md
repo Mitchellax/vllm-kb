@@ -667,8 +667,12 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   （logprobs <0.85 的图用 PP-OCRv5 det+rec 复跑，编辑距离一致则采纳）；
   ④救不回的走低置信人工审核兜底。
 - **OCR 双模型审评（2026-10，审核工作台「OCR 审评」页）**：构建时对**所有** OCR 图自动跑
-  本地 PP-OCR 第二意见复核（`second_opinion` 幂等缓存在 ocr.json；PP 未安装自动退化），
-  按三档分流：
+  本地 PP-OCR 第二意见复核（`second_opinion` 幂等缓存在 ocr.json；**PP 是可选依赖——
+  业务环境（openEuler + ascend NPU）默认不装**：主 OCR 是外部 API 与 paddle 无关，NPU 上
+  三方框架兼容性不做保证；不装则三档分流退化为现状——低置信直进人工审核，主链路零影响。
+  若启用：`pip install paddlepaddle paddleocr` 装 **CPU 版 wheel 即可**（paddlepaddle
+  默认就是 CPU 推理，不装 paddle-custom-npu 就不碰卡），Linux 系统库 libstdc++/libgomp
+  已预装、opencv 缺 libGL 时 `dnf install mesa-libGL`），按三档分流：
   - **自动**：高置信（≥ `ocr_min_confidence`）→ 现状采纳；PP 结果**仅记录**（PP 不审
     layout，对 VL 的版面取舍有系统性分歧误报——四图实证 issue 页 0.522 / doc 页 0.545
     均为侧栏取舍，内容实际重叠——故高置信不吃 PP 判定、不进队列）；
