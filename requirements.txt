@@ -3,6 +3,9 @@
 # 或先在有网环境 `pip download -r requirements.txt -d wheels/` 打包离线安装。
 
 # ---- 核心（采集 + 检索 + 图，必装）----
+# ⚠️ vllm-ascend 容器镜像（numpy=1.26.4）适配：pyarrow>=19 import 时硬检查 numpy>=2.0
+# 会崩（"pyarrow requires numpy 2.0 or newer"）——先 `pip install "pyarrow<19"` 再装
+# lancedb（resolver 自动选兼容版）；paddle 链 numpy<2 与镜像一致反而无冲突。
 requests>=2.28
 pydantic>=2.5
 lancedb>=0.9            # 向量库（未装时回退纯 Python 模式，功能不完整）
