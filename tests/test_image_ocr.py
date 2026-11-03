@@ -855,5 +855,65 @@ class TestSelfConfidenceParsing(unittest.TestCase):
         self.assertEqual(oc.prompt, "请识别文字")
 
 
+class TestDetectOutputAnomaly(unittest.TestCase):
+    """确定性结构检测：小 VLM 周期吸引子 / 数字汤（logprobs 对重复偏高，置信度判别失效）。"""
+
+    @classmethod
+    def _ocr_mod(cls):
+        import vllm_kb.ocr as _o
+        return _o
+
+    def test_line_period_attractor(self):
+        # 复读 attractor：读一段后逐字复读（贪婪解码重复已生成 token 序列）
+        m = self._ocr_mod()
+        block = ["第 128 页 耗时 3.2s", "第 129 页 耗时 3.1s", "第 130 页 耗时 3.3s"]
+        text = "\n".join(f"第 {i} 页 耗时 {3.0 + i % 7 * 0.1:.1f}s 共 {200 + i} 条"
+                         for i in range(1, 40)) + "\n" + "\n".join(block * 40)
+        self.assertEqual(m.detect_output_anomaly(text), "repetition")
+
+    def test_increasing_list_is_valid_transcription(self):
+        # 页码递增列表若为图片原生内容 → 正确转录，不标（结构相似≠复读）
+        m = self._ocr_mod()
+        text = "\n".join(f"第 {i} 页 耗时 {3.0 + i % 7 * 0.1:.1f}s 共 {200 + i} 条"
+                         for i in range(1, 60))
+        self.assertEqual(m.detect_output_anomaly(text), "")
+
+    def test_single_line_period(self):
+        # 纯数字流重复：本质是无结构数字汤（无汉字/字母），numeric_soup 语义更精确
+        self.assertEqual(self._ocr_mod().detect_output_anomaly("x " + "1.2.3." * 90),
+                         "numeric_soup")
+
+    def test_numeric_soup(self):
+        self.assertEqual(self._ocr_mod().detect_output_anomaly(" ".join(["1234567890"] * 40)),
+                         "numeric_soup")
+
+    def test_real_table_not_flagged(self):
+        # 真实性能表格：数字密集、行结构各异 → 不误伤
+        rows = []
+        for i in range(40):
+            rows.append(f"卡形{i % 5} TP{i % 8 + 1} 并发时延({i * 3}.2ms) 吞吐 {1287 + i * 7}.5")
+            rows.append(f"ACLNN 算子 {i}.{i % 9} 耗时 {8 + i}.21 GB/s")
+        self.assertEqual(self._ocr_mod().detect_output_anomaly("\n".join(rows)), "")
+
+    def test_normal_text_not_flagged(self):
+        text = ("这是一段正常的排障文档。\n" +
+                "".join(f"步骤 {i}：执行 hccn_tool 检查 {i} 号网卡的链路状态与误码率。\n"
+                        for i in range(1, 16)))
+        self.assertEqual(self._ocr_mod().detect_output_anomaly(text), "")
+
+    def test_short_text_skipped(self):
+        self.assertEqual(self._ocr_mod().detect_output_anomaly("1234567890 " * 5), "")
+
+    def test_engine_reported_anomaly_takes_priority(self):
+        # 引擎自报格式异常优先（语义更精确），不被结构检测覆盖
+        m = self._ocr_mod()
+        art = m.build_ocr_artifact(
+            b"", "s", m.OcrResult(text="1.2.3." * 90, confidence=None,
+                                  confidence_source="logprobs",
+                                  anomaly=m.ANOMALY_MISSING),
+            "openai", "chat", "m")
+        self.assertEqual(art.anomaly, "missing")
+
+
 if __name__ == "__main__":
     unittest.main()

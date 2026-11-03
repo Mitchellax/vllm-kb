@@ -70,6 +70,12 @@ ANOMALY_UNPARSABLE = "unparsable"        # 找到但数值不可解析
 ANOMALY_OUT_OF_RANGE = "out_of_range"    # 数值不在 [0,1]
 ANOMALY_MISPLACED = "misplaced"          # 不在末尾 / 出现多次（格式污染正文）
 ANOMALY_CONTRADICTORY = "contradictory"  # 正文为空却自报高置信
+ANOMALY_REPETITION = "repetition"        # 贪婪解码周期吸引子：小 VLM 对看不见尽头的无结构
+                                         # 数字长列表读一段后开始循环（repetition penalty 只
+                                         # 加长周期烧满 max_tokens，不能靠惩罚根治）
+ANOMALY_NUMERIC_SOUP = "numeric_soup"    # 无结构数字汤：图片不截断、正文是数字流——logprobs
+                                         # 对确定性重复天然偏高（如 0.968），置信度判别失效，
+                                         # 用字符类结构检测补位
 
 # 提示词版本：改动提示词/解析规则时必须 +1——引擎指纹随之变化，已有 ocr.json 缓存
 # 全部失效并自动重算（避免"图片没变、提示词变了，结果还是旧的"）。
@@ -618,15 +624,65 @@ class OcrArtifact:
         }
 
 
+def detect_output_anomaly(text: str) -> str:
+    """**确定性结构检测**（不依赖置信度）：补位 logprobs 对重复/退化输出的系统性偏高。
+
+    背景（业务实测）：小 VLM 对"看不见尽头的无结构数字长列表"贪婪解码陷入周期吸引子
+    ——**复读已生成过的 token 序列**（逐字重复），repetition penalty 只是加长周期照样
+    烧满 max_tokens；另一类图片不截断但正文是数字汤，logprobs 高达 0.968（自回归模型
+    对重复 conditioning 内容熵天然低）——两类垃圾输出都高置信，置信度判别失效。这里
+    用结构信号兜底，命中即 anomaly（进人工、不进正文、结构类不翻案）。**阈值保守**：
+
+    - numeric_soup：≥300 字符且汉字/字母占比 <3%（真实性能表格总有表头/单位/列名）；
+    - repetition：尾部 k 行块**逐字**（norm 后）连续重复 ≥20/30 轮，或字符级周期 ≥12
+      轮——复读 attractor 是几百行；正常模板列表十几行不误伤。注意**不判结构相似**
+      （形状签名）：页码递增列表若为图片原生内容是正确转录，逐字判据天然豁免。
+
+    返回 ANOMALY_* 或 ""（正常）。
+    """
+    if not text or len(text) < 120:
+        return ""
+    # ---- 数字汤先判（更精确的语义）：数字流无结构 ----
+    if len(text) >= 300:
+        alpha_han = sum(1 for c in text if c.isalnum() and not c.isascii())
+        alpha_latin = sum(1 for c in text if c.isascii() and c.isalpha())
+        if (alpha_han + alpha_latin) / len(text) < 0.03:
+            return ANOMALY_NUMERIC_SOUP
+    # ---- 行级逐字复读：尾部 k 行块连续重复 ≥N 轮（复读 attractor 是几百行，
+    #      正常模板列表十几行；k≥2 需 30 轮放过长性能表的两行交替模式）----
+    lines = [norm_text(l) for l in text.splitlines()]
+    lines = [l for l in lines if l]
+    n = len(lines)
+    for k in range(1, 7):
+        rounds = 20 if k == 1 else 30
+        if n >= k * rounds:
+            block = lines[n - k:]
+            if all(lines[n - k - i * k: n - i * k] == block for i in range(1, rounds)):
+                return ANOMALY_REPETITION
+    # ---- 字符级周期（单行内长重复）：尾部周期串 ≥12 轮 ----
+    tail = "".join(lines)[-400:]
+    for p in range(8, 65):
+        if len(tail) >= p * 12:
+            unit = tail[-p:]
+            if all(tail[-(i + 1) * p: -i * p] == unit for i in range(12)):
+                return ANOMALY_REPETITION
+    return ""
+
+
 def build_ocr_artifact(src: "str | Path | bytes", sha256: str, result: OcrResult,
                        provider: str, mode: str, model: str,
                        min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> OcrArtifact:
-    """由一次 OCR 调用结果构造产物（含签名提取与引擎指纹）。"""
+    """由一次 OCR 调用结果构造产物（含签名提取与引擎指纹）。
+
+    anomaly 取**引擎自报优先**（missing/misplaced 等格式异常语义更精确），为空才跑
+    确定性结构检测（repetition/numeric_soup——logprobs 对重复偏高时的兜底，见函数注释）。
+    """
     return OcrArtifact(
         sha256=sha256, provider=provider, mode=mode, model=model,
         fingerprint=engine_fingerprint(provider, mode, model),
         text=result.text or "", confidence=result.confidence,
-        confidence_source=result.confidence_source, anomaly=result.anomaly,
+        confidence_source=result.confidence_source,
+        anomaly=(result.anomaly or detect_output_anomaly(result.text or "")),
         signatures=extract_judgable_signatures(result.text or ""),
         min_confidence=min_confidence,
     )

@@ -661,6 +661,15 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     paddleocr-vl 类 OCR 专用模型**不自报置信度**，logprobs 是唯一模型侧来源；特殊 token
     （`<|...|>`）不计入均值（会把分数拉低到无意义）；无 logprobs 且无自报行 →
     `anomaly=no_confidence` 进人工核对；输出被截断（finish_reason=length）→ `anomaly=truncated`；
+  - **输出结构检测（确定性，不依赖置信度）**：业务实测小 VLM 对"看不见尽头的无结构数字
+    长列表"贪婪解码陷入周期吸引子（**复读已生成 token 序列**，repetition penalty 只是
+    加长周期照样烧满 max_tokens），另一类图片不截断但正文是无结构数字汤——两者 logprobs
+    都偏高（自回归模型对重复 conditioning 内容熵天然低，实测 0.968），置信度判别失效。
+    `vllm_kb/ocr.py detect_output_anomaly()` 在**引擎自报异常为空时**补两类结构 anomaly：
+    `numeric_soup`（≥300 字符且汉字/字母占比 <3%——真实性能表格总有表头不误伤）、
+    `repetition`（尾部 k 行块逐字复读 ≥20/30 轮或字符级周期 ≥12 轮——复读 attractor
+    是几百行，正常模板列表十几行不误伤；**不判结构相似**：页码递增列表若为图片原生
+    内容是正确转录，逐字判据天然豁免）。命中即进人工、不进正文、结构类不翻案；
 - key 可选（`ocr_api_key` 或环境变量 `OCR_API_KEY`）；`ocr_api_model` 可选透传（openai 模式必填）；
 - **置信度来源（单一来源原则）**：`custom` = 服务端返回（`confidence_source=service`）、
   `paddle` = 引擎逐行平均（`engine`）、`openai` = **logprobs 优先，自报回退**（`logprobs`/`model`）——
@@ -768,7 +777,7 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     默认 0.85）→ **翻案自动采纳**（confidence_source=cross_confirmed，正文注入），
     不进待办；「OCR 审评」页可展开 diff 抽查；
   - **有分歧 / 人工审核**：低置信 + PP 分歧（agree <0.85）→ 队列 reason=diverged（带
-    双模型全文）；结构类 anomaly（truncated/contradictory/misplaced）与 PP 未复核的
+    双模型全文）；结构类 anomaly（truncated/contradictory/misplaced/repetition/numeric_soup）与 PP 未复核的
     低置信 → 照旧人工审核。
   **审评操作**（队列点开 OCR 项详情）：类 GitHub unified diff（红=主引擎独有、绿=PP
   独有）逐差异块三选——采用主引擎 / 采用 PP / 手动编辑；保存即**锁定**（`ocr_reviews`
