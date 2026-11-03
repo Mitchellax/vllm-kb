@@ -494,7 +494,7 @@ def enrich_ocr_artifact(art: "OcrArtifact", img_path, *, min_confidence: float,
         pp = ppocr_second_opinion(img_path, pp_python=pp_python,
                                   pp_pythonpath=pp_pythonpath)
         if pp is not None:
-            art.second_opinion = {"engine": "PP-OCRv5(local)", "text": pp,
+            art.second_opinion = {"engine": "PP-OCR(local)", "text": pp,
                                   "agree": round(score_pair(pp, art.text or ""), 4)}
             changed = True
     if (not art.high_confidence and not art.anomaly

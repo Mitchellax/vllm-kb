@@ -301,7 +301,7 @@ def cmd_cross(bench: Path, threshold: float) -> int:
               f"ppocr字数={len(norm_text(txt))} 主引擎字数={len(norm_text(str(it.get('main_text', ''))))}")
         if agree < threshold:
             print(f"         ppocr头: {norm_text(txt)[:100]}")
-    report["cross_check"] = {"engine": "PP-OCRv5(local)", "threshold": threshold,
+    report["cross_check"] = {"engine": "PP-OCR(local)", "threshold": threshold,
                              "agree_rate": round(n_agree / len(rows), 4) if rows else None}
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[bench] 交叉一致率 {n_agree}/{len(rows)}，已写回 {report_path}——"

@@ -193,7 +193,7 @@ class TestEnrichCrossConfirm(unittest.TestCase):
 
     def test_idempotent_and_missing_pp(self):
         art = self._art(conf=0.4)
-        art.second_opinion = {"engine": "PP-OCRv5(local)", "text": "VL文本", "agree": 0.9}
+        art.second_opinion = {"engine": "PP-OCR(local)", "text": "VL文本", "agree": 0.9}
         calls = []
         with mock.patch("vllm_kb.ocr.ppocr_second_opinion",
                         side_effect=lambda p: calls.append(p) or "VL文本"):
@@ -252,18 +252,18 @@ class TestSeedThreeTiers(unittest.TestCase):
 
     def test_auto_consistent_not_queued(self):
         self._add_doc([self._ev("a" * 64, conf=0.4,
-                                so={"engine": "PP-OCRv5(local)", "agree": 0.92})])
+                                so={"engine": "PP-OCR(local)", "agree": 0.92})])
         self.assertEqual(self._seed(), [])   # 复核一致：不进待办
 
     def test_diverged_queued_with_both_texts(self):
         sha = "b" * 64
         (self.root / "data" / "parsed" / "images" / f"img_{sha[:16]}.ocr.json").write_text(
             json.dumps({"sha256": sha, "text": "VL全文", "confidence": 0.4,
-                        "second_opinion": {"engine": "PP-OCRv5(local)",
+                        "second_opinion": {"engine": "PP-OCR(local)",
                                            "text": "PP全文", "agree": 0.5}},
                        ensure_ascii=False), encoding="utf-8")
         self._add_doc([self._ev(sha, conf=0.4,
-                                so={"engine": "PP-OCRv5(local)", "agree": 0.5})])
+                                so={"engine": "PP-OCR(local)", "agree": 0.5})])
         items = self._seed()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["payload"]["reason"], "diverged")

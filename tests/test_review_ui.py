@@ -986,7 +986,7 @@ class OcrReviewApiTest(unittest.TestCase):
         (img_dir / f"img_{self.sha[:16]}.ocr.json").write_text(json.dumps({
             "sha256": self.sha, "text": "主引擎全文\n第二行", "confidence": 0.4,
             "confidence_source": "model", "anomaly": "",
-            "second_opinion": {"engine": "PP-OCRv5(local)", "text": "主引擎全文\nPP改写行",
+            "second_opinion": {"engine": "PP-OCR(local)", "text": "主引擎全文\nPP改写行",
                                "agree": 0.5},
         }, ensure_ascii=False), encoding="utf-8")
         from vllm_kb.config import AppConfig
