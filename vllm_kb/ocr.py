@@ -149,6 +149,13 @@ class OcrConfig:
     # 结果翻案自动采纳（不进待办）；< 此值进「有分歧」待办。高置信不受影响（PP 不审
     # layout，对高置信的版面取舍有系统性分歧误报）。image 源 `ocr_cross_threshold`。
     cross_threshold: float = 0.85
+    # PP 第二意见复核总开关（image 源 `ocr_second_opinion`，默认开）：装了 paddleocr
+    # 即启用复核；false 可单独关闭（复核拖慢构建/临时停用）——主 OCR 是外部 API，
+    # 此开关只影响第二意见，不影响主链路。
+    second_opinion: bool = True
+    # PP 专用解释器（image 源 `ocr_pp_python`，空=同进程 import）：独立 venv 隔离模式
+    # （如 `~/ppvenv/bin/python`）——vllm-ascend 共享 venv 场景必用，主 venv 零 paddle 依赖。
+    pp_python: str = ""
     extra: dict = field(default_factory=dict)
 
     @property
@@ -201,6 +208,15 @@ def as_prompt(v) -> str:
     return s or "OCR"
 
 
+def as_bool(v, default: bool = True) -> bool:
+    """宽松布尔解析（JSON true/false 之外容忍字符串 "true"/"false"/"1"/"0"）。"""
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+
 def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
     """从 config 的 image source 解析 OCR 配置。
 
@@ -223,6 +239,8 @@ def ocr_config_from_cfg(cfg) -> Optional[OcrConfig]:
         temperature=as_temperature(sc.get("ocr_temperature")),
         prompt=as_prompt(sc.get("ocr_api_prompt")),
         cross_threshold=as_confidence_threshold(sc.get("ocr_cross_threshold")),
+        second_opinion=as_bool(sc.get("ocr_second_opinion"), default=True),
+        pp_python=str(sc.get("ocr_pp_python", "") or ""),
     )
 
 
@@ -335,17 +353,80 @@ def score_pair(expect: str, actual: str) -> float:
 _PPOCR_ENGINE = None
 _PPOCR_FAILED = False
 
+# 子进程长驻客户端单例（ocr_pp_python 配置的独立 venv 隔离模式）
+_PP_SUBPROC = None
+_PP_SUBPROC_FAILED = False
 
-def ppocr_second_opinion(img_path) -> "str | None":
+
+class PpocrSubprocess:
+    """PP-OCR 子进程长驻客户端（**vllm-ascend 共存方案**）。
+
+    主 venv（vllm-ascend 共享环境）不能装/换 opencv（破坏依赖链）——paddle 全家桶放
+    独立 venv，主进程经 `ppvenv/bin/python scripts/ppocr_runner.py --serve` 的
+    stdin/stdout JSON 行协议逐图调用：paddle 冷启动只付一次，主 venv 零 paddle 依赖。
+    """
+
+    def __init__(self, pp_python: str):
+        import subprocess
+
+        runner = Path(__file__).resolve().parents[1] / "scripts" / "ppocr_runner.py"
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        self.p = subprocess.Popen(
+            [pp_python, "-X", "utf8", str(runner), "--serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1, env=env)
+
+    def text(self, img_path: str) -> str:
+        self.p.stdin.write(str(img_path).replace("\n", " ") + "\n")
+        self.p.stdin.flush()
+        line = self.p.stdout.readline()
+        if not line:
+            raise RuntimeError("PP runner 管道已关闭（进程退出）")
+        d = json.loads(line)
+        if d.get("error"):
+            raise RuntimeError(f"PP runner: {d['error']}")
+        return str(d.get("text", "") or "")
+
+    def close(self) -> None:
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            self.p.kill()
+
+
+def ppocr_second_opinion(img_path, pp_python: str = "") -> "str | None":
     """本地 PP-OCR（v5/v6 det+rec）第二意见文本。不可用/失败 → None（不阻塞主流程）。
 
     PP 不审 layout：全量文本流，与 VL 的版面取舍会有系统性"分歧"（侧栏/目录）——
     其一致度只用于**低置信结果的复核翻案**，高置信结果的分歧是预期误报（不进队列）。
-    可选依赖：pip install paddleocr paddlepaddle；paddle 3.3.1 CPU 的 oneDNN+PIR
-    兼容 bug 用 enable_mkldnn=False 规避；受限环境用 PADDLE_PDX_CACHE_HOME /
-    USERPROFILE 重定向模型缓存。
+    可选依赖两种模式：
+    - pp_python 为空（默认）：同进程懒 import paddleocr——主 venv 可自由安装时用；
+    - pp_python 指向独立解释器（如 `~/ppvenv/bin/python`）：**子进程长驻隔离**——
+      vllm-ascend 共享 venv 场景必用（主 venv 零 paddle/opencv 改动）。
+    paddle 3.3.1 CPU 的 oneDNN+PIR 兼容 bug 用 enable_mkldnn=False 规避。
     """
-    global _PPOCR_ENGINE, _PPOCR_FAILED
+    global _PPOCR_ENGINE, _PPOCR_FAILED, _PP_SUBPROC, _PP_SUBPROC_FAILED
+    if pp_python.strip():
+        # ---- 子进程隔离模式 ----
+        if _PP_SUBPROC_FAILED:
+            return None
+        try:
+            if _PP_SUBPROC is None:
+                _PP_SUBPROC = PpocrSubprocess(pp_python.strip())
+            return _PP_SUBPROC.text(str(img_path))
+        except Exception as e:  # noqa: BLE001 —— runner 崩溃/不可用只降级不阻塞
+            print(f"[ocr] PP 子进程复核不可用（{type(e).__name__}: {e}）"
+                  f"——本次构建不再尝试（检查 ocr_pp_python 解释器路径与独立 venv）", flush=True)
+            _PP_SUBPROC_FAILED = True
+            try:
+                if _PP_SUBPROC is not None:
+                    _PP_SUBPROC.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _PP_SUBPROC = None
+            return None
+    # ---- 同进程模式 ----
     if _PPOCR_FAILED:
         return None
     try:
@@ -381,9 +462,13 @@ def ppocr_second_opinion(img_path) -> "str | None":
 
 def enrich_ocr_artifact(art: "OcrArtifact", img_path, *, min_confidence: float,
                         cross_threshold: float = DEFAULT_CROSS_THRESHOLD,
+                        enabled: bool = True, pp_python: str = "",
                         save=None, image_ref: str = "") -> bool:
     """OCR 产物双引擎增强（in place）：第二意见复核（幂等）+ 低置信翻案判定。
 
+    - **enabled=False 直接跳过**（`ocr_second_opinion: false`——复核单独开关，主 OCR
+      是外部 API 不受影响）；PP 懒加载失败也自动跳过；
+    - **pp_python**：独立解释器路径（子进程隔离模式，vllm-ascend 共享 venv 必用）；
     - PP 全量复核：art.second_opinion 为空才跑（ocr.json 缓存幂等）；
     - **翻案**：低置信（无结构异常）+ PP 一致 ≥cross_threshold → confidence 提到
       cross_threshold、source=cross_confirmed（自动采纳，不进待办）；
@@ -393,8 +478,8 @@ def enrich_ocr_artifact(art: "OcrArtifact", img_path, *, min_confidence: float,
     返回是否发生变更。
     """
     changed = False
-    if not art.second_opinion:
-        pp = ppocr_second_opinion(img_path)
+    if enabled and not art.second_opinion:
+        pp = ppocr_second_opinion(img_path, pp_python=pp_python)
         if pp is not None:
             art.second_opinion = {"engine": "PP-OCRv5(local)", "text": pp,
                                   "agree": round(score_pair(pp, art.text or ""), 4)}

@@ -363,7 +363,8 @@ class BaseSource(ABC):
         from .ocr import enrich_ocr_artifact
 
         enrich_ocr_artifact(art, asset_path, min_confidence=oc.min_confidence,
-                            cross_threshold=oc.cross_threshold,
+                            cross_threshold=oc.cross_threshold, enabled=oc.second_opinion,
+                            pp_python=oc.pp_python,
                             save=lambda a, image_ref=image_ref: save_ocr_artifact(
                                 cache, a, image_ref=image_ref))
         if art.high_confidence and art.text.strip():
@@ -1297,8 +1298,9 @@ class ImageSource(BaseSource):
     def canonicalize(self) -> list[KbDocument]:
         import os
 
-        from .ocr import (OcrApiError, OcrResult, OcrUnavailable, as_confidence_threshold,
-                          as_timeout_seconds, build_ocr_artifact, enrich_ocr_artifact,
+        from .ocr import (OcrApiError, OcrResult, OcrUnavailable, as_bool,
+                          as_confidence_threshold, as_timeout_seconds,
+                          build_ocr_artifact, enrich_ocr_artifact,
                           engine_fingerprint, load_ocr_artifact, ocr_image_detail,
                           save_ocr_artifact)
         from .review import get_ocr_review
@@ -1327,6 +1329,8 @@ class ImageSource(BaseSource):
         temperature = as_temperature(self.cfg.get("ocr_temperature"))
         prompt = as_prompt(self.cfg.get("ocr_api_prompt"))
         cross_threshold = as_confidence_threshold(self.cfg.get("ocr_cross_threshold"))
+        second_opinion_on = as_bool(self.cfg.get("ocr_second_opinion"), default=True)
+        pp_python = str(self.cfg.get("ocr_pp_python", "") or "")
         provider = str(self.cfg.get("ocr_provider", "ask") or "ask").lower()
         api_base = str(self.cfg.get("ocr_api_base", "") or "")
         api_key = str(self.cfg.get("ocr_api_key", "") or os.environ.get("OCR_API_KEY", ""))
@@ -1359,7 +1363,8 @@ class ImageSource(BaseSource):
                 # ---- 第二意见复核（幂等）+ 低置信翻案（与 _ocr_artifact_for 同一套）----
                 # 仅在有变更时写盘（幂等：mtime 不动）
                 if enrich_ocr_artifact(cached, img, min_confidence=min_conf,
-                                       cross_threshold=cross_threshold):
+                                       cross_threshold=cross_threshold,
+                                       enabled=second_opinion_on, pp_python=pp_python):
                     changed = True
                 conf_sources[cached.confidence_source or "?"] += 1
                 if changed:
@@ -1410,7 +1415,8 @@ class ImageSource(BaseSource):
             save_ocr_artifact(ocr_path, art, image_ref=f"assets/images/{img.name}")
             # 新跑结果同样走第二意见复核 + 低置信翻案（有变更即回写）
             enrich_ocr_artifact(art, img, min_confidence=min_conf,
-                                cross_threshold=cross_threshold,
+                                cross_threshold=cross_threshold, enabled=second_opinion_on,
+                                pp_python=pp_python,
                                 save=lambda a: save_ocr_artifact(
                                     ocr_path, a, image_ref=f"assets/images/{img.name}"))
             conf_sources[art.confidence_source or "?"] += 1

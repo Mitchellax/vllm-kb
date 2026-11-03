@@ -699,7 +699,23 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   三方框架兼容性不做保证；不装则三档分流退化为现状——低置信直进人工审核，主链路零影响。
   若启用：`pip install paddlepaddle paddleocr` 装 **CPU 版 wheel 即可**（paddlepaddle
   默认就是 CPU 推理，不装 paddle-custom-npu 就不碰卡），Linux 系统库 libstdc++/libgomp
-  已预装、opencv 缺 libGL 时 `dnf install mesa-libGL`），按三档分流：
+  已预装、opencv 缺 libGL 时 `dnf install mesa-libGL` 或换 `opencv-contrib-python-headless`），
+  按三档分流：
+  - **开关**：image 源 `ocr_second_opinion`（默认 true）——装了 paddle 即启用复核，false
+    可单独关闭（复核拖慢构建/临时停用），**只影响第二意见，主 OCR（外部 API）不受影响**；
+  - **权重位置**：默认 `~/.paddlex/official_models/`（det/rec/textline 三个模型约 23MB），
+    `PADDLE_PDX_CACHE_HOME` 环境变量可重定向；离线环境在有网机器跑一次验证命令下载完后
+    整目录拷贝即可（systemd 部署在 unit 里加 `Environment=PADDLE_PDX_CACHE_HOME=/data/paddlex`）；
+  - **vllm-ascend 共享 venv 必用子进程隔离**：主 venv 里 opencv 被 vllm-ascend 依赖链
+    引用，**装/换/卸 opencv（含 headless 替换）会破坏 vllm-ascend**——paddle 全家桶装
+    独立 venv，主进程经子进程长驻管道调用（主 venv 零 paddle/opencv 改动）：
+    ```bash
+    python3 -m venv ~/ppvenv
+    ~/ppvenv/bin/pip install paddlepaddle==3.3.1 paddleocr==3.7.0
+    ```
+    config image 源加 `"ocr_pp_python": "~/ppvenv/bin/python"`（tilde 展开）/绝对路径。
+    权重/缓存重定向对 PP venv 生效（`PADDLE_PDX_CACHE_HOME` 要在**主进程环境**里设置，
+    runner 继承）；
   - **自动**：高置信（≥ `ocr_min_confidence`）→ 现状采纳；PP 结果**仅记录**（PP 不审
     layout，对 VL 的版面取舍有系统性分歧误报——四图实证 issue 页 0.522 / doc 页 0.545
     均为侧栏取舍，内容实际重叠——故高置信不吃 PP 判定、不进队列）；

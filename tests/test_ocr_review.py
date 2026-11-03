@@ -161,6 +161,34 @@ class TestEnrichCrossConfirm(unittest.TestCase):
         self.assertEqual(art.confidence_source, "model")
         self.assertTrue(art.high_confidence)                # 版面分歧是预期误报
 
+    def test_switch_off_skips_pp(self):
+        """ocr_second_opinion: false → 不跑 PP（主 OCR 外部 API 不受影响）。"""
+        art = self._art(conf=0.4)
+        calls = []
+        with mock.patch("vllm_kb.ocr.ppocr_second_opinion",
+                        side_effect=lambda p: calls.append(p) or "VL文本"):
+            changed = enrich_ocr_artifact(art, "x.png", min_confidence=0.6, enabled=False)
+        self.assertEqual(calls, [])                  # 开关关 → 引擎不加载
+        self.assertFalse(changed)
+        self.assertEqual(art.second_opinion, {})     # 无复核数据
+        self.assertEqual(art.review_reason, "low")   # 照旧低置信进人工
+        # 开关开（默认）→ 照常复核翻案
+        art2 = self._art(conf=0.4)
+        with mock.patch("vllm_kb.ocr.ppocr_second_opinion", return_value="VL文本"):
+            changed2 = enrich_ocr_artifact(art2, "x.png", min_confidence=0.6, enabled=True)
+        self.assertTrue(changed2)
+        self.assertEqual(art2.confidence_source, "cross_confirmed")
+
+    def test_pp_python_passthrough(self):
+        """ocr_pp_python（独立 venv 隔离模式）应透传到 ppocr_second_opinion。"""
+        art = self._art(conf=0.4)
+        seen = []
+        with mock.patch("vllm_kb.ocr.ppocr_second_opinion",
+                        side_effect=lambda p, pp_python="": seen.append(pp_python) or None):
+            enrich_ocr_artifact(art, "x.png", min_confidence=0.6,
+                                pp_python="/opt/ppvenv/bin/python")
+        self.assertEqual(seen, ["/opt/ppvenv/bin/python"])
+
     def test_idempotent_and_missing_pp(self):
         art = self._art(conf=0.4)
         art.second_opinion = {"engine": "PP-OCRv5(local)", "text": "VL文本", "agree": 0.9}
