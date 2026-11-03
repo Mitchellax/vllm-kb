@@ -752,6 +752,15 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     `"ocr_pp_pythonpath": "/opt/ppdeps"`（PYTHONPATH 仅注入 runner 子进程——主进程
     依旧用系统 numpy/pandas，**不遮蔽**）。装后校验 `pip check`（与装前一致）+ runner
     单图验证；
+    **⚠️ docker 双解释器坑**：容器常有 `/usr/local/bin/python3`（镜像自带，PATH 优先）
+    与 `/usr/bin/python3`（发行版）两个 python——`whereis` 只查固定目录不反映 PATH，
+    **shell 敲的 python3 ≠ /usr/bin/python3**。config 必须写**实际用来装 --target 的
+    那个解释器真身**（cp312 装的目录只有 3.12 能加载）：
+    ```bash
+    readlink -f "$(which python3)"        # config 的 ocr_pp_python 写这个输出
+    python3 -m pip show lancedb paddlepaddle   # 主解释器应有 lancedb、无 paddle（隔离生效判据）
+    /usr/bin/python3 -m pip show paddlepaddle  # 若这里有 paddle → 该解释器已被裸装污染，恢复见上
+    ```
   - **自动**：高置信（≥ `ocr_min_confidence`）→ 现状采纳；PP 结果**仅记录**（PP 不审
     layout，对 VL 的版面取舍有系统性分歧误报——四图实证 issue 页 0.522 / doc 页 0.545
     均为侧栏取舍，内容实际重叠——故高置信不吃 PP 判定、不进队列）；
