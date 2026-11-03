@@ -180,6 +180,33 @@ python scripts/build_kb.py --limit 100
 > 日常维护（全量部署 / 增量更新）优先用 §2.0 的 `maintain.py deploy` / `update` 单指令；
 > 本表是细分脚本，供需要精确控制时单独调用。
 
+**版本升级迁移清单（含 2026-10 OCR 双模型审评）**
+
+```bash
+# 0. 停审核台/检索服务（避免半新半旧进程写库）
+# 1. 拉代码
+git pull origin main
+# 2. 核心依赖（零新增必装项；paddle 两行是 requirements 里注释掉的可选项）
+pip install -r requirements.txt
+# 3. 数据无需手动迁移（ocr_reviews 表自动创建，kb/review sqlite 自动兼容）
+# 4. 重入库（触发 canonicalize：存量图走新逻辑）
+python scripts/build_kb.py --skip-pull
+# 5. 起审核台（seed 三档分流生效）
+python scripts/review_ui.py
+```
+
+**图片 OCR 重跑的三种场景**（多数情况**不需要**重跑主引擎）：
+
+| 场景 | 操作 | 成本 |
+|---|---|---|
+| 默认：不重跑主引擎（推荐） | 什么都不做——构建时 cached 命中（sha256+指纹不变）只刷新判定字段；装了 PP 会自动补 `second_opinion`（存量一次性约 20 分钟，之后仅增量） | 近零 / 20 分钟 |
+| 强制重跑主引擎 OCR | 改 `ocr_api_model`/`ocr_api_prompt`/`ocr_api_mode` → 引擎指纹变化自动全量重算；或 `rm data/parsed/images/*.ocr.json` 后 `--skip-pull` | API 7-12s/张 × 700 ≈ 1.5-2.5h |
+| 只调阈值（`ocr_min_confidence`/`ocr_cross_threshold`） | 改完直接重建——阈值不进引擎指纹，cached 命中时判定即时生效 | 秒级 |
+
+**清缓存不丢锁定**：`rm *.ocr.json` 只丢复核数据（重算）；已人工审评的图构建时直接以
+`ocr_reviews` 锁定文本构造产物，**不调 API**——人工劳动不随缓存清除失效。队列不重复
+打扰：已 approved 项 dedupe 不重建；删除审评项的图按当前状态重新归档。
+
 **拉取策略（GitHub）**
 
 首次拉取完成后置 `done`（checkpoint），此后默认**不再拉取**（日志打印
