@@ -201,14 +201,30 @@ class TestEnrichCrossConfirm(unittest.TestCase):
         fake.stdout = io.StringIO('\nFetching model files...\n{"text": "123 456"}\n')
         sub = PpocrSubprocess.__new__(PpocrSubprocess)
         sub.p = fake
+        sub._errbuf = []
         self.assertEqual(sub.text("x.png"), "123 456")
-        # 管道关闭（EOF）→ 明确报错降级
+        # 管道关闭（EOF）→ 明确报错，且带 stderr 死因尾部
         fake2 = mock.Mock()
         fake2.stdin = io.StringIO()
         fake2.stdout = io.StringIO("")
         sub.p = fake2
-        with self.assertRaises(RuntimeError):
+        sub._errbuf = ["paddle crash line", "segfault"]
+        with self.assertRaises(RuntimeError) as cm:
             sub.text("x.png")
+        self.assertIn("segfault", str(cm.exception))
+
+    def test_subproc_stderr_drain(self):
+        """stderr 排空线程：进程死因（Traceback/segfault）进入环形缓冲供自报告。"""
+        import collections
+        import io
+        from vllm_kb.ocr import PpocrSubprocess
+
+        sub = PpocrSubprocess.__new__(PpocrSubprocess)
+        sub._errbuf = collections.deque(maxlen=80)
+        sub.p = mock.Mock()
+        sub.p.stderr = io.StringIO("Traceback ...\nMemoryError\n")
+        sub._drain_stderr()
+        self.assertIn("MemoryError", sub._stderr_tail())
 
     def test_idempotent_and_missing_pp(self):
         art = self._art(conf=0.4)

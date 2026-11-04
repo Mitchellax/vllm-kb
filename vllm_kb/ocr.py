@@ -378,17 +378,34 @@ class PpocrSubprocess:
     """
 
     def __init__(self, pp_python: str, pp_pythonpath: str = ""):
+        import collections
         import subprocess
+        import threading
 
         runner = Path(__file__).resolve().parents[1] / "scripts" / "ppocr_runner.py"
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
         if pp_pythonpath:  # --target 隔离安装目录：只注入 runner 子进程（主进程不遮蔽系统包）
             env["PYTHONPATH"] = (pp_pythonpath + os.pathsep + env["PYTHONPATH"]
                                  if env.get("PYTHONPATH") else pp_pythonpath)
+        self._errbuf = collections.deque(maxlen=80)  # 子进程 stderr 环形缓冲（死因自报告）
         self.p = subprocess.Popen(
             [pp_python, "-X", "utf8", str(runner), "--serve"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1, env=env)
+        # 后台线程持续排空 stderr（不读会塞满管道缓冲区死锁 runner）；进程死后尾部
+        # stderr（Traceback / segfault / OOM-kill 痕迹）随 RuntimeError 上抛。
+        self._t = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._t.start()
+
+    def _drain_stderr(self) -> None:
+        try:
+            for line in self.p.stderr:
+                self._errbuf.append(line.rstrip())
+        except Exception:  # noqa: BLE001 —— 进程死后 stderr 关闭，静默收尾
+            pass
+
+    def _stderr_tail(self) -> str:
+        return " | ".join(list(self._errbuf)[-6:])
 
     def text(self, img_path: str) -> str:
         self.p.stdin.write(str(img_path).replace("\n", " ") + "\n")
@@ -399,7 +416,8 @@ class PpocrSubprocess:
         for _ in range(50):
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("PP runner 管道已关闭（进程退出）")
+                raise RuntimeError(f"PP runner 管道已关闭（进程退出）"
+                                   f" stderr 尾部: {self._stderr_tail() or '<空>'}")
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -409,7 +427,8 @@ class PpocrSubprocess:
             except ValueError:  # 截断/损坏 JSON 行 → 跳过继续读
                 continue
         if d is None:
-            raise RuntimeError("PP runner 连续 50 行无有效 JSON（协议错位）")
+            raise RuntimeError(f"PP runner 连续 50 行无有效 JSON（协议错位）"
+                               f" stderr 尾部: {self._stderr_tail() or '<空>'}")
         if d.get("error"):
             raise RuntimeError(f"PP runner: {d['error']}")
         return str(d.get("text", "") or "")
@@ -417,6 +436,9 @@ class PpocrSubprocess:
     def close(self) -> None:
         try:
             self.p.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.p.wait(timeout=10)
         except Exception:  # noqa: BLE001
             self.p.kill()
