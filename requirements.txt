@@ -37,6 +37,10 @@ jieba>=0.42             # 入库侧/查询侧分词（scripts/build_fts.py 重�
 # opencv-contrib-python 完整版避免并存冲突）。Windows 另需 VC++ Redist 2015-2022 x64。
 # 开关：image 源 ocr_second_opinion（默认 true）——装了即启用复核，false 单独关闭；
 # 权重默认 ~/.paddlex/official_models/（约 23MB），PADDLE_PDX_CACHE_HOME 可重定向；
+# **离线预置推荐 modelscope**（PYTHONPATH=/opt/ppdeps python3 -m modelscope download
+# --model PaddlePaddle/PP-OCRv6_medium_det|PP-OCRv6_medium_rec|PP-LCNet_x1_0_textline_ori
+# ——完整脚本见 USAGE §2.3）：paddle 自带下载器中断会留半截 pdiparams（加载 segfault），
+# modelscope 按仓库整下没有这问题。
 # **离线/内网环境加 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True**（paddlex 启动时会做
 # 模型源联网检查，离线机器卡超时；主进程环境设置即可，runner 子进程继承）。
 # **vllm-ascend 共享 venv 场景**：勿在主 venv 装/换 opencv（headless 替换会破坏 vllm-ascend

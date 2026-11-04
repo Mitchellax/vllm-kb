@@ -721,8 +721,23 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   - **开关**：image 源 `ocr_second_opinion`（默认 true）——装了 paddle 即启用复核，false
     可单独关闭（复核拖慢构建/临时停用），**只影响第二意见，主 OCR（外部 API）不受影响**；
   - **权重位置**：默认 `~/.paddlex/official_models/`（det/rec/textline 三个模型约 23MB），
-    `PADDLE_PDX_CACHE_HOME` 环境变量可重定向；离线环境在有网机器跑一次验证命令下载完后
-    整目录拷贝即可（systemd 部署在 unit 里加 `Environment=PADDLE_PDX_CACHE_HOME=/data/paddlex`）；
+    `PADDLE_PDX_CACHE_HOME` 环境变量可重定向；systemd 部署在 unit 里加
+    `Environment=PADDLE_PDX_CACHE_HOME=/data/paddlex`。
+    **离线预置（推荐 modelscope，不依赖 paddle 的下载器）**——有网机器下载后整目录拷到
+    业务环境同路径；注意 paddle 自带下载器中断会留半截 `inference.pdiparams`（加载时
+    segfault，见排查），modelscope 按仓库整下没有这个问题：
+    ```bash
+    CACHE=${PADDLE_PDX_CACHE_HOME:-$HOME/.paddlex}
+    for m in PP-OCRv6_medium_det PP-OCRv6_medium_rec PP-LCNet_x1_0_textline_ori; do
+      PYTHONPATH=/opt/ppdeps python3 -m modelscope download \
+        --model PaddlePaddle/$m --local_dir $CACHE/official_models/$m
+    done
+    # 校验：三个目录都应有 inference.pdiparams（det ~5MB / rec ~11MB / textline ~7MB）
+    ls -la $CACHE/official_models/*/
+    # 建议把 official_models/ 目录挂 docker volume 或纳入备份——容器重建后免重下
+    ```
+    业务环境加 `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True`（主进程环境，runner 继承）
+    跳过 paddlex 启动时的模型源联网检查；
   - **vllm-ascend 共享 venv 必用子进程隔离**：主 venv 里 opencv 被 vllm-ascend 依赖链
     引用，**装/换/卸 opencv（含 headless 替换）会破坏 vllm-ascend**——paddle 全家桶装
     独立 venv，主进程经子进程长驻管道调用（主 venv 零 paddle/opencv 改动）：
