@@ -716,7 +716,7 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
   # openEuler 容器
   dnf install -y mesa-libGL
   ```
-  无在线安装条件时再用 headless 规避（target/venv 目录级换 headless，见下文隔离安装）），
+  无在线安装条件时再用 headless 规避（target/venv 目录级换 headless，见下文隔离安装），
   按三档分流：
   - **开关**：image 源 `ocr_second_opinion`（默认 true）——装了 paddle 即启用复核，false
     可单独关闭（复核拖慢构建/临时停用），**只影响第二意见，主 OCR（外部 API）不受影响**；
@@ -728,11 +728,7 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     segfault，见排查），modelscope 按仓库整下没有这个问题：
     ```bash
     CACHE=${PADDLE_PDX_CACHE_HOME:-$HOME/.paddlex}
-    PYTHONPATH=/opt/ppdeps python3 -c "
-from modelscope import snapshot_download
-for m in ('PP-OCRv6_medium_det', 'PP-OCRv6_medium_rec', 'PP-LCNet_x1_0_textline_ori'):
-    snapshot_download(f'PaddlePaddle/{m}', local_dir=f'{CACHE}/official_models/{m}')
-"
+    PYTHONPATH=/opt/ppdeps python3 -c "from modelscope import snapshot_download; [snapshot_download('PaddlePaddle/' + m, local_dir='$CACHE/official_models/' + m) for m in ('PP-OCRv6_medium_det', 'PP-OCRv6_medium_rec', 'PP-LCNet_x1_0_textline_ori')]"
     # 校验：三个目录都应有 inference.pdiparams（det ~5MB / rec ~11MB / textline ~7MB）
     ls -la $CACHE/official_models/*/
     # 建议把 official_models/ 目录挂 docker volume 或纳入备份——容器重建后免重下
