@@ -17,6 +17,27 @@ import sys
 
 
 def _new_engine():
+    # aarch64 paddle 3.2.x 默认 PIR 模式在 PreparePirProgram/SaveOrLoadParameters 阶段
+    # segfault（权重完整也崩）——paddleocr 层拒绝 enable_new_ir 参数（Unknown argument），
+    # 从 paddlex 的 NEWIR_BLOCKLIST 绕：名单内模型 pp_option 自动 enable_new_ir=False
+    # （纯 Python 常量，安全 patch）。PP_DISABLE_NEW_IR=0 可关掉此规避。
+    import os
+
+    if os.environ.get("PP_DISABLE_NEW_IR", "1") != "0":
+        try:
+            from paddlex.inference.models.runners.paddle_static.config import (
+                pp_option,
+            )
+
+            patched = set(pp_option.NEWIR_BLOCKLIST) | {
+                "PP-OCRv5_medium_det", "PP-OCRv5_medium_rec",
+                "PP-OCRv5_server_det", "PP-OCRv5_server_rec",
+                "PP-OCRv6_medium_det", "PP-OCRv6_medium_rec",
+                "PP-LCNet_x1_0_textline_ori",
+            }
+            pp_option.NEWIR_BLOCKLIST = patched
+        except Exception:  # noqa: BLE001 —— paddlex 版本结构变化时静默跳过
+            pass
     from paddleocr import PaddleOCR
 
     try:  # 3.x 新 API
