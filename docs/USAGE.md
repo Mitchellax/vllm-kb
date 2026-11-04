@@ -728,14 +728,17 @@ python scripts/build_kb.py --skip-pull        # 触发 canonicalize（md 图片 
     segfault，见排查），modelscope 按仓库整下没有这个问题：
     ```bash
     CACHE=${PADDLE_PDX_CACHE_HOME:-$HOME/.paddlex}
-    for m in PP-OCRv6_medium_det PP-OCRv6_medium_rec PP-LCNet_x1_0_textline_ori; do
-      PYTHONPATH=/opt/ppdeps python3 -m modelscope download \
-        --model PaddlePaddle/$m --local_dir $CACHE/official_models/$m
-    done
+    PYTHONPATH=/opt/ppdeps python3 -c "
+from modelscope import snapshot_download
+for m in ('PP-OCRv6_medium_det', 'PP-OCRv6_medium_rec', 'PP-LCNet_x1_0_textline_ori'):
+    snapshot_download(f'PaddlePaddle/{m}', local_dir=f'{CACHE}/official_models/{m}')
+"
     # 校验：三个目录都应有 inference.pdiparams（det ~5MB / rec ~11MB / textline ~7MB）
     ls -la $CACHE/official_models/*/
     # 建议把 official_models/ 目录挂 docker volume 或纳入备份——容器重建后免重下
     ```
+    （modelscope 无 `python -m` 入口；若用 CLI 则是 `/opt/ppdeps/bin/modelscope download
+    --model PaddlePaddle/<模型名> --local_dir <目录>`）
     业务环境加 `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True`（主进程环境，runner 继承）
     跳过 paddlex 启动时的模型源联网检查；
   - **vllm-ascend 共享 venv 必用子进程隔离**：主 venv 里 opencv 被 vllm-ascend 依赖链
